@@ -1,0 +1,19 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "npm",
+      "script": "build",
+      "problemMatcher": [],
+      "label": "npm: build",
+      "detail": "Build the Go core, then bundle the extension"
+    },
+    {
+      "type": "npm",
+      "script": "watch",
+      "problemMatcher": "$esbuild-watch",
+      "isBackground": true,
+      "label": "npm: watch"
+    }
+  ]
+}

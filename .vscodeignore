@@ -1,0 +1,17 @@
+.vscode/**
+.github/**
+core/**
+scripts/**
+src/**
+node_modules/**
+out/**/*.map
+**/*.ts
+**/tsconfig.json
+esbuild.mjs
+.gitignore
+.mfagent/**
+
+# Keep only the binary for the target platform when packaging per-platform.
+!out/extension.js
+!media/**
+!bin/**

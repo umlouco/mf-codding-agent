@@ -1,0 +1,720 @@
+import * as fs from 'fs';
+import * as path from 'path';
+
+/**
+ * The task queue is the single source of truth for autonomous runs.
+ *
+ * Nothing is passed between agents in memory: the Supervisor and every
+ * Execution worker read and write this file, so a worker can be killed mid-run
+ * and the next one picks up exactly where the database says it should. Status
+ * transitions are the whole protocol.
+ *
+ *   PENDING ──claim──▶ EXECUTING ──worker done──▶ VERIFYING
+ *      ▲                   │                          │
+ *      │                   └── crash/timeout ─────────┤
+ *      │                                              │
+ *      ├── supervisor resets ◀── FAILED ◀── checks fail
+ *      └── VERIFIED ◀── checks pass
+ *
+ * PAUSED is a user-driven halt that survives a window reload.
+ */
+
+// ---- driver ------------------------------------------------------------
+
+interface RunInfo {
+  changes: number;
+  lastInsertRowid: number | bigint;
+}
+
+interface Stmt {
+  run(...params: unknown[]): RunInfo;
+  get(...params: unknown[]): any;
+  all(...params: unknown[]): any[];
+}
+
+interface Driver {
+  prepare(sql: string): Stmt;
+  exec(sql: string): void;
+  close(): void;
+}
+
+/**
+ * Loads better-sqlite3 when it is present, otherwise falls back to Node's
+ * built-in `node:sqlite`.
+ *
+ * better-sqlite3 is a native addon and has to match the Electron ABI of the
+ * running VS Code, which breaks on host upgrades; `node:sqlite` ships with the
+ * runtime and needs no build step. Both expose the same prepare/run/get/all
+ * shape, so the rest of this file does not care which one it got. Every query
+ * below uses positional `?` parameters, which are the only binding style both
+ * drivers agree on.
+ */
+function openDriver(file: string): { db: Driver; impl: string } {
+  // Both are marked external in esbuild.mjs, so these stay real runtime
+  // requires in the bundle and either one is allowed to be absent.
+  try {
+    const BetterSqlite3 = require('better-sqlite3');
+    return { db: new BetterSqlite3(file) as Driver, impl: 'better-sqlite3' };
+  } catch {
+    /* not installed, or built against a different ABI — fall through */
+  }
+
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    return { db: new DatabaseSync(file) as Driver, impl: 'node:sqlite' };
+  } catch (e: any) {
+    // Name the host: this is the failure a remote extension host hits, where
+    // the server's Node is not the Electron runtime the same VS Code uses
+    // locally, and `node:sqlite` needs Node 22.13 or newer.
+    const host =
+      `Node ${process.versions.node}` +
+      (process.versions.electron ? `, Electron ${process.versions.electron}` : '');
+    throw new Error(
+      `No SQLite driver available on this host (${host}). better-sqlite3 is not ` +
+        'bundled with the extension, and node:sqlite requires Node 22.13 or newer. ' +
+        `(${e?.message ?? e})`,
+    );
+  }
+}
+
+// ---- model -------------------------------------------------------------
+
+export const TASK_STATUSES = [
+  'PENDING',
+  'EXECUTING',
+  'VERIFYING',
+  'VERIFIED',
+  'FAILED',
+  'PAUSED',
+] as const;
+
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+
+export interface Task {
+  id: number;
+  title: string;
+  description: string;
+  /** How the Supervisor should check the code and files actually exist as described. */
+  implVerifyPrompt: string;
+  /** How the Supervisor should judge that the solution behaves correctly. */
+  solutionVerifyPrompt: string;
+  /** Shell command whose exit code decides the functional check. */
+  solutionVerifyCommand: string;
+  status: TaskStatus;
+  /** 1-based execution order. Gaps are allowed; the queue always sorts by this. */
+  seq: number;
+  /** Whatever the Execution agent reported back on its last run. */
+  output: string;
+  errorLog: string;
+  supervisorFeedback: string;
+  attempts: number;
+  maxAttempts: number;
+  /**
+   * When the worker on this task last wrote anything at all.
+   *
+   * This is what replaces a timeout. A worker waiting on a slow model keeps
+   * writing, so a stale timestamp means the process is gone — not that the work
+   * is taking too long, which is never by itself a reason to stop it.
+   */
+  lastActivityAt: number | null;
+  /** What it was doing when it last wrote: see the core's activity phases. */
+  activityPhase: string;
+  activityDetail: string;
+  createdAt: number;
+  updatedAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+/** Fields accepted when creating a task; everything else is defaulted. */
+export type NewTask = Pick<Task, 'title' | 'description'> &
+  Partial<
+    Pick<
+      Task,
+      | 'implVerifyPrompt'
+      | 'solutionVerifyPrompt'
+      | 'solutionVerifyCommand'
+      | 'seq'
+      | 'maxAttempts'
+      | 'status'
+    >
+  >;
+
+export type RunState = 'IDLE' | 'RUNNING' | 'PAUSED' | 'STOPPED';
+
+export interface QueueStats {
+  total: number;
+  byStatus: Record<TaskStatus, number>;
+  runState: RunState;
+}
+
+export interface TaskEvent {
+  id: number;
+  taskId: number | null;
+  actor: string;
+  kind: string;
+  message: string;
+  at: number;
+}
+
+const COLUMNS = `
+  id, title, description,
+  impl_verify_prompt      AS implVerifyPrompt,
+  solution_verify_prompt  AS solutionVerifyPrompt,
+  solution_verify_command AS solutionVerifyCommand,
+  status, seq, output,
+  error_log           AS errorLog,
+  supervisor_feedback AS supervisorFeedback,
+  attempts, max_attempts AS maxAttempts,
+  last_activity_at AS lastActivityAt,
+  activity_phase   AS activityPhase,
+  activity_detail  AS activityDetail,
+  created_at  AS createdAt,
+  updated_at  AS updatedAt,
+  started_at  AS startedAt,
+  finished_at AS finishedAt
+`;
+
+// ---- store -------------------------------------------------------------
+
+export class TaskQueue {
+  private readonly db: Driver;
+  readonly impl: string;
+  readonly path: string;
+
+  private constructor(db: Driver, impl: string, file: string) {
+    this.db = db;
+    this.impl = impl;
+    this.path = file;
+  }
+
+  /** Opens (creating if needed) the queue database for a workspace. */
+  static open(file: string): TaskQueue {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const { db, impl } = openDriver(file);
+    const q = new TaskQueue(db, impl, file);
+    q.migrate();
+    return q;
+  }
+
+  private migrate(): void {
+    // WAL lets the supervisor read while a worker writes; NORMAL sync is the
+    // right trade for a queue we can always rebuild.
+    this.db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA foreign_keys = ON;
+
+      CREATE TABLE IF NOT EXISTS tasks (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        title                   TEXT    NOT NULL,
+        description             TEXT    NOT NULL DEFAULT '',
+        impl_verify_prompt      TEXT    NOT NULL DEFAULT '',
+        solution_verify_prompt  TEXT    NOT NULL DEFAULT '',
+        solution_verify_command TEXT    NOT NULL DEFAULT '',
+        status                  TEXT    NOT NULL DEFAULT 'PENDING',
+        seq                     INTEGER NOT NULL,
+        output                  TEXT    NOT NULL DEFAULT '',
+        error_log               TEXT    NOT NULL DEFAULT '',
+        supervisor_feedback     TEXT    NOT NULL DEFAULT '',
+        attempts                INTEGER NOT NULL DEFAULT 0,
+        max_attempts            INTEGER NOT NULL DEFAULT 3,
+        created_at              INTEGER NOT NULL,
+        updated_at              INTEGER NOT NULL,
+        started_at              INTEGER,
+        finished_at             INTEGER,
+        CHECK (status IN ('PENDING','EXECUTING','VERIFYING','VERIFIED','FAILED','PAUSED'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_status_seq ON tasks(status, seq);
+      CREATE INDEX IF NOT EXISTS idx_tasks_seq        ON tasks(seq);
+
+      -- Append-only audit trail. The supervisor reads this to understand how a
+      -- task got into its current state, not just what that state is.
+      CREATE TABLE IF NOT EXISTS task_events (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+        actor   TEXT NOT NULL,
+        kind    TEXT NOT NULL,
+        message TEXT NOT NULL DEFAULT '',
+        at      INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id);
+
+      CREATE TABLE IF NOT EXISTS queue_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+
+    // Liveness lives on the task rather than in a separate table: it is read on
+    // every cron tick and written constantly, so it wants to be one cheap
+    // UPDATE next to the status it qualifies.
+    this.addColumn('last_activity_at', 'INTEGER');
+    this.addColumn('activity_phase', "TEXT NOT NULL DEFAULT ''");
+    this.addColumn('activity_detail', "TEXT NOT NULL DEFAULT ''");
+  }
+
+  /** Adds a column to `tasks` if this database predates it. */
+  private addColumn(name: string, decl: string): void {
+    const has = (this.db.prepare('PRAGMA table_info(tasks)').all() as any[]).some(
+      (c) => c.name === name,
+    );
+    if (!has) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${decl}`);
+    }
+  }
+
+  close(): void {
+    try {
+      this.db.close();
+    } catch {
+      /* already closed */
+    }
+  }
+
+  /** Runs `fn` inside a transaction, rolling back if it throws. */
+  private tx<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const out = fn();
+      this.db.exec('COMMIT');
+      return out;
+    } catch (e) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        /* nothing to roll back */
+      }
+      throw e;
+    }
+  }
+
+  // ---- meta ------------------------------------------------------------
+
+  getMeta(key: string, fallback = ''): string {
+    const row = this.db.prepare('SELECT value FROM queue_meta WHERE key = ?').get(key);
+    return row?.value ?? fallback;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO queue_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(key, value);
+  }
+
+  /**
+   * The supervisor's wake-up interval for *this* queue, in seconds. Zero means
+   * the queue has no opinion and the global setting applies.
+   *
+   * It lives in `queue_meta` rather than `settings.json` because it belongs to
+   * the plan: a queue of long migrations wants a slower cron than one of small
+   * edits, and the choice has to survive a window reload along with the run it
+   * was made for. `replaceAll` clears tasks and events but not meta, so
+   * regenerating a plan keeps the pace you picked for it.
+   */
+  get cronIntervalSeconds(): number {
+    const n = Number(this.getMeta('cronIntervalSeconds', '0'));
+    return Number.isFinite(n) && n > 0 ? Math.max(10, Math.floor(n)) : 0;
+  }
+
+  /** Pass 0 (or less) to hand this queue back to the global setting. */
+  setCronIntervalSeconds(seconds: number): void {
+    const n =
+      Number.isFinite(seconds) && seconds > 0 ? Math.max(10, Math.floor(seconds)) : 0;
+    this.setMeta('cronIntervalSeconds', String(n));
+    this.log(null, 'user', 'cron-interval', n > 0 ? `${n}s` : 'inherit setting');
+  }
+
+  get runState(): RunState {
+    return this.getMeta('runState', 'IDLE') as RunState;
+  }
+
+  setRunState(state: RunState): void {
+    this.setMeta('runState', state);
+    this.log(null, 'system', 'run-state', state);
+  }
+
+  // ---- reads -----------------------------------------------------------
+
+  list(): Task[] {
+    return this.db.prepare(`SELECT ${COLUMNS} FROM tasks ORDER BY seq ASC, id ASC`).all();
+  }
+
+  get(id: number): Task | undefined {
+    return this.db.prepare(`SELECT ${COLUMNS} FROM tasks WHERE id = ?`).get(id);
+  }
+
+  stats(): QueueStats {
+    const rows = this.db
+      .prepare('SELECT status, COUNT(*) AS n FROM tasks GROUP BY status')
+      .all();
+    const byStatus = Object.fromEntries(
+      TASK_STATUSES.map((s) => [s, 0]),
+    ) as Record<TaskStatus, number>;
+    let total = 0;
+    for (const r of rows) {
+      byStatus[r.status as TaskStatus] = r.n;
+      total += r.n;
+    }
+    return { total, byStatus, runState: this.runState };
+  }
+
+  events(taskId: number | null, limit = 100): TaskEvent[] {
+    const sql =
+      taskId === null
+        ? `SELECT id, task_id AS taskId, actor, kind, message, at
+             FROM task_events ORDER BY id DESC LIMIT ?`
+        : `SELECT id, task_id AS taskId, actor, kind, message, at
+             FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT ?`;
+    const stmt = this.db.prepare(sql);
+    return taskId === null ? stmt.all(limit) : stmt.all(taskId, limit);
+  }
+
+  log(taskId: number | null, actor: string, kind: string, message = ''): void {
+    this.db
+      .prepare(
+        'INSERT INTO task_events (task_id, actor, kind, message, at) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(taskId, actor, kind, message.slice(0, 8000), Date.now());
+  }
+
+  /**
+   * Appends one timestamped line of worker activity and refreshes the task's
+   * liveness in the same transaction.
+   *
+   * Both halves matter and they answer different questions. The event row is
+   * the transcript — what the worker was doing, in order, kept after the
+   * process is gone. The column is the index into it: the single timestamp the
+   * cron tick reads to decide whether anyone is still home.
+   */
+  recordActivity(taskId: number, phase: string, detail: string): void {
+    const now = Date.now();
+    this.tx(() => {
+      this.db
+        .prepare(
+          'INSERT INTO task_events (task_id, actor, kind, message, at) VALUES (?, ?, ?, ?, ?)',
+        )
+        .run(taskId, 'executor', `activity:${phase}`, detail.slice(0, 8000), now);
+      this.db
+        .prepare(
+          `UPDATE tasks SET last_activity_at = ?, activity_phase = ?, activity_detail = ?
+             WHERE id = ?`,
+        )
+        .run(now, phase, detail.slice(0, 500), taskId);
+    });
+  }
+
+  /**
+   * Tasks that are supposedly EXECUTING but have not written for `silentMs`.
+   *
+   * This is the only "the worker is gone" test in the system, and it is a
+   * statement about evidence rather than about elapsed time: a live worker
+   * writes while it waits on the model and while a long build runs, so silence
+   * here means the process died, not that the work is slow. A task claimed but
+   * still silent — no activity at all yet — is measured from when it started.
+   */
+  silentWorkers(silentMs: number): Task[] {
+    const cutoff = Date.now() - silentMs;
+    return this.db
+      .prepare(
+        `SELECT ${COLUMNS} FROM tasks
+         WHERE status = 'EXECUTING'
+           AND COALESCE(last_activity_at, started_at, 0) < ?
+         ORDER BY seq ASC`,
+      )
+      .all(cutoff);
+  }
+
+  // ---- writes ----------------------------------------------------------
+
+  /**
+   * Replaces the queue with a freshly generated task list. Used by the
+   * generation UI, which produces a whole plan at once rather than appending.
+   */
+  replaceAll(tasks: NewTask[]): number {
+    return this.tx(() => {
+      this.db.exec('DELETE FROM tasks');
+      this.db.exec('DELETE FROM task_events');
+      let n = 0;
+      for (const t of tasks) {
+        this.insert(t, ++n);
+      }
+      this.setMeta('runState', 'IDLE');
+      this.log(null, 'system', 'queue-generated', `${n} task(s)`);
+      return n;
+    });
+  }
+
+  addAll(tasks: NewTask[]): number {
+    return this.tx(() => {
+      let seq = this.maxSeq();
+      let n = 0;
+      for (const t of tasks) {
+        this.insert(t, t.seq ?? ++seq);
+        n++;
+      }
+      return n;
+    });
+  }
+
+  private maxSeq(): number {
+    return this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM tasks').get().m as number;
+  }
+
+  private insert(t: NewTask, seq: number): number {
+    const now = Date.now();
+    const info = this.db
+      .prepare(
+        `INSERT INTO tasks (
+           title, description, impl_verify_prompt, solution_verify_prompt,
+           solution_verify_command, status, seq, max_attempts, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        t.title,
+        t.description ?? '',
+        t.implVerifyPrompt ?? '',
+        t.solutionVerifyPrompt ?? '',
+        t.solutionVerifyCommand ?? '',
+        t.status ?? 'PENDING',
+        t.seq ?? seq,
+        t.maxAttempts ?? 3,
+        now,
+        now,
+      );
+    return Number(info.lastInsertRowid);
+  }
+
+  update(id: number, patch: Partial<Omit<Task, 'id' | 'createdAt'>>): void {
+    const map: Record<string, string> = {
+      title: 'title',
+      description: 'description',
+      implVerifyPrompt: 'impl_verify_prompt',
+      solutionVerifyPrompt: 'solution_verify_prompt',
+      solutionVerifyCommand: 'solution_verify_command',
+      status: 'status',
+      seq: 'seq',
+      output: 'output',
+      errorLog: 'error_log',
+      supervisorFeedback: 'supervisor_feedback',
+      attempts: 'attempts',
+      maxAttempts: 'max_attempts',
+      startedAt: 'started_at',
+      finishedAt: 'finished_at',
+    };
+
+    const sets: string[] = [];
+    const args: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) {
+      const col = map[k];
+      if (col && v !== undefined) {
+        sets.push(`${col} = ?`);
+        args.push(v);
+      }
+    }
+    if (sets.length === 0) {
+      return;
+    }
+    sets.push('updated_at = ?');
+    args.push(Date.now(), id);
+    this.db.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).run(...args);
+  }
+
+  remove(id: number): void {
+    this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+  }
+
+  /**
+   * Replaces one task with the smaller tasks it should have been.
+   *
+   * Everything after it shifts down to make room, so the queue keeps a dense
+   * ordering and a later `resetFrom(seq)` still means what it says. The original
+   * row is deleted rather than kept as a parent: the queue is a flat list, and a
+   * container task left behind would sit there unverifiable forever.
+   *
+   * Returns the number of tasks inserted.
+   */
+  splitTask(id: number, parts: NewTask[]): number {
+    return this.tx(() => {
+      const task = this.get(id);
+      if (!task || parts.length < 2) {
+        return 0;
+      }
+      const shift = parts.length - 1;
+      this.db
+        .prepare('UPDATE tasks SET seq = seq + ?, updated_at = ? WHERE seq > ?')
+        .run(shift, Date.now(), task.seq);
+      this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+
+      parts.forEach((p, i) => {
+        const newId = this.insert(
+          { ...p, seq: task.seq + i, maxAttempts: p.maxAttempts ?? task.maxAttempts },
+          task.seq + i,
+        );
+        this.log(newId, 'supervisor', 'split-from', `task ${task.seq}: ${task.title}`);
+      });
+      this.log(
+        null,
+        'supervisor',
+        'split',
+        `task ${task.seq} (${task.title}) replaced by ${parts.length} tasks`,
+      );
+      return parts.length;
+    });
+  }
+
+  /** Renumbers `seq` to 1..n in the given id order. Used by drag-to-reorder. */
+  reorder(idsInOrder: number[]): void {
+    this.tx(() => {
+      const stmt = this.db.prepare('UPDATE tasks SET seq = ?, updated_at = ? WHERE id = ?');
+      const now = Date.now();
+      idsInOrder.forEach((id, i) => stmt.run(i + 1, now, id));
+    });
+  }
+
+  // ---- state machine ---------------------------------------------------
+
+  /**
+   * Atomically claims the lowest-seq PENDING task and marks it EXECUTING.
+   *
+   * The read and the write share one transaction so two workers racing on the
+   * same queue cannot both take the same task — the second sees EXECUTING.
+   */
+  claimNext(): Task | undefined {
+    return this.tx(() => {
+      const row = this.db
+        .prepare(
+          `SELECT ${COLUMNS} FROM tasks WHERE status = 'PENDING'
+           ORDER BY seq ASC, id ASC LIMIT 1`,
+        )
+        .get() as Task | undefined;
+      if (!row) {
+        return undefined;
+      }
+      const now = Date.now();
+      // Liveness starts at the claim, not at the first thing the worker says:
+      // spawning a core and loading a local model can take a while, and that
+      // gap must not read as a worker that never showed up.
+      this.db
+        .prepare(
+          `UPDATE tasks SET status = 'EXECUTING', attempts = attempts + 1,
+             started_at = ?, updated_at = ?, last_activity_at = ?,
+             activity_phase = 'claimed', activity_detail = ''
+           WHERE id = ?`,
+        )
+        .run(now, now, now, row.id);
+      this.log(row.id, 'executor', 'claimed', `attempt ${row.attempts + 1}`);
+      return {
+        ...row,
+        status: 'EXECUTING' as TaskStatus,
+        attempts: row.attempts + 1,
+        lastActivityAt: now,
+        activityPhase: 'claimed',
+      };
+    });
+  }
+
+  /** Tasks the supervisor should inspect this cycle. */
+  awaitingVerification(): Task[] {
+    return this.db
+      .prepare(`SELECT ${COLUMNS} FROM tasks WHERE status = 'VERIFYING' ORDER BY seq ASC`)
+      .all();
+  }
+
+  /** True when at least one task is in FAILED state, blocking the queue. */
+  anyFailed(): boolean {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM tasks WHERE status = 'FAILED'")
+      .get();
+    return (row.n as number) > 0;
+  }
+
+  /** True when no task can make progress without intervention. */
+  isComplete(): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM tasks
+         WHERE status IN ('PENDING','EXECUTING','VERIFYING')`,
+      )
+      .get();
+    return (row.n as number) === 0;
+  }
+
+  /**
+   * Recovers tasks orphaned by a crashed worker or a window reload. Anything
+   * still EXECUTING at startup has no live process behind it.
+   */
+  requeueStale(olderThanMs: number): number {
+    const cutoff = Date.now() - olderThanMs;
+    // `<=` rather than `<`: with olderThanMs of 0 the caller means "everything
+    // currently EXECUTING", and a task claimed in the same millisecond as the
+    // sweep would slip through a strict comparison.
+    const stale: Task[] = this.db
+      .prepare(
+        `SELECT ${COLUMNS} FROM tasks
+         WHERE status = 'EXECUTING' AND COALESCE(started_at, 0) <= ?`,
+      )
+      .all(cutoff);
+    for (const t of stale) {
+      const dead = t.attempts >= t.maxAttempts;
+      this.update(t.id, {
+        status: dead ? 'FAILED' : 'PENDING',
+        errorLog: `${t.errorLog}\n[recovered] worker did not report back; task was left EXECUTING.`.trim(),
+      });
+      this.log(t.id, 'system', 'recovered', dead ? 'attempts exhausted → FAILED' : 'requeued');
+    }
+    return stale.length;
+  }
+
+  /** Clears all progress and returns every task to the start of the pipeline. */
+  resetAll(): void {
+    this.tx(() => {
+      this.db.exec(`
+        UPDATE tasks SET status = 'PENDING', attempts = 0, output = '',
+          error_log = '', supervisor_feedback = '', started_at = NULL,
+          finished_at = NULL, updated_at = ${Date.now()}
+      `);
+      this.setMeta('runState', 'IDLE');
+      this.log(null, 'system', 'reset', 'all tasks returned to PENDING');
+    });
+  }
+
+  /** Resets this task and every task after it — the supervisor's rollback. */
+  resetFrom(seq: number, feedback: string): number {
+    return this.tx(() => {
+      const info = this.db
+        .prepare(
+          `UPDATE tasks SET status = 'PENDING', attempts = 0, output = '',
+             started_at = NULL, finished_at = NULL,
+             supervisor_feedback = ?, updated_at = ?
+           WHERE seq >= ?`,
+        )
+        .run(feedback, Date.now(), seq);
+      this.log(null, 'supervisor', 'reset-from', `seq >= ${seq}: ${feedback}`);
+      return info.changes;
+    });
+  }
+
+  /** Pauses every task that has not finished, so a resume is a clean restart. */
+  pauseOpen(): void {
+    this.db
+      .prepare(
+        `UPDATE tasks SET status = 'PAUSED', updated_at = ?
+         WHERE status IN ('PENDING','EXECUTING')`,
+      )
+      .run(Date.now());
+    this.setRunState('PAUSED');
+  }
+
+  resumePaused(): void {
+    this.db
+      .prepare(`UPDATE tasks SET status = 'PENDING', updated_at = ? WHERE status = 'PAUSED'`)
+      .run(Date.now());
+    this.setRunState('RUNNING');
+  }
+}

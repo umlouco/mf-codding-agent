@@ -1,0 +1,12 @@
+node_modules/
+out/
+dist/
+bin/
+*.vsix
+.vscode-test/
+core/mfcore
+core/mfcore.exe
+*.db
+*.db-wal
+*.db-shm
+.env

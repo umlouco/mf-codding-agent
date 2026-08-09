@@ -1,0 +1,331 @@
+# MF Agent
+
+A lightweight coding agent for VS Code. Clean-room — no Copilot, no dependency on
+`vscode.lm`, no notebook support, no ecosystem you don't use.
+
+Built around four things: **graph memory that survives across sessions**, **strong
+editing tools**, **POSIX commands that work natively on Windows**, and **real browser
+testing**. Plus MCP, so you can plug in anything else.
+
+The whole extension is a **19 KB** JavaScript shim. Everything real happens in a
+single compiled Go binary.
+
+---
+
+## Why it's built this way
+
+VS Code only loads JavaScript in its extension host, so a shim is unavoidable. The
+shim is kept as small as it can be: spawn the core, pump JSON-RPC, render a webview.
+The agent loop, tools, memory, MCP clients and browser driver all live in Go and ship
+as one static binary with no runtime dependencies — the same pattern `gopls` and
+`rust-analyzer` use.
+
+```
+┌─ VS Code extension host ────────────┐
+│  extension.ts   commands, gating    │
+│  panel.ts       webview chat        │   19 KB of JS
+│  core.ts        JSON-RPC over stdio │
+└──────────────┬──────────────────────┘
+               │ newline-delimited JSON-RPC 2.0
+┌──────────────▼──────────────────────┐
+│  mfcore  (single static Go binary)  │
+│                                     │
+│  agent loop ── tools ── graph memory│
+│       │         │        (SQLite)   │
+│       │         ├─ MCP clients      │
+│       │         └─ browser (CDP)    │
+│       └─ LLM: Anthropic / OpenAI-compatible
+└─────────────────────────────────────┘
+```
+
+---
+
+## Two agents, one composer
+
+The selector next to the message box decides who answers.
+
+**Coder** is the chat you already know: one long-lived core, one conversation, tools
+that read and edit the workspace as you talk. This is the default, and every editor
+command (*Ask About Selection*, *Edit Selection*, *Explain Problems*) goes to it
+regardless of what the selector is set to — those are questions about the
+conversation.
+
+**Planner** does not join the conversation. It burns a throwaway core on the
+**Queue · Planner** model, explores the workspace, and writes a numbered plan —
+each task with an implementation check, a behaviour check and a command that must
+exit 0. The plan lands in the **Task Queue**, not in the chat; what you see in the
+chat is the exploring, then the finished list. If the queue already has tasks you
+are asked whether to replace them or append.
+
+Nothing starts running on its own. Review the plan in the Task Queue view and press
+**Start** when you want the autonomous run.
+
+---
+
+## Graph memory
+
+Most agents forget everything between sessions, or bolt on a vector store that
+returns semantically-similar-but-unrelated chunks. This uses a persistent property
+graph instead, in three tiers:
+
+| Tier | What it holds | How it's queried |
+|---|---|---|
+| **Observations** | Append-only facts attached to an entity | Full-text |
+| **Retrieval** | FTS5 seeds, then one hop across the graph | `memory_recall` |
+| **Substrate** | Typed nodes and typed, weighted edges | `memory_trace` |
+
+The one-hop expansion is the part that matters. Searching *"Stripe"* returns
+`StripeGateway` — and also the `exponential-backoff-policy` decision connected to it,
+which shares no vocabulary with the query and no keyword or vector search would find.
+An entity reached from two different seeds outranks one reached from a single seed.
+
+Entities are typed (`File`, `Symbol`, `Module`, `Decision`, `Bug`, `Requirement`,
+`Endpoint`, `Table`, …) and so are relations (`depends_on`, `calls`, `defines`,
+`fixes`, `supersedes`, `part_of`, …). A closed vocabulary is what keeps the graph
+queryable — an open label space degrades into a bag of strings.
+
+Storage is one SQLite file per workspace at `.mfagent/memory.db`, via a pure-Go
+driver. No server, no cgo, nothing to install.
+
+Inspect it any time with **MF Agent: Show Graph Memory**.
+
+---
+
+## Tools
+
+**Editing** — `read_file`, `write_file`, `edit_file`, `multi_edit`, `list_dir`.
+Edits are exact-string replacements that must match uniquely, so a change is
+reviewable rather than a whole-file rewrite. Writing a file the agent hasn't read, or
+that changed on disk since it read it, is refused. CRLF mismatches are detected and
+explained rather than failing silently.
+
+**Search** — `glob` (with `**`) and `grep` (RE2, with `lang` shorthands for
+`php`/`ts`/`js`/`go`/`delphi`). Both skip `node_modules`, `vendor`, `__history` and
+friends, which is what makes them fast enough not to need a native ripgrep.
+
+**`unix`** — a POSIX toolbox implemented natively in Go: `ls cat head tail grep sed
+sort uniq cut tr wc find stat du which echo pwd mkdir touch rm cp mv`, with pipes
+(`|`) and redirection (`>`, `>>`). Identical behaviour on Windows, macOS and Linux
+with no WSL, no Git Bash, no busybox. It cannot spawn a process, so read-only
+pipelines run without a prompt.
+
+```
+grep -rn TODO src | wc -l
+cat composer.json | grep require
+find . -name "*.pas" -type f | sort > delphi-files.txt
+```
+
+**`run_shell`** — the real shell (PowerShell on Windows, `sh` elsewhere) for builds,
+tests, package managers, compilers and git.
+
+**`project_info`** — detects languages, tooling, npm/composer scripts, and Delphi
+`.dpr`/`.dproj` projects.
+
+**Browser** — `browser_open`, `browser_elements`, `browser_click`, `browser_fill`,
+`browser_eval`, `browser_wait`, `browser_screenshot`, `browser_console`. Drives real
+Chromium over the DevTools Protocol. `browser_elements` returns interactive elements
+with ready-made CSS selectors, so the agent isn't guessing them; `browser_console`
+returns errors and uncaught exceptions, so "it compiles" and "it works" stay
+different claims. Screenshots appear inline in chat.
+
+**Memory** — `memory_recall`, `memory_trace`, `memory_remember`.
+
+**MCP** — every tool from every connected server, namespaced `mcp__<server>__<tool>`.
+
+---
+
+## Permissions
+
+Anything that writes, executes or navigates goes through one confirmation prompt.
+The gate lives in the agent loop, not in the individual tools, so a new tool cannot
+ship without it.
+
+Gated: `write_file`, `edit_file`, `multi_edit`, `run_shell`, `browser_open`,
+`browser_eval`, every MCP tool, and `unix` pipelines that mutate or redirect.
+
+Not gated: reads, searches, read-only `unix` pipelines, and `browser_click` /
+`browser_fill` — you already approved opening that page, and prompting per click
+makes browser testing unusable.
+
+"Always allow this tool" is persisted to workspace settings. A declined tool is
+reported to the model as a decision, not a failure, so it adapts instead of retrying.
+
+---
+
+## Setup
+
+Requires Go 1.24+ and Node 20+ to build.
+
+```bash
+npm install
+npm run build          # builds the Go core, then bundles the extension
+```
+
+Then press <kbd>F5</kbd> in VS Code to launch the Extension Development Host, or
+`npm run package` for a `.vsix`.
+
+### Providers and models
+
+Run **MF Agent: Settings — Providers & Models** from the command palette (or the gear
+on the Task Queue view). Everything to do with LLMs lives there, not in
+`settings.json`.
+
+**Providers.** Pick from Anthropic, OpenAI, OpenRouter, Google Gemini, DeepSeek,
+Mistral, Groq, xAI, Together, Fireworks, Cerebras, Ollama, LM Studio, vLLM, Voyage,
+or any OpenAI-compatible endpoint. Each one asks for the fields it actually needs.
+You can keep several — a hosted account and a local server side by side.
+
+**API keys** go to the OS keychain via VS Code's `SecretStorage`. Leave a key blank
+to fall back to the provider's environment variable (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, and so on).
+
+**Models** are fetched from the provider, with context window, pricing and
+capabilities where it publishes them. Nothing is hard-coded, so a model released
+this morning shows up after **Refresh**.
+
+**Roles** bind a provider and model to a job:
+
+| Role | What it drives |
+|---|---|
+| Coding | Chat and code generation. Every other role falls back to it. |
+| Vision | Image understanding — screenshots, mockups, diagrams. |
+| Embedding | Vectors for hybrid graph-memory search. Never inherits: it needs a real embeddings model. |
+| Queue · Planner | Turns a goal into a task list — from the sidebar or the chat's Planner. |
+| Queue · Supervisor | Verifies finished tasks. Use your strongest model. |
+| Queue · Executor | Does the work. A fast local model fits well. |
+
+A role can borrow the Coding provider but override just the model, so a cheap
+executor and a strong supervisor on one account do not need two profiles.
+
+**Export / Import** moves a setup between machines, with or without the keys.
+
+### MCP servers
+
+```jsonc
+{
+  "mfagent.mcpServers": [
+    { "name": "github", "url": "https://api.githubcopilot.com/mcp/" },
+    { "name": "postgres", "command": "npx", "args": ["-y", "@bytebase/dbhub"] }
+  ]
+}
+```
+
+Both stdio and streamable HTTP transports are supported. Servers connect in parallel
+at startup; one that fails is reported as a warning rather than blocking activation.
+
+---
+
+## Settings
+
+Providers, models, roles, languages and the browser toggle live on the **MF Agent
+Settings** page. What stays in `settings.json` is the handful of plain values the
+VS Code settings editor is genuinely good at:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `mfagent.memory.enabled` | `true` | Graph memory for this workspace |
+| `mfagent.mcpServers` | `[]` | See above |
+| `mfagent.queue.mode` | `lockstep` | or `continuous` |
+| `mfagent.queue.cronIntervalSeconds` | `60` | Default supervisor wake-up interval. A task list that picks its own in the Task Queue view wins |
+| `mfagent.queue.taskTimeoutMinutes` | `20` | Budget for a task's first attempt; retries get 50% more each, in step with the rounds |
+| `mfagent.queue.maxRounds` | `80` | Tool-calling rounds per unattended turn; retries get 50% more each |
+| `mfagent.queue.supervisorTimeoutMinutes` | `15` | Budget per supervisor pass |
+| `mfagent.queue.verifyCommandTimeoutSeconds` | `300` | Budget per verification command |
+
+Changing any of them, or anything on the settings page, restarts the core
+automatically.
+
+### What is worked out for you
+
+None of this is configurable, because none of it is a preference. The **Detected**
+tab on the settings page shows what was found.
+
+| | |
+|---|---|
+| Languages | Globbed from the workspace; override on the Workspace tab |
+| Graph memory DB | `.mfagent/memory.db` |
+| Task queue DB | `.mfagent/queue.db` |
+| Screenshots | `.mfagent/screenshots/` |
+| Agent core binary | Bundled in `bin/`; `MFAGENT_CORE_PATH` overrides |
+| Chrome / Chromium | System install, then apt, then a cached download; `MFAGENT_CHROME_PATH` overrides |
+
+Upgrading from an earlier version imports your old `mfagent.providers` setup into the
+new store on first launch and offers to delete the obsolete keys.
+
+> **Leave `thinking` on `adaptive`.** With thinking disabled, the model occasionally
+> writes a tool call into its visible text instead of emitting a real call — the turn
+> succeeds, the call silently never runs, and in an agentic loop that text pollutes
+> later turns. If you need to cut cost, lower `effort` instead.
+
+---
+
+## Commands
+
+| Command | Keybinding |
+|---|---|
+| Focus Chat | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>I</kbd> |
+| Edit Selection with Instructions | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>K</kbd> |
+| Ask About Selection | context menu |
+| Explain Problems in This File | feeds the file's diagnostics to the agent |
+| Show Graph Memory | entities, relations and observations |
+| Search Graph Memory | |
+| Open Preview in Simple Browser | |
+| Show MCP Server Status | |
+| Restart Core | |
+
+---
+
+## Development
+
+```bash
+npm run watch          # rebuild the extension on change
+npm run typecheck
+npm run build:core     # host platform only
+node scripts/build-core.mjs --all   # cross-compile all six targets
+cd core && go test ./...
+```
+
+Cross-compilation needs no per-platform toolchain — nothing in the core uses cgo.
+
+### Layout
+
+```
+src/            extension host shim (TypeScript)
+media/          webview chat UI (vanilla HTML/CSS/JS)
+core/
+  cmd/mfcore/   entry point, JSON-RPC method registration
+  internal/
+    agent/      agent loop and system prompt
+    llm/        Anthropic + OpenAI-compatible providers
+    memory/     graph store
+    tools/      file, search, POSIX, shell, memory, browser tools
+    mcp/        MCP client (stdio + streamable HTTP)
+    browser/    Chrome DevTools Protocol driver
+    rpc/        JSON-RPC transport
+```
+
+### Notes on the protocol
+
+Requests are handled **in order** on the read loop. Only `chat/send` is async, since
+a turn runs for minutes and must not block cancellation or the permission round-trip.
+That ordering guarantee is deliberate: an edit sent before a build must happen before
+the build.
+
+---
+
+## Known limitations
+
+- No inline ghost-text completion. This is an agent, not a completion engine.
+- `sed` supports substitution only (`s/a/b/[gi]`), not the full script language.
+- The browser driver needs Chrome or Edge installed; set `MFAGENT_CHROME_PATH` if
+  auto-detection picks the wrong one.
+- **The Vision role is configured but not yet consumed.** `browser_screenshot` shows
+  the image in the chat panel and hands the agent a file path; no image is sent to a
+  model. Binding the role is wired end to end — the core reports it and the extension
+  passes it through — but nothing calls it yet.
+- MCP support covers tools, not prompts or resources.
+- Prompt caching is Anthropic-only.
+
+## License
+
+MIT

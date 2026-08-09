@@ -1,0 +1,260 @@
+{
+  "name": "mf-agent",
+  "displayName": "MF Agent",
+  "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
+  "version": "0.1.0",
+  "publisher": "mflores",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "agent",
+    "php",
+    "typescript",
+    "go",
+    "delphi"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "mfagent",
+          "title": "MF Agent",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "mfagent": [
+        {
+          "id": "mfagent.queue",
+          "name": "Task Queue",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "mfagent.focusChat",
+        "title": "MF Agent: Focus Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "mfagent.newSession",
+        "title": "MF Agent: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "mfagent.askAboutSelection",
+        "title": "MF Agent: Ask About Selection"
+      },
+      {
+        "command": "mfagent.editSelection",
+        "title": "MF Agent: Edit Selection with Instructions"
+      },
+      {
+        "command": "mfagent.explainError",
+        "title": "MF Agent: Explain Problems in This File"
+      },
+      {
+        "command": "mfagent.restartCore",
+        "title": "MF Agent: Restart Core"
+      },
+      {
+        "command": "mfagent.showMemory",
+        "title": "MF Agent: Show Graph Memory"
+      },
+      {
+        "command": "mfagent.searchMemory",
+        "title": "MF Agent: Search Graph Memory"
+      },
+      {
+        "command": "mfagent.openPreview",
+        "title": "MF Agent: Open Preview in Simple Browser"
+      },
+      {
+        "command": "mfagent.showMcpStatus",
+        "title": "MF Agent: Show MCP Server Status"
+      },
+      {
+        "command": "mfagent.openSettings",
+        "title": "MF Agent: Settings — Providers & Models",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "mfagent.showOutput",
+        "title": "MF Agent: Show Core Log"
+      },
+      {
+        "command": "mfagent.queue.generate",
+        "title": "MF Agent: Generate Task Queue from a Goal"
+      },
+      {
+        "command": "mfagent.queue.start",
+        "title": "MF Agent: Start Autonomous Run",
+        "icon": "$(play)"
+      },
+      {
+        "command": "mfagent.queue.pause",
+        "title": "MF Agent: Pause Autonomous Run",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "mfagent.queue.stop",
+        "title": "MF Agent: Stop Autonomous Run",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "mfagent.queue.reset",
+        "title": "MF Agent: Reset Task Queue"
+      },
+      {
+        "command": "mfagent.queue.checkNow",
+        "title": "MF Agent: Run Supervisor Check Now"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "mfagent.askAboutSelection",
+          "when": "editorHasSelection",
+          "group": "mfagent@1"
+        },
+        {
+          "command": "mfagent.editSelection",
+          "when": "editorHasSelection",
+          "group": "mfagent@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "mfagent.queue.start",
+          "when": "view == mfagent.queue",
+          "group": "navigation@1"
+        },
+        {
+          "command": "mfagent.queue.pause",
+          "when": "view == mfagent.queue",
+          "group": "navigation@2"
+        },
+        {
+          "command": "mfagent.queue.stop",
+          "when": "view == mfagent.queue",
+          "group": "navigation@3"
+        },
+        {
+          "command": "mfagent.openSettings",
+          "when": "view == mfagent.queue",
+          "group": "navigation@4"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "mfagent.focusChat",
+        "key": "ctrl+alt+i",
+        "mac": "cmd+alt+i"
+      },
+      {
+        "command": "mfagent.editSelection",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "editorHasSelection"
+      }
+    ],
+    "configuration": {
+      "title": "MF Agent",
+      "properties": {
+        "mfagent.memory.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the persistent graph memory for this workspace. The database lives at .mfagent/memory.db."
+        },
+        "mfagent.mcpServers": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "MCP servers to connect. Each entry takes either `command` + `args` (stdio) or `url` (streamable HTTP).",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string" },
+              "command": { "type": "string" },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "env": { "type": "object" },
+              "url": { "type": "string" },
+              "headers": { "type": "object" },
+              "enabled": { "type": "boolean" }
+            }
+          }
+        },
+        "mfagent.queue.mode": {
+          "type": "string",
+          "enum": ["lockstep", "continuous"],
+          "default": "lockstep",
+          "description": "lockstep = verify before next task. continuous = run ahead, audit behind."
+        },
+        "mfagent.queue.cronIntervalSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "description": "Default supervisor wake-up interval in seconds. A task list that sets its own interval in the Task Queue view overrides this."
+        },
+        "mfagent.queue.taskTimeoutMinutes": {
+          "type": "number",
+          "default": 20,
+          "markdownDescription": "Minutes an execution task gets on its first attempt. Retries get 50% more per attempt (capped at 3× the base), in step with `#mfagent.queue.maxRounds#` — extra rounds inside a fixed timeout only move where the attempt dies. The worker stops and writes a handoff report before the timeout is reached."
+        },
+        "mfagent.queue.maxRounds": {
+          "type": "number",
+          "default": 80,
+          "minimum": 10,
+          "markdownDescription": "Tool-calling rounds an unattended executor gets per turn. Retries get 50% more per attempt (capped at 3× the base), in step with `#mfagent.queue.taskTimeoutMinutes#`."
+        },
+        "mfagent.queue.supervisorMaxRounds": {
+          "type": "number",
+          "default": 40,
+          "minimum": 10,
+          "description": "Tool-calling rounds the supervisor gets per task. Lower is cheaper and usually enough for verification."
+        },
+        "mfagent.queue.supervisorTimeoutMinutes": {
+          "type": "number",
+          "default": 15,
+          "description": "Max minutes per supervisor pass."
+        },
+        "mfagent.queue.verifyCommandTimeoutSeconds": {
+          "type": "number",
+          "default": 300,
+          "description": "Max seconds per verification command."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build:core": "node scripts/build-core.mjs",
+    "build:ext": "node esbuild.mjs",
+    "build": "npm run build:core && npm run build:ext",
+    "build:all": "node scripts/build-core.mjs --all && npm run build:ext",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "npm run build:all && npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.3.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  }
+}
