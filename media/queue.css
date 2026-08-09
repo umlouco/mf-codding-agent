@@ -250,6 +250,83 @@ button:disabled { opacity: .45; cursor: default; }
 }
 
 /*
+ * What the running worker is doing, next to the status it qualifies. Sized and
+ * coloured like the seq rather than the pill: it changes every half minute, and
+ * a chip that redraws that often reads as an alarm rather than as reassurance.
+ * It shrinks before the title does, since a truncated task name is worse than a
+ * truncated phase.
+ */
+.live {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.live:empty { display: none; }
+
+/*
+ * Token spend, on the row and in the counts bar. Deliberately the quietest
+ * thing in both: it is a number you check, not one you monitor, and giving it
+ * any more weight would have it competing with the status for attention.
+ */
+.tokens,
+.counts .tokentotal {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.tokens:empty { display: none; }
+
+/*
+ * `.counts span` gives every child the status-pill treatment, which this must
+ * opt out of: the token total is not a status, and dressing it as one would put
+ * a seventh badge in a row whose whole job is counting task states.
+ */
+.counts .tokentotal {
+  margin-left: auto;
+  padding: 1px 0 1px 8px;
+  font-weight: 400;
+  background: none;
+  border-color: transparent;
+}
+
+/*
+ * Remove, on the row. Hidden until the row is hovered or the button itself has
+ * focus: it is one click from destroying a task, so it should not sit there
+ * inviting the cursor, but it must still be reachable by keyboard — hence
+ * focus-visible rather than hover alone.
+ */
+.rowdel {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.task > summary:hover .rowdel,
+.rowdel:focus-visible { opacity: 1; }
+
+.rowdel:hover {
+  color: var(--vscode-errorForeground);
+  background: color-mix(in srgb, var(--vscode-errorForeground) 12%, transparent);
+}
+
+.rowdel:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+
+/*
  * The status colour is a *text* colour, tinted into the background at low alpha
  * rather than used as a fill. A filled chip has to solve contrast twice — once
  * for the fill against the panel, once for the label against the fill — and the

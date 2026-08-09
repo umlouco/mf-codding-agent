@@ -60,6 +60,8 @@
     $(id).addEventListener('click', () => send({ type }));
   }
 
+  $('genDocs').addEventListener('click', () => send({ type: 'generateDocs' }));
+
   // ---- state ----
 
   /**
@@ -181,6 +183,25 @@
       .filter((s) => stats.byStatus[s] > 0)
       .map((s) => `<span class="${s}">${s} ${stats.byStatus[s]}</span>`)
       .join('');
+
+    // What the whole run has cost, next to what it has produced. Cached input
+    // is called out separately because it is the cheap half of the bill and
+    // folding it into the input total would misrepresent the spend.
+    const u = stats.usage || {};
+    const total = (u.input || 0) + (u.cacheRead || 0) + (u.output || 0);
+    if (total > 0) {
+      const bits = [`${compact(u.input || 0)} in`, `${compact(u.output || 0)} out`];
+      if (u.cacheRead) bits.push(`${compact(u.cacheRead)} cached`);
+      const span = document.createElement('span');
+      span.className = 'tokentotal';
+      span.title =
+        `${(u.input || 0).toLocaleString()} input · ` +
+        `${(u.output || 0).toLocaleString()} output · ` +
+        `${(u.cacheRead || 0).toLocaleString()} cache read · ` +
+        `${(u.cacheWrite || 0).toLocaleString()} cache write`;
+      span.textContent = bits.join(' · ');
+      countsEl.appendChild(span);
+    }
   }
 
   function renderTasks(tasks, st) {
@@ -195,6 +216,57 @@
     }
   }
 
+  const PHASE_LABELS = {
+    claimed: 'starting',
+    model_wait: 'waiting on the model',
+    model_stream: 'reading the reply',
+    tool: 'running a tool',
+    report: 'writing its report',
+    stalled: 'connection dropped',
+    stopped: 'stopped',
+    error: 'error',
+    done: 'finishing',
+  };
+
+  /** "waiting on the model · 12m ago" — the evidence the worker is still alive. */
+  function liveLabel(t) {
+    const label = PHASE_LABELS[t.activityPhase] || t.activityPhase || '';
+    if (!label) {
+      return '';
+    }
+    const ago = Date.now() - (t.lastActivityAt || 0);
+    if (!t.lastActivityAt || ago < 60_000) {
+      return label;
+    }
+    return `${label} · ${Math.round(ago / 60_000)}m ago`;
+  }
+
+  /**
+   * Deleting a task cannot be undone, so anything that already cost something —
+   * a run, a review, tokens — is confirmed on the extension side first. A task
+   * nobody has touched goes straight away: asking there is just a second click.
+   */
+  function removeTask(t) {
+    const worked = t.attempts > 0 || t.status === 'VERIFIED' || t.tokensIn > 0;
+    send({ type: 'deleteTask', id: t.id, confirm: worked });
+  }
+
+  /** "12.4k ↓ · 3.1k ↑" — what this task has cost so far, or nothing yet. */
+  function tokenLabel(t) {
+    const total = (t.tokensIn || 0) + (t.tokensCacheRead || 0);
+    if (!total && !t.tokensOut) {
+      return '';
+    }
+    return `${compact(total)} ↓ · ${compact(t.tokensOut || 0)} ↑`;
+  }
+
+  /** 1234 → "1.2k". Exact counts past a thousand are noise on a summary row. */
+  function compact(n) {
+    if (n < 1000) return String(n);
+    if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
+    return `${(n / 1_000_000).toFixed(1)}M`;
+  }
+
   function taskEl(t, st) {
     const d = document.createElement('details');
     d.className = `task ${t.status}` + (st.currentTaskId === t.id ? ' current' : '');
@@ -205,8 +277,30 @@
     s.innerHTML =
       `<span class="seq">${t.seq}</span>` +
       `<span class="title"></span>` +
+      `<span class="live"></span>` +
+      `<span class="tokens"></span>` +
       `<span class="pill ${t.status}">${t.status}</span>`;
     s.querySelector('.title').textContent = t.title;
+    // What the worker is doing right now, and how long ago it said so. A task
+    // that is simply slow keeps refreshing this; one that has stopped does not.
+    s.querySelector('.live').textContent = t.status === 'EXECUTING' ? liveLabel(t) : '';
+    s.querySelector('.tokens').textContent = tokenLabel(t);
+
+    // Removing a task is one click from the list, because that is where you
+    // decide you do not want it. It sits inside the summary, so it has to stop
+    // the click from also toggling the row open.
+    const del = document.createElement('button');
+    del.className = 'rowdel';
+    del.type = 'button';
+    del.title = `Remove task ${t.seq}`;
+    del.setAttribute('aria-label', `Remove task ${t.seq}: ${t.title}`);
+    del.textContent = '✕';
+    del.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      removeTask(t);
+    });
+    s.appendChild(del);
     d.appendChild(s);
 
     const body = document.createElement('div');

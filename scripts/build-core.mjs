@@ -29,16 +29,18 @@ const pkgVersion = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf
 const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 12);
 const ldflags = `-s -w -X main.version=${pkgVersion}+${stamp}`;
 
+const hostMcpExe = process.platform === 'win32' ? 'mfagent-mcp.exe' : 'mfagent-mcp';
+
 const targets = all
   ? [
-      { goos: 'windows', goarch: 'amd64', dir: 'win32-x64', exe: 'mfcore.exe' },
-      { goos: 'windows', goarch: 'arm64', dir: 'win32-arm64', exe: 'mfcore.exe' },
-      { goos: 'darwin', goarch: 'amd64', dir: 'darwin-x64', exe: 'mfcore' },
-      { goos: 'darwin', goarch: 'arm64', dir: 'darwin-arm64', exe: 'mfcore' },
-      { goos: 'linux', goarch: 'amd64', dir: 'linux-x64', exe: 'mfcore' },
-      { goos: 'linux', goarch: 'arm64', dir: 'linux-arm64', exe: 'mfcore' },
+      { goos: 'windows', goarch: 'amd64', dir: 'win32-x64', exe: 'mfcore.exe', mcpExe: 'mfagent-mcp.exe' },
+      { goos: 'windows', goarch: 'arm64', dir: 'win32-arm64', exe: 'mfcore.exe', mcpExe: 'mfagent-mcp.exe' },
+      { goos: 'darwin', goarch: 'amd64', dir: 'darwin-x64', exe: 'mfcore', mcpExe: 'mfagent-mcp' },
+      { goos: 'darwin', goarch: 'arm64', dir: 'darwin-arm64', exe: 'mfcore', mcpExe: 'mfagent-mcp' },
+      { goos: 'linux', goarch: 'amd64', dir: 'linux-x64', exe: 'mfcore', mcpExe: 'mfagent-mcp' },
+      { goos: 'linux', goarch: 'arm64', dir: 'linux-arm64', exe: 'mfcore', mcpExe: 'mfagent-mcp' },
     ]
-  : [{ goos: '', goarch: '', dir: '', exe: hostExe }];
+  : [{ goos: '', goarch: '', dir: '', exe: hostExe, mcpExe: hostMcpExe }];
 
 if (!existsSync(coreDir)) {
   console.error(`No core/ directory at ${coreDir}`);
@@ -50,18 +52,35 @@ mkdirSync(binDir, { recursive: true });
 for (const t of targets) {
   const outDir = t.dir ? path.join(binDir, t.dir) : binDir;
   mkdirSync(outDir, { recursive: true });
-  const out = path.join(outDir, t.exe);
 
   const env = { ...process.env, CGO_ENABLED: '0' };
   if (t.goos) env.GOOS = t.goos;
   if (t.goarch) env.GOARCH = t.goarch;
-
   const label = t.dir || `${process.platform}-${process.arch}`;
+
+  // ---- mfcore ----
+  const coreOut = path.join(outDir, t.exe);
   process.stdout.write(`building core for ${label}… `);
   try {
     execFileSync(
       'go',
-      ['build', '-trimpath', '-ldflags', ldflags, '-o', out, './cmd/mfcore'],
+      ['build', '-trimpath', '-ldflags', ldflags, '-o', coreOut, './cmd/mfcore'],
+      { cwd: coreDir, env, stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    console.log('ok');
+  } catch (e) {
+    console.log('FAILED');
+    console.error(String(e.stderr ?? e.message));
+    process.exit(1);
+  }
+
+  // ---- mfagent-mcp ----
+  const mcpOut = path.join(outDir, t.mcpExe);
+  process.stdout.write(`building mcp   for ${label}… `);
+  try {
+    execFileSync(
+      'go',
+      ['build', '-trimpath', '-ldflags', ldflags, '-o', mcpOut, './cmd/mfagent-mcp'],
       { cwd: coreDir, env, stdio: ['ignore', 'ignore', 'pipe'] },
     );
     console.log('ok');
@@ -88,6 +107,16 @@ if (existsSync(from)) {
   mkdirSync(path.dirname(to), { recursive: true });
   copyFileSync(from, to);
   console.log(`synced ${path.relative(root, to)} from ${path.relative(root, from)}`);
+}
+
+const hostMcpPlatformCopy = path.join(binDir, hostDir, hostMcpExe);
+const hostMcpRootCopy = path.join(binDir, hostMcpExe);
+const [mcpFrom, mcpTo] = all ? [hostMcpPlatformCopy, hostMcpRootCopy] : [hostMcpRootCopy, hostMcpPlatformCopy];
+
+if (existsSync(mcpFrom)) {
+  mkdirSync(path.dirname(mcpTo), { recursive: true });
+  copyFileSync(mcpFrom, mcpTo);
+  console.log(`synced ${path.relative(root, mcpTo)} from ${path.relative(root, mcpFrom)}`);
 }
 
 console.log(`core version ${pkgVersion}+${stamp}`);

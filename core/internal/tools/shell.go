@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,20 +12,69 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 func lookPath(name string) (string, error) { return exec.LookPath(name) }
 
 // shellFor picks the host shell. Nothing here is Unix-specific: on Windows we
 // use PowerShell, elsewhere sh.
-func shellFor(cmd string) (string, []string) {
-	if runtime.GOOS == "windows" {
-		if ps, err := exec.LookPath("pwsh"); err == nil {
-			return ps, []string{"-NoProfile", "-NonInteractive", "-Command", cmd}
-		}
-		return "powershell.exe", []string{"-NoProfile", "-NonInteractive", "-Command", cmd}
+//
+// On Windows the script is handed over base64-encoded rather than as a quoted
+// argument, and that is the whole reason quoting bugs stop here.
+//
+// A Windows process does not receive an argument vector; it receives one string
+// and parses it itself. Go builds that string with C-runtime rules — double
+// quotes, backslash escapes — and PowerShell then re-parses it with completely
+// different rules, where the escape character is a backtick and a quote is
+// doubled. Any script containing a quote, a dollar sign or a backtick is
+// therefore rewritten in transit by two layers that disagree, which is why
+// `-Command` breaks on exactly the commands worth running. `-EncodedCommand`
+// takes UTF-16LE base64: the argument is alphanumeric, so neither layer can
+// touch it, and PowerShell decodes the script byte for byte.
+//
+// Returns a cleanup to run once the command has finished.
+func shellFor(cmd string) (string, []string, func()) {
+	if runtime.GOOS != "windows" {
+		return "/bin/sh", []string{"-c", cmd}, func() {}
 	}
-	return "/bin/sh", []string{"-c", cmd}
+
+	exe := "powershell.exe"
+	if ps, err := exec.LookPath("pwsh"); err == nil {
+		exe = ps
+	}
+
+	// Windows caps a command line at 32767 characters and UTF-16LE base64 costs
+	// 2.67 bytes per source character, so a long script has to travel as a file
+	// instead. -File takes the path as a plain argument and reads the script off
+	// disk, so it is exactly as quote-proof as the encoded form.
+	if encoded := encodePowerShell(cmd); len(encoded) < 30000 {
+		return exe, []string{"-NoProfile", "-NonInteractive", "-EncodedCommand", encoded}, func() {}
+	}
+
+	f, err := os.CreateTemp("", "mfagent-*.ps1")
+	if err != nil {
+		// Nothing left to fall back to; the encoded form at least fails loudly
+		// at the length limit rather than silently mangling the script.
+		return exe, []string{"-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(cmd)}, func() {}
+	}
+	path := f.Name()
+	// The BOM is what tells PowerShell the file is UTF-8 rather than the ANSI
+	// codepage, which would corrupt every non-ASCII character in the script.
+	_, _ = f.WriteString("\xEF\xBB\xBF" + cmd)
+	_ = f.Close()
+	return exe, []string{"-NoProfile", "-NonInteractive", "-File", path}, func() { _ = os.Remove(path) }
+}
+
+// encodePowerShell renders a script as the UTF-16LE base64 blob that
+// -EncodedCommand expects.
+func encodePowerShell(cmd string) string {
+	units := utf16.Encode([]rune(cmd))
+	b := make([]byte, 0, len(units)*2)
+	for _, u := range units {
+		b = append(b, byte(u), byte(u>>8))
+	}
+	return base64.StdEncoding.EncodeToString(b)
 }
 
 // deniedPatterns are refused outright. This is a guardrail against obvious
@@ -98,7 +148,8 @@ func RegisterShell(r *Registry) {
 			cctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
-			name, args := shellFor(a.Command)
+			name, args, cleanup := shellFor(a.Command)
+			defer cleanup()
 			cmd := exec.CommandContext(cctx, name, args...)
 			cmd.Dir = dir
 			cmd.Env = append(os.Environ(), "MFAGENT=1", "NO_COLOR=1", "CI=1")

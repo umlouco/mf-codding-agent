@@ -42,8 +42,10 @@ export interface CoreConfig {
   autoApprove: string[];
   /** Tool-calling rounds per turn. 0 leaves the core on its own default. */
   maxIterations: number;
-  /** Seconds a turn may run before the core stops and reports. 0 means no limit. */
-  maxDurationSeconds: number;
+  /** Seconds a reply may deliver nothing before the connection counts as dropped. */
+  llmIdleSeconds: number;
+  /** How often a waiting turn writes an activity record. */
+  activitySeconds: number;
   languages: string[];
   mcpServers: any[];
   browserExecutable: string;
@@ -101,11 +103,11 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     // Unattended edits are gated by the queue's own supervisor rather than a
     // per-tool prompt; this preserves the behaviour the core already had.
     autoApprove: ['*'],
-    // The chat keeps the core's defaults: a person is watching, can say
-    // "continue", and can stop a turn that is taking too long. Queue workers
-    // override both per role in queue/agents.ts.
+    // The chat keeps the core's default round ceiling: a person is watching and
+    // can say "continue". Queue workers override it per role in queue/agents.ts.
     maxIterations: 0,
-    maxDurationSeconds: 0,
+    llmIdleSeconds: Math.max(1, cfg.get<number>('llm.idleMinutes', 30)) * 60,
+    activitySeconds: Math.max(5, cfg.get<number>('activityIntervalSeconds', 30)),
     languages,
     mcpServers: cfg.get<any[]>('mcpServers', []) ?? [],
     browserExecutable: '',

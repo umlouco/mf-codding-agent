@@ -11,12 +11,19 @@ import * as path from 'path';
  *
  *   PENDING ──claim──▶ EXECUTING ──worker done──▶ VERIFYING
  *      ▲                   │                          │
- *      │                   └── crash/timeout ─────────┤
+ *      │                   └── died with a message ───┤
+ *      │                   │                          │
+ *      ├── went silent ◀───┘                          │
  *      │                                              │
  *      ├── supervisor resets ◀── FAILED ◀── checks fail
  *      └── VERIFIED ◀── checks pass
  *
  * PAUSED is a user-driven halt that survives a window reload.
+ *
+ * Nothing leaves EXECUTING because it took too long. A worker is judged by what
+ * it writes: it records what it is doing as it goes, and only the absence of
+ * those records — never their content, and never the clock — marks it as gone.
+ * See recordActivity and silentWorkers.
  */
 
 // ---- driver ------------------------------------------------------------
@@ -120,6 +127,11 @@ export interface Task {
   /** What it was doing when it last wrote: see the core's activity phases. */
   activityPhase: string;
   activityDetail: string;
+  /** Tokens this task has cost so far, summed over every attempt and review. */
+  tokensIn: number;
+  tokensOut: number;
+  tokensCacheRead: number;
+  tokensCacheWrite: number;
   createdAt: number;
   updatedAt: number;
   startedAt: number | null;
@@ -142,10 +154,20 @@ export type NewTask = Pick<Task, 'title' | 'description'> &
 
 export type RunState = 'IDLE' | 'RUNNING' | 'PAUSED' | 'STOPPED';
 
+/** Token counts as the core reports them. */
+export interface Usage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
 export interface QueueStats {
   total: number;
   byStatus: Record<TaskStatus, number>;
   runState: RunState;
+  /** What the whole queue has cost so far. */
+  usage: Usage;
 }
 
 export interface TaskEvent {
@@ -169,6 +191,10 @@ const COLUMNS = `
   last_activity_at AS lastActivityAt,
   activity_phase   AS activityPhase,
   activity_detail  AS activityDetail,
+  tokens_in          AS tokensIn,
+  tokens_out         AS tokensOut,
+  tokens_cache_read  AS tokensCacheRead,
+  tokens_cache_write AS tokensCacheWrite,
   created_at  AS createdAt,
   updated_at  AS updatedAt,
   started_at  AS startedAt,
@@ -254,6 +280,14 @@ export class TaskQueue {
     this.addColumn('last_activity_at', 'INTEGER');
     this.addColumn('activity_phase', "TEXT NOT NULL DEFAULT ''");
     this.addColumn('activity_detail', "TEXT NOT NULL DEFAULT ''");
+
+    // Token spend accumulates per task across every agent run it causes —
+    // each execution attempt and each supervisor pass. Kept here rather than
+    // derived from the event log because a retry must add to the bill, not
+    // replace it: what a task cost is the sum of everything it took.
+    for (const c of ['tokens_in', 'tokens_out', 'tokens_cache_read', 'tokens_cache_write']) {
+      this.addColumn(c, 'INTEGER NOT NULL DEFAULT 0');
+    }
   }
 
   /** Adds a column to `tasks` if this database predates it. */
@@ -361,7 +395,46 @@ export class TaskQueue {
       byStatus[r.status as TaskStatus] = r.n;
       total += r.n;
     }
-    return { total, byStatus, runState: this.runState };
+
+    const u = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(tokens_in), 0)          AS input,
+                COALESCE(SUM(tokens_out), 0)         AS output,
+                COALESCE(SUM(tokens_cache_read), 0)  AS cacheRead,
+                COALESCE(SUM(tokens_cache_write), 0) AS cacheWrite
+           FROM tasks`,
+      )
+      .get();
+
+    return { total, byStatus, runState: this.runState, usage: u as Usage };
+  }
+
+  /**
+   * Adds one agent run's token usage to a task's running total.
+   *
+   * Every run counts, including the ones that produced nothing: a worker that
+   * was cut off or died still spent the tokens, and hiding that would make the
+   * expensive failures look free.
+   */
+  addUsage(taskId: number, usage: Partial<Usage> | undefined): void {
+    if (!usage) {
+      return;
+    }
+    const { input = 0, output = 0, cacheRead = 0, cacheWrite = 0 } = usage;
+    if (!(input || output || cacheRead || cacheWrite)) {
+      return;
+    }
+    this.db
+      .prepare(
+        `UPDATE tasks SET
+           tokens_in          = tokens_in + ?,
+           tokens_out         = tokens_out + ?,
+           tokens_cache_read  = tokens_cache_read + ?,
+           tokens_cache_write = tokens_cache_write + ?,
+           updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(input, output, cacheRead, cacheWrite, Date.now(), taskId);
   }
 
   events(taskId: number | null, limit = 100): TaskEvent[] {
@@ -391,21 +464,35 @@ export class TaskQueue {
    * the transcript — what the worker was doing, in order, kept after the
    * process is gone. The column is the index into it: the single timestamp the
    * cron tick reads to decide whether anyone is still home.
+   *
+   * Returns true when this record changed the phase, which is the caller's cue
+   * to refresh the view. A heartbeat that repeats the current phase is worth
+   * storing but not worth redrawing for — the panel rebuilds every row, and
+   * doing that twice a minute would fight anyone editing a task.
+   *
+   * `actor` is on the event row rather than assumed, because a supervisor's
+   * review is a turn against the same model on the same task and goes just as
+   * silent when its core wedges — the transcript has to say which of the two
+   * stopped writing.
    */
-  recordActivity(taskId: number, phase: string, detail: string): void {
+  recordActivity(taskId: number, phase: string, detail: string, actor = 'executor'): boolean {
     const now = Date.now();
-    this.tx(() => {
+    return this.tx(() => {
+      const before = this.db
+        .prepare('SELECT activity_phase AS phase FROM tasks WHERE id = ?')
+        .get(taskId);
       this.db
         .prepare(
           'INSERT INTO task_events (task_id, actor, kind, message, at) VALUES (?, ?, ?, ?, ?)',
         )
-        .run(taskId, 'executor', `activity:${phase}`, detail.slice(0, 8000), now);
+        .run(taskId, actor, `activity:${phase}`, detail.slice(0, 8000), now);
       this.db
         .prepare(
           `UPDATE tasks SET last_activity_at = ?, activity_phase = ?, activity_detail = ?
              WHERE id = ?`,
         )
         .run(now, phase, detail.slice(0, 500), taskId);
+      return (before?.phase ?? '') !== phase;
     });
   }
 
@@ -525,8 +612,25 @@ export class TaskQueue {
     this.db.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).run(...args);
   }
 
+  /**
+   * Deletes a task and closes the gap it leaves.
+   *
+   * Renumbering matters more than it looks: `seq` is what the supervisor names
+   * in a RESET_FROM, and what the panel shows as the task's identity. Leaving
+   * holes in it would make "roll back to task 4" mean something different
+   * before and after a deletion.
+   */
   remove(id: number): void {
-    this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+    this.tx(() => {
+      const task = this.get(id);
+      if (!task) {
+        return;
+      }
+      this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+      this.db
+        .prepare('UPDATE tasks SET seq = seq - 1, updated_at = ? WHERE seq > ?')
+        .run(Date.now(), task.seq);
+    });
   }
 
   /**
@@ -556,6 +660,18 @@ export class TaskQueue {
           { ...p, seq: task.seq + i, maxAttempts: p.maxAttempts ?? task.maxAttempts },
           task.seq + i,
         );
+        // What the original cost was really spent, so it moves to the first
+        // part rather than disappearing with the row. Attributing all of it to
+        // one part is imprecise, but the queue total stays honest, and that is
+        // the number anyone is actually reading.
+        if (i === 0) {
+          this.addUsage(newId, {
+            input: task.tokensIn,
+            output: task.tokensOut,
+            cacheRead: task.tokensCacheRead,
+            cacheWrite: task.tokensCacheWrite,
+          });
+        }
         this.log(newId, 'supervisor', 'split-from', `task ${task.seq}: ${task.title}`);
       });
       this.log(
@@ -634,12 +750,19 @@ export class TaskQueue {
     return (row.n as number) > 0;
   }
 
-  /** True when no task can make progress without intervention. */
+  /**
+   * True when the run is genuinely over: every task VERIFIED, or the only ones
+   * left are PAUSED because someone asked for that.
+   *
+   * FAILED is counted as open on purpose. Nothing produces it any more, but a
+   * database written by an older build can still contain it, and treating it as
+   * finished is how a queue reports success with work outstanding.
+   */
   isComplete(): boolean {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS n FROM tasks
-         WHERE status IN ('PENDING','EXECUTING','VERIFYING')`,
+         WHERE status IN ('PENDING','EXECUTING','VERIFYING','FAILED')`,
       )
       .get();
     return (row.n as number) === 0;
@@ -661,14 +784,37 @@ export class TaskQueue {
       )
       .all(cutoff);
     for (const t of stale) {
-      const dead = t.attempts >= t.maxAttempts;
+      // Unconditionally requeued. A window that reloaded says nothing about
+      // whether the task can be done, so counting it against the task and
+      // retiring it on the attempt count would strand work for a reason that
+      // has nothing to do with the work.
       this.update(t.id, {
-        status: dead ? 'FAILED' : 'PENDING',
+        status: 'PENDING',
         errorLog: `${t.errorLog}\n[recovered] worker did not report back; task was left EXECUTING.`.trim(),
       });
-      this.log(t.id, 'system', 'recovered', dead ? 'attempts exhausted → FAILED' : 'requeued');
+      this.log(t.id, 'system', 'recovered', 'requeued');
     }
     return stale.length;
+  }
+
+  /**
+   * Returns tasks retired by an earlier version, or by a run that still had a
+   * failure state, to the queue.
+   *
+   * FAILED is no longer reachable: a task that cannot pass is a task whose
+   * instructions the supervisor has not fixed yet, and the run continues until
+   * every task is VERIFIED. Rows left in that state by an older build would
+   * otherwise sit there while `isComplete` counted them as finished business.
+   */
+  reviveFailed(): number {
+    const failed: Task[] = this.db
+      .prepare(`SELECT ${COLUMNS} FROM tasks WHERE status = 'FAILED'`)
+      .all();
+    for (const t of failed) {
+      this.update(t.id, { status: 'PENDING', finishedAt: null });
+      this.log(t.id, 'system', 'revived', 'returned to the queue; tasks are no longer retired');
+    }
+    return failed.length;
   }
 
   /** Clears all progress and returns every task to the start of the pipeline. */
@@ -677,7 +823,10 @@ export class TaskQueue {
       this.db.exec(`
         UPDATE tasks SET status = 'PENDING', attempts = 0, output = '',
           error_log = '', supervisor_feedback = '', started_at = NULL,
-          finished_at = NULL, updated_at = ${Date.now()}
+          finished_at = NULL, last_activity_at = NULL, activity_phase = '',
+          activity_detail = '', tokens_in = 0, tokens_out = 0,
+          tokens_cache_read = 0, tokens_cache_write = 0,
+          updated_at = ${Date.now()}
       `);
       this.setMeta('runState', 'IDLE');
       this.log(null, 'system', 'reset', 'all tasks returned to PENDING');

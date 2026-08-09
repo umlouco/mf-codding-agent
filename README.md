@@ -227,13 +227,35 @@ VS Code settings editor is genuinely good at:
 | `mfagent.mcpServers` | `[]` | See above |
 | `mfagent.queue.mode` | `lockstep` | or `continuous` |
 | `mfagent.queue.cronIntervalSeconds` | `60` | Default supervisor wake-up interval. A task list that picks its own in the Task Queue view wins |
-| `mfagent.queue.taskTimeoutMinutes` | `20` | Budget for a task's first attempt; retries get 50% more each, in step with the rounds |
-| `mfagent.queue.maxRounds` | `80` | Tool-calling rounds per unattended turn; retries get 50% more each |
-| `mfagent.queue.supervisorTimeoutMinutes` | `15` | Budget per supervisor pass |
-| `mfagent.queue.verifyCommandTimeoutSeconds` | `300` | Budget per verification command |
+| `mfagent.queue.maxRounds` | `80` | Tool-calling rounds per unattended turn — the only budget a task has; retries get 50% more each |
+| `mfagent.queue.workerSilentMinutes` | `10` | How long a worker may write nothing before it counts as dead |
+| `mfagent.activityIntervalSeconds` | `30` | How often a working agent records what it is doing |
+| `mfagent.llm.idleMinutes` | `30` | How long a reply may deliver nothing before the connection counts as dropped |
+| `mfagent.queue.verifyCommandTimeoutSeconds` | `300` | Budget for a verification command — a shell command, not an agent |
 
 Changing any of them, or anything on the settings page, restarts the core
 automatically.
+
+### No timeouts on agents
+
+A task is never stopped for taking too long, because "too long" is not knowable
+in advance: a local model can spend hours on one reply, and that is work, not a
+hang. So an agent is not given a deadline — it is asked to keep saying what it
+is doing.
+
+Every worker writes a timestamped record to the queue database as it goes: each
+round it sends to the model, every thirty seconds it spends waiting on a reply,
+every tool call and how long it took. Those records are the run's transcript,
+and they outlive the process that wrote them. The supervisor's cron tick reads
+the newest timestamp per task, and a task that has written *nothing* for
+`workerSilentMinutes` is requeued — not because it is slow, but because nothing
+that is alive stays quiet that long.
+
+The one thing that ends a call is a connection that has stopped delivering.
+Every byte read from the model resets that window, so a reply that takes six
+hours is fine as long as it is still arriving; a socket that delivers nothing
+for `llm.idleMinutes` is dropped, and the worker records that it stopped before
+it goes.
 
 ### What is worked out for you
 

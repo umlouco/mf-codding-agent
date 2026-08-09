@@ -45,6 +45,12 @@ type server struct {
 }
 
 func main() {
+	// Subcommands are checked before flag parsing so `mfcore sh` can own its own
+	// flags. With no subcommand this is the JSON-RPC server it has always been.
+	if len(os.Args) > 1 && os.Args[1] == "sh" {
+		os.Exit(runSh(os.Args[2:]))
+	}
+
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -90,6 +96,7 @@ func (s *server) shutdown() {
 	if s.mem != nil {
 		_ = s.mem.Close()
 	}
+	tools.KillAllBgProcs()
 }
 
 func (s *server) log(level, msg string) {
@@ -164,6 +171,7 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	tools.RegisterSearch(s.registry)
 	tools.RegisterPosix(s.registry)
 	tools.RegisterShell(s.registry)
+	tools.RegisterShellBg(s.registry)
 
 	// Graph memory.
 	embModel, embKey, embBaseURL := cfg.ResolveEmbedding()
@@ -245,6 +253,9 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		warnings = append(warnings,
 			"No API key for the coding provider. Add one on the MF Agent settings page.")
 	}
+
+	// Docgen tool — markdown + screenshot documentation.
+	tools.RegisterDocgen(s.registry, s.brw, s.env, provider)
 
 	_, visModel, _, _ := cfg.ResolveRole(cfg.Vision)
 

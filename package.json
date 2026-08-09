@@ -119,6 +119,10 @@
       {
         "command": "mfagent.queue.checkNow",
         "title": "MF Agent: Run Supervisor Check Now"
+      },
+      {
+        "command": "mfagent.generateDocumentation",
+        "title": "MF Agent: Generate Documentation"
       }
     ],
     "menus": {
@@ -208,27 +212,35 @@
           "minimum": 10,
           "description": "Default supervisor wake-up interval in seconds. A task list that sets its own interval in the Task Queue view overrides this."
         },
-        "mfagent.queue.taskTimeoutMinutes": {
+        "mfagent.queue.workerSilentMinutes": {
           "type": "number",
-          "default": 20,
-          "markdownDescription": "Minutes an execution task gets on its first attempt. Retries get 50% more per attempt (capped at 3× the base), in step with `#mfagent.queue.maxRounds#` — extra rounds inside a fixed timeout only move where the attempt dies. The worker stops and writes a handoff report before the timeout is reached."
+          "default": 10,
+          "minimum": 1,
+          "markdownDescription": "How long a running worker may write nothing before it is treated as dead and its task requeued. This is not a time limit on the task: a live worker writes an activity record every `#mfagent.activityIntervalSeconds#` even while it waits on the model, so only a process that has actually stopped goes quiet for this long. Raise it if you see healthy workers being requeued."
+        },
+        "mfagent.activityIntervalSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "description": "How often a working agent records what it is doing. These records are the queue's evidence that work is progressing, and they are kept per task."
+        },
+        "mfagent.llm.idleMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "How long a model reply may deliver nothing at all before the connection is treated as dropped. This is not a limit on how long a reply may take — every byte received resets it, so a slow local model can stream for hours."
         },
         "mfagent.queue.maxRounds": {
           "type": "number",
           "default": 80,
           "minimum": 10,
-          "markdownDescription": "Tool-calling rounds an unattended executor gets per turn. Retries get 50% more per attempt (capped at 3× the base), in step with `#mfagent.queue.taskTimeoutMinutes#`."
+          "markdownDescription": "Tool-calling rounds an unattended executor gets per turn — the only budget a task has. Retries get 50% more per attempt (capped at 3× the base)."
         },
         "mfagent.queue.supervisorMaxRounds": {
           "type": "number",
           "default": 40,
           "minimum": 10,
           "description": "Tool-calling rounds the supervisor gets per task. Lower is cheaper and usually enough for verification."
-        },
-        "mfagent.queue.supervisorTimeoutMinutes": {
-          "type": "number",
-          "default": 15,
-          "description": "Max minutes per supervisor pass."
         },
         "mfagent.queue.verifyCommandTimeoutSeconds": {
           "type": "number",

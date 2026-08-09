@@ -6,6 +6,7 @@ bin/
 .vscode-test/
 core/mfcore
 core/mfcore.exe
+core/mfagent-mcp.exe
 *.db
 *.db-wal
 *.db-shm

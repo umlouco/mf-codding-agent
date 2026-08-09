@@ -1,3 +1,5 @@
+import * as cp from 'child_process';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { CoreClient, InitResult } from './core';
 import { ChatPanel } from './panel';
@@ -367,6 +369,19 @@ async function openTaskQueue(context: vscode.ExtensionContext): Promise<void> {
     output.appendLine(`[queue] recovered ${recovered} task(s) orphaned by a previous session`);
     queueView?.render();
   }
+
+  // RUNNING is stored in the database, not in this process, so a window that
+  // reloads mid-run comes back saying the queue is running — and until this
+  // call, saying it was the only thing it did. The cron lives in the extension
+  // host and died with the old one, so nothing was armed, nothing pumped, and a
+  // task left in VERIFYING sat there under a green light. Re-arm instead:
+  // RUNNING means running, and the state was written precisely so an unattended
+  // run could survive the host that started it.
+  if (q.runState === 'RUNNING') {
+    output.appendLine('[queue] a run was in progress before this window reloaded; resuming it');
+    orch.start();
+    queueView?.render();
+  }
 }
 
 function registerCommands(context: vscode.ExtensionContext): void {
@@ -532,6 +547,124 @@ function registerCommands(context: vscode.ExtensionContext): void {
       );
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Could not read MCP status: ${e?.message ?? e}`);
+    }
+  });
+
+  reg('mfagent.generateDocumentation', async () => {
+    const scope = await vscode.window.showQuickPick(
+      [
+        { label: 'Whole project', description: 'Document the entire workspace' },
+        { label: 'Specific module', description: 'Document a subdirectory or module' },
+      ],
+      { title: 'Generate Documentation — choose scope' },
+    );
+    if (!scope) {
+      return;
+    }
+
+    let projectPath: string | undefined;
+    if (scope.label === 'Specific module') {
+      const folders = vscode.workspace.workspaceFolders;
+      if (!folders || folders.length === 0) {
+        void vscode.window.showErrorMessage('No workspace folder is open.');
+        return;
+      }
+      const root = folders[0].uri.fsPath;
+      const uri = await vscode.window.showOpenDialog({
+        defaultUri: vscode.Uri.file(root),
+        canSelectFolders: true,
+        canSelectFiles: false,
+        openLabel: 'Select module to document',
+      });
+      if (!uri || uri.length === 0) {
+        return;
+      }
+      projectPath = uri[0].fsPath;
+    }
+
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Generating documentation…',
+          cancellable: false,
+        },
+        async (progress) => {
+          progress.report({ message: 'Analysing project and generating markdown…' });
+
+          const input: any = {};
+          if (projectPath) {
+            input.project_path = projectPath;
+          }
+
+          const result: any = await core.request('tools/invoke', {
+            name: 'docgen_generate',
+            input,
+          });
+
+          if (result.isError) {
+            void vscode.window.showErrorMessage(
+              `Documentation generation failed: ${result.output}`,
+            );
+            return;
+          }
+
+          progress.report({ message: 'Assembling .docx…' });
+
+          const folders = vscode.workspace.workspaceFolders;
+          if (!folders || folders.length === 0) {
+            void vscode.window.showErrorMessage('No workspace folder is open.');
+            return;
+          }
+
+          const root = folders[0].uri.fsPath;
+          const manifestPath = path.join(root, '.mfagent', 'docgen', 'manifest.json');
+          const docxPath = path.join(root, '.mfagent', 'docgen', 'documentation.docx');
+
+          const scriptsDir = path.join(context.extensionPath, 'scripts');
+          const docxGenScript = path.join(scriptsDir, 'docx-gen.py');
+
+          await new Promise<void>((resolve, reject) => {
+            const child = cp.spawn('python', [docxGenScript, '--manifest', manifestPath, '--output', docxPath], {
+              cwd: root,
+              env: { ...process.env },
+              windowsHide: true,
+            });
+
+            let stderr = '';
+            child.stderr.on('data', (d: Buffer) => {
+              stderr += d.toString();
+            });
+
+            child.on('error', (err) => {
+              reject(new Error(`Could not start python: ${err.message}`));
+            });
+
+            child.on('exit', (code) => {
+              if (code === 0) {
+                resolve();
+              } else {
+                reject(
+                  new Error(
+                    `docx-gen.py exited with code ${code}${stderr ? ': ' + stderr.trim() : ''}`,
+                  ),
+                );
+              }
+            });
+          });
+
+          const docxUri = vscode.Uri.file(docxPath);
+          await vscode.env.openExternal(docxUri);
+
+          void vscode.window.showInformationMessage(
+            `Documentation saved to ${docxPath}`,
+          );
+        },
+      );
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(
+        `Documentation generation failed: ${e?.message ?? e}`,
+      );
     }
   });
 }

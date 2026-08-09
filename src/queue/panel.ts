@@ -140,10 +140,16 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           queue.log(Number(msg.id), 'user', 'status-set', msg.status);
           this.render();
           break;
-        case 'deleteTask':
+        case 'deleteTask': {
+          const task = queue.get(Number(msg.id));
+          if (task && msg.confirm && !(await this.confirmDelete(task))) {
+            break;
+          }
           queue.remove(Number(msg.id));
+          queue.log(null, 'user', 'task-deleted', task ? `${task.seq}: ${task.title}` : '');
           this.render();
           break;
+        }
         case 'reorder':
           queue.reorder((msg.ids as unknown[]).map(Number));
           this.render();
@@ -157,6 +163,10 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
             queue.replaceAll([]);
             this.render();
           }
+          break;
+
+        case 'generateDocs':
+          await vscode.commands.executeCommand('mfagent.generateDocumentation');
           break;
 
         case 'showEvents':
@@ -240,6 +250,33 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       'Start run',
     );
     return pick === 'Start run';
+  }
+
+  /**
+   * Asked only for a task that has already cost something. Deleting is not
+   * undoable and takes its attempts, output and token spend with it, which is
+   * worth one dialog — but a task nobody has run yet is not.
+   */
+  private async confirmDelete(task: Task): Promise<boolean> {
+    const spent = task.tokensIn + task.tokensCacheRead + task.tokensOut;
+    const detail = [
+      task.attempts > 0 ? `${task.attempts} attempt(s)` : '',
+      spent > 0 ? `${spent.toLocaleString()} tokens` : '',
+    ]
+      .filter(Boolean)
+      .join(' and ');
+
+    const pick = await vscode.window.showWarningMessage(
+      `Remove task ${task.seq}: ${task.title}?`,
+      {
+        modal: true,
+        detail: detail
+          ? `This task has ${detail} behind it. Removing it discards its output and history, and cannot be undone.`
+          : 'This cannot be undone.',
+      },
+      'Remove',
+    );
+    return pick === 'Remove';
   }
 
   private async confirmReset(): Promise<boolean> {
@@ -398,6 +435,8 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     <div class="row foot">
       <button id="addTask" class="ghost">Add task</button>
       <button id="clearQueue" class="ghost">Clear queue</button>
+      <span class="spacer"></span>
+      <button id="genDocs" class="ghost">Generate Docs</button>
       <span class="spacer"></span>
       <button id="openSettings" class="ghost">Settings</button>
       <button id="showLog" class="ghost">Log</button>

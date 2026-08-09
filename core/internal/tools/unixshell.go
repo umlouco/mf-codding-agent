@@ -59,6 +59,15 @@ func scriptEnv() []string {
 	return append(os.Environ(), "MFAGENT=1", "NO_COLOR=1", "CI=1")
 }
 
+// RunScript runs one script through the portable interpreter, for callers
+// outside the agent loop — see `mfcore sh`, which is how the extension runs a
+// task's verification command with the same shell semantics the agent used to
+// satisfy it. A check that disagrees with the build about what `&&` means is
+// worse than no check at all.
+func RunScript(ctx context.Context, env *Env, dir, script string) (string, uint8, error) {
+	return runScript(ctx, env, dir, script)
+}
+
 // runScript interprets one script rooted at dir and returns its combined
 // output together with the exit status. A non-zero status is not a Go error:
 // it is reported through the status return so && and || behave normally.
@@ -132,19 +141,43 @@ func dispatch(env *Env) interp.ExecHandlerFunc {
 	return self
 }
 
-// runOnHost hands a command with no Go implementation to the real host shell.
-// Going through a shell rather than exec'ing the binary directly is what makes
-// .cmd shims such as npm and yarn, and PowerShell cmdlets, resolve on Windows.
+// runOnHost runs a command that has no Go implementation.
+//
+// A real program is executed directly, with the argument vector the POSIX
+// parser already produced and no shell anywhere in the path. That is not an
+// optimisation — it is the difference between arguments that survive and
+// arguments that get re-parsed. Handing `go build ./...` to PowerShell means
+// pasting the arguments back into one string for a second parser with different
+// quoting rules to split again, and every quote, dollar sign and backtick in
+// them is a chance to come out the other side as something else.
+//
+// The shell is kept only for what genuinely needs it: .cmd and .bat shims like
+// npm and yarn, which are scripts rather than programs, and bare cmdlet names
+// that are not on disk at all.
 func runOnHost(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	name, shArgs := shellFor(hostCommandLine(args))
-	cmd := exec.CommandContext(ctx, name, shArgs...)
+	cmd, cleanup, viaShell := hostCommand(ctx, hc.Dir, args)
+	defer cleanup()
 	cmd.Dir = hc.Dir
 	cmd.Env = scriptEnv()
 	cmd.Stdin = hc.Stdin
 	cmd.Stdout = hc.Stdout
-	cmd.Stderr = hc.Stderr
+
+	// PowerShell serialises its own error records as a CLIXML document when its
+	// stderr is a pipe, so anything it complains about — a name it cannot
+	// resolve, most often — arrives as unreadable XML. Direct execution never
+	// does this, so only the shell path pays for the translation.
+	stderr := hc.Stderr
+	var psErr bytes.Buffer
+	if viaShell && runtime.GOOS == "windows" {
+		cmd.Stderr = &psErr
+	} else {
+		cmd.Stderr = stderr
+	}
 
 	err := cmd.Run()
+	if psErr.Len() > 0 {
+		fmt.Fprint(stderr, decodeCLIXML(psErr.String()))
+	}
 	if err == nil {
 		return nil
 	}
@@ -158,6 +191,92 @@ func runOnHost(ctx context.Context, hc interp.HandlerContext, args []string) err
 	}
 	fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
 	return interp.NewExitStatus(127)
+}
+
+// hostCommand builds the process for one command, and reports whether it had to
+// go through a shell to do it.
+func hostCommand(ctx context.Context, dir string, args []string) (*exec.Cmd, func(), bool) {
+	if path, ok := resolveProgram(dir, args[0]); ok && !needsShell(path) {
+		return exec.CommandContext(ctx, path, args[1:]...), func() {}, false
+	}
+	name, shArgs, cleanup := shellFor(hostCommandLine(args))
+	return exec.CommandContext(ctx, name, shArgs...), cleanup, true
+}
+
+// needsShell reports whether a resolved path is a script that an interpreter
+// has to read rather than a program the OS can start.
+func needsShell(path string) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".cmd", ".bat", ".ps1":
+		return true
+	}
+	return false
+}
+
+// resolveProgram finds the program a command name refers to. A name containing
+// a separator is a path and is resolved against the script's own directory —
+// PATH has nothing to do with `./scripts/build.sh`.
+func resolveProgram(dir, name string) (string, bool) {
+	if !strings.ContainsAny(name, `/\`) {
+		path, err := exec.LookPath(name)
+		return path, err == nil
+	}
+
+	path := name
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(dir, path)
+	}
+	if st, err := os.Stat(path); err == nil && !st.IsDir() {
+		return path, true
+	}
+	// On Windows the extension is usually left implicit.
+	if runtime.GOOS == "windows" {
+		for _, ext := range filepath.SplitList(os.Getenv("PATHEXT")) {
+			if st, err := os.Stat(path + ext); err == nil && !st.IsDir() {
+				return path + ext, true
+			}
+		}
+	}
+	return "", false
+}
+
+// decodeCLIXML turns PowerShell's serialised error stream back into the text a
+// human — or a supervisor agent reading a failed check — was supposed to see.
+// Anything that is not a CLIXML document is passed through untouched.
+func decodeCLIXML(s string) string {
+	if !strings.HasPrefix(strings.TrimSpace(s), "#< CLIXML") {
+		return s
+	}
+	var b strings.Builder
+	rest := s
+	for {
+		i := strings.Index(rest, `<S S="Error">`)
+		if i < 0 {
+			break
+		}
+		rest = rest[i+len(`<S S="Error">`):]
+		j := strings.Index(rest, "</S>")
+		if j < 0 {
+			break
+		}
+		b.WriteString(rest[:j])
+		rest = rest[j+len("</S>"):]
+	}
+	if b.Len() == 0 {
+		return s
+	}
+	// The serialiser escapes the line breaks and the XML entities it needs to.
+	out := b.String()
+	for _, r := range []struct{ from, to string }{
+		{"_x000D__x000A_", "\n"}, {"_x000A_", "\n"}, {"_x000D_", "\n"},
+		{"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", `"`}, {"&apos;", "'"},
+	} {
+		out = strings.ReplaceAll(out, r.from, r.to)
+	}
+	return out
 }
 
 // hostCommandLine re-quotes an already-tokenised command for the host shell.
