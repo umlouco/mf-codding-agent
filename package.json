@@ -85,6 +85,10 @@
         "title": "MF Agent: Show MCP Server Status"
       },
       {
+        "command": "mfagent.copyMcpConfig",
+        "title": "MF Agent: Copy MCP Config for Claude Code"
+      },
+      {
         "command": "mfagent.openSettings",
         "title": "MF Agent: Settings — Providers & Models",
         "icon": "$(settings-gear)"

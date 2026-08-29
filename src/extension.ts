@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { CoreClient, InitResult } from './core';
 import { ChatPanel } from './panel';
-import { queueDbPath } from './detect';
+import { queueDbPath, resolveMcpBinary } from './detect';
 import { TaskQueue } from './queue/db';
 import { Orchestrator } from './queue/orchestrator';
 import { QueueViewProvider } from './queue/panel';
@@ -547,6 +547,45 @@ function registerCommands(context: vscode.ExtensionContext): void {
       );
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Could not read MCP status: ${e?.message ?? e}`);
+    }
+  });
+
+  reg('mfagent.copyMcpConfig', async () => {
+    const mcpBin = resolveMcpBinary(context);
+    if (!mcpBin) {
+      const searched = [
+        path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'mfagent-mcp.exe' : 'mfagent-mcp'),
+        path.join(context.extensionPath, 'bin', `${process.platform}-${process.arch}`, process.platform === 'win32' ? 'mfagent-mcp.exe' : 'mfagent-mcp'),
+      ];
+      void vscode.window.showErrorMessage(
+        `mfagent-mcp binary not found. Build it first: cd core && go build -o ../bin/ ./cmd/mfagent-mcp\n\nSearched:\n${searched.join('\n')}`,
+      );
+      return;
+    }
+
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '${workspaceFolder}';
+    const config = {
+      mcpServers: {
+        'mfagent-task-queue': {
+          command: mcpBin,
+          args: ['--workspace', workspaceRoot],
+        },
+      },
+    };
+
+    const json = JSON.stringify(config, null, 2);
+    await vscode.env.clipboard.writeText(json);
+
+    const pick = await vscode.window.showInformationMessage(
+      'MCP configuration copied to clipboard. Paste it into your Claude Code config (.claude.json or .mcp.json).',
+      'Show config',
+    );
+    if (pick === 'Show config') {
+      const doc = await vscode.workspace.openTextDocument({
+        content: `// Paste this into your Claude Code config file:\n//   - .claude.json (global, in your home directory)\n//   - .mcp.json (per-project, at the workspace root)\n//\n// If the workspace path changes per project, remove the --workspace arg\n// and the server will use the current working directory.\n\n${json}\n`,
+        language: 'jsonc',
+      });
+      await vscode.window.showTextDocument(doc);
     }
   });
 

@@ -4,9 +4,12 @@ package tools
 //
 // Shell syntax — pipelines, && and ||, for/while/if, command substitution,
 // globbing, here-documents, variables and redirection — comes from mvdan.cc/sh,
-// a parser and interpreter written in Go. The utilities themselves (grep, sed,
-// awk, …) are the Go builtins in posix.go and posixutil.go, so a script means
-// the same thing on every platform with no busybox, WSL or Git Bash installed.
+// a parser and interpreter written in Go, so the syntax means the same thing on
+// every platform with no busybox, WSL or Git Bash installed.
+//
+// The utilities themselves (grep, sed, awk, …) are the Go builtins in posix.go
+// and posixutil.go, except where the host has a real implementation worth
+// deferring to — see hostPreferred.
 //
 // Anything without a Go implementation falls through to the host shell —
 // PowerShell on Windows, /bin/sh elsewhere — so builds, package managers and
@@ -99,10 +102,70 @@ func runScript(ctx context.Context, env *Env, dir, script string) (string, uint8
 	return out.String(), 0, runErr
 }
 
-// dispatch routes a command to its Go implementation when one exists, and to
-// the host shell otherwise. It is only reached for commands the interpreter
-// does not handle itself — cd, echo, printf, test, read and the other shell
-// builtins never arrive here.
+/*
+hostPreferred lists the builtins that should defer to the host's own
+implementation whenever the host has one.
+
+The builtins exist so that a script means the same thing on a Windows machine
+with no WSL or Git Bash as it does anywhere else. On Linux and macOS that trade
+runs backwards: the real utilities are already installed and complete, while
+these reimplementations cover only the flags that have been needed so far. The
+Go sed does substitution and nothing else, so on a Linux host `sed -n '1,50p'`
+and `sed -i` fail against a shim standing in front of a working GNU sed — and
+the model cannot tell that from sed being broken.
+
+Only read-only utilities are listed. Anything that creates, deletes or rewrites
+a file — mkdir, touch, rm, cp, mv, tee — stays in Go on every platform: those
+resolve their arguments through Env.Resolve, which confines them to the
+workspace, and report what they wrote through Env.FileChanged, and neither
+survives being handed to /usr/bin.
+
+What this gives up: a delegated utility does not read through Env.Resolve, so
+`cat ../../outside` stops being refused, and a host `sed -i` rewrites a file
+without the editor being told. Both are already true of every command that has
+no Go implementation at all, which the shell has always run on the host as-is,
+so this widens nothing that was not already open. Writes through redirection
+stay confined either way — the interpreter's OpenHandler sees those regardless
+of which implementation runs the command.
+*/
+var hostPreferred = map[string]bool{
+	"awk": true, "basename": true, "cat": true, "comm": true, "cut": true,
+	"diff": true, "dirname": true, "du": true, "find": true, "grep": true,
+	"head": true, "ls": true, "nl": true, "paste": true, "rev": true,
+	"sed": true, "seq": true, "sort": true, "stat": true, "tail": true,
+	"tr": true, "uniq": true, "wc": true, "xargs": true,
+}
+
+// hostUtilPath caches the PATH lookup per utility name, holding "" for the ones
+// the host does not have. Every stage of every pipeline asks, and PATH does not
+// change underneath a running core.
+var hostUtilPath sync.Map
+
+// preferHostUtil reports whether args[0] should be run from the host rather
+// than from posix.go. Setting MFAGENT_PORTABLE_UTILS forces the builtins
+// everywhere, which is how you reproduce Windows behaviour on a Unix box.
+func preferHostUtil(name string) bool {
+	if runtime.GOOS == "windows" || !hostPreferred[name] {
+		return false
+	}
+	if os.Getenv("MFAGENT_PORTABLE_UTILS") != "" {
+		return false
+	}
+	if v, ok := hostUtilPath.Load(name); ok {
+		return v.(string) != ""
+	}
+	path, err := exec.LookPath(name)
+	if err != nil {
+		path = ""
+	}
+	hostUtilPath.Store(name, path)
+	return path != ""
+}
+
+// dispatch routes a command to its Go implementation when one exists and the
+// host has nothing better, and to the host otherwise. It is only reached for
+// commands the interpreter does not handle itself — cd, echo, printf, test,
+// read and the other shell builtins never arrive here.
 func dispatch(env *Env) interp.ExecHandlerFunc {
 	var self interp.ExecHandlerFunc
 	self = func(ctx context.Context, args []string) error {
@@ -111,7 +174,7 @@ func dispatch(env *Env) interp.ExecHandlerFunc {
 		}
 		hc := interp.HandlerCtx(ctx)
 		b, ok := builtins[args[0]]
-		if !ok {
+		if !ok || preferHostUtil(args[0]) {
 			return runOnHost(ctx, hc, args)
 		}
 		c := &cmdCtx{
@@ -132,6 +195,16 @@ func dispatch(env *Env) interp.ExecHandlerFunc {
 			var code exitCodeError
 			if errors.As(err, &code) {
 				return interp.NewExitStatus(uint8(code))
+			}
+			// A builtin implements a subset of its utility's flags, so a
+			// rejected argument is usually a request for something
+			// unimplemented rather than a typo. Printing what this one does
+			// accept turns a dead end into one retry, and this is the only
+			// place the usage string is ever shown.
+			var usage usageError
+			if errors.As(err, &usage) {
+				fmt.Fprintf(hc.Stderr, "%s: %v\nusage: %s\n", args[0], err, b.usage)
+				return interp.NewExitStatus(1)
 			}
 			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
 			return interp.NewExitStatus(1)
@@ -361,17 +434,53 @@ func builtinNames() []string {
 	return names
 }
 
+// utilitiesBlurb tells the model which utilities a script gets on this host and,
+// for the ones answered in Go, which flags they accept.
+//
+// The builtins cover a subset of each utility that nobody can guess from the
+// name — reaching for `sed -n` costs a round to discover that this sed only
+// substitutes. Spelling the subset out is close to free here, because the tool
+// definitions sit in the cached prefix of every request, and it is only ever
+// expensive to learn by trial.
+func utilitiesBlurb() string {
+	var host, portable []string
+	for _, n := range builtinNames() {
+		if preferHostUtil(n) {
+			host = append(host, n)
+			continue
+		}
+		// The usage string already starts with the command name.
+		portable = append(portable, builtins[n].usage)
+	}
+
+	var sb strings.Builder
+	if len(host) > 0 {
+		fmt.Fprintf(&sb, "These run this host's own implementation, with all of their usual flags: %s. ",
+			strings.Join(host, ", "))
+	}
+	if len(portable) > 0 {
+		list := strings.Join(portable, "; ")
+		// Several usage strings end in "...", which would take a fourth dot.
+		end := ". "
+		if strings.HasSuffix(list, ".") {
+			end = " "
+		}
+		fmt.Fprintf(&sb, "These are portable Go builtins and accept only what is shown here: %s%s",
+			list, end)
+	}
+	return sb.String()
+}
+
 func RegisterPosix(r *Registry) {
 	r.Add(&Tool{
 		Name: "unix",
-		Description: "Run a POSIX shell script, interpreted natively in Go so it behaves the " +
-			"same on Windows, macOS and Linux with no WSL, busybox or Git Bash. Full sh " +
-			"syntax: pipelines, && and ||, for/while/if, command substitution, globbing, " +
-			"here-documents, variables and redirection. These utilities are built in and " +
-			"portable: " + strings.Join(builtinNames(), ", ") + ". Any other command runs " +
-			"through the host shell (PowerShell on Windows, sh elsewhere), so builds, " +
-			"package managers, git and compilers work in the same script. Returns combined " +
-			"stdout and stderr plus the exit code.",
+		Description: "Run a POSIX shell script. The syntax is interpreted natively in Go and is " +
+			"identical on Windows, macOS and Linux with no WSL, busybox or Git Bash: " +
+			"pipelines, && and ||, for/while/if, command substitution, globbing, " +
+			"here-documents, variables and redirection. " + utilitiesBlurb() +
+			"Any other command runs through the host shell (PowerShell on Windows, sh " +
+			"elsewhere), so builds, package managers, git and compilers work in the same " +
+			"script. Returns combined stdout and stderr plus the exit code.",
 		// Deliberately not gated: this tool never asks for confirmation. Writes
 		// are still confined to the workspace and deniedPatterns still applies.
 		Mutating: false,

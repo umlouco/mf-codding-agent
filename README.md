@@ -103,11 +103,21 @@ explained rather than failing silently.
 `php`/`ts`/`js`/`go`/`delphi`). Both skip `node_modules`, `vendor`, `__history` and
 friends, which is what makes them fast enough not to need a native ripgrep.
 
-**`unix`** — a POSIX toolbox implemented natively in Go: `ls cat head tail grep sed
-sort uniq cut tr wc find stat du which echo pwd mkdir touch rm cp mv`, with pipes
-(`|`) and redirection (`>`, `>>`). Identical behaviour on Windows, macOS and Linux
-with no WSL, no Git Bash, no busybox. It cannot spawn a process, so read-only
-pipelines run without a prompt.
+**`unix`** — a POSIX shell interpreted natively in Go: full `sh` syntax — pipes
+(`|`), `&&` and `||`, `for`/`while`/`if`, command substitution, globbing,
+here-documents and redirection (`>`, `>>`) — identical on Windows, macOS and Linux
+with no WSL, no Git Bash, no busybox.
+
+The utilities behind that syntax come from whichever implementation is better. On
+Linux and macOS the host's own `sed`, `grep`, `awk`, `find`, `ls` and friends
+answer, so the complete utility is available; on Windows, where none is installed,
+Go builtins cover a documented subset of each — the tool description carries their
+exact usage, and a builtin that is asked for something it does not implement says
+so and prints what it does accept. `MFAGENT_PORTABLE_UTILS=1` forces the builtins
+everywhere. `mkdir touch rm cp mv tee` are always the Go versions, and redirections
+always go through the workspace guard, so neither can write outside the workspace.
+Anything with no Go implementation at all — `composer`, `npm`, `go`, `git` — runs on
+the host shell, so builds compose into the same script.
 
 ```
 grep -rn TODO src | wc -l

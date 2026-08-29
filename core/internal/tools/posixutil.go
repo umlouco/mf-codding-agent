@@ -25,6 +25,19 @@ type exitCodeError uint8
 
 func (e exitCodeError) Error() string { return fmt.Sprintf("exit status %d", uint8(e)) }
 
+// usageError marks "this builtin does not implement what you asked for", as
+// distinct from "what you asked for went wrong". dispatch answers it with the
+// builtin's usage line, so a caller that reached for an unimplemented flag is
+// told what the implemented subset is instead of just being refused.
+type usageError struct{ err error }
+
+func (u usageError) Error() string { return u.err.Error() }
+func (u usageError) Unwrap() error { return u.err }
+
+func usagef(format string, a ...any) error {
+	return usageError{fmt.Errorf(format, a...)}
+}
+
 func (c *cmdCtx) stderr() io.Writer {
 	if c.errw != nil {
 		return c.errw

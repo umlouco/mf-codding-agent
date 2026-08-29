@@ -86,6 +86,25 @@ export function resolveCoreBinary(context: vscode.ExtensionContext): CoreBinary 
   return { source: 'bundled', searched: candidates.map(([c]) => c) };
 }
 
+/**
+ * Locates the MCP server binary (mfagent-mcp), using the same candidate
+ * directories as the core binary.
+ */
+export function resolveMcpBinary(context: vscode.ExtensionContext): string | undefined {
+  const exe = process.platform === 'win32' ? 'mfagent-mcp.exe' : 'mfagent-mcp';
+  const candidates = [
+    path.join(context.extensionPath, 'bin', exe),
+    path.join(context.extensionPath, 'bin', `${process.platform}-${process.arch}`, exe),
+    path.join(context.extensionPath, '..', 'bin', exe),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) {
+      return c;
+    }
+  }
+  return undefined;
+}
+
 // ---- languages -----------------------------------------------------------
 
 /**

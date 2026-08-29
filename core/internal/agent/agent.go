@@ -105,6 +105,14 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	defs := a.toolDefs()
 	result := &SendResult{SessionID: req.SessionID}
 	maxIterations := a.maxIterations()
+
+	// Accumulate text across every assistant turn, not just the final one.
+	// OpenAI-compatible models routinely emit text and a tool call in the
+	// same response chunk, and the text is added to the session but not to
+	// the result. A planner that writes its JSON array then calls read_file
+	// in the same turn would produce a final result with no JSON at all.
+	var accumulated strings.Builder
+
 	for iter := 1; iter <= maxIterations; iter++ {
 		select {
 		case <-ctx.Done():
@@ -140,6 +148,14 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 			return nil, err
 		}
 
+		turnText := turn.Text()
+		if turnText != "" {
+			if accumulated.Len() > 0 {
+				accumulated.WriteString("\n\n")
+			}
+			accumulated.WriteString(turnText)
+		}
+
 		a.mu.Lock()
 		sess.Messages = append(sess.Messages, llm.Message{Role: llm.RoleAssistant, Blocks: turn.Blocks})
 		sess.Usage.Input += turn.Usage.Input
@@ -151,7 +167,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 
 		calls := turn.ToolCalls()
 		if len(calls) == 0 {
-			result.Text = turn.Text()
+			result.Text = accumulated.String()
 			result.StopReason = turn.StopReason
 			a.activity(req.SessionID, PhaseDone, fmt.Sprintf(
 				"answered after %d round(s), %d in / %d out tokens",
@@ -182,7 +198,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	// way, and "nothing reported" is indistinguishable from "nothing done" — so
 	// the supervisor retries a task that may already be half-built, and the next
 	// attempt starts from zero with the same budget.
-	return a.finalReport(ctx, req, sess, system, maxIterations)
+	return a.finalReport(ctx, req, sess, system, maxIterations, accumulated.String())
 }
 
 func (a *Agent) maxIterations() int {
@@ -206,6 +222,7 @@ func (a *Agent) finalReport(
 	sess *Session,
 	system string,
 	rounds int,
+	accumulated string,
 ) (*SendResult, error) {
 	result := &SendResult{SessionID: req.SessionID, Iterations: rounds, StopReason: "max_iterations"}
 	a.activity(req.SessionID, PhaseReport, fmt.Sprintf(
@@ -242,9 +259,13 @@ func (a *Agent) finalReport(
 		a.mu.Lock()
 		result.Usage = sess.Usage
 		a.mu.Unlock()
-		result.Text = fmt.Sprintf(
-			"Stopped after %d tool-calling rounds, and the closing summary could not be "+
-				"produced: %v. Treat any work from this turn as unverified.", rounds, err)
+			var prefix string
+			if accumulated != "" {
+				prefix = accumulated + "\n\n"
+			}
+			result.Text = fmt.Sprintf(
+				"%sStopped after %d tool-calling rounds, and the closing summary could not be "+
+					"produced: %v. Treat any work from this turn as unverified.", prefix, rounds, err)
 		a.emit("stream/done", map[string]any{
 			"sessionId": req.SessionID, "stopReason": "max_iterations",
 			"usage": result.Usage, "iterations": rounds,
@@ -261,9 +282,13 @@ func (a *Agent) finalReport(
 	result.Usage = sess.Usage
 	a.mu.Unlock()
 
-	result.Text = fmt.Sprintf(
-		"[cut off after %d tool-calling rounds — this is a partial-progress report, not a "+
-			"finished task]\n\n%s", rounds, turn.Text())
+		var prefix string
+		if accumulated != "" {
+			prefix = accumulated + "\n\n"
+		}
+		result.Text = fmt.Sprintf(
+			"%s[cut off after %d tool-calling rounds — this is a partial-progress report, not a "+
+				"finished task]\n\n%s", prefix, rounds, turn.Text())
 	a.emit("stream/done", map[string]any{
 		"sessionId": req.SessionID, "stopReason": "max_iterations",
 		"usage": result.Usage, "iterations": rounds,

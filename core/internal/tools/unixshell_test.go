@@ -3,10 +3,27 @@ package tools
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// TestMain pins the Go builtins for the whole package.
+//
+// These tests assert what the Go implementations produce, down to exact output
+// in places. On Linux and macOS the shell prefers the host's own utilities, and
+// `nl`, `diff` and `wc` there are formatted differently and differ again between
+// GNU and BSD — so without this the suite would be asserting coreutils' output
+// on one platform and ours on another. TestPrefersHostUtilities clears the
+// variable to cover the delegation itself.
+func TestMain(m *testing.M) {
+	if err := os.Setenv("MFAGENT_PORTABLE_UTILS", "1"); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
 
 func writeFile(t *testing.T, root, rel, body string) {
 	t.Helper()
@@ -274,5 +291,63 @@ func TestShellParseErrorIsReported(t *testing.T) {
 	env := &Env{Root: root}
 	if _, _, err := runScript(context.Background(), env, env.realRoot(), `for f in`); err == nil {
 		t.Error("a syntax error should be reported")
+	}
+}
+
+// TestPrefersHostUtilities covers the choice between a Go builtin and the host's
+// own implementation. It runs against whatever this machine actually has, so it
+// asserts the decision rather than any particular utility's output.
+func TestPrefersHostUtilities(t *testing.T) {
+	t.Setenv("MFAGENT_PORTABLE_UTILS", "")
+
+	// Anything that writes is answered in Go on every platform: those resolve
+	// through Env.Resolve and report through Env.FileChanged, and delegating
+	// them would drop the workspace confinement and the editor notification.
+	for _, name := range []string{"mkdir", "touch", "rm", "cp", "mv", "tee"} {
+		if hostPreferred[name] {
+			t.Errorf("%s writes files and must not be delegated to the host", name)
+		}
+		if preferHostUtil(name) {
+			t.Errorf("preferHostUtil(%q) = true, want false", name)
+		}
+	}
+
+	if runtime.GOOS == "windows" {
+		// Nothing is delegated. The builtins exist precisely because a Windows
+		// box has none of these.
+		for name := range hostPreferred {
+			if preferHostUtil(name) {
+				t.Errorf("preferHostUtil(%q) = true on Windows, want false", name)
+			}
+		}
+		return
+	}
+
+	// sed is the case that motivated the delegation: a Unix host has a complete
+	// one, and the builtin only substitutes.
+	if _, err := exec.LookPath("sed"); err != nil {
+		t.Skipf("no host sed to defer to: %v", err)
+	}
+	if !preferHostUtil("sed") {
+		t.Fatal("host has sed but preferHostUtil(sed) = false")
+	}
+
+	root := t.TempDir()
+	writeFile(t, root, "a.txt", "one\ntwo\nthree\n")
+
+	// The address form the builtin rejects outright.
+	out, code := run(t, root, `sed -n '2p' a.txt`)
+	if code != 0 || strings.TrimSpace(out) != "two" {
+		t.Errorf("sed -n '2p': got %q code %d, want two", out, code)
+	}
+
+	// The force flag has to win, or there is no way back to the portable
+	// behaviour when the host and the builtin disagree.
+	t.Setenv("MFAGENT_PORTABLE_UTILS", "1")
+	if preferHostUtil("sed") {
+		t.Error("MFAGENT_PORTABLE_UTILS did not force the builtin")
+	}
+	if _, code := run(t, root, `sed -n '2p' a.txt`); code == 0 {
+		t.Error("the builtin sed should reject -n, but the script succeeded")
 	}
 }

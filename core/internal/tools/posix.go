@@ -7,6 +7,11 @@ package tools
 // the utilities the shell in unixshell.go dispatches to; shell syntax itself
 // lives there, and anything without an implementation here falls through to
 // the host shell.
+//
+// Each command covers the flags that have been needed, not the whole utility,
+// which is why unixshell.go prefers the host's own implementation where there is
+// one. A command that is asked for something outside its subset must say so with
+// usagef, so the caller is told what the subset is.
 
 import (
 	"bufio"
@@ -133,7 +138,7 @@ func parseFlags(args []string, withValue string) (*flags, error) {
 					i++
 					f.vals[ch] = args[i]
 				} else {
-					return nil, fmt.Errorf("-%c requires a value", ch)
+					return nil, usagef("-%c requires a value", ch)
 				}
 				f.set[ch] = true
 				j = len(body)
@@ -484,7 +489,10 @@ func cmdGrep(c *cmdCtx) error {
 func splitSed(script string) (pattern, replacement, flags string, err error) {
 	r := []rune(script)
 	if len(r) < 4 || r[0] != 's' {
-		return "", "", "", fmt.Errorf("only substitution is supported: s/pattern/replacement/[gi]")
+		return "", "", "", usagef(
+			"only substitution is supported: s/pattern/replacement/[gi] — " +
+				"for line ranges use head/tail or read_file, for deletion use grep -v, " +
+				"and for an in-place edit use edit_file")
 	}
 	delim := r[1]
 	var parts []string
@@ -507,7 +515,7 @@ func splitSed(script string) (pattern, replacement, flags string, err error) {
 	}
 	parts = append(parts, string(cur))
 	if len(parts) < 2 {
-		return "", "", "", fmt.Errorf("malformed script %q: expected s%cpattern%creplacement%c[gi]",
+		return "", "", "", usagef("malformed script %q: expected s%cpattern%creplacement%c[gi]",
 			script, delim, delim, delim)
 	}
 	pattern, replacement = parts[0], parts[1]
@@ -516,7 +524,7 @@ func splitSed(script string) (pattern, replacement, flags string, err error) {
 	}
 	for _, f := range flags {
 		if f != 'g' && f != 'i' {
-			return "", "", "", fmt.Errorf("unsupported flag %q (only g and i are supported)", string(f))
+			return "", "", "", usagef("unsupported flag %q (only g and i are supported)", string(f))
 		}
 	}
 	if pattern == "" {
@@ -527,7 +535,7 @@ func splitSed(script string) (pattern, replacement, flags string, err error) {
 
 func cmdSed(c *cmdCtx) error {
 	if len(c.args) == 0 {
-		return fmt.Errorf("missing script, expected s/pattern/replacement/[g]")
+		return usagef("missing script, expected s/pattern/replacement/[g]")
 	}
 	pattern, replacement, flagStr, err := splitSed(c.args[0])
 	if err != nil {
