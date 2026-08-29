@@ -22,6 +22,12 @@ type ProviderConfig struct {
 type RoleConfig struct {
 	ProviderID string `json:"providerId"`
 	Model      string `json:"model"`
+	// Effort is a reasoning-effort hint ("low"/"medium"/"high"/"max"/…), or ""
+	// to use the provider's own default. Only the Coding role's value is ever
+	// consumed today: the core binds one provider per process, and the queue
+	// spins up a fresh process per role with that role rewritten onto Coding
+	// (see the editor's queue/agents.ts), so this one field covers every role.
+	Effort string `json:"effort"`
 }
 
 func (r RoleConfig) IsZero() bool { return r.ProviderID == "" && r.Model == "" }
@@ -116,10 +122,10 @@ func (c *Config) ResolveEmbedding() (model, apiKey, baseURL string) {
 	return model, c.resolveAPIKey(p), c.resolveBaseURL(p)
 }
 
-// ResolveRole returns the effective (provider, model, apiKey, baseURL) for a
-// role. Falls back to the Coding role if the given role is unset, then falls
-// back to the first enabled provider.
-func (c *Config) ResolveRole(role RoleConfig) (string, string, string, string) {
+// ResolveRole returns the effective (provider, model, apiKey, baseURL,
+// effort) for a role. Falls back to the Coding role if the given role is
+// unset, then falls back to the first enabled provider.
+func (c *Config) ResolveRole(role RoleConfig) (string, string, string, string, string) {
 	rc := role
 	if rc.IsZero() {
 		rc = c.Coding
@@ -130,26 +136,26 @@ func (c *Config) ResolveRole(role RoleConfig) (string, string, string, string) {
 				if len(c.Providers[i].Models) > 0 {
 					return c.Providers[i].Type, c.Providers[i].Models[0],
 						c.resolveAPIKey(&c.Providers[i]),
-						c.resolveBaseURL(&c.Providers[i])
+						c.resolveBaseURL(&c.Providers[i]), rc.Effort
 				}
 				return c.Providers[i].Type, "",
 					c.resolveAPIKey(&c.Providers[i]),
-					c.resolveBaseURL(&c.Providers[i])
+					c.resolveBaseURL(&c.Providers[i]), rc.Effort
 			}
 		}
-		return "openai-compatible", "", "", ""
+		return "openai-compatible", "", "", "", ""
 	}
 
 	p := c.ResolveProvider(rc.ProviderID)
 	if p == nil {
-		return "openai-compatible", rc.Model, os.Getenv("ANTHROPIC_API_KEY"), ""
+		return "openai-compatible", rc.Model, os.Getenv("ANTHROPIC_API_KEY"), "", rc.Effort
 	}
 
 	model := rc.Model
 	if model == "" && len(p.Models) > 0 {
 		model = p.Models[0]
 	}
-	return p.Type, model, c.resolveAPIKey(p), c.resolveBaseURL(p)
+	return p.Type, model, c.resolveAPIKey(p), c.resolveBaseURL(p), rc.Effort
 }
 
 func (c *Config) resolveAPIKey(p *ProviderConfig) string {

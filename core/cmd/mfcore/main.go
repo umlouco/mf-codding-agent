@@ -244,8 +244,15 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	wg.Wait()
 
 	// LLM provider — resolved from the providers list via the coding role.
-	provType, provModel, provKey, provBase := cfg.ResolveRole(cfg.Coding)
-	provider := llm.NewProvider(provType, provBase, provKey, provModel, 64000, "xhigh", "adaptive")
+	provType, provModel, provKey, provBase, provEffort := cfg.ResolveRole(cfg.Coding)
+	if provEffort == "" && provType == "anthropic" {
+		// Preserves the previous unconditional behaviour for anyone who has
+		// not picked an effort yet — Claude has no "provider default" of its
+		// own to fall back to the way a reasoning model on an OpenAI-compatible
+		// endpoint does, so the core has always had to pick one.
+		provEffort = "xhigh"
+	}
+	provider := llm.NewProvider(provType, provBase, provKey, provModel, 64000, provEffort, "adaptive")
 	if provModel == "" {
 		warnings = append(warnings,
 			"No coding model is set. Run \"MF Agent: Settings\" and bind a provider to the Coding role.")
@@ -257,7 +264,7 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	// Docgen tool — markdown + screenshot documentation.
 	tools.RegisterDocgen(s.registry, s.brw, s.env, provider)
 
-	_, visModel, _, _ := cfg.ResolveRole(cfg.Vision)
+	_, visModel, _, _, _ := cfg.ResolveRole(cfg.Vision)
 
 	system := agent.BuildSystemPrompt(agent.PromptInput{
 		WorkspaceRoot: cfg.WorkspaceRoot,
@@ -265,6 +272,7 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		MemoryEnabled: s.mem != nil,
 		BrowserReady:  true,
 		MCPServers:    mcpNames,
+		ProjectFacts:  agent.LoadProjectInstructions(cfg.WorkspaceRoot),
 	})
 
 	s.ag = agent.New(&cfg, provider, s.registry, s.env,

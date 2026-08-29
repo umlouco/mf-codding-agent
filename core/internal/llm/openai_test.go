@@ -140,3 +140,75 @@ func TestStreamDoesNotRetryServerErrors(t *testing.T) {
 		t.Errorf("attempts = %d, want 1", attempts)
 	}
 }
+
+// reasoning_effort is what lets a reasoning model routed through OpenRouter,
+// or OpenAI directly, be told how hard to think — but only when a role
+// actually asked for it. Sending it unconditionally would break the strict
+// local servers stream_options already has to work around.
+func TestStreamSendsReasoningEffortWhenConfigured(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"ok"}}]}`)))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(srv.URL)
+	p.effort = "high"
+	if _, err := p.Stream(context.Background(), Request{}, nil); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if body["reasoning_effort"] != "high" {
+		t.Errorf("reasoning_effort = %v, want %q", body["reasoning_effort"], "high")
+	}
+}
+
+func TestStreamOmitsReasoningEffortByDefault(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"ok"}}]}`)))
+	}))
+	defer srv.Close()
+
+	if _, err := newTestProvider(srv.URL).Stream(context.Background(), Request{}, nil); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if _, present := body["reasoning_effort"]; present {
+		t.Errorf("reasoning_effort should be omitted when no role configured one, got %v", body["reasoning_effort"])
+	}
+}
+
+// A strict server that 4xxs on reasoning_effort must still get an answer,
+// exactly like the stream_options case above — the retry logic covers both.
+func TestStreamRetriesWithoutReasoningEffortOnRejection(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if _, asked := body["reasoning_effort"]; asked {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"unrecognized field reasoning_effort"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"still works"}}]}`)))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(srv.URL)
+	p.effort = "high"
+	turn, err := p.Stream(context.Background(), Request{}, nil)
+	if err != nil {
+		t.Fatalf("a server rejecting reasoning_effort must still answer: %v", err)
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (with, then without)", attempts)
+	}
+	if turn.Text() != "still works" {
+		t.Errorf("text = %q, want %q", turn.Text(), "still works")
+	}
+}

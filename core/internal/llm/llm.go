@@ -131,7 +131,7 @@ func NewProvider(providerType, baseURL, apiKey, model string, maxTokens int64, e
 	case "anthropic":
 		return NewAnthropic(apiKey, model, baseURL, effort, maxTokens, strings.EqualFold(thinking, "adaptive"))
 	default:
-		return NewOpenAICompat(baseURL, apiKey, model, maxTokens)
+		return NewOpenAICompat(baseURL, apiKey, model, maxTokens, effort)
 	}
 }
 

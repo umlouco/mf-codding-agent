@@ -78,6 +78,12 @@ export interface Profile {
 export interface RoleBinding {
   profileId: string;
   model: string;
+  /**
+   * Reasoning-effort hint ('', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'),
+   * or '' to use the provider's own default. Support and vocabulary vary by
+   * provider and model — this is passed through, not validated.
+   */
+  effort: string;
 }
 
 export interface AgentSettings {
@@ -97,6 +103,8 @@ export interface ResolvedRole {
   /** 'anthropic' or 'openai-compatible' — what the core switches on. */
   kind: string;
   model: string;
+  /** Reasoning-effort hint, or '' for the provider's own default. */
+  effort: string;
   baseURL: string;
   apiKey: string;
   /** True when this role borrowed the coding role's binding. */
@@ -108,7 +116,7 @@ const SECRET_PREFIX = 'mfagent.apiKey.';
 const MIGRATED_KEY = 'mfagent.migratedFromSettings';
 
 function emptyRoles(): Record<Role, RoleBinding> {
-  return Object.fromEntries(ROLES.map((r) => [r, { profileId: '', model: '' }])) as Record<
+  return Object.fromEntries(ROLES.map((r) => [r, { profileId: '', model: '', effort: '' }])) as Record<
     Role,
     RoleBinding
   >;
@@ -173,7 +181,7 @@ export class ProfileStore {
     // up saves a step and stops the extension booting with nothing bound.
     const roles = { ...this.cache.roles };
     if (profiles.length === 1 && !roles.coding.profileId) {
-      roles.coding = { profileId: profile.id, model: '' };
+      roles.coding = { profileId: profile.id, model: '', effort: '' };
     }
 
     await this.write({ ...this.cache, profiles, roles });
@@ -212,7 +220,7 @@ export class ProfileStore {
     const roles = { ...this.cache.roles };
     for (const r of ROLES) {
       if (roles[r].profileId === id) {
-        roles[r] = { profileId: '', model: '' };
+        roles[r] = { profileId: '', model: '', effort: '' };
       }
     }
     await this.context.secrets.delete(SECRET_PREFIX + id);
@@ -287,26 +295,38 @@ export class ProfileStore {
    * "not configured".
    */
   async resolve(role: Role): Promise<ResolvedRole> {
-    const own = this.cache.roles[role] ?? { profileId: '', model: '' };
+    const own = this.cache.roles[role] ?? { profileId: '', model: '', effort: '' };
     let profileId = own.profileId;
     let model = own.model;
+    let effort = own.effort || '';
     let inherited = false;
 
     if (!profileId && INHERITS_CODING.has(role)) {
-      // Provider and model are inherited separately, so you can point a role
-      // at a different model on the same account without duplicating the
-      // profile — the common case for a cheap executor next to a strong
-      // supervisor.
+      // Provider, model and effort are inherited separately, so you can point
+      // a role at a different model — or a different effort level — on the
+      // same account without duplicating the profile: the common case for a
+      // cheap, low-effort executor next to a strong, high-effort supervisor.
       profileId = this.cache.roles.coding.profileId;
       inherited = !!profileId;
       if (!model) {
         model = this.cache.roles.coding.model;
       }
+      if (!effort) {
+        effort = this.cache.roles.coding.effort || '';
+      }
     }
 
     const profile = profileId ? this.profile(profileId) : undefined;
     if (!profile) {
-      return { role, kind: 'openai-compatible', model, baseURL: '', apiKey: '', inherited: false };
+      return {
+        role,
+        kind: 'openai-compatible',
+        model,
+        effort,
+        baseURL: '',
+        apiKey: '',
+        inherited: false,
+      };
     }
 
     const def = providerOrFallback(profile.providerId);
@@ -316,6 +336,7 @@ export class ProfileStore {
       def,
       kind: def.kind,
       model,
+      effort,
       baseURL: effectiveBaseURL(profile.providerId, profile.baseURL),
       apiKey: await this.effectiveApiKey(profile.id, def),
       inherited,
@@ -421,7 +442,7 @@ export class ProfileStore {
       const bind = (role: Role, from: any) => {
         const pid = byLegacyId.get(String(from?.providerId ?? ''));
         if (pid) {
-          roles[role] = { profileId: pid, model: String(from?.model ?? '') };
+          roles[role] = { profileId: pid, model: String(from?.model ?? ''), effort: '' };
         }
       };
       bind('coding', cfg.get<any>('coding'));
@@ -537,6 +558,7 @@ function normalise(raw: unknown): AgentSettings {
     roles[role] = {
       profileId: known.has(profileId) ? profileId : '',
       model: String(b?.model ?? ''),
+      effort: String(b?.effort ?? ''),
     };
   }
 

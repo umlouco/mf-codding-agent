@@ -521,8 +521,21 @@
     return def.serves.chat;
   }
 
+  /** Reasoning-effort choices offered in the role editor. Support and exact
+   *  vocabulary vary by provider and model; this is a hint, passed through
+   *  rather than validated, and "Default" always means "send nothing". */
+  const EFFORT_CHOICES = [
+    ['', 'Default'],
+    ['minimal', 'Minimal'],
+    ['low', 'Low'],
+    ['medium', 'Medium'],
+    ['high', 'High'],
+    ['xhigh', 'Extra high'],
+    ['max', 'Max (Anthropic)'],
+  ];
+
   function renderRole(role) {
-    const binding = S.settings.roles[role.id] || { profileId: '', model: '' };
+    const binding = S.settings.roles[role.id] || { profileId: '', model: '', effort: '' };
     const inheritable = role.id !== 'coding' && role.id !== 'embedding';
     const inheritsProvider = !binding.profileId && inheritable;
     const effectiveId = binding.profileId || (inheritable ? S.settings.roles.coding.profileId : '');
@@ -539,6 +552,7 @@
           // Switching provider invalidates the model id, so clear it rather
           // than send a model the new endpoint has never heard of.
           model: e.target.value === binding.profileId ? binding.model : '',
+          effort: binding.effort || '',
         }),
     });
     if (inheritable) {
@@ -605,8 +619,35 @@
           // of the model alone.
           profileId: binding.profileId,
           model: e.target.value.trim(),
+          effort: binding.effort || '',
         }),
     });
+
+    // Effort column. Embeddings never reason, so the control would be pure
+    // noise there; every other role can point at a reasoning model.
+    const currentEffort = binding.effort || (inherited ? S.settings.roles.coding.effort || '' : '') || '';
+    const effortSelect =
+      role.id === 'embedding'
+        ? null
+        : el(
+            'select',
+            {
+              disabled: !profile,
+              onchange: (e) =>
+                send({
+                  type: 'setRole',
+                  role: role.id,
+                  profileId: binding.profileId,
+                  model: binding.model,
+                  effort: e.target.value,
+                }),
+            },
+            EFFORT_CHOICES.map(([value, label]) => {
+              const opt = el('option', { value, text: label });
+              if (value === currentEffort) opt.selected = true;
+              return opt;
+            }),
+          );
 
     const info = list.models.find((m) => m.id === currentModel);
 
@@ -621,6 +662,9 @@
       if (inherited && !binding.model) meta.push('Following the Coding model.');
       else if (inherited) meta.push('Coding provider, own model.');
       if (!currentModel) meta.push('No model chosen — this role cannot run.');
+      if (inherited && !binding.effort && currentEffort) {
+        meta.push(`Following the Coding effort (${currentEffort}).`);
+      }
       const described = describeModel(info);
       if (described) meta.push(described);
       if (role.id === 'vision' && currentModel && info && info.vision === false) {
@@ -645,6 +689,13 @@
         datalist,
         el('div', { class: 'meta' + (bad ? ' bad' : ''), text: meta.join(' · ') }),
       ]),
+      el(
+        'div',
+        {},
+        effortSelect
+          ? [el('div', { class: 'effort-label', text: 'Reasoning effort' }), effortSelect]
+          : [],
+      ),
     ]);
   }
 

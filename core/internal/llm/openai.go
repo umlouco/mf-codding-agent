@@ -20,10 +20,16 @@ type OpenAIProvider struct {
 	apiKey    string
 	model     string
 	maxTokens int64
-	http      *http.Client
+	// effort is sent as top-level "reasoning_effort" when set. Left empty by
+	// default: unlike Anthropic, "OpenAI-compatible" spans strict local
+	// servers that 4xx on a field they do not recognise (see stream's retry
+	// logic below), so this is only ever sent when the user opted in for a
+	// role that actually wants it — never assumed.
+	effort string
+	http   *http.Client
 }
 
-func NewOpenAICompat(baseURL, apiKey, model string, maxTokens int64) *OpenAIProvider {
+func NewOpenAICompat(baseURL, apiKey, model string, maxTokens int64, effort string) *OpenAIProvider {
 	if maxTokens <= 0 {
 		maxTokens = 8192
 	}
@@ -32,6 +38,7 @@ func NewOpenAICompat(baseURL, apiKey, model string, maxTokens int64) *OpenAIProv
 		apiKey:    apiKey,
 		model:     model,
 		maxTokens: maxTokens,
+		effort:    strings.ToLower(strings.TrimSpace(effort)),
 		// No client timeout. It would cap the whole exchange, which is exactly
 		// the thing that must not be capped: a local model can legitimately
 		// stream one reply for hours. Liveness is judged from the bytes instead
@@ -188,15 +195,21 @@ func (p *OpenAIProvider) post(ctx context.Context, body map[string]any) (*http.R
 	return resp, nil
 }
 
-/*
-stream sends the request, dropping stream_options and retrying once if the
-server will not accept it.
+// optionalBodyFields are asks that improve the reply when a server honours
+// them but are never required to get one: token usage, and a reasoning-effort
+// hint for models that support it. Both are dropped together on retry — see
+// stream — because "OpenAI-compatible" spans strict local servers that 4xx on
+// any field they do not implement rather than ignoring it.
+var optionalBodyFields = []string{"stream_options", "reasoning_effort"}
 
-"OpenAI-compatible" covers a wide range of implementations, and some of the
-local ones reject fields they do not implement rather than ignoring them.
-Asking for token counts must never cost us the reply itself, so a 4xx on the
-first attempt is retried without the field: worst case we lose the token count
-for that provider, which is exactly where we were before asking.
+/*
+stream sends the request, dropping the optional fields above and retrying
+once if the server will not accept them.
+
+Asking for token counts or a reasoning effort must never cost us the reply
+itself, so a 4xx on the first attempt is retried without them: worst case we
+lose the token count or the effort hint for that provider, which is exactly
+where we were before asking.
 */
 func (p *OpenAIProvider) stream(ctx context.Context, body map[string]any) (*http.Response, error) {
 	resp, err := p.post(ctx, body)
@@ -210,13 +223,18 @@ func (p *OpenAIProvider) stream(ctx context.Context, body map[string]any) (*http
 	first, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	resp.Body.Close()
 
-	_, askedForUsage := body["stream_options"]
-	if !askedForUsage || resp.StatusCode >= 500 {
+	var hadOptional bool
+	for _, k := range optionalBodyFields {
+		if _, ok := body[k]; ok {
+			hadOptional = true
+			delete(body, k)
+		}
+	}
+	if !hadOptional || resp.StatusCode >= 500 {
 		return nil, fmt.Errorf("http %d from %s: %s",
 			resp.StatusCode, p.baseURL, strings.TrimSpace(string(first)))
 	}
 
-	delete(body, "stream_options")
 	retry, err := p.post(ctx, body)
 	if err != nil {
 		return nil, err
@@ -263,6 +281,15 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 	if len(tools) > 0 {
 		body["tools"] = tools
 		body["tool_choice"] = "auto"
+	}
+	if p.effort != "" {
+		// The shorthand OpenAI's own reasoning models and OpenRouter both
+		// accept directly on the request body (OpenRouter treats it as
+		// equivalent to `reasoning: {effort: ...}` and translates it for
+		// whichever backend actually serves the model). A provider that has
+		// never heard of it either ignores it or 4xxs, and the latter is
+		// handled by stream's retry above.
+		body["reasoning_effort"] = p.effort
 	}
 
 	resp, err := p.stream(ctx, body)

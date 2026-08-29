@@ -205,9 +205,24 @@ this morning shows up after **Refresh**.
 | Queue · Executor | Does the work. A fast local model fits well. |
 
 A role can borrow the Coding provider but override just the model, so a cheap
-executor and a strong supervisor on one account do not need two profiles.
+executor and a strong supervisor on one account do not need two profiles. It can
+also override just the **reasoning effort** the same way — Minimal through Extra
+High, plus Max on Anthropic — so a low-effort executor and a high-effort supervisor
+can share one account and one model. This is sent as `reasoning_effort` on the
+request, which OpenAI's own reasoning models and OpenRouter both understand
+(OpenRouter treats it as shorthand for `reasoning: {effort}` and translates it for
+whatever actually serves the model); a provider that has never heard of it either
+ignores it or gets it silently dropped on retry, the same way an unsupported
+`stream_options` already does.
 
 **Export / Import** moves a setup between machines, with or without the keys.
+
+### Project instructions
+
+Drop an `AGENTS.md`, `CLAUDE.md`, or `.mfagent/instructions.md` in the workspace
+root and the agent reads it into the system prompt on every session — repo-specific
+conventions, where things live, what not to touch. Checked in that order, first
+match wins; nothing is required and nothing merges, so pick one.
 
 ### MCP servers
 
@@ -242,6 +257,7 @@ VS Code settings editor is genuinely good at:
 | `mfagent.activityIntervalSeconds` | `30` | How often a working agent records what it is doing |
 | `mfagent.llm.idleMinutes` | `30` | How long a reply may deliver nothing before the connection counts as dropped |
 | `mfagent.queue.verifyCommandTimeoutSeconds` | `300` | Budget for a verification command — a shell command, not an agent |
+| `mfagent.queue.notifyCommand` | `""` | Run with a JSON summary as its one argument when an autonomous run finishes — a script that pings your phone, Slack, or anything else, for the run that finished after you stopped watching |
 
 Changing any of them, or anything on the settings page, restarts the core
 automatically.

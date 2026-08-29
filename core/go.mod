@@ -1,6 +1,6 @@
 module github.com/mflores/mfagent/core
 
-go 1.24
+go 1.27
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.62.0

@@ -23,13 +23,14 @@ export interface RoleConfig {
   model: string;
   baseURL: string;
   apiKey: string;
+  effort: string;
 }
 
 /**
  * Resolves a queue role to an endpoint.
  *
  * The store already knows how to fall back to the coding role, so this is a
- * thin adapter down to the four fields the core needs.
+ * thin adapter down to the fields the core needs.
  */
 export async function roleConfig(role: Role): Promise<RoleConfig> {
   const r = await getStore().resolve(role);
@@ -38,6 +39,7 @@ export async function roleConfig(role: Role): Promise<RoleConfig> {
     model: r.model,
     baseURL: r.baseURL,
     apiKey: r.apiKey,
+    effort: r.effort,
   };
 }
 
@@ -58,7 +60,7 @@ async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<Core
       reasoning: rc.provider === 'anthropic',
       enabled: true,
     }],
-    coding: { providerId: `queue-${role}`, model: rc.model },
+    coding: { providerId: `queue-${role}`, model: rc.model, effort: rc.effort },
     autoApprove: ['*'],
     maxIterations,
   };

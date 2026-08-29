@@ -28,6 +28,8 @@ export interface CoreProvider {
 export interface CoreRole {
   providerId: string;
   model: string;
+  /** Reasoning-effort hint, or '' to use the provider's own default. */
+  effort: string;
 }
 
 /** The initialize payload the Go core expects. */
@@ -62,7 +64,7 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
   /** Registers the role's provider (once) and returns the core-side binding. */
   const bind = (r: ResolvedRole): CoreRole => {
     if (!r.profile) {
-      return { providerId: '', model: '' };
+      return { providerId: '', model: '', effort: '' };
     }
     let entry = providers.get(r.profile.id);
     if (!entry) {
@@ -81,7 +83,7 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     if (r.model && !entry.models.includes(r.model)) {
       entry.models.push(r.model);
     }
-    return { providerId: r.profile.id, model: r.model };
+    return { providerId: r.profile.id, model: r.model, effort: r.effort };
   };
 
   const coding = bind(resolved.coding);

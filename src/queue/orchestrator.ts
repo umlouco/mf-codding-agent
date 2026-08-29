@@ -1,3 +1,4 @@
+import * as cp from 'child_process';
 import * as vscode from 'vscode';
 import {
   CommandResult,
@@ -6,7 +7,7 @@ import {
   superviseTask,
   SupervisorDecision,
 } from './agents';
-import { Task, TaskQueue } from './db';
+import { QueueStats, Task, TaskQueue } from './db';
 
 /**
  * The cron engine.
@@ -725,6 +726,44 @@ export class Orchestrator implements vscode.Disposable {
         ? `MF Agent queue finished: ${s.byStatus.VERIFIED} verified, ${failed} failed.`
         : `MF Agent queue finished: all ${s.byStatus.VERIFIED} tasks verified.`,
     );
+    this.notify('finished', s);
+  }
+
+  /**
+   * Runs the user's notify command, if any, with a JSON summary as its one
+   * argument — modelled on Codex's `notify` hook, for the same reason: an
+   * unattended run this long-lived has nobody watching the editor when it
+   * finally finishes, and the in-editor toast above is silent to them.
+   *
+   * Best-effort and never awaited: a broken or slow notify command must not
+   * hold up the queue, which is exactly the thing this run was trying not to
+   * need a babysitter for.
+   */
+  private notify(event: string, stats: QueueStats): void {
+    const command = this.cfg<string>('queue.notifyCommand', '').trim();
+    if (!command) {
+      return;
+    }
+    const payload = JSON.stringify({
+      event,
+      workspaceRoot: this.workspaceRoot,
+      verified: stats.byStatus.VERIFIED,
+      total: stats.total,
+      usage: stats.usage,
+      at: Date.now(),
+    });
+    try {
+      const child = cp.spawn(command, [payload], {
+        shell: true,
+        windowsHide: true,
+        stdio: 'ignore',
+        cwd: this.workspaceRoot,
+      });
+      child.on('error', (e) => this.log(`notify command failed to start: ${e.message}`));
+      child.unref();
+    } catch (e: any) {
+      this.log(`notify command failed: ${e?.message ?? e}`);
+    }
   }
 
   /**

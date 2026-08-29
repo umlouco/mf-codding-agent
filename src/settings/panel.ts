@@ -155,6 +155,7 @@ export class SettingsPanel {
           await this.store.setRole(String(msg.role) as Role, {
             profileId: String(msg.profileId ?? ''),
             model: String(msg.model ?? ''),
+            effort: String(msg.effort ?? ''),
           });
           break;
 

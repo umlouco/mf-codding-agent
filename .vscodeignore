@@ -9,6 +9,7 @@ out/**/*.map
 **/tsconfig.json
 esbuild.mjs
 .gitignore
+.env
 .mfagent/**
 
 # Keep only the binary for the target platform when packaging per-platform.

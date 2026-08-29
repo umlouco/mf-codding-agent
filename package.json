@@ -250,6 +250,11 @@
           "type": "number",
           "default": 300,
           "description": "Max seconds per verification command."
+        },
+        "mfagent.queue.notifyCommand": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Command run when an autonomous run finishes, with a JSON summary (`event`, `verified`, `total`, `usage`, `workspaceRoot`, `at`) as its one argument — e.g. a script that sends a desktop or Slack notification. Left empty (the default), nothing runs; the queue still shows an in-editor notification either way, which is only useful if someone is watching the editor when it lands."
         }
       }
     }
