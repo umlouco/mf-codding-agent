@@ -1,13 +1,23 @@
 import * as cp from 'child_process';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import {
+  AuditDecision,
+  auditExecution,
   CommandResult,
+  encodeRegion,
   executeTask,
+  expandPhase,
+  parseRegion,
+  PhaseExpansion,
+  Region,
+  runScanCommand,
   runVerifyCommand,
   superviseTask,
   SupervisorDecision,
+  withinRegion,
 } from './agents';
-import { QueueStats, Task, TaskQueue } from './db';
+import { NewTask, QueueStats, Task, TaskQueue } from './db';
 
 /**
  * The cron engine.
@@ -73,6 +83,33 @@ const KEEP_ATTEMPTS = 6;
  * Entries are delimited by the `[attempt N]` prefix every writer uses, so this
  * splits on the same boundary `attemptHistory` reads back.
  */
+/** Trims a value to `max` chars once stringified, for a log line that stays scannable. */
+function briefJson(value: unknown, max: number): string {
+  if (value === undefined) {
+    return '';
+  }
+  const s = typeof value === 'string' ? value : JSON.stringify(value);
+  return s.length <= max ? s : `${s.slice(0, max)}…`;
+}
+
+/**
+ * One line describing a finished tool call — the qualitative substrate
+ * `auditExecution` reads. Bounded generously but kept, unlike the liveness
+ * pings in `recordActivity`, which deliberately carry no content at all.
+ */
+function formatToolEvent(
+  name: string,
+  input: unknown,
+  status: string,
+  output: unknown,
+  elapsedMs: unknown,
+): string {
+  const args = briefJson(input, 300);
+  const result = briefJson(output, 1500);
+  const timing = typeof elapsedMs === 'number' ? ` in ${elapsedMs}ms` : '';
+  return `${name}(${args}) → ${status || 'ok'}${timing}${result ? `\n${result}` : ''}`;
+}
+
 function appendAttempt(log: string, entry: string): string {
   const all = `${log}\n${entry}`
     .split(/\n(?=\[(?:attempt \d+|recovered)\])/)
@@ -86,15 +123,36 @@ export class Orchestrator implements vscode.Disposable {
   private watchdog: NodeJS.Timeout | undefined;
   /** Rollbacks taken this run — see the RESET_FROM branch. */
   private rollbacks = 0;
-  private executing = false;
   private supervising = false;
   private review: Review | null = null;
   private reviewGen = 0;
+  /**
+   * Kills the execution worker currently in flight, if any.
+   *
+   * This is the one thing about a running worker that genuinely cannot live
+   * in the database: an OS process handle. Everything else — whether a
+   * worker is running, which task, whether its last write-back still counts —
+   * is decided by reading the `tasks` row itself (see claimNext, activeTask,
+   * finishExecution in db.ts), not by anything kept here.
+   */
+  private executionAbort: (() => void) | null = null;
   /** Which supervision cycle owns `supervising`; see tick and sweepSilentReview. */
   private cycle = 0;
-  private currentTaskId: number | null = null;
   private nextTickAt: number | null = null;
   private disposed = false;
+  private auditTimer: NodeJS.Timeout | undefined;
+  /** Guards one audit call at a time — mirrors `supervising`. */
+  private auditing = false;
+  /** Kills the audit's own turn; see auditActiveExecution. */
+  private auditAbort: (() => void) | null = null;
+  /**
+   * The newest tool-call event `auditActiveExecution` has already judged, for
+   * the (task, attempt) it belongs to. Kept in memory only: it is a cursor
+   * into what has already been looked at, not a fact about the task, so
+   * losing it on a reload just means the next audit re-reads a bit of history
+   * it has already seen rather than anything being wrong.
+   */
+  private lastAudited: { taskId: number; attempt: number; eventId: number } | null = null;
 
   private readonly _onDidChange = new vscode.EventEmitter<void>();
   /** Fires whenever the queue or run state moves, so the UI can re-render. */
@@ -141,16 +199,29 @@ export class Orchestrator implements vscode.Disposable {
     return this.cfg<RunMode>('queue.mode', 'lockstep');
   }
 
+  /**
+   * How often the audit pass checks on the currently EXECUTING task —
+   * independent of the verification cron, and deliberately shorter by
+   * default: catching a task going down a wrong path is worth looking sooner
+   * than the cadence a verification check is tuned for. See auditActiveExecution.
+   */
+  private get auditIntervalMs(): number {
+    return Math.max(30, this.cfg<number>('queue.auditIntervalSeconds', 90)) * 1000;
+  }
+
   private get workspaceRoot(): string {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
   }
 
   status(): OrchestratorStatus {
+    // "Is a worker doing useful work" is answered by reading the row
+    // claimNext wrote, not by a flag mirrored here — see activeTask.
+    const active = this.queue.activeTask();
     return {
       running: this.queue.runState === 'RUNNING',
-      executing: this.executing,
+      executing: !!active,
       supervising: this.supervising,
-      currentTaskId: this.currentTaskId,
+      currentTaskId: active?.id ?? null,
       nextTickAt: this.nextTickAt,
       intervalMs: this.intervalMs,
       intervalOwn: this.queue.cronIntervalSeconds > 0,
@@ -196,6 +267,12 @@ export class Orchestrator implements vscode.Disposable {
     if (!this.watchdog) {
       this.watchdog = setInterval(() => this.kick(), WATCHDOG_MS);
     }
+    // Same reasoning as the watchdog: left running rather than torn down on
+    // every stop/pause, since auditActiveExecution reads the run state itself
+    // and is a no-op whenever nothing is EXECUTING.
+    if (!this.auditTimer) {
+      this.auditTimer = setInterval(() => void this.auditActiveExecution(), this.auditIntervalMs);
+    }
     this.changed();
     this.log(`started — cron every ${Math.round(this.intervalMs / 1000)}s, mode ${this.mode}`);
     void this.pump();
@@ -203,9 +280,12 @@ export class Orchestrator implements vscode.Disposable {
 
   stop(): void {
     this.disarm();
-    // A review still in flight would otherwise hold `supervising` past the next
-    // start, and the run would come back up already blocked.
+    // A review or an execution still in flight would otherwise keep running
+    // in the background after the queue claims to be stopped — see
+    // abandonReview and abandonExecution.
     this.abandonReview();
+    this.abandonExecution();
+    this.abandonAudit();
     this.queue.setRunState('STOPPED');
     this.changed();
     this.log('stopped');
@@ -214,6 +294,8 @@ export class Orchestrator implements vscode.Disposable {
   pause(): void {
     this.disarm();
     this.abandonReview();
+    this.abandonExecution();
+    this.abandonAudit();
     this.queue.pauseOpen();
     this.changed();
     this.log('paused');
@@ -222,6 +304,8 @@ export class Orchestrator implements vscode.Disposable {
   reset(): void {
     this.disarm();
     this.abandonReview();
+    this.abandonExecution();
+    this.abandonAudit();
     this.queue.resetAll();
     this.changed();
     this.log('reset — every task back to PENDING');
@@ -383,6 +467,47 @@ export class Orchestrator implements vscode.Disposable {
     }
   }
 
+  /**
+   * Kills the execution worker in flight, if any, and puts its task back in
+   * the database right away rather than waiting for that turn to settle on
+   * its own — which, on a slow model, can be many minutes away.
+   *
+   * This is `requeueStale(0)`, the same recovery a reload uses for a worker
+   * that died outright: whatever is EXECUTING right now has no live process
+   * behind it, because the line above just killed it. Nothing here needs to
+   * remember which task that was or compare generations — the next claimNext
+   * (or the next requeueStale, if the process took a moment to actually die)
+   * reads the database and finds the truth on its own. If the killed worker's
+   * `pump()` call is still awaiting the request when it rejects, its
+   * write-back targets a row that is no longer EXECUTING and finishExecution
+   * silently drops it — see pump().
+   */
+  private abandonExecution(): void {
+    const abort = this.executionAbort;
+    this.executionAbort = null;
+    try {
+      abort?.();
+    } catch {
+      /* the core was already gone */
+    }
+    const recovered = this.queue.requeueStale(0);
+    if (recovered > 0) {
+      this.log(`stopped mid-execution; ${recovered} task(s) returned to PENDING`);
+    }
+  }
+
+  /** Kills the audit turn in flight, if any. Mirrors abandonReview/abandonExecution. */
+  private abandonAudit(): void {
+    const abort = this.auditAbort;
+    this.auditAbort = null;
+    this.auditing = false;
+    try {
+      abort?.();
+    } catch {
+      /* the core was already gone */
+    }
+  }
+
   private sweepSilentWorkers(): void {
     const silentMs = this.silentMs;
     for (const task of this.queue.silentWorkers(silentMs)) {
@@ -405,6 +530,116 @@ export class Orchestrator implements vscode.Disposable {
       this.log(`task ${task.seq} — ${note}; requeued`);
       this.changed();
     }
+  }
+
+  // ---- the audit pass ---------------------------------------------------
+
+  /**
+   * Checks in on the currently EXECUTING task, if there is one, and stops and
+   * rewrites it if it has visibly gone down the wrong path.
+   *
+   * Runs on its own timer rather than the verification cron — see
+   * auditIntervalMs — because "is this still on track" wants checking sooner
+   * than "is this finished" does. The round cap in pump() is what used to be
+   * the only thing watching a task while it ran; this is what makes that a
+   * backstop instead of the whole safety net.
+   *
+   * The cost gate below is deliberately about *content*, not time or rounds:
+   * an audit only spends a turn when new tool-call events exist since the
+   * last one looked, so a tick with nothing to judge is a free DB read.
+   */
+  private async auditActiveExecution(): Promise<void> {
+    if (this.disposed || this.queue.runState !== 'RUNNING' || this.auditing) {
+      return;
+    }
+    const task = this.queue.activeTask();
+    // Phases have their own region-based safety net (see runExpansion /
+    // resplitPhaseRegion) — auditing is about a task's approach to real work,
+    // which a phase does not do.
+    if (!task || task.kind !== 'task') {
+      return;
+    }
+
+    const events = this.queue
+      .events(task.id, 200)
+      .filter((e) => e.kind === 'tool')
+      .reverse(); // chronological, oldest first
+    if (events.length === 0) {
+      return;
+    }
+    const sinceId =
+      this.lastAudited?.taskId === task.id && this.lastAudited.attempt === task.attempts
+        ? this.lastAudited.eventId
+        : 0;
+    const fresh = events.filter((e) => e.id > sinceId);
+    if (fresh.length === 0) {
+      return;
+    }
+
+    this.auditing = true;
+    this.changed();
+    let decision: AuditDecision;
+    try {
+      const trail = fresh.map((e) => e.message).join('\n\n');
+      decision = await auditExecution(this.context, this.output, task, trail, {
+        onAbort: (abort) => {
+          this.auditAbort = abort;
+        },
+      });
+    } catch (e: any) {
+      // Same failure bias as a parse failure inside auditExecution itself:
+      // an audit that could not even run must not be treated as a verdict.
+      this.log(`audit of task ${task.seq} failed: ${e?.message ?? e}; leaving it running`);
+      this.auditAbort = null;
+      this.auditing = false;
+      this.changed();
+      return;
+    }
+
+    this.lastAudited = { taskId: task.id, attempt: task.attempts, eventId: events[events.length - 1].id };
+    this.auditAbort = null;
+    this.queue.addUsage(task.id, decision.usage);
+    this.queue.log(task.id, 'supervisor', `audit:${decision.verdict}`, decision.feedback);
+
+    if (decision.verdict !== 'STOP') {
+      this.auditing = false;
+      this.changed();
+      return;
+    }
+
+    // Kill the live worker directly — not the queue-wide requeueStale sweep
+    // abandonExecution uses for "the run itself is stopping", which writes a
+    // generic message that would misdescribe a deliberate, targeted stop.
+    const abort = this.executionAbort;
+    this.executionAbort = null;
+    try {
+      abort?.();
+    } catch {
+      /* the core was already gone */
+    }
+
+    // Same fencing token finishExecution always uses: if the killed worker's
+    // own write-back lands first (or a second audit tick somehow raced this
+    // one), this write is silently dropped rather than corrupting whatever is
+    // true now — see finishExecution in db.ts.
+    const applied = this.queue.finishExecution(task.id, task.attempts, {
+      status: 'PENDING',
+      finishedAt: null,
+      description: decision.description || task.description,
+      solutionVerifyCommand: decision.solutionVerifyCommand || task.solutionVerifyCommand,
+      errorLog: appendAttempt(
+        task.errorLog,
+        `[attempt ${task.attempts}] stopped mid-run by the supervisor: ${decision.feedback}`,
+      ),
+    });
+    if (applied) {
+      this.queue.log(task.id, 'supervisor', 'audit-stop', decision.feedback);
+      this.log(`task ${task.seq} — supervisor stopped it mid-run and rewrote its instructions`);
+    } else {
+      this.log(`task ${task.seq} — audit verdict arrived after the run moved past this attempt; discarding it`);
+    }
+    this.auditing = false;
+    this.changed();
   }
 
   /** Runs the full verification pass for one task and applies the verdict. */
@@ -612,9 +847,17 @@ export class Orchestrator implements vscode.Disposable {
    * In lockstep mode nothing starts while a task is awaiting verification, so
    * task N+1 is never built on top of unverified task N. Continuous mode lets
    * the queue run ahead and the supervisor audit behind it.
+   *
+   * "At most one worker at a time" is not enforced here. `claimNext` refuses
+   * to hand out a task while any row is EXECUTING, so calling this twice at
+   * once — the cron tick and the watchdog firing together, say — costs a
+   * wasted query on the loser, never a second worker. That is also what makes
+   * this call safe to repeat after a stop-and-restart: whatever the database
+   * says about the previous attempt is what decides whether this one may
+   * proceed, not anything remembered from before the restart.
    */
   private async pump(): Promise<void> {
-    if (this.disposed || this.executing || this.queue.runState !== 'RUNNING') {
+    if (this.disposed || this.queue.runState !== 'RUNNING') {
       return;
     }
     if (this.mode === 'lockstep' && this.queue.awaitingVerification().length > 0) {
@@ -629,21 +872,78 @@ export class Orchestrator implements vscode.Disposable {
       return;
     }
 
-    this.executing = true;
-    this.currentTaskId = task.id;
+    // The fencing token: claimNext bumped this when it claimed the row, and
+    // finishExecution below will only write back while both this number and
+    // 'EXECUTING' still match what is actually in the database. A turn
+    // abandonExecution has since given up on — the queue was stopped, this
+    // very task was reclaimed by a fresh attempt — fails that match and its
+    // write is silently dropped, no in-memory bookkeeping required.
+    const attempt = task.attempts;
     this.changed();
+
+    // A phase is a coarse slice of the plan awaiting expansion into real
+    // tasks, not work to execute — see TaskKind. It shares this same claim so
+    // that everything below (the cron ordering, requeueStale, silentWorkers,
+    // the watchdog) covers phase-expansion crashes for free.
+    if (task.kind === 'phase') {
+      await this.runExpansion(task, attempt);
+      if (this.mode === 'continuous') {
+        void this.pump();
+      }
+      return;
+    }
+
     this.log(`executing task ${task.seq} — ${task.title} (attempt ${task.attempts})`);
+
+    // stream/tool fires twice per call — once on "running" (carries the
+    // input, not the output), once on completion (carries the output, not
+    // the input) — matched by id. Correlating them here is what turns the
+    // liveness pings elsewhere into a trail with actual content: which file,
+    // which command, what came back. See auditExecution, which is the reason
+    // this exists — a mid-run check has nothing qualitative to judge without it.
+    const pendingTools = new Map<string, { name: string; input: unknown }>();
 
     try {
       // Every record the worker writes lands in the database as it happens, so
       // the run is legible while it is still going and survives the process
       // that produced it. This is also the only thing keeping the task off the
       // silent list — see sweepSilentWorkers.
-      const res = await executeTask(this.context, this.output, task, (a) => {
-        if (this.queue.recordActivity(task.id, a.phase, a.detail)) {
-          this.changed();
-        }
-      });
+      const res = await executeTask(
+        this.context,
+        this.output,
+        task,
+        (a) => {
+          if (this.queue.recordActivity(task.id, a.phase, a.detail)) {
+            this.changed();
+          }
+        },
+        (method, params) => {
+          if (method !== 'stream/tool' || !params?.id) {
+            return;
+          }
+          if (params.status === 'running') {
+            pendingTools.set(params.id, { name: String(params.name ?? 'tool'), input: params.input });
+            return;
+          }
+          const started = pendingTools.get(params.id);
+          pendingTools.delete(params.id);
+          this.queue.log(
+            task.id,
+            'executor',
+            'tool',
+            formatToolEvent(
+              started?.name ?? String(params.name ?? 'tool'),
+              started?.input,
+              String(params.status ?? ''),
+              params.output,
+              params.elapsedMs,
+            ),
+          );
+        },
+        (abort) => {
+          this.executionAbort = abort;
+        },
+      );
 
       // A cut-off worker reports partial progress, not a finished task. Record
       // that in the error log: the retry prompt feeds it back, so the next
@@ -659,31 +959,35 @@ export class Orchestrator implements vscode.Disposable {
         : undefined;
 
       this.queue.addUsage(task.id, res.usage);
-      this.queue.update(task.id, {
+      const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'VERIFYING',
         output: res.text,
         ...(cutOffNote ? { errorLog: cutOffNote } : {}),
       });
-      this.queue.log(
-        task.id,
-        'executor',
-        res.cutOff ? 'cut-off' : 'completed',
-        res.text.slice(0, 4000),
-      );
-      this.log(
-        res.cutOff
-          ? `task ${task.seq} cut off after ${res.rounds} rounds; awaiting supervision`
-          : `task ${task.seq} done; awaiting supervision`,
-      );
+      if (!applied) {
+        this.log(`task ${task.seq} — result arrived after the run moved past this attempt; discarding it`);
+      } else {
+        this.queue.log(
+          task.id,
+          'executor',
+          res.cutOff ? 'cut-off' : 'completed',
+          res.text.slice(0, 4000),
+        );
+        this.log(
+          res.cutOff
+            ? `task ${task.seq} cut off after ${res.rounds} rounds; awaiting supervision`
+            : `task ${task.seq} done; awaiting supervision`,
+        );
+      }
     } catch (e: any) {
       const msg = String(e?.message ?? e);
-      // A worker that died mid-turn — a dropped connection, a crashed core —
-      // still edited real files. Send it to the supervisor, which verifies by
-      // reading the workspace rather than by trusting a report; bouncing it
-      // straight back to PENDING spends another whole attempt with no idea what
-      // the last one built. The journal it wrote on the way down says how far
-      // it got.
-      this.queue.update(task.id, {
+      // A worker that died mid-turn — a dropped connection, a crashed core, or
+      // abandonExecution killing it on purpose — still edited real files. Send
+      // it to the supervisor, which verifies by reading the workspace rather
+      // than by trusting a report; bouncing it straight back to PENDING spends
+      // another whole attempt with no idea what the last one built. The
+      // journal it wrote on the way down says how far it got.
+      const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'VERIFYING',
         output: '',
         errorLog: appendAttempt(
@@ -693,18 +997,206 @@ export class Orchestrator implements vscode.Disposable {
             'activity log, rather than assuming nothing happened.',
         ),
       });
-      this.queue.recordActivity(task.id, 'stopped', msg);
-      this.queue.log(task.id, 'executor', 'stopped', msg);
-      this.log(`task ${task.seq} stopped without reporting: ${msg}; awaiting supervision`);
+      if (applied) {
+        this.queue.recordActivity(task.id, 'stopped', msg);
+        this.queue.log(task.id, 'executor', 'stopped', msg);
+        this.log(`task ${task.seq} stopped without reporting: ${msg}; awaiting supervision`);
+      } else {
+        this.log(`task ${task.seq} — its worker stopped after the run moved past this attempt; ignoring it`);
+      }
     } finally {
-      this.executing = false;
-      this.currentTaskId = null;
+      this.executionAbort = null;
       this.changed();
     }
 
-    // Continuous mode keeps going without waiting for the cron.
+    // Continuous mode keeps going without waiting for the cron. pump() will
+    // no-op on its own if the database says there is nothing left to claim.
     if (this.mode === 'continuous') {
       void this.pump();
+    }
+  }
+
+  /**
+   * Expands one phase into the tasks — or, occasionally, the smaller phases —
+   * it should have been.
+   *
+   * Unlike a task's result this never enters VERIFYING: a planning decision
+   * is not a functional check, so success replaces the phase row outright via
+   * `expandTask`, and failure puts it straight back to PENDING, the same as a
+   * worker that stopped mid-turn in `pump()` above.
+   */
+  private async runExpansion(task: Task, attempt: number): Promise<void> {
+    this.log(`expanding phase ${task.seq} — ${task.title} (attempt ${task.attempts})`);
+    const goal = this.queue.getMeta('goal');
+
+    let result: PhaseExpansion;
+    try {
+      result = await expandPhase(
+        this.context,
+        this.output,
+        task,
+        goal,
+        (a) => {
+          if (this.queue.recordActivity(task.id, a.phase, a.detail)) {
+            this.changed();
+          }
+        },
+        undefined,
+        (abort) => {
+          this.executionAbort = abort;
+        },
+      );
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      const applied = this.queue.finishExecution(task.id, attempt, {
+        status: 'PENDING',
+        finishedAt: null,
+        errorLog: appendAttempt(
+          task.errorLog,
+          `[attempt ${task.attempts}] the expansion agent stopped before reporting: ${msg}.`,
+        ),
+      });
+      if (applied) {
+        this.queue.recordActivity(task.id, 'stopped', msg);
+        this.queue.log(task.id, 'planner', 'stopped', msg);
+        this.log(`phase ${task.seq} stopped without reporting: ${msg}; awaiting another attempt`);
+      } else {
+        this.log(`phase ${task.seq} — its worker stopped after the run moved past this attempt; ignoring it`);
+      }
+      this.executionAbort = null;
+      this.changed();
+      return;
+    }
+
+    this.executionAbort = null;
+    this.queue.addUsage(task.id, result.usage);
+
+    // The expander itself may flag a slice of its own region as still too
+    // broad once it has actually explored it — code, not the model, decides
+    // how much smaller that slice really needs to be. See resplitPhaseRegion.
+    const resolvedSplits: NewTask[] = [];
+    for (const req of result.splitRequests) {
+      const parts = await this.resplitPhaseRegion(
+        task,
+        req.path,
+        req.title || task.title,
+        req.description || task.description,
+      );
+      resolvedSplits.push(...parts);
+    }
+
+    let parts: NewTask[] = [...result.tasks, ...resolvedSplits];
+
+    if (parts.length === 0 && result.cutOff) {
+      // The round budget ran out before anything usable came back — a size
+      // signal, not just "it failed" — so code tries to shrink the phase
+      // itself rather than asking an identically-scoped retry to hit the
+      // same wall again.
+      parts = await this.resplitPhaseRegion(task, undefined, task.title, task.description);
+    }
+
+    if (parts.length > 0) {
+      const applied = this.queue.expandTask(task.id, attempt, parts);
+      if (applied > 0) {
+        this.queue.log(task.id, 'planner', 'expanded', `${applied} row(s)`);
+        this.log(`phase ${task.seq} expanded into ${applied} row(s)`);
+      } else {
+        this.log(`phase ${task.seq} — result arrived after the run moved past this attempt; discarding it`);
+      }
+      this.changed();
+      return;
+    }
+
+    // Nothing usable, and nothing left for code to try splitting further —
+    // the same shape as a task RETRY: back to PENDING with a note, no attempt
+    // limit that ends this phase.
+    const note = result.cutOff
+      ? 'cut off before producing a usable task list, and the region could not be split any further'
+      : 'produced no usable tasks';
+    const applied = this.queue.finishExecution(task.id, attempt, {
+      status: 'PENDING',
+      finishedAt: null,
+      errorLog: appendAttempt(task.errorLog, `[attempt ${task.attempts}] ${note}.`),
+    });
+    if (applied) {
+      this.queue.log(task.id, 'planner', 'retry', note);
+      this.log(`phase ${task.seq} ${note}; awaiting another attempt`);
+    }
+    this.changed();
+  }
+
+  /**
+   * Deterministically re-derives smaller regions for (part of) a phase's own
+   * territory and turns each into a fresh phase row.
+   *
+   * Two callers, two shapes of the same idea. A phase that merged several
+   * scanned regions un-merges back into one phase per region — always a real
+   * reduction in scope, and no rescan is needed to know that. A phase over a
+   * single region (or a sub-slice the expander itself named) gets that one
+   * path rescanned at half the usual ceiling, which only produces more than
+   * one region if there is real subdirectory structure to divide it by.
+   * Either way, size comes from a fresh count of files, never from the
+   * model's own say-so.
+   */
+  private async resplitPhaseRegion(
+    phase: Task,
+    narrowToPath: string | undefined,
+    title: string,
+    description: string,
+  ): Promise<NewTask[]> {
+    const region = parseRegion(phase.region);
+    const maxPerRegion = Math.max(1, this.cfg<number>('queue.maxFilesPerRegion', 150));
+
+    if (!narrowToPath && region.paths.length > 1) {
+      const parts: NewTask[] = [];
+      for (const p of region.paths) {
+        const fileCount = await this.regionFileCount(p, maxPerRegion);
+        parts.push({
+          title: `${title} — ${p}`,
+          description,
+          kind: 'phase',
+          region: encodeRegion({ paths: [p], fileCount }),
+        });
+      }
+      return parts;
+    }
+
+    const target = narrowToPath && withinRegion(narrowToPath, region.paths) ? narrowToPath : region.paths[0];
+    if (!target) {
+      return [];
+    }
+
+    const forced = Math.max(1, Math.ceil(maxPerRegion / 2));
+    let sub: Region[];
+    try {
+      sub = await runScanCommand(this.context, path.join(this.workspaceRoot, target), forced);
+    } catch (e: any) {
+      this.log(`could not re-scan ${target} while splitting phase ${phase.seq}: ${e?.message ?? e}`);
+      return [];
+    }
+    if (sub.length <= 1) {
+      // No further directory structure to divide on — nothing more code can
+      // try; the caller falls back to a plain retry.
+      return [];
+    }
+    return sub.map((r) => {
+      const joined = r.path === '.' ? target : `${target}/${r.path}`;
+      return {
+        title: `${title} — ${joined}`,
+        description,
+        kind: 'phase' as const,
+        region: encodeRegion({ paths: [joined], fileCount: r.fileCount }),
+      };
+    });
+  }
+
+  /** The real file count behind one already-known region path, via a fresh scan. */
+  private async regionFileCount(relPath: string, ceiling: number): Promise<number> {
+    try {
+      const regions = await runScanCommand(this.context, path.join(this.workspaceRoot, relPath), ceiling);
+      return regions.reduce((sum, r) => sum + r.fileCount, 0);
+    } catch {
+      return 0;
     }
   }
 
@@ -775,12 +1267,14 @@ export class Orchestrator implements vscode.Disposable {
    * had its own cause and each cause has its own fix above, and none of that is
    * worth much at four in the morning, because the next stall will have a cause
    * nobody has thought of yet. This does not care why: it asks whether the queue
-   * claims to be running while no worker and no review is in flight and there is
-   * still work to do, and if so it starts the pump again.
+   * claims to be running while there is still work open, and if so it nudges
+   * the pump.
    *
-   * A pump that was not actually stuck returns immediately on its own guards, so
-   * running this every tick costs nothing and needs no judgement about whether a
-   * stall is "real".
+   * `this.supervising` is the only in-memory check left — a cheap way to skip
+   * a nudge that is almost certainly pointless, since something is visibly
+   * being reviewed. It is not load-bearing: pump() decides for itself, from
+   * the database, whether a worker may actually start, so a nudge sent while
+   * one is genuinely still running costs one wasted query and nothing else.
    */
   private kick(): void {
     // Runs on its own timer, independent of the cron, and reads the run state
@@ -794,7 +1288,7 @@ export class Orchestrator implements vscode.Disposable {
       this.log('the cron was not armed while the queue was running; re-arming');
       this.arm();
     }
-    if (this.executing || this.supervising) {
+    if (this.supervising) {
       return;
     }
 
@@ -814,7 +1308,13 @@ export class Orchestrator implements vscode.Disposable {
       clearInterval(this.watchdog);
       this.watchdog = undefined;
     }
+    if (this.auditTimer) {
+      clearInterval(this.auditTimer);
+      this.auditTimer = undefined;
+    }
     this.abandonReview();
+    this.abandonExecution();
+    this.abandonAudit();
     this._onDidChange.dispose();
   }
 }

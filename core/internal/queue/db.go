@@ -61,6 +61,15 @@ type Task struct {
 	UpdatedAt             int64      `json:"updatedAt"`
 	StartedAt             *int64     `json:"startedAt"`
 	FinishedAt            *int64     `json:"finishedAt"`
+	// Kind is "task" (the default) or "phase" — a phase is a coarse slice of
+	// the plan awaiting expansion into real tasks by the extension's queue
+	// orchestrator, not something this server creates. It is mirrored here
+	// purely so a client listing tasks sees what a row actually is instead of
+	// a "task" with no verify prompts and no explanation why.
+	Kind string `json:"kind"`
+	// Region is set only on phase rows: JSON describing the workspace slice
+	// (paths + file count) the expansion agent was bounded to.
+	Region string `json:"region"`
 }
 
 // Usage holds token counts aggregated across tasks.
@@ -235,6 +244,8 @@ func (d *DB) migrate() error {
 	for _, c := range []string{"tokens_in", "tokens_out", "tokens_cache_read", "tokens_cache_write"} {
 		d.addColumn(c, "INTEGER NOT NULL DEFAULT 0")
 	}
+	d.addColumn("kind", "TEXT NOT NULL DEFAULT 'task'")
+	d.addColumn("region", "TEXT NOT NULL DEFAULT ''")
 
 	return nil
 }
@@ -420,7 +431,8 @@ SELECT id, title, description,
        attempts, max_attempts,
        last_activity_at, activity_phase, activity_detail,
        tokens_in, tokens_out, tokens_cache_read, tokens_cache_write,
-       created_at, updated_at, started_at, finished_at
+       created_at, updated_at, started_at, finished_at,
+       kind, region
 `
 
 // scanTasks reads a *sql.Rows cursor into a slice of Task.
@@ -437,6 +449,7 @@ func scanTasks(rows *sql.Rows) ([]Task, error) {
 			&t.LastActivityAt, &t.ActivityPhase, &t.ActivityDetail,
 			&t.TokensIn, &t.TokensOut, &t.TokensCacheRead, &t.TokensCacheWrite,
 			&t.CreatedAt, &t.UpdatedAt, &t.StartedAt, &t.FinishedAt,
+			&t.Kind, &t.Region,
 		); err != nil {
 			return out, fmt.Errorf("scanTasks: %w", err)
 		}

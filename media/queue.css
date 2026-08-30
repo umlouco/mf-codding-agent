@@ -367,6 +367,26 @@ button:disabled { opacity: .45; cursor: default; }
 .FAILED    { --st: var(--vscode-charts-red, var(--vscode-errorForeground, #f14c4c)); }
 .PAUSED    { --st: var(--vscode-charts-yellow, #cca700); }
 
+/*
+ * A phase is a coarse slice of the plan awaiting expansion into real tasks —
+ * see TaskKind in db.ts — not work to execute or verify. The dashed left
+ * border is the one visual cue that survives every status colour a phase
+ * might otherwise share with an ordinary task (PENDING, EXECUTING).
+ */
+.task.phase { border-left-style: dashed; }
+
+.phasepill {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  padding: 1px 6px;
+  border-radius: 9px;
+  white-space: nowrap;
+  color: var(--vscode-charts-purple, #b180d7);
+  background: color-mix(in srgb, var(--vscode-charts-purple, #b180d7) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vscode-charts-purple, #b180d7) 55%, transparent);
+}
+
 .body {
   padding: 8px;
   border-top: 1px solid var(--vscode-panel-border);

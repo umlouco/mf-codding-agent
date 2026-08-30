@@ -50,6 +50,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "sh" {
 		os.Exit(runSh(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "scan" {
+		os.Exit(runScan(os.Args[2:]))
+	}
 
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()

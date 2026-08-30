@@ -50,15 +50,24 @@ command (*Ask About Selection*, *Edit Selection*, *Explain Problems*) goes to it
 regardless of what the selector is set to — those are questions about the
 conversation.
 
-**Planner** does not join the conversation. It burns a throwaway core on the
-**Queue · Planner** model, explores the workspace, and writes a numbered plan —
-each task with an implementation check, a behaviour check and a command that must
-exit 0. The plan lands in the **Task Queue**, not in the chat; what you see in the
-chat is the exploring, then the finished list. If the queue already has tasks you
-are asked whether to replace them or append.
+**Planner** does not join the conversation, and it does not try to plan the whole
+project in one turn either. The workspace is scanned first — a deterministic,
+non-LLM pass that splits it into regions no larger than
+`mfagent.queue.maxFilesPerRegion` files each, so the size of that scan never
+depends on a model's judgement of its own context budget. A throwaway core on the
+**Queue · Planner** model then reasons over that compact region list (paths, file
+counts, languages — not file contents) and scopes a handful of **phases**, which
+land in the **Task Queue** as their own kind of row. What you see in the chat is
+the scan, then the phases. If the queue already has tasks you are asked whether to
+replace them or append.
 
-Nothing starts running on its own. Review the plan in the Task Queue view and press
-**Start** when you want the autonomous run.
+Nothing starts running on its own. Review the phases in the Task Queue view and
+press **Start**: each phase is claimed the same way a task is, explored within its
+own region by a fresh throwaway core, and expanded into the concrete, verifiable
+tasks that carry it out — so the same crash-safe claim/cron machinery that runs
+the autonomous execution covers planning a large codebase too, and a phase whose
+region turns out to still be too big splits further by re-scanning it, rather than
+asking a model to size its own work.
 
 ---
 
@@ -253,7 +262,9 @@ VS Code settings editor is genuinely good at:
 | `mfagent.queue.mode` | `lockstep` | or `continuous` |
 | `mfagent.queue.cronIntervalSeconds` | `60` | Default supervisor wake-up interval. A task list that picks its own in the Task Queue view wins |
 | `mfagent.queue.maxRounds` | `80` | Tool-calling rounds per unattended turn — the only budget a task has; retries get 50% more each |
+| `mfagent.queue.maxFilesPerRegion` | `150` | Largest file count one region of the workspace may hold before the deterministic scan splits it further — bounds how much a phase's expansion agent explores in one sitting, regardless of project size |
 | `mfagent.queue.workerSilentMinutes` | `10` | How long a worker may write nothing before it counts as dead |
+| `mfagent.queue.auditIntervalSeconds` | `90` | How often the supervisor checks a still-running task's tool-call trail and decides whether to stop and rewrite it, independent of the verification cadence |
 | `mfagent.activityIntervalSeconds` | `30` | How often a working agent records what it is doing |
 | `mfagent.llm.idleMinutes` | `30` | How long a reply may deliver nothing before the connection counts as dropped |
 | `mfagent.queue.verifyCommandTimeoutSeconds` | `300` | Budget for a verification command — a shell command, not an agent |
@@ -282,6 +293,22 @@ Every byte read from the model resets that window, so a reply that takes six
 hours is fine as long as it is still arriving; a socket that delivers nothing
 for `llm.idleMinutes` is dropped, and the worker records that it stopped before
 it goes.
+
+### Mid-run auditing
+
+A task's round cap (`maxRounds`) is a backstop, not the thing watching it. On
+its own timer — `auditIntervalSeconds`, independent of the verification cron —
+the supervisor reads the executor's tool calls since the last check (which
+file, which command, what came back, not just "still alive") and judges
+whether the run is still headed somewhere useful. An executor that is still
+iterating on a real problem is left alone; one that is repeating a failing
+action, editing unrelated files, or has drifted from what the task actually
+asks is stopped there, handed a rewritten description, and restarted —
+before it grinds through its whole round budget going the wrong way. A check
+with nothing new since the last one costs a database read, not a model call,
+and an audit that fails to parse or proposes no real rewrite always falls
+back to leaving the task running: the failure mode of a broken audit must
+never be worse than the failure mode of not having one.
 
 ### What is worked out for you
 

@@ -1,13 +1,10 @@
 import * as vscode from 'vscode';
 import { CoreClient, InitResult } from './core';
-import { generateTasks } from './queue/agents';
+import { planGoal } from './queue/agents';
 import { TaskQueue } from './queue/db';
 
 /** Which agent handles the next message from the composer. */
 export type ChatAgent = 'coder' | 'planner';
-
-/** How many tasks the chat planner asks for; the sidebar has its own control. */
-const PLAN_LIMIT = 20;
 
 /**
  * ChatPanel renders the agent conversation in a full editor tab. It uses a
@@ -282,16 +279,18 @@ export class ChatPanel {
 
     this.post({
       type: 'system',
-      text: 'Planning — the planner model reads the workspace before it writes the task list.',
+      text: 'Scanning the workspace and scoping a plan — the planner reasons over the shape of the ' +
+        'workspace before it writes the phases; each phase is explored and turned into tasks once you ' +
+        'press Start in the Task Queue view.',
     });
 
     let cancelled = false;
     try {
-      const tasks = await generateTasks(
+      const phases = await planGoal(
         this.context,
         this.output,
+        target.queue,
         goal,
-        PLAN_LIMIT,
         (method, params) => this.onPlannerEvent(method, params),
         (cancel) => {
           this.cancelPlan = () => {
@@ -301,20 +300,20 @@ export class ChatPanel {
         },
       );
 
-      const n = append ? target.queue.addAll(tasks) : target.queue.replaceAll(tasks);
+      const n = append ? target.queue.addAll(phases) : target.queue.replaceAll(phases);
       target.changed();
       this.post({ type: 'done' });
       this.post({
         type: 'plan',
         total: n,
         appended: append,
-        tasks: tasks.map((t) => ({
-          seq: t.seq ?? 0,
-          title: t.title,
-          command: t.solutionVerifyCommand ?? '',
+        tasks: phases.map((p) => ({
+          seq: p.seq ?? 0,
+          title: p.title,
+          command: '',
         })),
       });
-      this.output.appendLine(`[chat:planner] ${append ? 'appended' : 'wrote'} ${n} task(s)`);
+      this.output.appendLine(`[chat:planner] ${append ? 'appended' : 'wrote'} ${n} phase(s)`);
     } catch (e: any) {
       this.post({ type: 'done' });
       this.post({

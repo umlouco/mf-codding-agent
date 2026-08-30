@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { getStore } from '../providers/instance';
-import { generateTasks } from './agents';
+import { planGoal } from './agents';
 import { Task, TaskQueue } from './db';
 import { Orchestrator } from './orchestrator';
 
@@ -68,7 +68,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
 
   /** Entry point for the `Generate Task Queue` command palette action. */
   generateFromCommand(goal: string): void {
-    void this.generate(goal, 20, false);
+    void this.generate(goal, false);
   }
 
   // ---- messages --------------------------------------------------------
@@ -105,7 +105,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
 
       switch (msg.type) {
         case 'generate':
-          await this.generate(msg.goal, Number(msg.limit) || 20, !!msg.append);
+          await this.generate(msg.goal, !!msg.append);
           break;
 
         case 'start':
@@ -180,7 +180,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async generate(goal: string, limit: number, append: boolean): Promise<void> {
+  private async generate(goal: string, append: boolean): Promise<void> {
     const queue = this.queue;
     if (!queue) {
       void vscode.window.showWarningMessage(
@@ -200,25 +200,27 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
 
     try {
       await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'Generating task list…' },
+        { location: vscode.ProgressLocation.Notification, title: 'Scanning the workspace and scoping a plan…' },
         async (progress) => {
-          const tasks = await generateTasks(
+          const phases = await planGoal(
             this.context,
             this.output,
+            queue,
             goal,
-            limit,
             (method, params) => {
               if (method === 'stream/tool' && params?.status === 'running') {
                 progress.report({ message: params.name });
               }
             },
           );
-          const n = append ? queue.addAll(tasks) : queue.replaceAll(tasks);
-          void vscode.window.showInformationMessage(`Generated ${n} task(s).`);
+          const n = append ? queue.addAll(phases) : queue.replaceAll(phases);
+          void vscode.window.showInformationMessage(
+            `Generated ${n} phase(s). Press Start to expand and run them.`,
+          );
         },
       );
     } catch (e: any) {
-      void vscode.window.showErrorMessage(`Could not generate tasks: ${e?.message ?? e}`);
+      void vscode.window.showErrorMessage(`Could not generate a plan: ${e?.message ?? e}`);
     } finally {
       this.generating = false;
       this.render();
@@ -396,12 +398,10 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     <label class="lbl" for="goal">What should the agents build?</label>
     <textarea id="goal" rows="6" placeholder="e.g. Add a REST API for invoices with auth, validation and integration tests."></textarea>
     <div class="row">
-      <label class="lbl" for="limit">Max tasks</label>
-      <input id="limit" type="number" min="1" max="100" value="20" />
       <label class="chk"><input id="append" type="checkbox" /> Append to queue</label>
     </div>
-    <button id="generate" class="primary">Generate task list</button>
-    <p class="hint">The planner model reads the workspace, then writes a numbered plan with a verification step and test command per task.</p>
+    <button id="generate" class="primary">Generate plan</button>
+    <p class="hint">The workspace is scanned and split into regions first, then the planner scopes phases over them — each phase is explored and turned into verifiable tasks with a test command once you press Start, so planning stays fast no matter how large the project is.</p>
   </section>
 
   <section id="pane-run" class="pane">

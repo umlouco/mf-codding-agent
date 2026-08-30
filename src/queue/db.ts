@@ -97,10 +97,28 @@ export const TASK_STATUSES = [
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
+/**
+ * A `task` row is real, executable work. A `phase` row is a coarse slice of
+ * the plan awaiting expansion into `task` rows by the queue orchestrator — see
+ * `expandTask` and the orchestrator's `runExpansion`. Both share every other
+ * column and the same PENDING → EXECUTING state machine, which is what lets
+ * the existing claim/cron/watchdog/requeueStale machinery cover phase
+ * expansion crash-safety without any changes of its own.
+ */
+export type TaskKind = 'task' | 'phase';
+
 export interface Task {
   id: number;
   title: string;
   description: string;
+  /** 'task' unless this row is a phase awaiting expansion — see TaskKind. */
+  kind: TaskKind;
+  /**
+   * Phase rows only: JSON `{ paths: string[], fileCount: number }` naming the
+   * deterministically-sized slice of the workspace the expansion agent must
+   * stay within. Empty for ordinary tasks.
+   */
+  region: string;
   /** How the Supervisor should check the code and files actually exist as described. */
   implVerifyPrompt: string;
   /** How the Supervisor should judge that the solution behaves correctly. */
@@ -149,6 +167,8 @@ export type NewTask = Pick<Task, 'title' | 'description'> &
       | 'seq'
       | 'maxAttempts'
       | 'status'
+      | 'kind'
+      | 'region'
     >
   >;
 
@@ -198,7 +218,8 @@ const COLUMNS = `
   created_at  AS createdAt,
   updated_at  AS updatedAt,
   started_at  AS startedAt,
-  finished_at AS finishedAt
+  finished_at AS finishedAt,
+  kind, region
 `;
 
 // ---- store -------------------------------------------------------------
@@ -288,6 +309,11 @@ export class TaskQueue {
     for (const c of ['tokens_in', 'tokens_out', 'tokens_cache_read', 'tokens_cache_write']) {
       this.addColumn(c, 'INTEGER NOT NULL DEFAULT 0');
     }
+
+    // See TaskKind — a phase row shares this table and this state machine
+    // rather than living in one of its own.
+    this.addColumn('kind', "TEXT NOT NULL DEFAULT 'task'");
+    this.addColumn('region', "TEXT NOT NULL DEFAULT ''");
   }
 
   /** Adds a column to `tasks` if this database predates it. */
@@ -559,8 +585,9 @@ export class TaskQueue {
       .prepare(
         `INSERT INTO tasks (
            title, description, impl_verify_prompt, solution_verify_prompt,
-           solution_verify_command, status, seq, max_attempts, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           solution_verify_command, status, seq, max_attempts, created_at, updated_at,
+           kind, region
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.title,
@@ -573,43 +600,91 @@ export class TaskQueue {
         t.maxAttempts ?? 3,
         now,
         now,
+        t.kind ?? 'task',
+        t.region ?? '',
       );
     return Number(info.lastInsertRowid);
   }
 
-  update(id: number, patch: Partial<Omit<Task, 'id' | 'createdAt'>>): void {
-    const map: Record<string, string> = {
-      title: 'title',
-      description: 'description',
-      implVerifyPrompt: 'impl_verify_prompt',
-      solutionVerifyPrompt: 'solution_verify_prompt',
-      solutionVerifyCommand: 'solution_verify_command',
-      status: 'status',
-      seq: 'seq',
-      output: 'output',
-      errorLog: 'error_log',
-      supervisorFeedback: 'supervisor_feedback',
-      attempts: 'attempts',
-      maxAttempts: 'max_attempts',
-      startedAt: 'started_at',
-      finishedAt: 'finished_at',
-    };
+  private static readonly COLUMN_MAP: Record<string, string> = {
+    title: 'title',
+    description: 'description',
+    implVerifyPrompt: 'impl_verify_prompt',
+    solutionVerifyPrompt: 'solution_verify_prompt',
+    solutionVerifyCommand: 'solution_verify_command',
+    status: 'status',
+    seq: 'seq',
+    output: 'output',
+    errorLog: 'error_log',
+    supervisorFeedback: 'supervisor_feedback',
+    attempts: 'attempts',
+    maxAttempts: 'max_attempts',
+    startedAt: 'started_at',
+    finishedAt: 'finished_at',
+    kind: 'kind',
+    region: 'region',
+  };
 
+  /** Builds a `col = ?` list and its bound values for a partial task patch. */
+  private buildSet(
+    patch: Partial<Omit<Task, 'id' | 'createdAt'>>,
+  ): { sets: string[]; args: unknown[] } {
     const sets: string[] = [];
     const args: unknown[] = [];
     for (const [k, v] of Object.entries(patch)) {
-      const col = map[k];
+      const col = TaskQueue.COLUMN_MAP[k];
       if (col && v !== undefined) {
         sets.push(`${col} = ?`);
         args.push(v);
       }
     }
+    return { sets, args };
+  }
+
+  update(id: number, patch: Partial<Omit<Task, 'id' | 'createdAt'>>): void {
+    const { sets, args } = this.buildSet(patch);
     if (sets.length === 0) {
       return;
     }
     sets.push('updated_at = ?');
     args.push(Date.now(), id);
     this.db.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).run(...args);
+  }
+
+  /**
+   * Writes back an execution result, but only if this is still the attempt
+   * that produced it.
+   *
+   * `claimNext` hands out `attempts` as a fencing token along with the task —
+   * the two travel together through the whole life of one worker run. A
+   * worker the orchestrator has since given up on (the queue was stopped, the
+   * task was reclaimed by a fresh attempt after being reset) is writing into a
+   * row that either is no longer EXECUTING or has moved on to a later
+   * attempt, and this update matches neither, so it silently does nothing
+   * instead of overwriting whatever is true now. No in-memory bookkeeping is
+   * needed to tell a live result from a stale one — the row itself is the
+   * only witness that has to agree.
+   *
+   * Returns whether the write actually landed.
+   */
+  finishExecution(
+    id: number,
+    attempt: number,
+    patch: Partial<Omit<Task, 'id' | 'createdAt'>>,
+  ): boolean {
+    const { sets, args } = this.buildSet(patch);
+    if (sets.length === 0) {
+      return false;
+    }
+    sets.push('updated_at = ?');
+    args.push(Date.now());
+    const info = this.db
+      .prepare(
+        `UPDATE tasks SET ${sets.join(', ')}
+           WHERE id = ? AND attempts = ? AND status = 'EXECUTING'`,
+      )
+      .run(...args, id, attempt);
+    return info.changes > 0;
   }
 
   /**
@@ -684,6 +759,63 @@ export class TaskQueue {
     });
   }
 
+  /**
+   * Replaces a phase with the tasks (or, occasionally, smaller sub-phases) it
+   * expanded into.
+   *
+   * This is `splitTask`'s twin for the planning side rather than the
+   * execution side: a phase expanding into exactly one task is a normal,
+   * unremarkable outcome — not the "nothing usable came back" case
+   * `splitTask`'s `>= 2` guard exists to catch — so `parts.length >= 1` is
+   * enough here.
+   *
+   * `attempt` is the same fencing token `finishExecution` checks: an
+   * expansion worker the orchestrator has since given up on — the queue was
+   * stopped, this phase was reclaimed by a fresh attempt — is writing into a
+   * row that no longer matches, so the write is silently dropped rather than
+   * corrupting whatever is true now.
+   *
+   * Returns the number of rows inserted, or 0 if the write did not land.
+   */
+  expandTask(id: number, attempt: number, parts: NewTask[]): number {
+    return this.tx(() => {
+      const task = this.get(id);
+      if (!task || task.status !== 'EXECUTING' || task.attempts !== attempt || parts.length < 1) {
+        return 0;
+      }
+      const shift = parts.length - 1;
+      if (shift > 0) {
+        this.db
+          .prepare('UPDATE tasks SET seq = seq + ?, updated_at = ? WHERE seq > ?')
+          .run(shift, Date.now(), task.seq);
+      }
+      this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+
+      parts.forEach((p, i) => {
+        const newId = this.insert(
+          { ...p, seq: task.seq + i, maxAttempts: p.maxAttempts ?? task.maxAttempts },
+          task.seq + i,
+        );
+        if (i === 0) {
+          this.addUsage(newId, {
+            input: task.tokensIn,
+            output: task.tokensOut,
+            cacheRead: task.tokensCacheRead,
+            cacheWrite: task.tokensCacheWrite,
+          });
+        }
+        this.log(newId, 'planner', 'expanded-from', `phase ${task.seq}: ${task.title}`);
+      });
+      this.log(
+        null,
+        'planner',
+        'expanded',
+        `phase ${task.seq} (${task.title}) expanded into ${parts.length} row(s)`,
+      );
+      return parts.length;
+    });
+  }
+
   /** Renumbers `seq` to 1..n in the given id order. Used by drag-to-reorder. */
   reorder(idsInOrder: number[]): void {
     this.tx(() => {
@@ -698,14 +830,20 @@ export class TaskQueue {
   /**
    * Atomically claims the lowest-seq PENDING task and marks it EXECUTING.
    *
-   * The read and the write share one transaction so two workers racing on the
-   * same queue cannot both take the same task — the second sees EXECUTING.
+   * "At most one worker at a time" is enforced right here with the `NOT
+   * EXISTS`, not by a flag the orchestrator keeps in memory. `BEGIN
+   * IMMEDIATE` (see `tx`) takes the write lock before either statement runs,
+   * so two callers racing on the same queue — two ticks in one process, or
+   * two windows open on the same workspace — cannot both see no task
+   * EXECUTING and both proceed to claim one: whichever transaction commits
+   * first is the one the other's `NOT EXISTS` sees.
    */
   claimNext(): Task | undefined {
     return this.tx(() => {
       const row = this.db
         .prepare(
           `SELECT ${COLUMNS} FROM tasks WHERE status = 'PENDING'
+             AND NOT EXISTS (SELECT 1 FROM tasks WHERE status = 'EXECUTING')
            ORDER BY seq ASC, id ASC LIMIT 1`,
         )
         .get() as Task | undefined;
@@ -740,6 +878,19 @@ export class TaskQueue {
     return this.db
       .prepare(`SELECT ${COLUMNS} FROM tasks WHERE status = 'VERIFYING' ORDER BY seq ASC`)
       .all();
+  }
+
+  /**
+   * The task a worker is currently on, if any — read fresh from the row
+   * `claimNext` wrote, not from anything the orchestrator remembers about its
+   * own pump. This is what the status panel and the watchdog ask instead of
+   * keeping a parallel "am I executing" flag that can drift from what the
+   * database actually says happened.
+   */
+  activeTask(): Task | undefined {
+    return this.db
+      .prepare(`SELECT ${COLUMNS} FROM tasks WHERE status = 'EXECUTING' ORDER BY seq ASC LIMIT 1`)
+      .get();
   }
 
   /** True when at least one task is in FAILED state, blocking the queue. */

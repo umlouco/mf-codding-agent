@@ -34,7 +34,6 @@
     send({
       type: 'generate',
       goal: /** @type {HTMLTextAreaElement} */ ($('goal')).value,
-      limit: /** @type {HTMLInputElement} */ ($('limit')).value,
       append: /** @type {HTMLInputElement} */ ($('append')).checked,
     }),
   );
@@ -112,7 +111,7 @@
     /** @type {HTMLButtonElement} */ ($('generate')).disabled = state.generating;
     /** @type {HTMLButtonElement} */ ($('generate')).textContent = state.generating
       ? 'Generating…'
-      : 'Generate task list';
+      : 'Generate plan';
 
     const st = state.status;
     /** @type {HTMLButtonElement} */ ($('start')).disabled = st.running;
@@ -260,6 +259,18 @@
     return `${compact(total)} ↓ · ${compact(t.tokensOut || 0)} ↑`;
   }
 
+  /** The paths and file count a phase was scoped to — see TaskKind in db.ts. */
+  function regionSummary(raw) {
+    try {
+      const r = JSON.parse(raw || '{}');
+      const paths = Array.isArray(r.paths) ? r.paths : [];
+      if (!paths.length) return '(no region recorded)';
+      return `${paths.join('\n')}\n\n${r.fileCount || 0} file(s) total`;
+    } catch {
+      return '(no region recorded)';
+    }
+  }
+
   /** 1234 → "1.2k". Exact counts past a thousand are noise on a summary row. */
   function compact(n) {
     if (n < 1000) return String(n);
@@ -267,9 +278,18 @@
     return `${(n / 1_000_000).toFixed(1)}M`;
   }
 
+  /** "phase — awaiting expansion" / "phase — expanding…" next to the status pill. */
+  function phaseLabel(t) {
+    if (t.status === 'EXECUTING') return 'phase — expanding…';
+    if (t.status === 'PENDING') return 'phase — awaiting expansion';
+    return 'phase';
+  }
+
   function taskEl(t, st) {
+    const isPhase = t.kind === 'phase';
     const d = document.createElement('details');
-    d.className = `task ${t.status}` + (st.currentTaskId === t.id ? ' current' : '');
+    d.className =
+      `task ${t.status}` + (isPhase ? ' phase' : '') + (st.currentTaskId === t.id ? ' current' : '');
     d.open = open.has(t.id);
     d.addEventListener('toggle', () => (d.open ? open.add(t.id) : open.delete(t.id)));
 
@@ -279,7 +299,9 @@
       `<span class="title"></span>` +
       `<span class="live"></span>` +
       `<span class="tokens"></span>` +
-      `<span class="pill ${t.status}">${t.status}</span>`;
+      (isPhase
+        ? `<span class="pill phasepill">${phaseLabel(t)}</span>`
+        : `<span class="pill ${t.status}">${t.status}</span>`);
     s.querySelector('.title').textContent = t.title;
     // What the worker is doing right now, and how long ago it said so. A task
     // that is simply slow keeps refreshing this; one that has stopped does not.
@@ -307,24 +329,32 @@
     body.className = 'body';
 
     body.appendChild(field('Description', t.description, (v) => patch(t.id, { description: v })));
-    body.appendChild(
-      field('Implementation verification', t.implVerifyPrompt, (v) =>
-        patch(t.id, { implVerifyPrompt: v }),
-      ),
-    );
-    body.appendChild(
-      field('Solution verification', t.solutionVerifyPrompt, (v) =>
-        patch(t.id, { solutionVerifyPrompt: v }),
-      ),
-    );
-    body.appendChild(
-      field(
-        'Verification command',
-        t.solutionVerifyCommand,
-        (v) => patch(t.id, { solutionVerifyCommand: v }),
-        true,
-      ),
-    );
+
+    if (isPhase) {
+      // A phase has no verify prompts of its own — those belong to the tasks
+      // it expands into — but it does have the workspace slice it was scoped
+      // to, which is the thing worth showing here instead.
+      body.appendChild(readonlyBlock('Region', regionSummary(t.region), false));
+    } else {
+      body.appendChild(
+        field('Implementation verification', t.implVerifyPrompt, (v) =>
+          patch(t.id, { implVerifyPrompt: v }),
+        ),
+      );
+      body.appendChild(
+        field('Solution verification', t.solutionVerifyPrompt, (v) =>
+          patch(t.id, { solutionVerifyPrompt: v }),
+        ),
+      );
+      body.appendChild(
+        field(
+          'Verification command',
+          t.solutionVerifyCommand,
+          (v) => patch(t.id, { solutionVerifyCommand: v }),
+          true,
+        ),
+      );
+    }
 
     if (t.supervisorFeedback) {
       body.appendChild(readonlyBlock('Supervisor feedback', t.supervisorFeedback, false));

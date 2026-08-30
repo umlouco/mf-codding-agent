@@ -58,6 +58,9 @@ func TestOpenCreateListStatsClose(t *testing.T) {
 	if t1.MaxAttempts != 3 {
 		t.Fatalf("expected maxAttempts 3, got %d", t1.MaxAttempts)
 	}
+	if t1.Kind != "task" {
+		t.Fatalf("expected kind %q (this server never creates phases), got %q", "task", t1.Kind)
+	}
 
 	// Stats should reflect the single task.
 	stats, err := Stats(db)

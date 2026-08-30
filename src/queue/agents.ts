@@ -1,9 +1,9 @@
 import * as cp from 'child_process';
 import * as vscode from 'vscode';
 import { CoreClient, CoreConfig } from '../core';
-import { resolveCoreBinary } from '../detect';
+import { resolveCoreBinary, workspaceRoot } from '../detect';
 import { getStore } from '../providers/instance';
-import { NewTask, Task, Usage } from './db';
+import { NewTask, Task, TaskQueue, Usage } from './db';
 
 /**
  * Agent runners for autonomous runs.
@@ -382,9 +382,126 @@ export function unwrapArray(parsed: unknown): unknown {
   return parsed;
 }
 
-// ---- planner -----------------------------------------------------------
+// ---- workspace scan ------------------------------------------------------
 
-const MAX_TASKS = 100;
+/**
+ * One deterministically-sized slice of the workspace, as reported by
+ * `mfcore scan` — see core/internal/tools/scan.go. No LLM is involved in
+ * producing this: it exists so "is this slice small enough to explore in one
+ * turn" is a file count code already checked, not a question the planner or
+ * an expansion agent has to size up on its own.
+ */
+export interface Region {
+  path: string;
+  fileCount: number;
+  languages: Record<string, number>;
+}
+
+/**
+ * Runs the deterministic workspace scan and returns the regions it found.
+ *
+ * This is a plain subprocess call, not an agent turn — there is nothing here
+ * for a model to get wrong or take a long time over, which is the point:
+ * sizing the plan happens before any LLM is involved.
+ */
+export async function runScanCommand(
+  context: vscode.ExtensionContext,
+  root: string,
+  maxPerRegion: number,
+): Promise<Region[]> {
+  const bin = resolveCoreBinary(context).path;
+  if (!bin) {
+    throw new AgentRunError('the mfcore binary could not be found, so the workspace cannot be scanned');
+  }
+
+  const timeoutMs = 30_000;
+  return new Promise<Region[]>((resolve, reject) => {
+    const child = cp.spawn(
+      bin,
+      ['scan', '--json', '--dir', root, '--max-per-region', String(Math.max(1, Math.round(maxPerRegion)))],
+      { cwd: root, windowsHide: true },
+    );
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(killer);
+      fn();
+    };
+
+    const killer = setTimeout(() => {
+      killTree(child.pid);
+      finish(() =>
+        reject(new AgentRunError(`the workspace scan was still running after ${Math.round(timeoutMs / 1000)}s`)),
+      );
+    }, timeoutMs);
+
+    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+    child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+    child.on('error', (e) =>
+      finish(() => reject(new AgentRunError(`could not start mfcore scan: ${e.message}`))),
+    );
+    child.on('close', () => {
+      finish(() => {
+        try {
+          const env = JSON.parse(stdout.trim().split('\n').pop() ?? '{}');
+          if (env.error) {
+            reject(new AgentRunError(`workspace scan failed: ${env.error}`));
+            return;
+          }
+          resolve(Array.isArray(env.regions) ? env.regions : []);
+        } catch {
+          reject(
+            new AgentRunError(`mfcore scan did not return a result: ${(stderr || stdout).slice(0, 500)}`),
+          );
+        }
+      });
+    });
+  });
+}
+
+/** What a phase's `region` column carries — see TaskKind. */
+export interface RegionInfo {
+  paths: string[];
+  fileCount: number;
+}
+
+const EMPTY_REGION: RegionInfo = { paths: [], fileCount: 0 };
+
+export function parseRegion(raw: string): RegionInfo {
+  if (!raw) {
+    return EMPTY_REGION;
+  }
+  try {
+    const d = JSON.parse(raw);
+    return {
+      paths: Array.isArray(d.paths) ? d.paths.map((p: unknown) => String(p)) : [],
+      fileCount: Number(d.fileCount) || 0,
+    };
+  } catch {
+    return EMPTY_REGION;
+  }
+}
+
+export function encodeRegion(r: RegionInfo): string {
+  return JSON.stringify(r);
+}
+
+/** True when `candidate` is `region.paths[i]` itself or somewhere under it. */
+export function withinRegion(candidate: string, paths: string[]): boolean {
+  const norm = candidate.trim().replace(/\\/g, '/').replace(/^\.\/?/, '');
+  return paths.some((p) => {
+    const base = p.trim().replace(/\\/g, '/').replace(/^\.\/?/, '');
+    return norm !== '' && (norm === base || norm.startsWith(`${base}/`));
+  });
+}
+
+// ---- planner -----------------------------------------------------------
 
 /** True for a value the planner can turn into tasks. */
 function isPlan(value: unknown): boolean {
@@ -392,76 +509,305 @@ function isPlan(value: unknown): boolean {
   return Array.isArray(list) && list.length > 0;
 }
 
-export async function generateTasks(
+const MAX_PHASES = 40;
+
+function languageSummary(languages: Record<string, number> | undefined): string {
+  const entries = Object.entries(languages ?? {}).sort((a, b) => b[1] - a[1]);
+  return entries.length ? `, ${entries.map(([lang, n]) => `${lang}:${n}`).join(' ')}` : '';
+}
+
+/**
+ * Turns a goal into coarse phases, each scoped to one or more regions from a
+ * prior `runScanCommand` — never into the finished task list itself.
+ *
+ * This is what replaces the old single-shot planner. The model reasons over a
+ * compact structural summary (paths, file counts, language mix) instead of
+ * exploring the tree, so this turn's cost stays flat as the workspace grows;
+ * exploring each phase's own slice in depth is `expandPhase`'s job, one phase
+ * at a time, later.
+ */
+export async function generatePhases(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   goal: string,
-  limit: number,
+  regions: Region[],
+  maxFilesPerRegion: number,
   onEvent?: (method: string, params: any) => void,
   onCancellable?: (cancel: () => void) => void,
 ): Promise<NewTask[]> {
-  const n = Math.min(Math.max(limit || 20, 1), MAX_TASKS);
-  const prompt = `You are planning an autonomous coding run. Break the goal below into at most ${n} tasks.
+  const regionList = regions
+    .map((r) => `- ${r.path}  (${r.fileCount} file(s)${languageSummary(r.languages)})`)
+    .join('\n');
+
+  const prompt = `You are planning an autonomous coding run over a large workspace. The workspace has
+already been scanned and split into regions small enough for one agent to explore in a
+single sitting — you are not exploring the tree yourself, you are deciding which regions
+matter for the goal below and how to group them into phases. A later agent will explore
+each phase's own region in depth and write its detailed tasks; your job stops at scoping.
 
 GOAL
 ${goal}
 
-First explore the workspace enough to ground the plan in what is actually there — read the files you need. Then reply with ONE JSON array and nothing else.
+REGIONS (path, file count, language mix — not file contents)
+${regionList || '(none — the workspace appears to be empty)'}
 
+Break the goal into at most ${MAX_PHASES} phases. Reply with ONE JSON array and nothing else.
 Each element must be an object with exactly these keys:
-  "title"                  short imperative summary, under 80 characters
-  "description"            what to build, precise enough to act on with no other context: name the files, functions and behaviour
-  "implVerifyPrompt"       how a reviewer confirms the code and files exist as described
-  "solutionVerifyPrompt"   how a reviewer confirms the behaviour is correct
-  "solutionVerifyCommand"  a single shell command that exits 0 on success and non-zero on failure, or "" if none applies
+  "title"        short imperative summary of this phase, under 80 characters
+  "description"  what this phase covers and why it matters to the goal — the agent that
+                 expands it later will see nothing else about the overall plan but this and
+                 the goal above
+  "regionPaths"  array of one or more paths taken VERBATIM from the REGIONS list above — the
+                 exact slice of the workspace this phase is scoped to
 
 Rules:
-- Order the array in the sequence the tasks must be executed.
-- Each task must be completable by one agent in a single sitting, touching a handful of files.
-- Every task must be independently verifiable. Prefer real commands (test runners, builds, linters) that already work in this repo — do not invent scripts that do not exist.
-- Do not include a task for the plan itself.`;
+- Drop regions that have nothing to do with the goal — do not create a phase for them.
+- Keep each region in its own phase unless a few small, closely related regions clearly
+  belong together. Do not merge a region whose file count alone is already close to
+  ${maxFilesPerRegion} — that phase would not fit its own exploration in one sitting.
+- Order phases in the sequence they should be expanded and executed.
+- Do not invent paths that are not in the REGIONS list.`;
 
   const { text } = await runOnce(context, output, 'planner', prompt, {
     maxIterations: baseRounds(),
     onEvent,
     onCancellable,
   });
-  output.appendLine(`[queue:planner] raw reply is ${text.length} chars`);
-  // A plan is a non-empty array, or an envelope around one. Saying so is what
-  // stops a stray `[ ]` in the planner's own narration from being read as a
-  // plan with no tasks in it.
+  output.appendLine(`[queue:planner] raw phase reply is ${text.length} chars`);
+
   let parsed = extractJson<unknown>(text, isPlan);
   parsed = unwrapArray(parsed);
   if (!Array.isArray(parsed)) {
-    // Log the type and a sample of what was actually returned so the user can
-    // diagnose the failure without having to re-run the planner.
     const sample =
-      typeof parsed === 'string'
-        ? parsed.slice(0, 500)
-        : JSON.stringify(parsed).slice(0, 500);
-    output.appendLine(
-      `[queue:planner] extracted ${typeof parsed} instead of array: ${sample}`,
-    );
-    throw new AgentRunError('the planner returned JSON but not an array of tasks');
+      typeof parsed === 'string' ? parsed.slice(0, 500) : JSON.stringify(parsed).slice(0, 500);
+    output.appendLine(`[queue:planner] extracted ${typeof parsed} instead of array: ${sample}`);
+    throw new AgentRunError('the planner returned JSON but not an array of phases');
   }
-  const raw = parsed as any[];
 
-  const tasks: NewTask[] = raw
+  const byPath = new Map(regions.map((r) => [r.path, r]));
+  const raw = (parsed as any[]).filter(
+    (p) => p && typeof p === 'object' && String(p.title ?? '').trim(),
+  );
+
+  const phases: NewTask[] = [];
+  for (const p of raw.slice(0, MAX_PHASES)) {
+    const title = String(p.title).trim().slice(0, 200);
+    const description = String(p.description ?? '').trim();
+    const paths: string[] = (Array.isArray(p.regionPaths) ? p.regionPaths : [])
+      .map((s: unknown) => String(s).trim())
+      .filter((s: string) => byPath.has(s));
+    if (paths.length === 0) {
+      continue; // no real region behind this phase — nothing to expand
+    }
+
+    // Code decides size, not the model's choice of what to merge: a phase
+    // whose combined region file count is still too big for one sitting is
+    // split back into one phase per region instead of trusting the merge.
+    const totalFiles = paths.reduce((sum, path) => sum + (byPath.get(path)?.fileCount ?? 0), 0);
+    if (paths.length > 1 && totalFiles > maxFilesPerRegion) {
+      for (const path of paths) {
+        const r = byPath.get(path)!;
+        phases.push({
+          title: `${title} — ${path}`,
+          description,
+          kind: 'phase',
+          region: encodeRegion({ paths: [path], fileCount: r.fileCount }),
+        });
+      }
+    } else {
+      phases.push({
+        title,
+        description,
+        kind: 'phase',
+        region: encodeRegion({ paths, fileCount: totalFiles }),
+      });
+    }
+  }
+
+  if (phases.length === 0) {
+    throw new AgentRunError('the planner produced no usable phases');
+  }
+  phases.forEach((ph, i) => (ph.seq = i + 1));
+  return phases;
+}
+
+/**
+ * End-to-end entry point for both planning surfaces (the Task Queue sidebar
+ * and the chat's Planner): scan the workspace, generate phases for `goal`,
+ * and remember the goal itself so a later `expandPhase` call — which may
+ * happen long after this one returns, and in a different process entirely —
+ * still knows what the plan as a whole is for.
+ */
+export async function planGoal(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+  queue: TaskQueue,
+  goal: string,
+  onEvent?: (method: string, params: any) => void,
+  onCancellable?: (cancel: () => void) => void,
+): Promise<NewTask[]> {
+  const root = workspaceRoot() || process.cwd();
+  const maxPerRegion = Math.max(
+    1,
+    vscode.workspace.getConfiguration('mfagent').get<number>('queue.maxFilesPerRegion', 150),
+  );
+  const regions = await runScanCommand(context, root, maxPerRegion);
+  output.appendLine(`[queue:planner] scanned workspace into ${regions.length} region(s)`);
+  const phases = await generatePhases(context, output, goal, regions, maxPerRegion, onEvent, onCancellable);
+  queue.setMeta('goal', goal);
+  return phases;
+}
+
+// ---- phase expansion -----------------------------------------------------
+
+const MAX_TASKS_PER_PHASE = 20;
+
+/** A sub-slice of a phase's region that the expander itself flagged as still
+ * too broad to carry out in one sitting, after actually exploring it. */
+export interface PhaseSplitRequest {
+  title: string;
+  description: string;
+  /** Workspace-relative path inside the phase's own region, if named. */
+  path?: string;
+}
+
+export interface PhaseExpansion {
+  tasks: NewTask[];
+  splitRequests: PhaseSplitRequest[];
+  /** The turn hit its round ceiling — a size signal, not just "it failed". */
+  cutOff: boolean;
+  usage: Usage;
+}
+
+/**
+ * Expands one phase into the concrete tasks it should carry out.
+ *
+ * Exploration is bounded to the phase's own region, so — unlike the old
+ * single-shot planner — this turn's cost stays roughly constant regardless of
+ * how large the overall workspace is. The model may still report that its own
+ * region turned out to hold more than one distinct piece of work once it has
+ * actually looked (`splitRequests`); code, not the model, then decides how
+ * much smaller that piece really is — see the orchestrator's
+ * `resplitPhaseRegion`.
+ */
+export async function expandPhase(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+  phase: Task,
+  goal: string,
+  onActivity?: (a: ActivityRecord) => void,
+  onEvent?: (method: string, params: any) => void,
+  onAbort?: (abort: () => void) => void,
+): Promise<PhaseExpansion> {
+  const region = parseRegion(phase.region);
+  const scopeNote = region.paths.length
+    ? `Explore ONLY these paths — they were chosen because together they hold about
+${region.fileCount} file(s), small enough to cover in this one sitting. Do not read or plan
+for anything outside them:
+${region.paths.map((p) => `  - ${p}`).join('\n')}`
+    : "No region was recorded for this phase — explore only as much of the workspace as this phase's description names.";
+
+  const retry =
+    phase.attempts > 1
+      ? `\nTHIS IS ATTEMPT ${phase.attempts}. An earlier attempt did not produce a usable task list.\n` +
+        `How it ended:\n${attemptHistory(phase)}\n`
+      : '';
+
+  const prompt = `You are expanding one phase of a larger autonomous coding plan into the concrete tasks
+that carry it out. Another agent already broke the project into phases and scoped each one
+to a slice of the workspace it can be explored in one sitting — you are not planning the
+rest of the project, only this phase.
+
+OVERALL GOAL
+${goal}
+
+THIS PHASE (${phase.seq}): ${phase.title}
+${phase.description}
+
+${scopeNote}
+${retry}
+First explore the region above enough to ground the plan in what is actually there. Then
+reply with ONE JSON array and nothing else, at most ${MAX_TASKS_PER_PHASE} elements.
+
+Each element must be an object with exactly these keys:
+  "title"                  short imperative summary, under 80 characters
+  "description"            what to build, precise enough to act on with no other context:
+                            name the files, functions and behaviour
+  "implVerifyPrompt"       how a reviewer confirms the code and files exist as described
+  "solutionVerifyPrompt"   how a reviewer confirms the behaviour is correct
+  "solutionVerifyCommand"  a single shell command that exits 0 on success and non-zero on
+                            failure, or "" if none applies
+  "kind"                   "task" (the default). Use "phase" instead, ONLY after exploring,
+                            if part of this region turns out to be a distinct piece of work
+                            that does not belong with the rest — in that case also set
+                            "regionPath" to the real subdirectory (inside the paths above)
+                            that piece lives under; leave "description" describing just that
+                            piece. Do not use "phase" to avoid writing tasks — code decides
+                            how much smaller that piece needs to be, not you.
+
+Rules:
+- Order the array in the sequence the tasks must be executed.
+- Stay inside this phase's region. Do not propose work on files outside it.
+- Each task must be completable by one agent in a single sitting, touching a handful of files.
+- Every task must be independently verifiable. Prefer real commands (test runners, builds,
+  linters) that already work in this repo — do not invent scripts that do not exist.
+- Do not include a task for the phase itself.`;
+
+  const { text, stopReason, usage } = await runOnce(context, output, 'planner', prompt, {
+    maxIterations: baseRounds(),
+    onActivity,
+    onEvent,
+    onAbort,
+  });
+  output.appendLine(`[queue:planner] phase ${phase.seq} raw reply is ${text.length} chars`);
+  const cutOff = stopReason === 'max_iterations';
+
+  let parsed: unknown;
+  try {
+    parsed = unwrapArray(extractJson<unknown>(text, isPlan));
+  } catch (e) {
+    // Cut off before it could even finish writing JSON is a size signal, not
+    // a generic parse failure the caller cannot act on — let it through as an
+    // empty result rather than throwing.
+    if (cutOff) {
+      return { tasks: [], splitRequests: [], cutOff: true, usage };
+    }
+    throw e;
+  }
+  if (!Array.isArray(parsed)) {
+    const sample =
+      typeof parsed === 'string' ? parsed.slice(0, 500) : JSON.stringify(parsed).slice(0, 500);
+    output.appendLine(
+      `[queue:planner] phase ${phase.seq} extracted ${typeof parsed} instead of array: ${sample}`,
+    );
+    if (cutOff) {
+      return { tasks: [], splitRequests: [], cutOff: true, usage };
+    }
+    throw new AgentRunError('the phase expansion returned JSON but not an array of tasks');
+  }
+
+  const tasks: NewTask[] = [];
+  const splitRequests: PhaseSplitRequest[] = [];
+  for (const t of (parsed as any[])
     .filter((t) => t && typeof t === 'object' && String(t.title ?? '').trim())
-    .slice(0, n)
-    .map((t, i) => ({
-      title: String(t.title).trim().slice(0, 200),
-      description: String(t.description ?? '').trim(),
+    .slice(0, MAX_TASKS_PER_PHASE)) {
+    const title = String(t.title).trim().slice(0, 200);
+    const description = String(t.description ?? '').trim();
+    if (String(t.kind ?? '').trim().toLowerCase() === 'phase') {
+      splitRequests.push({ title, description, path: String(t.regionPath ?? '').trim() || undefined });
+      continue;
+    }
+    tasks.push({
+      title,
+      description,
+      kind: 'task',
       implVerifyPrompt: String(t.implVerifyPrompt ?? '').trim(),
       solutionVerifyPrompt: String(t.solutionVerifyPrompt ?? '').trim(),
       solutionVerifyCommand: String(t.solutionVerifyCommand ?? '').trim(),
-      seq: i + 1,
-    }));
-
-  if (tasks.length === 0) {
-    throw new AgentRunError('the planner produced no usable tasks');
+    });
   }
-  return tasks;
+
+  return { tasks, splitRequests, cutOff: cutOff && tasks.length === 0, usage };
 }
 
 // ---- executor ----------------------------------------------------------
@@ -557,6 +903,7 @@ export async function executeTask(
   task: Task,
   onActivity?: (a: ActivityRecord) => void,
   onEvent?: (method: string, params: any) => void,
+  onAbort?: (abort: () => void) => void,
 ): Promise<ExecutionOutcome> {
   const retry = retryBriefing(task);
 
@@ -587,6 +934,7 @@ Rules:
     maxIterations: rounds,
     onActivity,
     onEvent,
+    onAbort,
   });
   return {
     text,
@@ -1133,4 +1481,135 @@ and the attempt above used your latest version and still did not pass. Whatever 
 executor to do differently, it was not enough. Do not send a third phrasing of the same idea —
 change the plan, split the task, or correct the premise that is actually wrong.
 `;
+}
+
+// ---- mid-execution audit -------------------------------------------------
+
+/**
+ * True for a value the audit reply can be judged from rather than something
+ * quoted along the way — same shape test as `isReview`, minus the fields only
+ * a finished-task verdict would have.
+ */
+function isAuditReply(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const v = value as Record<string, unknown>;
+  return 'verdict' in v || 'feedback' in v;
+}
+
+export interface AuditDecision {
+  verdict: 'CONTINUE' | 'STOP';
+  feedback: string;
+  /** Required for STOP; a STOP without one is downgraded to CONTINUE. */
+  description?: string;
+  solutionVerifyCommand?: string;
+  usage: Usage;
+}
+
+/**
+ * Checks in on a task that is still `EXECUTING` — not finished, not cut off —
+ * and decides whether it is still headed somewhere useful.
+ *
+ * This is deliberately not `superviseTask` in miniature: there is no VERIFIED,
+ * no SPLIT, no RESET_FROM, because none of those questions can be answered
+ * before the work is done. The only thing worth deciding early is whether to
+ * keep going at all, which is why the verdict set is just CONTINUE or STOP.
+ *
+ * Failure is biased toward CONTINUE on purpose. The worst outcome of a broken
+ * *task* is another wasted attempt; the worst outcome of a broken *audit*
+ * would be killing a task that was actually fine, which is strictly worse —
+ * so an unparseable reply, or a STOP with no real rewrite behind it (the same
+ * `rewritten()` check a RETRY verdict is held to), both fall back to CONTINUE
+ * rather than stopping anything.
+ */
+export async function auditExecution(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+  task: Task,
+  trail: string,
+  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
+): Promise<AuditDecision> {
+  const prompt = `You are the supervisor of an autonomous coding run, checking in on a task that is
+STILL BEING WORKED ON — it has not finished, and has not been cut off. Decide only whether to
+let it keep going.
+
+TASK ${task.seq}: ${task.title}
+This is attempt ${task.attempts}.
+
+What the task requires:
+${task.description}
+
+Implementation check to apply once finished:
+${task.implVerifyPrompt || 'confirm the described code exists and is coherent'}
+
+Behaviour check to apply once finished:
+${task.solutionVerifyPrompt || 'confirm the described behaviour works'}
+
+What the executor has done so far this attempt (its tool calls, oldest first):
+${trail || '(nothing recorded yet)'}
+
+Judge only whether this is still headed somewhere useful — not whether it is finished. An
+executor that is still reading files, still iterating on a test it is actively fixing, or
+partway through a large but coherent change is on track: choose CONTINUE. An executor that is
+repeating the same failing action without changing approach, editing files that have nothing to
+do with the task, contradicting what the task actually asks for, or has clearly wandered into
+unrelated work is not: choose STOP.
+
+Stopping a task that is genuinely still making progress throws away the work it has already
+done, so only choose STOP when the trail above already shows the problem clearly. When in doubt,
+CONTINUE — there will be another chance to look before this attempt runs out.
+
+Reply with ONE JSON object and nothing else:
+{
+  "verdict": "CONTINUE" | "STOP",
+  "feedback": "what you observed, in one or two sentences",
+  "description": "REQUIRED if STOP: the full replacement description the next attempt should
+                  start from — self-contained, naming exactly what went wrong and what to do
+                  differently. Omit for CONTINUE.",
+  "solutionVerifyCommand": "a corrected check command, only if STOP and the current one is part
+                            of the problem — omit to leave it unchanged"
+}`;
+
+  const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
+    maxIterations: Math.min(supervisorRounds(), 15),
+    ...opts,
+  });
+
+  let d: Record<string, unknown> = {};
+  try {
+    d = extractJson<Record<string, unknown>>(text, isAuditReply);
+  } catch {
+    // A reply that cannot be parsed must not silently stop a running task —
+    // see the note on failure bias above.
+    return {
+      verdict: 'CONTINUE',
+      feedback: 'the audit reply could not be parsed; leaving the task running',
+      usage,
+    };
+  }
+
+  const feedback = String(d.feedback ?? '').trim();
+  if (String(d.verdict ?? '').toUpperCase() !== 'STOP') {
+    return { verdict: 'CONTINUE', feedback, usage };
+  }
+
+  const description = String(d.description ?? '').trim();
+  if (!rewritten(description, task.description)) {
+    return {
+      verdict: 'CONTINUE',
+      feedback: feedback
+        ? `${feedback} (no usable rewrite was supplied, so the run was left going)`
+        : 'STOP was chosen with no usable rewrite, so the run was left going',
+      usage,
+    };
+  }
+
+  return {
+    verdict: 'STOP',
+    feedback,
+    description,
+    solutionVerifyCommand: String(d.solutionVerifyCommand ?? '').trim() || undefined,
+    usage,
+  };
 }

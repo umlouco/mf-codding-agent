@@ -5,6 +5,15 @@
   "version": "0.1.0",
   "publisher": "mflores",
   "license": "MIT",
+  "pricing": "Free",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/umlouco/mf-codding-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/umlouco/mf-codding-agent/issues"
+  },
+  "homepage": "https://github.com/umlouco/mf-codding-agent#readme",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -240,11 +249,23 @@
           "minimum": 10,
           "markdownDescription": "Tool-calling rounds an unattended executor gets per turn — the only budget a task has. Retries get 50% more per attempt (capped at 3× the base)."
         },
+        "mfagent.queue.maxFilesPerRegion": {
+          "type": "number",
+          "default": 150,
+          "minimum": 10,
+          "markdownDescription": "Largest file count one region of the workspace may hold before the deterministic scan splits it further. This is what bounds how much a phase's expansion agent has to explore in one sitting, regardless of how large the whole project is — see the Plan tab. Lower it if expansions on a dense codebase keep getting cut off; raise it to produce fewer, coarser phases on a small one."
+        },
         "mfagent.queue.supervisorMaxRounds": {
           "type": "number",
           "default": 40,
           "minimum": 10,
           "description": "Tool-calling rounds the supervisor gets per task. Lower is cheaper and usually enough for verification."
+        },
+        "mfagent.queue.auditIntervalSeconds": {
+          "type": "number",
+          "default": 90,
+          "minimum": 30,
+          "markdownDescription": "How often the supervisor checks in on a task that is still running, independent of `#mfagent.queue.cronIntervalSeconds#`. Each check reads the executor's tool calls so far and either lets it continue or stops and rewrites it — the round cap is only the backstop for when this does not catch a bad turn first. A check with nothing new to look at costs no LLM call."
         },
         "mfagent.queue.verifyCommandTimeoutSeconds": {
           "type": "number",
