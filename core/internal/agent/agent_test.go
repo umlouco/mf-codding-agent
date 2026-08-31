@@ -193,6 +193,23 @@ func TestSendAsksForAReportWhenRoundsRunOut(t *testing.T) {
 	}
 }
 
+func TestDisableToolsMakesSupervisorConclusionOnly(t *testing.T) {
+	fake := &fakeProvider{finalText: `{"verdict":"VERIFIED"}`}
+	a := newTestAgent(t, fake, 10)
+	a.cfg.DisableTools = true
+
+	res, err := a.Send(context.Background(), SendRequest{SessionID: "review", Text: "judge evidence"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if fake.calls != 1 || fake.toolless != 1 {
+		t.Fatalf("calls=%d toolless=%d, want one tool-less conclusion", fake.calls, fake.toolless)
+	}
+	if res.Text != fake.finalText {
+		t.Fatalf("Text=%q, want %q", res.Text, fake.finalText)
+	}
+}
+
 /*
 The rest of these pin the liveness contract, which exists so that no part of a
 turn is ever cut off for being slow.

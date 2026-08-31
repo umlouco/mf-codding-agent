@@ -5,6 +5,7 @@ import { resolveCoreBinary, workspaceRoot } from '../detect';
 import { registerEditorFsHandlers } from '../editorFs';
 import { getStore } from '../providers/instance';
 import { NewTask, Task, TaskQueue, Usage } from './db';
+import { parseExecutorValidation, serializeValidation, validationForSupervisor } from './validation';
 
 /**
  * Agent runners for autonomous runs.
@@ -63,6 +64,10 @@ async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<Core
     }],
     coding: { providerId: `queue-${role}`, model: rc.model, effort: rc.effort },
     autoApprove: ['*'],
+    // Supervisors only validate the executor's persisted conclusion. They are
+    // intentionally unable to inspect files, execute commands, or drive a browser.
+    disableTools: role === 'supervisor',
+    ...(role === 'supervisor' ? { memoryEnabled: false, mcpServers: [] } : {}),
     maxIterations,
   };
 }
@@ -122,6 +127,22 @@ export interface RunOptions {
   onAbort?: (abort: () => void) => void;
   /** Where the worker's activity records go. */
   onActivity?: (a: ActivityRecord) => void;
+}
+
+/** Stops a spawned command and its descendants. */
+function killTree(pid: number | undefined): void {
+  if (!pid) {
+    return;
+  }
+  try {
+    if (process.platform === 'win32') {
+      cp.spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+    } else {
+      process.kill(-pid, 'SIGKILL');
+    }
+  } catch {
+    // The process already exited.
+  }
 }
 
 /*
@@ -816,6 +837,8 @@ Rules:
 
 export interface ExecutionOutcome {
   text: string;
+  /** JSON evidence produced by the executor after it performed the checks. */
+  validationReport: string;
   ok: boolean;
   /** The worker hit the round ceiling; `text` is partial progress, not a result. */
   cutOff: boolean;
@@ -915,7 +938,11 @@ TASK ${task.seq}: ${task.title}
 
 ${task.description}
 ${retry}
-This is how your work will be checked, so satisfy it directly:
+You own both implementation AND verification. Before reporting, perform every
+applicable check yourself and record the evidence. The supervisor will not read
+files, run commands, or drive a browser; it only judges your stored conclusion.
+
+Verification requirements:
 - Implementation check: ${task.implVerifyPrompt || 'the described code exists and is coherent'}
 - Behaviour check: ${task.solutionVerifyPrompt || 'the described behaviour works'}
 ${task.solutionVerifyCommand ? `- This command must exit 0: \`${task.solutionVerifyCommand}\`` : ''}
@@ -924,7 +951,22 @@ Rules:
 - Do the work. Read what you need, then edit the files for real — do not describe changes you have not made.
 - Stay inside this task. Do not start the next one, and do not refactor unrelated code.
 - If the task turns out to be impossible or already done, say so plainly and explain why.
-- Finish with a short report: what you changed, which files, and anything the reviewer should know.`;
+- Inspect the final code and diff yourself. Run relevant builds and tests. For UI/browser
+  work, use the browser tools (including Playwright-style interaction) and record what happened.
+- Do not claim PASS from expectation. Every required check needs concrete observed evidence.
+- Finish with ONE JSON object and nothing else, in this exact shape:
+{
+  "report": "short summary of changes and files",
+  "validation": {
+    "conclusion": "PASS" | "FAIL" | "INCOMPLETE",
+    "summary": "overall validation conclusion",
+    "implementationEvidence": "what you inspected in the final code/diff",
+    "behaviorEvidence": "what behavior you actually exercised",
+    "checks": [{ "kind": "inspection" | "command" | "test" | "browser" | "other",
+                 "name": "command or check name", "passed": true, "evidence": "observed output" }],
+    "remaining": "anything unverified or still broken; empty only when nothing remains"
+  }
+}`;
 
   // Rounds are the only budget an attempt has, and a retry gets more of them —
   // capped so token spend cannot run away across attempts. How long those
@@ -938,182 +980,16 @@ Rules:
     onEvent,
     onAbort,
   });
+  const validation = parseExecutorValidation(text, stopReason === 'max_iterations');
   return {
     text,
+    validationReport: serializeValidation(validation),
     ok: text.trim().length > 0,
     cutOff: stopReason === 'max_iterations',
     stopReason,
     rounds,
     usage,
   };
-}
-
-// ---- functional check --------------------------------------------------
-
-export interface CommandResult {
-  ran: boolean;
-  code: number | null;
-  output: string;
-  /**
-   * The command never ran: a syntax error, or a program that does not exist.
-   *
-   * This is the distinction the whole check depends on. A command that runs and
-   * exits non-zero is evidence about the code. A command that could not run is
-   * evidence about the command — and blaming the executor for it is how a task
-   * fails forever over a check that was never valid.
-   */
-  invalid: boolean;
-  timedOut: boolean;
-  /** Why it could not run, when it could not run. */
-  error: string;
-}
-
-const NOT_RUN: CommandResult = {
-  ran: false,
-  code: null,
-  output: '',
-  invalid: false,
-  timedOut: false,
-  error: '',
-};
-
-function clampOutput(s: string): string {
-  return s.length > 12000 ? `${s.slice(0, 12000)}\n… (truncated)` : s;
-}
-
-/**
- * Runs a task's verification command and reports what happened.
- *
- * This runs here rather than inside the Supervisor's turn on purpose: an exit
- * code is objective, and asking a model to both run and judge the check invites
- * it to report a pass it never observed.
- *
- * It goes through `mfcore sh` — the same portable POSIX interpreter the agent's
- * `unix` tool runs on — for one reason: a check has to mean the same thing as
- * the work it is checking. When this spawned PowerShell directly, an executor
- * would satisfy a task with `cd core && go build ./...`, and the check would
- * then report exit 1 because PowerShell 5.1 has no `&&`. The code was fine and
- * the task failed anyway, which is the worst failure this system can have: the
- * supervisor is handed false evidence and acts on it.
- *
- * The script travels on stdin and the result comes back as JSON, so there is no
- * command line for anything to re-parse and no exit code doing double duty.
- */
-export async function runVerifyCommand(
-  context: vscode.ExtensionContext,
-  command: string,
-  cwd: string,
-  timeoutMs: number,
-): Promise<CommandResult> {
-  if (!command.trim()) {
-    return NOT_RUN;
-  }
-
-  const bin = resolveCoreBinary(context).path;
-  if (!bin) {
-    return {
-      ...NOT_RUN,
-      ran: true,
-      invalid: true,
-      error: 'the mfcore binary could not be found, so no verification command can run',
-    };
-  }
-
-  return new Promise<CommandResult>((resolve) => {
-    const child = cp.spawn(
-      bin,
-      ['sh', '--json', '--dir', cwd, '--timeout', `${Math.max(1, Math.round(timeoutMs / 1000))}s`],
-      { cwd, windowsHide: true },
-    );
-
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-    const done = (r: CommandResult) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(killer);
-      resolve(r);
-    };
-
-    // `mfcore sh` enforces its own deadline, so this only fires if the core
-    // itself is the thing that hung. Nothing in a queue run may block forever,
-    // least of all a call that used to run synchronously on the extension host
-    // and took the whole window down with it.
-    const killer = setTimeout(() => {
-      killTree(child.pid);
-      done({
-        ...NOT_RUN,
-        ran: true,
-        timedOut: true,
-        output: clampOutput(`${stdout}${stderr}`.trim()),
-        error: `the verification command was still running after ${Math.round(timeoutMs / 1000)}s`,
-      });
-    }, timeoutMs + 15_000);
-
-    child.stdout.on('data', (d: Buffer) => {
-      stdout += d.toString();
-    });
-    child.stderr.on('data', (d: Buffer) => {
-      stderr += d.toString();
-    });
-
-    child.on('error', (e) =>
-      done({ ...NOT_RUN, ran: true, invalid: true, error: `could not start mfcore sh: ${e.message}` }),
-    );
-
-    child.on('close', () => {
-      try {
-        const env = JSON.parse(stdout.trim().split('\n').pop() ?? '{}');
-        done({
-          ran: true,
-          code: typeof env.code === 'number' ? env.code : null,
-          output: clampOutput(String(env.output ?? '')),
-          invalid: Boolean(env.invalid),
-          timedOut: Boolean(env.timedOut),
-          error: String(env.error ?? ''),
-        });
-      } catch {
-        // No envelope means the core never got as far as producing one.
-        done({
-          ...NOT_RUN,
-          ran: true,
-          invalid: true,
-          output: clampOutput(`${stdout}${stderr}`.trim()),
-          error: 'mfcore sh did not return a result',
-        });
-      }
-    });
-
-    child.stdin.on('error', () => {
-      /* the child died before taking the script; `close` reports it */
-    });
-    child.stdin.end(command);
-  });
-}
-
-/**
- * Kills a process and everything it started.
- *
- * A build spawns compilers and test runners, and killing only the process we
- * launched leaves those holding the pipes — which is how a "timed out" command
- * goes on consuming the machine after the queue has moved on.
- */
-function killTree(pid: number | undefined): void {
-  if (!pid) {
-    return;
-  }
-  try {
-    if (process.platform === 'win32') {
-      cp.spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
-    } else {
-      process.kill(-pid, 'SIGKILL');
-    }
-  } catch {
-    /* already gone */
-  }
 }
 
 // ---- supervisor --------------------------------------------------------
@@ -1161,107 +1037,53 @@ export async function superviseTask(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   task: Task,
-  check: CommandResult,
   /** How many times this task has already been rewritten — see rewriteNotice. */
   rewrites: number,
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
 ): Promise<SupervisorDecision> {
-  const checkReport = !check.ran
-    ? 'No verification command was configured for this task, so you must verify by inspection.'
-    : check.invalid || check.timedOut
-      ? `The verification command \`${task.solutionVerifyCommand}\` DID NOT RUN.
+  const prompt = `You are the supervisor of an autonomous coding run. Make a lightweight
+accept/reject decision from the executor validation stored in the queue database.
 
-${check.error}
-${check.output ? `\nOutput before it stopped:\n${check.output}` : ''}
-
-This says nothing about the code. It is a defect in the task's own check, and
-it is yours to fix: put a corrected "solutionVerifyCommand" in "taskEdits" for
-seq ${task.seq}. Commands run under a POSIX shell that works the same on every
-platform, so \`&&\`, \`||\`, pipes and quoting are all available — but the
-programs themselves still have to exist in this repo. Then judge the task on
-what you find in the files, not on this.`
-      : `The verification command \`${task.solutionVerifyCommand}\` exited with code ${check.code}.
-
-Output:
-${check.output || '(no output)'}`;
-
-  const prompt = `You are the supervisor of an autonomous coding run. Judge one completed task and decide what happens next.
+You have no tools and must not inspect files, execute commands, rerun tests, or drive a browser.
+That verification belongs exclusively to the executor. Check only whether its conclusion is
+consistent, whether every required check has concrete evidence, and whether failures or missing
+evidence require another attempt.
 
 TASK ${task.seq}: ${task.title}
-This is attempt ${task.attempts}.
+Attempt ${task.attempts}.
 ${rewriteNotice(rewrites)}
-What the task required:
+Requirements:
 ${task.description}
 
-Implementation check to apply:
-${task.implVerifyPrompt || 'confirm the described code exists and is coherent'}
+Required implementation check:
+${task.implVerifyPrompt || 'the described code exists and is coherent'}
 
-Behaviour check to apply:
-${task.solutionVerifyPrompt || 'confirm the described behaviour works'}
+Required behaviour check:
+${task.solutionVerifyPrompt || 'the described behaviour works'}
+${task.solutionVerifyCommand ? `Required command: ${task.solutionVerifyCommand}` : ''}
 
-What the execution agent reported:
-${task.output || '(nothing reported)'}
+EXECUTOR VALIDATION READ FROM THE DATABASE:
+${validationForSupervisor(task.validationReport)}
 
-How the earlier attempts on this task ended, oldest first:
+Earlier attempt outcomes:
 ${attemptHistory(task)}
 
-${checkReport}
-
-Now verify this yourself. Read the files that were supposed to change and confirm they really did — the agent's report is a claim, not evidence. Check the diff for regressions and for damage outside the task's scope.
-
-Then reply with ONE JSON object and nothing else:
+Reply with ONE JSON object and nothing else:
 {
   "verdict": "VERIFIED" | "RETRY" | "SPLIT" | "RESET_FROM",
-  "feedback": "what you found, and for a retry exactly what to do differently",
+  "feedback": "why the stored validation is or is not sufficient",
   "resetFromSeq": <number, only with RESET_FROM>,
   "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
   "taskEdits": [{ "seq": <number>, "description": "...", "solutionVerifyCommand": "..." }]
 }
 
-Choose:
-- VERIFIED   the work is done and correct.
-- RETRY      this task needs another attempt. You MUST also include seq ${task.seq} in
-              "taskEdits" with a REWRITTEN "description". This is not optional and it
-              is not a formality: the executor is a fresh agent with no memory of this
-              conversation, and the description is nearly everything it will see. Send
-              back the same description and you have ordered an identical attempt that
-              will fail in the identical way. Write the description you wish the task
-              had started with — name the files, the functions, the exact change, and
-              what the last attempt got wrong.
-- SPLIT      the approach is right but the task is too big to finish in one sitting.
-              Choose this when attempts keep running out of tool-calling rounds, or keep
-              failing to even finish an attempt at all — the worker goes silent, its
-              process dies, or it never reports back, possibly several times in a row (the
-              attempt history below says so explicitly when this is what happened) — rather
-              than the work coming out wrong. Either pattern means another identically-scoped
-              attempt hits the same wall again, and no rewrite of the same-sized task fixes
-              that. "splitInto" replaces this task with the steps it should have been.
-- RESET_FROM the project went in a wrong direction and earlier work must be redone from
-              "resetFromSeq". Use this sparingly: it throws away finished work, and
-              choosing it repeatedly is how a run makes no progress at all.
-
-There is no verdict for giving up, and there is no attempt limit that ends this task.
-The run does not stop until every task is VERIFIED, so a task you cannot pass is a task
-whose instructions are still wrong — that is the thing you have the power to change.
-Each time you send RETRY, the executor gets whatever description you write and nothing
-else, so make each one different from the last in a way that matters.
-
-If the same approach has now failed twice, do not send a third variation of it. Change
-what the task asks for: SPLIT it into steps, replace the technique, or fix a premise
-that turned out to be false — including the verification command, if that is what is
-actually wrong. A task that keeps failing before an attempt ever finishes — rather than
-finishing and coming out wrong — is rarely fixed by yet another rewrite of the same
-scope; it is usually just too much for one sitting, which is what SPLIT is for.
-
-For SPLIT: give two to ${MAX_SPLIT_PARTS} parts, in execution order, each completable by one
-agent in one sitting and independently verifiable. Do not include work the earlier
-attempts already finished on disk — start from where they actually stopped, and say
-in "feedback" what you confirmed was already done.
-
-Use "taskEdits" for upcoming tasks too, whenever you learn something that makes them
-wrong — a corrected "solutionVerifyCommand" for a check that could not run, or a
-"description" that assumed something you now know is false.`;
+Choose VERIFIED only when the executor concluded PASS and its database report contains concrete
+implementation and behaviour evidence plus successful required commands/tests. Do not independently
+repeat the checks. Choose RETRY for FAIL, INCOMPLETE, contradictory conclusions, or missing evidence;
+include a materially rewritten description for task ${task.seq}. Choose SPLIT after repeated cutoffs
+or when the remaining work is too large for one executor turn. RESET_FROM is only for evidence that
+earlier completed work must be redone. There is no give-up verdict.`;
 
   const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
     maxIterations: supervisorRounds(),
@@ -1563,135 +1385,4 @@ and the attempt above used your latest version and still did not pass. Whatever 
 executor to do differently, it was not enough. Do not send a third phrasing of the same idea —
 change the plan, split the task, or correct the premise that is actually wrong.
 `;
-}
-
-// ---- mid-execution audit -------------------------------------------------
-
-/**
- * True for a value the audit reply can be judged from rather than something
- * quoted along the way — same shape test as `isReview`, minus the fields only
- * a finished-task verdict would have.
- */
-function isAuditReply(value: unknown): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const v = value as Record<string, unknown>;
-  return 'verdict' in v || 'feedback' in v;
-}
-
-export interface AuditDecision {
-  verdict: 'CONTINUE' | 'STOP';
-  feedback: string;
-  /** Required for STOP; a STOP without one is downgraded to CONTINUE. */
-  description?: string;
-  solutionVerifyCommand?: string;
-  usage: Usage;
-}
-
-/**
- * Checks in on a task that is still `EXECUTING` — not finished, not cut off —
- * and decides whether it is still headed somewhere useful.
- *
- * This is deliberately not `superviseTask` in miniature: there is no VERIFIED,
- * no SPLIT, no RESET_FROM, because none of those questions can be answered
- * before the work is done. The only thing worth deciding early is whether to
- * keep going at all, which is why the verdict set is just CONTINUE or STOP.
- *
- * Failure is biased toward CONTINUE on purpose. The worst outcome of a broken
- * *task* is another wasted attempt; the worst outcome of a broken *audit*
- * would be killing a task that was actually fine, which is strictly worse —
- * so an unparseable reply, or a STOP with no real rewrite behind it (the same
- * `rewritten()` check a RETRY verdict is held to), both fall back to CONTINUE
- * rather than stopping anything.
- */
-export async function auditExecution(
-  context: vscode.ExtensionContext,
-  output: vscode.OutputChannel,
-  task: Task,
-  trail: string,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
-): Promise<AuditDecision> {
-  const prompt = `You are the supervisor of an autonomous coding run, checking in on a task that is
-STILL BEING WORKED ON — it has not finished, and has not been cut off. Decide only whether to
-let it keep going.
-
-TASK ${task.seq}: ${task.title}
-This is attempt ${task.attempts}.
-
-What the task requires:
-${task.description}
-
-Implementation check to apply once finished:
-${task.implVerifyPrompt || 'confirm the described code exists and is coherent'}
-
-Behaviour check to apply once finished:
-${task.solutionVerifyPrompt || 'confirm the described behaviour works'}
-
-What the executor has done so far this attempt (its tool calls, oldest first):
-${trail || '(nothing recorded yet)'}
-
-Judge only whether this is still headed somewhere useful — not whether it is finished. An
-executor that is still reading files, still iterating on a test it is actively fixing, or
-partway through a large but coherent change is on track: choose CONTINUE. An executor that is
-repeating the same failing action without changing approach, editing files that have nothing to
-do with the task, contradicting what the task actually asks for, or has clearly wandered into
-unrelated work is not: choose STOP.
-
-Stopping a task that is genuinely still making progress throws away the work it has already
-done, so only choose STOP when the trail above already shows the problem clearly. When in doubt,
-CONTINUE — there will be another chance to look before this attempt runs out.
-
-Reply with ONE JSON object and nothing else:
-{
-  "verdict": "CONTINUE" | "STOP",
-  "feedback": "what you observed, in one or two sentences",
-  "description": "REQUIRED if STOP: the full replacement description the next attempt should
-                  start from — self-contained, naming exactly what went wrong and what to do
-                  differently. Omit for CONTINUE.",
-  "solutionVerifyCommand": "a corrected check command, only if STOP and the current one is part
-                            of the problem — omit to leave it unchanged"
-}`;
-
-  const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
-    maxIterations: Math.min(supervisorRounds(), 15),
-    ...opts,
-  });
-
-  let d: Record<string, unknown> = {};
-  try {
-    d = extractJson<Record<string, unknown>>(text, isAuditReply);
-  } catch {
-    // A reply that cannot be parsed must not silently stop a running task —
-    // see the note on failure bias above.
-    return {
-      verdict: 'CONTINUE',
-      feedback: 'the audit reply could not be parsed; leaving the task running',
-      usage,
-    };
-  }
-
-  const feedback = String(d.feedback ?? '').trim();
-  if (String(d.verdict ?? '').toUpperCase() !== 'STOP') {
-    return { verdict: 'CONTINUE', feedback, usage };
-  }
-
-  const description = String(d.description ?? '').trim();
-  if (!rewritten(description, task.description)) {
-    return {
-      verdict: 'CONTINUE',
-      feedback: feedback
-        ? `${feedback} (no usable rewrite was supplied, so the run was left going)`
-        : 'STOP was chosen with no usable rewrite, so the run was left going',
-      usage,
-    };
-  }
-
-  return {
-    verdict: 'STOP',
-    feedback,
-    description,
-    solutionVerifyCommand: String(d.solutionVerifyCommand ?? '').trim() || undefined,
-    usage,
-  };
 }

@@ -46,6 +46,7 @@ type Task struct {
 	Status                TaskStatus `json:"status"`
 	Seq                   int        `json:"seq"`
 	Output                string     `json:"output"`
+	ValidationReport      string     `json:"validationReport"`
 	ErrorLog              string     `json:"errorLog"`
 	SupervisorFeedback    string     `json:"supervisorFeedback"`
 	Attempts              int        `json:"attempts"`
@@ -209,6 +210,7 @@ func (d *DB) migrate() error {
 			status                  TEXT    NOT NULL DEFAULT 'PENDING',
 			seq                     INTEGER NOT NULL,
 			output                  TEXT    NOT NULL DEFAULT '',
+			validation_report       TEXT    NOT NULL DEFAULT '',
 			error_log               TEXT    NOT NULL DEFAULT '',
 			supervisor_feedback     TEXT    NOT NULL DEFAULT '',
 			attempts                INTEGER NOT NULL DEFAULT 0,
@@ -253,6 +255,7 @@ func (d *DB) migrate() error {
 	d.addColumn("kind", "TEXT NOT NULL DEFAULT 'task'")
 	d.addColumn("region", "TEXT NOT NULL DEFAULT ''")
 	d.addColumn("no_report_streak", "INTEGER NOT NULL DEFAULT 0")
+	d.addColumn("validation_report", "TEXT NOT NULL DEFAULT ''")
 
 	return nil
 }
@@ -434,6 +437,7 @@ const taskColumns = `
 SELECT id, title, description,
        impl_verify_prompt, solution_verify_prompt, solution_verify_command,
        status, seq, output,
+       validation_report,
        error_log, supervisor_feedback,
        attempts, max_attempts, no_report_streak,
        last_activity_at, activity_phase, activity_detail,
@@ -451,6 +455,7 @@ func scanTasks(rows *sql.Rows) ([]Task, error) {
 			&t.ID, &t.Title, &t.Description,
 			&t.ImplVerifyPrompt, &t.SolutionVerifyPrompt, &t.SolutionVerifyCommand,
 			&t.Status, &t.Seq, &t.Output,
+			&t.ValidationReport,
 			&t.ErrorLog, &t.SupervisorFeedback,
 			&t.Attempts, &t.MaxAttempts, &t.NoReportStreak,
 			&t.LastActivityAt, &t.ActivityPhase, &t.ActivityDetail,

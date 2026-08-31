@@ -42,6 +42,8 @@ export interface CoreConfig {
   memoryEnabled: boolean;
   memoryPath: string;
   autoApprove: string[];
+  /** When true, the model receives no tool definitions. */
+  disableTools: boolean;
   /** Tool-calling rounds per turn. 0 leaves the core on its own default. */
   maxIterations: number;
   /** Seconds a reply may deliver nothing before the connection counts as dropped. */
@@ -105,6 +107,7 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     // Unattended edits are gated by the queue's own supervisor rather than a
     // per-tool prompt; this preserves the behaviour the core already had.
     autoApprove: ['*'],
+    disableTools: false,
     // The chat keeps the core's default round ceiling: a person is watching and
     // can say "continue". Queue workers override it per role in queue/agents.ts.
     maxIterations: 0,

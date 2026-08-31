@@ -264,10 +264,8 @@ VS Code settings editor is genuinely good at:
 | `mfagent.queue.maxRounds` | `80` | Tool-calling rounds per unattended turn — the only budget a task has; retries get 50% more each |
 | `mfagent.queue.maxFilesPerRegion` | `150` | Largest file count one region of the workspace may hold before the deterministic scan splits it further — bounds how much a phase's expansion agent explores in one sitting, regardless of project size |
 | `mfagent.queue.workerSilentMinutes` | `10` | How long a worker may write nothing before it counts as dead |
-| `mfagent.queue.auditIntervalSeconds` | `90` | How often the supervisor checks a still-running task's tool-call trail and decides whether to stop and rewrite it, independent of the verification cadence |
 | `mfagent.activityIntervalSeconds` | `30` | How often a working agent records what it is doing |
 | `mfagent.llm.idleMinutes` | `30` | How long a reply may deliver nothing before the connection counts as dropped |
-| `mfagent.queue.verifyCommandTimeoutSeconds` | `300` | Budget for a verification command — a shell command, not an agent |
 | `mfagent.queue.notifyCommand` | `""` | Run with a JSON summary as its one argument when an autonomous run finishes — a script that pings your phone, Slack, or anything else, for the run that finished after you stopped watching |
 
 Changing any of them, or anything on the settings page, restarts the core
@@ -294,21 +292,18 @@ hours is fine as long as it is still arriving; a socket that delivers nothing
 for `llm.idleMinutes` is dropped, and the worker records that it stopped before
 it goes.
 
-### Mid-run auditing
+### Executor-owned validation
 
-A task's round cap (`maxRounds`) is a backstop, not the thing watching it. On
-its own timer — `auditIntervalSeconds`, independent of the verification cron —
-the supervisor reads the executor's tool calls since the last check (which
-file, which command, what came back, not just "still alive") and judges
-whether the run is still headed somewhere useful. An executor that is still
-iterating on a real problem is left alone; one that is repeating a failing
-action, editing unrelated files, or has drifted from what the task actually
-asks is stopped there, handed a rewritten description, and restarted —
-before it grinds through its whole round budget going the wrong way. A check
-with nothing new since the last one costs a database read, not a model call,
-and an audit that fails to parse or proposes no real rewrite always falls
-back to leaving the task running: the failure mode of a broken audit must
-never be worse than the failure mode of not having one.
+The executor owns the expensive verification work. In the same turn that edits
+the code it inspects the final diff, runs configured commands and test suites,
+and drives the browser for UI work. It finishes with a structured PASS, FAIL, or
+INCOMPLETE report containing the observed evidence for every check.
+
+That report is written to `validation_report` in `.mfagent/queue.db` before the
+task enters `VERIFYING`. The supervisor receives no tools at all: it reads this
+database report, checks that the conclusion is consistent and adequately
+supported, and either validates the task or sends it back with revised
+instructions. It never reads code, executes a command, or reruns browser tests.
 
 ### What is worked out for you
 

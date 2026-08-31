@@ -130,6 +130,8 @@ export interface Task {
   seq: number;
   /** Whatever the Execution agent reported back on its last run. */
   output: string;
+  /** Structured verification evidence written by that same executor attempt. */
+  validationReport: string;
   errorLog: string;
   supervisorFeedback: string;
   attempts: number;
@@ -215,6 +217,7 @@ const COLUMNS = `
   solution_verify_prompt  AS solutionVerifyPrompt,
   solution_verify_command AS solutionVerifyCommand,
   status, seq, output,
+  validation_report AS validationReport,
   error_log           AS errorLog,
   supervisor_feedback AS supervisorFeedback,
   attempts, max_attempts AS maxAttempts,
@@ -273,6 +276,7 @@ export class TaskQueue {
         status                  TEXT    NOT NULL DEFAULT 'PENDING',
         seq                     INTEGER NOT NULL,
         output                  TEXT    NOT NULL DEFAULT '',
+        validation_report       TEXT    NOT NULL DEFAULT '',
         error_log               TEXT    NOT NULL DEFAULT '',
         supervisor_feedback     TEXT    NOT NULL DEFAULT '',
         attempts                INTEGER NOT NULL DEFAULT 0,
@@ -329,6 +333,8 @@ export class TaskQueue {
     // See the Task.noReportStreak doc comment — counts a worker's consecutive
     // failures to report back at all, independent of `attempts`.
     this.addColumn('no_report_streak', 'INTEGER NOT NULL DEFAULT 0');
+    // Executors persist their own checks here; supervisors only consume them.
+    this.addColumn('validation_report', "TEXT NOT NULL DEFAULT ''");
   }
 
   /** Adds a column to `tasks` if this database predates it. */
@@ -630,6 +636,7 @@ export class TaskQueue {
     status: 'status',
     seq: 'seq',
     output: 'output',
+    validationReport: 'validation_report',
     errorLog: 'error_log',
     supervisorFeedback: 'supervisor_feedback',
     attempts: 'attempts',
@@ -874,7 +881,7 @@ export class TaskQueue {
         .prepare(
           `UPDATE tasks SET status = 'EXECUTING', attempts = attempts + 1,
              started_at = ?, updated_at = ?, last_activity_at = ?,
-             activity_phase = 'claimed', activity_detail = ''
+             activity_phase = 'claimed', activity_detail = '', validation_report = ''
            WHERE id = ?`,
         )
         .run(now, now, now, row.id);
@@ -1014,7 +1021,7 @@ export class TaskQueue {
   resetAll(): void {
     this.tx(() => {
       this.db.exec(`
-        UPDATE tasks SET status = 'PENDING', attempts = 0, output = '',
+        UPDATE tasks SET status = 'PENDING', attempts = 0, output = '', validation_report = '',
           error_log = '', supervisor_feedback = '', started_at = NULL,
           finished_at = NULL, last_activity_at = NULL, activity_phase = '',
           activity_detail = '', tokens_in = 0, tokens_out = 0,
@@ -1031,7 +1038,7 @@ export class TaskQueue {
     return this.tx(() => {
       const info = this.db
         .prepare(
-          `UPDATE tasks SET status = 'PENDING', attempts = 0, output = '',
+          `UPDATE tasks SET status = 'PENDING', attempts = 0, output = '', validation_report = '',
              started_at = NULL, finished_at = NULL, no_report_streak = 0,
              supervisor_feedback = ?, updated_at = ?
            WHERE seq >= ?`,

@@ -259,13 +259,13 @@ func (a *Agent) finalReport(
 		a.mu.Lock()
 		result.Usage = sess.Usage
 		a.mu.Unlock()
-			var prefix string
-			if accumulated != "" {
-				prefix = accumulated + "\n\n"
-			}
-			result.Text = fmt.Sprintf(
-				"%sStopped after %d tool-calling rounds, and the closing summary could not be "+
-					"produced: %v. Treat any work from this turn as unverified.", prefix, rounds, err)
+		var prefix string
+		if accumulated != "" {
+			prefix = accumulated + "\n\n"
+		}
+		result.Text = fmt.Sprintf(
+			"%sStopped after %d tool-calling rounds, and the closing summary could not be "+
+				"produced: %v. Treat any work from this turn as unverified.", prefix, rounds, err)
 		a.emit("stream/done", map[string]any{
 			"sessionId": req.SessionID, "stopReason": "max_iterations",
 			"usage": result.Usage, "iterations": rounds,
@@ -282,13 +282,13 @@ func (a *Agent) finalReport(
 	result.Usage = sess.Usage
 	a.mu.Unlock()
 
-		var prefix string
-		if accumulated != "" {
-			prefix = accumulated + "\n\n"
-		}
-		result.Text = fmt.Sprintf(
-			"%s[cut off after %d tool-calling rounds — this is a partial-progress report, not a "+
-				"finished task]\n\n%s", prefix, rounds, turn.Text())
+	var prefix string
+	if accumulated != "" {
+		prefix = accumulated + "\n\n"
+	}
+	result.Text = fmt.Sprintf(
+		"%s[cut off after %d tool-calling rounds — this is a partial-progress report, not a "+
+			"finished task]\n\n%s", prefix, rounds, turn.Text())
 	a.emit("stream/done", map[string]any{
 		"sessionId": req.SessionID, "stopReason": "max_iterations",
 		"usage": result.Usage, "iterations": rounds,
@@ -297,6 +297,9 @@ func (a *Agent) finalReport(
 }
 
 func (a *Agent) toolDefs() []llm.ToolDef {
+	if a.cfg.DisableTools {
+		return nil
+	}
 	list := a.registry.List()
 	defs := make([]llm.ToolDef, 0, len(list))
 	for _, t := range list {

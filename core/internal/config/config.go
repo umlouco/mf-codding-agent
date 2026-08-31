@@ -54,10 +54,13 @@ type Config struct {
 	Vision    RoleConfig `json:"vision"`
 	Embedding RoleConfig `json:"embedding"`
 
-	MemoryEnabled   bool   `json:"memoryEnabled"`
-	MemoryPath      string `json:"memoryPath"`
+	MemoryEnabled bool   `json:"memoryEnabled"`
+	MemoryPath    string `json:"memoryPath"`
 
 	AutoApprove []string `json:"autoApprove"`
+	// DisableTools creates a conclusion-only turn. Queue supervisors use it so
+	// verification commands, browser runs, and code inspection stay executor work.
+	DisableTools bool `json:"disableTools"`
 
 	// Tool-calling rounds allowed in one turn. Zero means the built-in default.
 	// The editor raises it for unattended queue workers, which have nobody to

@@ -2,9 +2,6 @@ import * as cp from 'child_process';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
-  AuditDecision,
-  auditExecution,
-  CommandResult,
   encodeRegion,
   executeTask,
   expandPhase,
@@ -12,7 +9,6 @@ import {
   PhaseExpansion,
   Region,
   runScanCommand,
-  runVerifyCommand,
   superviseTask,
   SupervisorDecision,
   withinRegion,
@@ -28,9 +24,8 @@ import { NewTask, QueueStats, Task, TaskQueue } from './db';
  *                    writes the result back, and stops. Spawning the next
  *                    worker is a fresh process with a fresh context window.
  *
- *   supervision pump fires on the cron interval, inspects everything sitting in
- *                    VERIFYING, and rules on it. It owns every transition out
- *                    of VERIFYING, including rolling the queue backwards.
+ *   supervision pump fires on the cron interval, reads executor validation
+ *                    reports from rows sitting in VERIFYING, and rules on them.
  *
  * Neither pump holds state between ticks — if the window reloads mid-run, the
  * database still knows exactly what was happening, and `requeueStale` recovers
@@ -93,9 +88,8 @@ function briefJson(value: unknown, max: number): string {
 }
 
 /**
- * One line describing a finished tool call — the qualitative substrate
- * `auditExecution` reads. Bounded generously but kept, unlike the liveness
- * pings in `recordActivity`, which deliberately carry no content at all.
+ * One line describing a finished executor tool call. It is retained as a
+ * durable diagnostic trail, unlike liveness pings, which carry no content.
  */
 function formatToolEvent(
   name: string,
@@ -140,19 +134,7 @@ export class Orchestrator implements vscode.Disposable {
   private cycle = 0;
   private nextTickAt: number | null = null;
   private disposed = false;
-  private auditTimer: NodeJS.Timeout | undefined;
-  /** Guards one audit call at a time — mirrors `supervising`. */
-  private auditing = false;
-  /** Kills the audit's own turn; see auditActiveExecution. */
-  private auditAbort: (() => void) | null = null;
-  /**
-   * The newest tool-call event `auditActiveExecution` has already judged, for
-   * the (task, attempt) it belongs to. Kept in memory only: it is a cursor
-   * into what has already been looked at, not a fact about the task, so
-   * losing it on a reload just means the next audit re-reads a bit of history
-   * it has already seen rather than anything being wrong.
-   */
-  private lastAudited: { taskId: number; attempt: number; eventId: number } | null = null;
+
 
   private readonly _onDidChange = new vscode.EventEmitter<void>();
   /** Fires whenever the queue or run state moves, so the UI can re-render. */
@@ -197,16 +179,6 @@ export class Orchestrator implements vscode.Disposable {
 
   get mode(): RunMode {
     return this.cfg<RunMode>('queue.mode', 'lockstep');
-  }
-
-  /**
-   * How often the audit pass checks on the currently EXECUTING task —
-   * independent of the verification cron, and deliberately shorter by
-   * default: catching a task going down a wrong path is worth looking sooner
-   * than the cadence a verification check is tuned for. See auditActiveExecution.
-   */
-  private get auditIntervalMs(): number {
-    return Math.max(30, this.cfg<number>('queue.auditIntervalSeconds', 90)) * 1000;
   }
 
   private get workspaceRoot(): string {
@@ -283,12 +255,6 @@ export class Orchestrator implements vscode.Disposable {
     if (!this.watchdog) {
       this.watchdog = setInterval(() => this.kick(), WATCHDOG_MS);
     }
-    // Same reasoning as the watchdog: left running rather than torn down on
-    // every stop/pause, since auditActiveExecution reads the run state itself
-    // and is a no-op whenever nothing is EXECUTING.
-    if (!this.auditTimer) {
-      this.auditTimer = setInterval(() => void this.auditActiveExecution(), this.auditIntervalMs);
-    }
     this.changed();
     this.log(`started — cron every ${Math.round(this.intervalMs / 1000)}s, mode ${this.mode}`);
     void this.pump();
@@ -301,7 +267,6 @@ export class Orchestrator implements vscode.Disposable {
     // abandonReview and abandonExecution.
     this.abandonReview();
     this.abandonExecution();
-    this.abandonAudit();
     this.queue.setRunState('STOPPED');
     this.changed();
     this.log('stopped');
@@ -311,7 +276,6 @@ export class Orchestrator implements vscode.Disposable {
     this.disarm();
     this.abandonReview();
     this.abandonExecution();
-    this.abandonAudit();
     this.queue.pauseOpen();
     this.changed();
     this.log('paused');
@@ -321,7 +285,6 @@ export class Orchestrator implements vscode.Disposable {
     this.disarm();
     this.abandonReview();
     this.abandonExecution();
-    this.abandonAudit();
     this.queue.resetAll();
     this.changed();
     this.log('reset — every task back to PENDING');
@@ -523,18 +486,6 @@ export class Orchestrator implements vscode.Disposable {
     }
   }
 
-  /** Kills the audit turn in flight, if any. Mirrors abandonReview/abandonExecution. */
-  private abandonAudit(): void {
-    const abort = this.auditAbort;
-    this.auditAbort = null;
-    this.auditing = false;
-    try {
-      abort?.();
-    } catch {
-      /* the core was already gone */
-    }
-  }
-
   private sweepSilentWorkers(): void {
     const silentMs = this.silentMs;
     const escalateAfter = this.noReportEscalateAfter;
@@ -583,149 +534,9 @@ export class Orchestrator implements vscode.Disposable {
     }
   }
 
-  // ---- the audit pass ---------------------------------------------------
-
-  /**
-   * Checks in on the currently EXECUTING task, if there is one, and stops and
-   * rewrites it if it has visibly gone down the wrong path.
-   *
-   * Runs on its own timer rather than the verification cron — see
-   * auditIntervalMs — because "is this still on track" wants checking sooner
-   * than "is this finished" does. The round cap in pump() is what used to be
-   * the only thing watching a task while it ran; this is what makes that a
-   * backstop instead of the whole safety net.
-   *
-   * The cost gate below is deliberately about *content*, not time or rounds:
-   * an audit only spends a turn when new tool-call events exist since the
-   * last one looked, so a tick with nothing to judge is a free DB read.
-   */
-  private async auditActiveExecution(): Promise<void> {
-    if (this.disposed || this.queue.runState !== 'RUNNING' || this.auditing) {
-      return;
-    }
-    const task = this.queue.activeTask();
-    // Phases have their own region-based safety net (see runExpansion /
-    // resplitPhaseRegion) — auditing is about a task's approach to real work,
-    // which a phase does not do.
-    if (!task || task.kind !== 'task') {
-      return;
-    }
-
-    const events = this.queue
-      .events(task.id, 200)
-      .filter((e) => e.kind === 'tool')
-      .reverse(); // chronological, oldest first
-    if (events.length === 0) {
-      return;
-    }
-    const sinceId =
-      this.lastAudited?.taskId === task.id && this.lastAudited.attempt === task.attempts
-        ? this.lastAudited.eventId
-        : 0;
-    const fresh = events.filter((e) => e.id > sinceId);
-    if (fresh.length === 0) {
-      return;
-    }
-
-    this.auditing = true;
-    this.changed();
-    let decision: AuditDecision;
-    try {
-      const trail = fresh.map((e) => e.message).join('\n\n');
-      decision = await auditExecution(this.context, this.output, task, trail, {
-        onAbort: (abort) => {
-          this.auditAbort = abort;
-        },
-      });
-    } catch (e: any) {
-      // Same failure bias as a parse failure inside auditExecution itself:
-      // an audit that could not even run must not be treated as a verdict.
-      this.log(`audit of task ${task.seq} failed: ${e?.message ?? e}; leaving it running`);
-      this.auditAbort = null;
-      this.auditing = false;
-      this.changed();
-      return;
-    }
-
-    this.lastAudited = { taskId: task.id, attempt: task.attempts, eventId: events[events.length - 1].id };
-    this.auditAbort = null;
-    this.queue.addUsage(task.id, decision.usage);
-    this.queue.log(task.id, 'supervisor', `audit:${decision.verdict}`, decision.feedback);
-
-    if (decision.verdict !== 'STOP') {
-      this.auditing = false;
-      this.changed();
-      return;
-    }
-
-    // Kill the live worker directly — not the queue-wide requeueStale sweep
-    // abandonExecution uses for "the run itself is stopping", which writes a
-    // generic message that would misdescribe a deliberate, targeted stop.
-    const abort = this.executionAbort;
-    this.executionAbort = null;
-    try {
-      abort?.();
-    } catch {
-      /* the core was already gone */
-    }
-
-    // Same fencing token finishExecution always uses: if the killed worker's
-    // own write-back lands first (or a second audit tick somehow raced this
-    // one), this write is silently dropped rather than corrupting whatever is
-    // true now — see finishExecution in db.ts.
-    const applied = this.queue.finishExecution(task.id, task.attempts, {
-      status: 'PENDING',
-      finishedAt: null,
-      // The supervisor was actively watching this attempt, so however it
-      // ends this is not the kind of silent no-report failure the streak
-      // tracks — see sweepSilentWorkers and requeueStale.
-      noReportStreak: 0,
-      description: decision.description || task.description,
-      solutionVerifyCommand: decision.solutionVerifyCommand || task.solutionVerifyCommand,
-      errorLog: appendAttempt(
-        task.errorLog,
-        `[attempt ${task.attempts}] stopped mid-run by the supervisor: ${decision.feedback}`,
-      ),
-    });
-    if (applied) {
-      this.queue.log(task.id, 'supervisor', 'audit-stop', decision.feedback);
-      this.log(`task ${task.seq} — supervisor stopped it mid-run and rewrote its instructions`);
-    } else {
-      this.log(`task ${task.seq} — audit verdict arrived after the run moved past this attempt; discarding it`);
-    }
-    this.auditing = false;
-    this.changed();
-  }
-
   /** Runs the full verification pass for one task and applies the verdict. */
   private async supervise(task: Task): Promise<void> {
     this.log(`supervising task ${task.seq} — ${task.title}`);
-
-    let check: CommandResult = {
-      ran: false,
-      code: null,
-      output: '',
-      invalid: false,
-      timedOut: false,
-      error: '',
-    };
-    if (task.solutionVerifyCommand) {
-      const budget = this.cfg<number>('queue.verifyCommandTimeoutSeconds', 300) * 1000;
-      check = await runVerifyCommand(
-        this.context,
-        task.solutionVerifyCommand,
-        this.workspaceRoot,
-        budget,
-      );
-      this.queue.log(
-        task.id,
-        'supervisor',
-        'verify-command',
-        check.invalid || check.timedOut
-          ? `did not run — ${check.error}: ${check.output.slice(0, 2000)}`
-          : `exit ${check.code}: ${check.output.slice(0, 2000)}`,
-      );
-    }
 
     // From here until the verdict lands there is a turn running that only this
     // record can account for — see sweepSilentReview.
@@ -735,7 +546,7 @@ export class Orchestrator implements vscode.Disposable {
 
     let decision: SupervisorDecision;
     try {
-      decision = await superviseTask(this.context, this.output, task, check, this.rewrites(task), {
+      decision = await superviseTask(this.context, this.output, task, this.rewrites(task), {
         onAbort: (abort) => {
           review.abort = abort;
         },
@@ -901,7 +712,7 @@ export class Orchestrator implements vscode.Disposable {
    *
    * In lockstep mode nothing starts while a task is awaiting verification, so
    * task N+1 is never built on top of unverified task N. Continuous mode lets
-   * the queue run ahead and the supervisor audit behind it.
+   * later executors may run ahead while conclusion checks follow behind.
    *
    * "At most one worker at a time" is not enforced here. `claimNext` refuses
    * to hand out a task while any row is EXECUTING, so calling this twice at
@@ -953,9 +764,8 @@ export class Orchestrator implements vscode.Disposable {
     // stream/tool fires twice per call — once on "running" (carries the
     // input, not the output), once on completion (carries the output, not
     // the input) — matched by id. Correlating them here is what turns the
-    // liveness pings elsewhere into a trail with actual content: which file,
-    // which command, what came back. See auditExecution, which is the reason
-    // this exists — a mid-run check has nothing qualitative to judge without it.
+    // liveness pings elsewhere into a diagnostic trail with actual content:
+    // which file, which command, and what came back.
     const pendingTools = new Map<string, { name: string; input: unknown }>();
 
     try {
@@ -1017,6 +827,9 @@ export class Orchestrator implements vscode.Disposable {
       const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'VERIFYING',
         output: res.text,
+        // This is the hand-off contract: verification evidence crosses the
+        // executor/supervisor boundary only through the queue database.
+        validationReport: res.validationReport,
         // The worker reported, whatever it reported — see noReportStreak.
         noReportStreak: 0,
         ...(cutOffNote ? { errorLog: cutOffNote } : {}),
@@ -1030,6 +843,7 @@ export class Orchestrator implements vscode.Disposable {
           res.cutOff ? 'cut-off' : 'completed',
           res.text.slice(0, 4000),
         );
+        this.queue.log(task.id, 'executor', 'validation', res.validationReport.slice(0, 8000));
         this.log(
           res.cutOff
             ? `task ${task.seq} cut off after ${res.rounds} rounds; awaiting supervision`
@@ -1040,10 +854,9 @@ export class Orchestrator implements vscode.Disposable {
       const msg = String(e?.message ?? e);
       // A worker that died mid-turn — a dropped connection, a crashed core, or
       // abandonExecution killing it on purpose — still edited real files. Send
-      // it to the supervisor, which verifies by reading the workspace rather
-      // than by trusting a report; bouncing it straight back to PENDING spends
-      // another whole attempt with no idea what the last one built. The
-      // journal it wrote on the way down says how far it got.
+      // it to the supervisor with an empty validation report. The supervisor
+      // cannot inspect the workspace, so it will reject the missing evidence
+      // and use the journal/error history to shape the next attempt.
       const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'VERIFYING',
         output: '',
@@ -1368,13 +1181,8 @@ export class Orchestrator implements vscode.Disposable {
       clearInterval(this.watchdog);
       this.watchdog = undefined;
     }
-    if (this.auditTimer) {
-      clearInterval(this.auditTimer);
-      this.auditTimer = undefined;
-    }
     this.abandonReview();
     this.abandonExecution();
-    this.abandonAudit();
     this._onDidChange.dispose();
   }
 }

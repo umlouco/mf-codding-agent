@@ -217,7 +217,7 @@
           "type": "string",
           "enum": ["lockstep", "continuous"],
           "default": "lockstep",
-          "description": "lockstep = verify before next task. continuous = run ahead, audit behind."
+          "description": "lockstep = validate before next task. continuous = executors run ahead while conclusion checks follow."
         },
         "mfagent.queue.cronIntervalSeconds": {
           "type": "number",
@@ -265,18 +265,7 @@
           "type": "number",
           "default": 40,
           "minimum": 10,
-          "description": "Tool-calling rounds the supervisor gets per task. Lower is cheaper and usually enough for verification."
-        },
-        "mfagent.queue.auditIntervalSeconds": {
-          "type": "number",
-          "default": 90,
-          "minimum": 30,
-          "markdownDescription": "How often the supervisor checks in on a task that is still running, independent of `#mfagent.queue.cronIntervalSeconds#`. Each check reads the executor's tool calls so far and either lets it continue or stops and rewrites it — the round cap is only the backstop for when this does not catch a bad turn first. A check with nothing new to look at costs no LLM call."
-        },
-        "mfagent.queue.verifyCommandTimeoutSeconds": {
-          "type": "number",
-          "default": 300,
-          "description": "Max seconds per verification command."
+          "description": "Compatibility ceiling for supervisor replies. Supervisors receive no tools and normally finish in one conclusion-only response."
         },
         "mfagent.queue.notifyCommand": {
           "type": "string",
