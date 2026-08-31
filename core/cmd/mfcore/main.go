@@ -168,6 +168,8 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		FileChanged: func(path string) {
 			_ = s.conn.Notify("file/changed", map[string]any{"path": path})
 		},
+		EditorWrite: s.editorWrite,
+		EditorEdit:  s.editorEdit,
 	}
 
 	tools.RegisterFS(s.registry)
@@ -366,6 +368,49 @@ func (s *server) ask(ctx context.Context, tool, summary string, input any) (bool
 		s.cfg.AutoApprove = append(s.cfg.AutoApprove, tool)
 	}
 	return reply.Approved, nil
+}
+
+// ---- editor-side file writes --------------------------------------------
+//
+// These hand the actual mutation to the extension instead of touching the
+// file directly — see Env.EditorWrite / Env.EditorEdit and src/editorFs.ts.
+// The point is not speed, it is correctness: the extension applies the
+// change through vscode.workspace.applyEdit against whatever is actually
+// live for that file (an open, possibly unsaved buffer, or disk if nothing
+// has it open), so an edit can never silently overwrite work the user has
+// not saved yet, and it participates in VS Code's own undo stack. It always
+// ends with the document saved, so every other tool — which still reads and
+// writes the workspace directly — keeps seeing disk as the single source of
+// truth.
+
+func (s *server) editorWrite(ctx context.Context, path, content string) error {
+	var reply struct {
+		OK bool `json:"ok"`
+	}
+	return s.conn.Call(ctx, "fs/write", map[string]any{
+		"path": path, "content": content,
+	}, &reply)
+}
+
+func (s *server) editorEdit(ctx context.Context, path string, edits []tools.EditOp) (int, error) {
+	type editParam struct {
+		OldString  string `json:"old_string"`
+		NewString  string `json:"new_string"`
+		ReplaceAll bool   `json:"replace_all"`
+	}
+	params := make([]editParam, len(edits))
+	for i, e := range edits {
+		params[i] = editParam{OldString: e.OldString, NewString: e.NewString, ReplaceAll: e.ReplaceAll}
+	}
+	var reply struct {
+		Replacements int `json:"replacements"`
+	}
+	if err := s.conn.Call(ctx, "fs/edit", map[string]any{
+		"path": path, "edits": params,
+	}, &reply); err != nil {
+		return 0, err
+	}
+	return reply.Replacements, nil
 }
 
 // ---- chat --------------------------------------------------------------

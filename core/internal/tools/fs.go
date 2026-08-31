@@ -174,11 +174,21 @@ func RegisterFS(r *Registry) {
 			if err := reads.check(abs); err != nil {
 				return Errf("%v", err)
 			}
-			if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-				return Errf("mkdir: %v", err)
-			}
-			if err := os.WriteFile(abs, []byte(a.Content), 0o644); err != nil {
-				return Errf("write %s: %v", a.Path, err)
+			if env.EditorWrite != nil {
+				// Goes through the editor's own document/edit APIs — if the file
+				// is open, this lands as a real edit against whatever is actually
+				// in the buffer (including unsaved changes) instead of a raw byte
+				// overwrite that would clobber them. See src/editorFs.ts.
+				if err := env.EditorWrite(ctx, abs, a.Content); err != nil {
+					return Errf("write %s: %v", a.Path, err)
+				}
+			} else {
+				if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+					return Errf("mkdir: %v", err)
+				}
+				if err := os.WriteFile(abs, []byte(a.Content), 0o644); err != nil {
+					return Errf("write %s: %v", a.Path, err)
+				}
 			}
 			reads.mark(abs)
 			if env.FileChanged != nil {
@@ -227,14 +237,29 @@ func RegisterFS(r *Registry) {
 			if err != nil {
 				return Errf("%v", err)
 			}
-			out, n, err := applyEdit(abs, a.OldString, a.NewString, a.ReplaceAll)
+			if err := reads.check(abs); err != nil {
+				return Errf("%v", err)
+			}
+			var n int
+			if env.EditorEdit != nil {
+				// The match itself is recomputed in the editor against whatever
+				// text is actually live there — see the comment on write_file
+				// above and src/editorFs.ts — and lands as a small range edit,
+				// not a full-file rewrite, which is what makes this safe to use
+				// on a large file.
+				n, err = env.EditorEdit(ctx, abs, []EditOp{
+					{OldString: a.OldString, NewString: a.NewString, ReplaceAll: a.ReplaceAll},
+				})
+			} else {
+				_, n, err = applyEditRaw(abs, a.OldString, a.NewString, a.ReplaceAll)
+			}
 			if err != nil {
 				return Errf("%v", err)
 			}
+			reads.mark(abs)
 			if env.FileChanged != nil {
 				env.FileChanged(abs)
 			}
-			_ = out
 			return Ok(fmt.Sprintf("Applied %d replacement(s) in %s.", n, env.Rel(abs)))
 		},
 	})
@@ -286,22 +311,40 @@ func RegisterFS(r *Registry) {
 			if err := reads.check(abs); err != nil {
 				return Errf("%v", err)
 			}
-			raw, err := os.ReadFile(abs)
-			if err != nil {
-				return Errf("read %s: %v", a.Path, err)
-			}
-			text := string(raw)
-			total := 0
-			for i, e := range a.Edits {
-				next, n, err := replaceIn(text, e.OldString, e.NewString, e.ReplaceAll)
-				if err != nil {
-					return Errf("edit %d/%d failed: %v (no changes written)", i+1, len(a.Edits), err)
+
+			var total int
+			if env.EditorEdit != nil {
+				// The whole ordered batch goes over in one call so the editor can
+				// apply it as a single native edit — one undo step — rather than
+				// one write per replacement. See src/editorFs.ts, which folds the
+				// edits the same way this function does below (each one sees the
+				// text the one before it produced).
+				ops := make([]EditOp, len(a.Edits))
+				for i, e := range a.Edits {
+					ops[i] = EditOp{OldString: e.OldString, NewString: e.NewString, ReplaceAll: e.ReplaceAll}
 				}
-				text = next
-				total += n
-			}
-			if err := os.WriteFile(abs, []byte(text), 0o644); err != nil {
-				return Errf("write %s: %v", a.Path, err)
+				var err error
+				total, err = env.EditorEdit(ctx, abs, ops)
+				if err != nil {
+					return Errf("%v (no changes written)", err)
+				}
+			} else {
+				raw, err := os.ReadFile(abs)
+				if err != nil {
+					return Errf("read %s: %v", a.Path, err)
+				}
+				text := string(raw)
+				for i, e := range a.Edits {
+					next, n, err := replaceIn(text, e.OldString, e.NewString, e.ReplaceAll)
+					if err != nil {
+						return Errf("edit %d/%d failed: %v (no changes written)", i+1, len(a.Edits), err)
+					}
+					text = next
+					total += n
+				}
+				if err := os.WriteFile(abs, []byte(text), 0o644); err != nil {
+					return Errf("write %s: %v", a.Path, err)
+				}
 			}
 			reads.mark(abs)
 			if env.FileChanged != nil {
@@ -354,10 +397,10 @@ func RegisterFS(r *Registry) {
 	})
 }
 
-func applyEdit(abs, oldStr, newStr string, all bool) (string, int, error) {
-	if err := reads.check(abs); err != nil {
-		return "", 0, err
-	}
+// applyEditRaw is the fallback used when no editor is connected to apply the
+// edit natively (see Env.EditorEdit) — a plain in-process read/replace/write.
+// The caller has already checked reads.check.
+func applyEditRaw(abs, oldStr, newStr string, all bool) (string, int, error) {
 	raw, err := os.ReadFile(abs)
 	if err != nil {
 		return "", 0, fmt.Errorf("read: %w", err)

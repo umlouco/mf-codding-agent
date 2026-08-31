@@ -2,6 +2,7 @@ import * as cp from 'child_process';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CoreClient, InitResult } from './core';
+import { registerEditorFsHandlers } from './editorFs';
 import { ChatPanel } from './panel';
 import { queueDbPath, resolveMcpBinary } from './detect';
 import { TaskQueue } from './queue/db';
@@ -34,6 +35,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   core = new CoreClient(context, output);
   context.subscriptions.push(core);
+  registerEditorFsHandlers(core);
 
   chat = ChatPanel.createOrShow(context, core, output);
 
@@ -363,10 +365,11 @@ async function openTaskQueue(context: vscode.ExtensionContext): Promise<void> {
   queueView?.attach(q, orch);
 
   // A run interrupted by a reload left tasks marked EXECUTING with no process
-  // behind them; put them back in the queue before anyone reads it.
-  const recovered = q.requeueStale(0);
-  if (recovered > 0) {
-    output.appendLine(`[queue] recovered ${recovered} task(s) orphaned by a previous session`);
+  // behind them; put them back in the queue before anyone reads it. Routed
+  // through the orchestrator rather than the queue directly so a task that
+  // keeps ending up orphaned gets escalated to the supervisor — see
+  // Orchestrator.recoverOrphaned.
+  if (orch.recoverOrphaned() > 0) {
     queueView?.render();
   }
 

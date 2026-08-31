@@ -231,6 +231,12 @@
           "minimum": 1,
           "markdownDescription": "How long a running worker may write nothing before it is treated as dead and its task requeued. This is not a time limit on the task: a live worker writes an activity record every `#mfagent.activityIntervalSeconds#` even while it waits on the model, so only a process that has actually stopped goes quiet for this long. Raise it if you see healthy workers being requeued."
         },
+        "mfagent.queue.noReportEscalateAfter": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "markdownDescription": "How many times in a row a task's worker may fail to report back at all — go silent past `#mfagent.queue.workerSilentMinutes#`, or the process (or the window around it) die with it — before the task is sent to the supervisor instead of requeued again with nobody reviewing it. This is what lets a task whose worker keeps crashing or hanging eventually get split into smaller tasks or rewritten, instead of looping for hours with no one noticing."
+        },
         "mfagent.activityIntervalSeconds": {
           "type": "number",
           "default": 30,

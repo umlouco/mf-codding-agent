@@ -2,6 +2,7 @@ import * as cp from 'child_process';
 import * as vscode from 'vscode';
 import { CoreClient, CoreConfig } from '../core';
 import { resolveCoreBinary, workspaceRoot } from '../detect';
+import { registerEditorFsHandlers } from '../editorFs';
 import { getStore } from '../providers/instance';
 import { NewTask, Task, TaskQueue, Usage } from './db';
 
@@ -144,6 +145,7 @@ async function runOnce(
   opts: RunOptions = {},
 ): Promise<TurnResult> {
   const client = new CoreClient(context, output);
+  registerEditorFsHandlers(client);
   const { maxIterations = 0, onEvent, onCancellable, onAbort, onActivity } = opts;
 
   client.onNotification((method, params) => {
@@ -1228,10 +1230,13 @@ Choose:
               had started with — name the files, the functions, the exact change, and
               what the last attempt got wrong.
 - SPLIT      the approach is right but the task is too big to finish in one sitting.
-              Choose this when attempts keep running out of tool-calling rounds rather
-              than getting the work wrong — another identical attempt will be cut off in
-              the same place. "splitInto" replaces this task with the steps it should
-              have been.
+              Choose this when attempts keep running out of tool-calling rounds, or keep
+              failing to even finish an attempt at all — the worker goes silent, its
+              process dies, or it never reports back, possibly several times in a row (the
+              attempt history below says so explicitly when this is what happened) — rather
+              than the work coming out wrong. Either pattern means another identically-scoped
+              attempt hits the same wall again, and no rewrite of the same-sized task fixes
+              that. "splitInto" replaces this task with the steps it should have been.
 - RESET_FROM the project went in a wrong direction and earlier work must be redone from
               "resetFromSeq". Use this sparingly: it throws away finished work, and
               choosing it repeatedly is how a run makes no progress at all.
@@ -1245,7 +1250,9 @@ else, so make each one different from the last in a way that matters.
 If the same approach has now failed twice, do not send a third variation of it. Change
 what the task asks for: SPLIT it into steps, replace the technique, or fix a premise
 that turned out to be false — including the verification command, if that is what is
-actually wrong.
+actually wrong. A task that keeps failing before an attempt ever finishes — rather than
+finishing and coming out wrong — is rarely fixed by yet another rewrite of the same
+scope; it is usually just too much for one sitting, which is what SPLIT is for.
 
 For SPLIT: give two to ${MAX_SPLIT_PARTS} parts, in execution order, each completable by one
 agent in one sitting and independently verifiable. Do not include work the earlier
@@ -1267,15 +1274,28 @@ wrong — a corrected "solutionVerifyCommand" for a check that could not run, or
   try {
     d = extractJson<SupervisorDecision>(text, isReview);
   } catch {
-    // A supervisor that cannot be parsed must not silently pass the task — but
-    // it must not silently retry it either, because a retry with no rewrite is
-    // the same attempt again. Fall through to the repair pass below.
-    parsed = false;
-    d = {
-      verdict: 'RETRY',
-      feedback:
-        'The supervisor did not return a parseable verdict. Raw reply:\n' + text.slice(0, 2000),
-    };
+    // The model may well have reached a real conclusion — "the work is
+    // correct", say — and simply forgotten the JSON envelope. Ask it to
+    // restate that same judgement in the required shape before this code
+    // assumes anything on its behalf; see reformatVerdict for why that is not
+    // the same repair demandRewrite does.
+    const reformatted = await reformatVerdict(context, output, task, text, opts);
+    addUsage(total, reformatted.usage);
+    if (reformatted.decision) {
+      d = reformatted.decision;
+    } else {
+      // Still nothing usable. A supervisor that cannot be understood must not
+      // silently pass the task — but it must not silently retry it either,
+      // because a retry with no rewrite is the same attempt again. Fall
+      // through to the demandRewrite repair pass below.
+      parsed = false;
+      d = {
+        verdict: 'RETRY',
+        feedback:
+          "The supervisor's reply could not be understood as a verdict, even after being asked " +
+          'to restate it. Raw reply:\n' + text.slice(0, 2000),
+      };
+    }
   }
 
   const named = String(d.verdict ?? '').toUpperCase();
@@ -1378,6 +1398,68 @@ function addUsage(into: Usage, add: Usage): void {
   into.output += add.output;
   into.cacheRead += add.cacheRead;
   into.cacheWrite += add.cacheWrite;
+}
+
+/**
+ * Asks the supervisor to restate its own last reply as the required JSON
+ * object, without reconsidering what it concluded.
+ *
+ * A reply that reads as a real conclusion in plain prose — "the work is
+ * complete and correct" — is not evidence the task failed; it is evidence the
+ * model forgot the JSON envelope. Treating every unparseable reply as a
+ * disguised RETRY, the way the fallback below has to, throws that conclusion
+ * away and replaces it with a manufactured "did not return a parseable
+ * verdict" note — which then goes on to look like negative feedback on a task
+ * that may well have just been verified. This asks for nothing but the
+ * format fix, so whatever verdict comes back — VERIFIED included — is the
+ * model's real judgement, not a guess this code made on its behalf.
+ *
+ * Deliberately not `demandRewrite`: that prompt is built on the premise that
+ * the model already asked for another attempt and only forgot the rewrite.
+ * Handing it a reply that was never a RETRY in the first place — most often
+ * exactly this "it's already done" case — asks the model to justify a
+ * decision it never made, which produces a second reply no more trustworthy
+ * than the first.
+ */
+async function reformatVerdict(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+  task: Task,
+  rawReply: string,
+  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'>,
+): Promise<{ decision?: Partial<SupervisorDecision>; usage: Usage }> {
+  const prompt = `Your last reply about task ${task.seq} was not returned as the required JSON object, so it
+could not be read as a verdict. Here is exactly what you wrote:
+
+${rawReply.slice(0, 4000)}
+
+Restate the SAME judgement — do not reconsider it, do not change your mind, just put it in the
+required shape — as ONE JSON object and nothing else:
+{
+  "verdict": "VERIFIED" | "RETRY" | "SPLIT" | "RESET_FROM",
+  "feedback": "what you found, and for a retry exactly what to do differently",
+  "resetFromSeq": <number, only with RESET_FROM>,
+  "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
+                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
+  "taskEdits": [{ "seq": <number>, "description": "...", "solutionVerifyCommand": "..." }]
+}
+
+If your reply above reached a clear conclusion — the work is correct, it needs another attempt,
+it is too big to finish in one sitting, or the project needs to roll back — that conclusion,
+and nothing else, is what "verdict" should say. If it was VERIFIED, say so; do not turn a pass
+into a retry just because the first reply was not formatted correctly. If your conclusion really
+was that this task needs another attempt, "taskEdits" must include a rewritten "description" for
+task ${task.seq} — the same requirement the original instructions gave you.`;
+
+  try {
+    const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
+      maxIterations: Math.min(supervisorRounds(), 12),
+      ...opts,
+    });
+    return { decision: extractJson<Partial<SupervisorDecision>>(text, isReview), usage };
+  } catch {
+    return { usage: { ...NO_USAGE } };
+  }
 }
 
 /**

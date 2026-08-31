@@ -320,9 +320,21 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content   string        `json:"content"`
-					Reasoning string        `json:"reasoning_content"`
-					ToolCalls []oaiToolCall `json:"tool_calls"`
+					Content string `json:"content"`
+					// Two spellings for the same thing, because the
+					// providers behind this one endpoint shape disagree.
+					// DeepSeek's own API (and some vLLM/llama.cpp builds)
+					// send "reasoning_content"; OpenRouter normalises every
+					// backend it fronts — including that same DeepSeek
+					// model — to a bare "reasoning" instead. Missing either
+					// one means the entire reasoning stream is silently
+					// dropped: not shown as thinking, not counted, gone —
+					// while the connection stays busy for however long the
+					// model spends thinking, which for a real reasoning
+					// model is most of the turn.
+					ReasoningContent string        `json:"reasoning_content"`
+					Reasoning        string        `json:"reasoning"`
+					ToolCalls        []oaiToolCall `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
@@ -348,8 +360,12 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 			}
 		}
 		for _, ch := range chunk.Choices {
-			if ch.Delta.Reasoning != "" && sink != nil {
-				sink(Event{Kind: EventThinking, Text: ch.Delta.Reasoning})
+			reasoning := ch.Delta.ReasoningContent
+			if reasoning == "" {
+				reasoning = ch.Delta.Reasoning
+			}
+			if reasoning != "" && sink != nil {
+				sink(Event{Kind: EventThinking, Text: reasoning})
 			}
 			if ch.Delta.Content != "" {
 				text.WriteString(ch.Delta.Content)

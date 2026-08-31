@@ -212,3 +212,47 @@ func TestStreamRetriesWithoutReasoningEffortOnRejection(t *testing.T) {
 		t.Errorf("text = %q, want %q", turn.Text(), "still works")
 	}
 }
+
+// DeepSeek's own API (and some local servers) stream reasoning under
+// "reasoning_content"; OpenRouter normalises every backend it fronts —
+// including that same DeepSeek model — to a bare "reasoning" instead. Missing
+// either spelling means that provider's entire reasoning stream is silently
+// dropped: not shown as thinking, not counted, gone, while the connection
+// stays busy for however long the model spends thinking.
+func TestStreamCollectsReasoningUnderEitherFieldName(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+	}{
+		{"DeepSeek-native", "reasoning_content"},
+		{"OpenRouter-normalised", "reasoning"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(sse(
+					fmt.Sprintf(`{"choices":[{"delta":{"%s":"thinking a"}}]}`, tc.field),
+					fmt.Sprintf(`{"choices":[{"delta":{"%s":"thinking b"}}]}`, tc.field),
+					`{"choices":[{"delta":{"content":"the answer"}}]}`,
+				)))
+			}))
+			defer srv.Close()
+
+			var thinking strings.Builder
+			turn, err := newTestProvider(srv.URL).Stream(context.Background(), Request{}, func(ev Event) {
+				if ev.Kind == EventThinking {
+					thinking.WriteString(ev.Text)
+				}
+			})
+			if err != nil {
+				t.Fatalf("Stream: %v", err)
+			}
+			if got := thinking.String(); got != "thinking athinking b" {
+				t.Errorf("reasoning collected = %q, want %q", got, "thinking athinking b")
+			}
+			if turn.Text() != "the answer" {
+				t.Errorf("text = %q, want %q — reasoning must not leak into visible content", turn.Text(), "the answer")
+			}
+		})
+	}
+}

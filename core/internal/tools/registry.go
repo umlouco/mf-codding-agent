@@ -76,8 +76,29 @@ type Env struct {
 	// FileChanged notifies the editor that a path was written.
 	FileChanged func(path string)
 
+	// EditorWrite, when set, asks the editor to create or fully replace a
+	// file's content through its own document/edit APIs instead of a raw OS
+	// write — see write_file in fs.go. Nil in any process with no live editor
+	// connection (`mfcore sh`, unit tests), which falls back to a plain
+	// os.WriteFile.
+	EditorWrite func(ctx context.Context, path, content string) error
+
+	// EditorEdit, when set, asks the editor to apply one or more find/replace
+	// edits to a file through its own document/edit APIs — see edit_file and
+	// multi_edit in fs.go. Nil the same as EditorWrite, and falls back the
+	// same way, to an in-process read/replace/write.
+	EditorEdit func(ctx context.Context, path string, edits []EditOp) (int, error)
+
 	rootOnce sync.Once
 	rootReal string
+}
+
+// EditOp is one find/replace instruction handed to Env.EditorEdit — the same
+// shape edit_file and multi_edit already take from the model.
+type EditOp struct {
+	OldString  string
+	NewString  string
+	ReplaceAll bool
 }
 
 // realRoot is the workspace root with symlinks and Windows 8.3 short names

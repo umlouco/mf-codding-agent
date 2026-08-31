@@ -240,15 +240,31 @@ export class Orchestrator implements vscode.Disposable {
 
   // ---- controls --------------------------------------------------------
 
+  /**
+   * Recovers tasks left EXECUTING by a process that no longer exists —
+   * a crashed core, or a window that reloaded mid-run. Called from `start()`
+   * and also directly on activation, before the run may even be RUNNING, so
+   * a workspace that was left orphaned is fixed before anyone reads it.
+   *
+   * Uses `noReportEscalateAfter`: this is the actual crash-recovery moment,
+   * so a task that keeps ending up here is a task whose worker keeps dying
+   * before writing anything, and it is escalated to the supervisor rather
+   * than silently requeued again — see requeueStale.
+   */
+  recoverOrphaned(): number {
+    const recovered = this.queue.requeueStale(0, this.noReportEscalateAfter);
+    if (recovered > 0) {
+      this.log(`recovered ${recovered} orphaned task(s) from a previous session`);
+    }
+    return recovered;
+  }
+
   start(): void {
     if (this.queue.runState === 'RUNNING' && this.timer) {
       return;
     }
     // Anything left EXECUTING belongs to a process that no longer exists.
-    const recovered = this.queue.requeueStale(0);
-    if (recovered > 0) {
-      this.log(`recovered ${recovered} orphaned task(s) from a previous session`);
-    }
+    this.recoverOrphaned();
     const revived = this.queue.reviveFailed();
     if (revived > 0) {
       this.log(`returned ${revived} task(s) retired by an earlier run to the queue`);
@@ -412,6 +428,17 @@ export class Orchestrator implements vscode.Disposable {
   }
 
   /**
+   * How many consecutive times a task's worker may fail to report back at
+   * all — go silent, or the process (or the host around it) die outright —
+   * before the task is routed to the supervisor instead of requeued again
+   * with nobody looking at it. See requeueStale's `escalateAfter` and
+   * sweepSilentWorkers below; this is the threshold both apply.
+   */
+  private get noReportEscalateAfter(): number {
+    return Math.max(1, this.cfg<number>('queue.noReportEscalateAfter', 2));
+  }
+
+  /**
    * The same test as sweepSilentWorkers, applied to the supervisor.
    *
    * A review is a turn against a model like any other and wedges the same way,
@@ -510,24 +537,48 @@ export class Orchestrator implements vscode.Disposable {
 
   private sweepSilentWorkers(): void {
     const silentMs = this.silentMs;
+    const escalateAfter = this.noReportEscalateAfter;
     for (const task of this.queue.silentWorkers(silentMs)) {
       const quiet = Math.round((Date.now() - (task.lastActivityAt ?? task.startedAt ?? 0)) / 60_000);
       const note =
         `the worker went silent for ${quiet} minute(s) while ${task.activityPhase || 'starting up'}` +
         (task.activityDetail ? ` (${task.activityDetail})` : '');
 
-      // Straight back to PENDING rather than to the supervisor: unlike a worker
-      // that died with a message, this one never said goodbye, and there is no
-      // report to judge. The journal is still there for the next attempt. A dead
-      // process is also not evidence that the task is wrong, so this is the one
-      // path that requeues without asking the supervisor to rewrite anything.
-      this.queue.update(task.id, {
-        status: 'PENDING',
-        errorLog: appendAttempt(task.errorLog, `[attempt ${task.attempts}] ${note}.`),
-        finishedAt: null,
-      });
-      this.queue.log(task.id, 'system', 'silent', note);
-      this.log(`task ${task.seq} — ${note}; requeued`);
+      // A dead process is not evidence that the task is wrong, so on its own
+      // this requeues without asking the supervisor to rewrite anything —
+      // unlike a worker that died with a message, this one never said
+      // goodbye, and there is no report to judge. But enough of them in a row
+      // (a phase never counts — see TaskKind) is itself evidence the
+      // supervisor has never had a chance to see: a task whose worker cannot
+      // even finish one attempt, over and over, may simply be too big for one
+      // sitting. Past `escalateAfter`, it goes to VERIFYING instead — the
+      // same route a task takes when it genuinely finishes — so the
+      // supervisor can retry it with better instructions, split it, or roll
+      // it back, rather than it spinning forever with nobody looking.
+      const streak = task.kind === 'task' ? task.noReportStreak + 1 : task.noReportStreak;
+      if (task.kind === 'task' && streak >= escalateAfter) {
+        this.queue.update(task.id, {
+          status: 'VERIFYING',
+          finishedAt: null,
+          noReportStreak: 0,
+          errorLog: appendAttempt(
+            task.errorLog,
+            `[attempt ${task.attempts}] ${note}. This is the ${streak}th time in a row a worker has ` +
+              'failed to even finish this task — escalating to the supervisor instead of retrying blindly.',
+          ),
+        });
+        this.queue.log(task.id, 'system', 'escalated', `${note}; ${streak} consecutive no-report failures`);
+        this.log(`task ${task.seq} — ${note}; escalated to the supervisor after ${streak} silent attempt(s)`);
+      } else {
+        this.queue.update(task.id, {
+          status: 'PENDING',
+          errorLog: appendAttempt(task.errorLog, `[attempt ${task.attempts}] ${note}.`),
+          finishedAt: null,
+          ...(task.kind === 'task' ? { noReportStreak: streak } : {}),
+        });
+        this.queue.log(task.id, 'system', 'silent', note);
+        this.log(`task ${task.seq} — ${note}; requeued`);
+      }
       this.changed();
     }
   }
@@ -625,6 +676,10 @@ export class Orchestrator implements vscode.Disposable {
     const applied = this.queue.finishExecution(task.id, task.attempts, {
       status: 'PENDING',
       finishedAt: null,
+      // The supervisor was actively watching this attempt, so however it
+      // ends this is not the kind of silent no-report failure the streak
+      // tracks — see sweepSilentWorkers and requeueStale.
+      noReportStreak: 0,
       description: decision.description || task.description,
       solutionVerifyCommand: decision.solutionVerifyCommand || task.solutionVerifyCommand,
       errorLog: appendAttempt(
@@ -962,6 +1017,8 @@ export class Orchestrator implements vscode.Disposable {
       const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'VERIFYING',
         output: res.text,
+        // The worker reported, whatever it reported — see noReportStreak.
+        noReportStreak: 0,
         ...(cutOffNote ? { errorLog: cutOffNote } : {}),
       });
       if (!applied) {
@@ -990,6 +1047,9 @@ export class Orchestrator implements vscode.Disposable {
       const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'VERIFYING',
         output: '',
+        // The supervisor is about to look at this attempt directly, so it is
+        // not the kind of unseen failure the streak exists to catch.
+        noReportStreak: 0,
         errorLog: appendAttempt(
           task.errorLog,
           `[attempt ${task.attempts}] the worker stopped before reporting: ${msg}. ` +

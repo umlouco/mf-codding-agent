@@ -135,6 +135,16 @@ export interface Task {
   attempts: number;
   maxAttempts: number;
   /**
+   * Consecutive times in a row this task's worker has failed to report back
+   * at all — gone silent, or the process itself died — since the last time it
+   * actually reported something. Reset to 0 whenever it does. See
+   * `requeueStale`'s `escalateAfter` and the orchestrator's `sweepSilentWorkers`:
+   * once this crosses the configured threshold the task is routed to the
+   * supervisor instead of requeued blindly again, so a task whose worker keeps
+   * dying before writing anything eventually gets a chance to be split.
+   */
+  noReportStreak: number;
+  /**
    * When the worker on this task last wrote anything at all.
    *
    * This is what replaces a timeout. A worker waiting on a slow model keeps
@@ -208,6 +218,7 @@ const COLUMNS = `
   error_log           AS errorLog,
   supervisor_feedback AS supervisorFeedback,
   attempts, max_attempts AS maxAttempts,
+  no_report_streak AS noReportStreak,
   last_activity_at AS lastActivityAt,
   activity_phase   AS activityPhase,
   activity_detail  AS activityDetail,
@@ -314,6 +325,10 @@ export class TaskQueue {
     // rather than living in one of its own.
     this.addColumn('kind', "TEXT NOT NULL DEFAULT 'task'");
     this.addColumn('region', "TEXT NOT NULL DEFAULT ''");
+
+    // See the Task.noReportStreak doc comment — counts a worker's consecutive
+    // failures to report back at all, independent of `attempts`.
+    this.addColumn('no_report_streak', 'INTEGER NOT NULL DEFAULT 0');
   }
 
   /** Adds a column to `tasks` if this database predates it. */
@@ -619,6 +634,7 @@ export class TaskQueue {
     supervisorFeedback: 'supervisor_feedback',
     attempts: 'attempts',
     maxAttempts: 'max_attempts',
+    noReportStreak: 'no_report_streak',
     startedAt: 'started_at',
     finishedAt: 'finished_at',
     kind: 'kind',
@@ -922,8 +938,20 @@ export class TaskQueue {
   /**
    * Recovers tasks orphaned by a crashed worker or a window reload. Anything
    * still EXECUTING at startup has no live process behind it.
+   *
+   * `escalateAfter` turns a blind requeue into an escalation: once a task
+   * (never a phase — see TaskKind) has now failed to report back this many
+   * times in a row, for any reason, it goes to VERIFYING instead of straight
+   * back to PENDING, the same route a task takes when it genuinely finishes an
+   * attempt. Without this, a task whose worker keeps dying or whose host keeps
+   * reloading before it can write anything never once reaches the supervisor,
+   * so nobody ever gets a chance to notice it and split it into something
+   * smaller — which is exactly how a task can spin for hours with nothing to
+   * show for it. Pass 0 (the default) to keep the old unconditional requeue,
+   * for callers where an orphaned task says nothing about the work itself —
+   * a deliberate stop or pause, say.
    */
-  requeueStale(olderThanMs: number): number {
+  requeueStale(olderThanMs: number, escalateAfter = 0): number {
     const cutoff = Date.now() - olderThanMs;
     // `<=` rather than `<`: with olderThanMs of 0 the caller means "everything
     // currently EXECUTING", and a task claimed in the same millisecond as the
@@ -935,15 +963,29 @@ export class TaskQueue {
       )
       .all(cutoff);
     for (const t of stale) {
-      // Unconditionally requeued. A window that reloaded says nothing about
-      // whether the task can be done, so counting it against the task and
-      // retiring it on the attempt count would strand work for a reason that
-      // has nothing to do with the work.
-      this.update(t.id, {
-        status: 'PENDING',
-        errorLog: `${t.errorLog}\n[recovered] worker did not report back; task was left EXECUTING.`.trim(),
-      });
-      this.log(t.id, 'system', 'recovered', 'requeued');
+      const note = `${t.errorLog}\n[recovered] worker did not report back; task was left EXECUTING.`.trim();
+      // Attempts still count against the task the same as any other requeue —
+      // see `attempts` on Task — so this only changes where it lands, not
+      // whether it is retried at all.
+      const streak = t.kind === 'task' ? t.noReportStreak + 1 : t.noReportStreak;
+      if (escalateAfter > 0 && t.kind === 'task' && streak >= escalateAfter) {
+        this.update(t.id, {
+          status: 'VERIFYING',
+          finishedAt: null,
+          noReportStreak: 0,
+          errorLog:
+            `${note} This has now happened ${streak} time(s) in a row without the task ` +
+            'ever finishing an attempt — escalating to the supervisor instead of retrying blindly.',
+        });
+        this.log(t.id, 'system', 'escalated', `${streak} consecutive no-report failures`);
+      } else {
+        this.update(t.id, {
+          status: 'PENDING',
+          errorLog: note,
+          ...(escalateAfter > 0 && t.kind === 'task' ? { noReportStreak: streak } : {}),
+        });
+        this.log(t.id, 'system', 'recovered', 'requeued');
+      }
     }
     return stale.length;
   }
@@ -976,7 +1018,7 @@ export class TaskQueue {
           error_log = '', supervisor_feedback = '', started_at = NULL,
           finished_at = NULL, last_activity_at = NULL, activity_phase = '',
           activity_detail = '', tokens_in = 0, tokens_out = 0,
-          tokens_cache_read = 0, tokens_cache_write = 0,
+          tokens_cache_read = 0, tokens_cache_write = 0, no_report_streak = 0,
           updated_at = ${Date.now()}
       `);
       this.setMeta('runState', 'IDLE');
@@ -990,7 +1032,7 @@ export class TaskQueue {
       const info = this.db
         .prepare(
           `UPDATE tasks SET status = 'PENDING', attempts = 0, output = '',
-             started_at = NULL, finished_at = NULL,
+             started_at = NULL, finished_at = NULL, no_report_streak = 0,
              supervisor_feedback = ?, updated_at = ?
            WHERE seq >= ?`,
         )
