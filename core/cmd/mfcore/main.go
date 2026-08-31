@@ -161,7 +161,6 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 
 	s.env = &tools.Env{
 		Root: cfg.WorkspaceRoot,
-		Ask:  s.ask,
 		Emit: func(kind string, payload any) {
 			_ = s.conn.Notify("stream/event", map[string]any{"kind": kind, "payload": payload})
 		},
@@ -170,6 +169,9 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		},
 		EditorWrite: s.editorWrite,
 		EditorEdit:  s.editorEdit,
+	}
+	if cfg.EditorTerminal {
+		s.env.EditorTerminal = s.editorTerminal
 	}
 
 	tools.RegisterFS(s.registry)
@@ -348,28 +350,6 @@ func sanitize(s string) string {
 	return b.String()
 }
 
-// ---- permission gate ---------------------------------------------------
-
-func (s *server) ask(ctx context.Context, tool, summary string, input any) (bool, error) {
-	if s.cfg != nil && s.cfg.IsAutoApproved(tool) {
-		return true, nil
-	}
-	var reply struct {
-		Approved  bool `json:"approved"`
-		AlwaysAllow bool `json:"alwaysAllow"`
-	}
-	err := s.conn.Call(ctx, "permission/request", map[string]any{
-		"tool": tool, "summary": summary, "input": input,
-	}, &reply)
-	if err != nil {
-		return false, err
-	}
-	if reply.AlwaysAllow && s.cfg != nil {
-		s.cfg.AutoApprove = append(s.cfg.AutoApprove, tool)
-	}
-	return reply.Approved, nil
-}
-
 // ---- editor-side file writes --------------------------------------------
 //
 // These hand the actual mutation to the extension instead of touching the
@@ -390,6 +370,27 @@ func (s *server) editorWrite(ctx context.Context, path, content string) error {
 	return s.conn.Call(ctx, "fs/write", map[string]any{
 		"path": path, "content": content,
 	}, &reply)
+}
+
+// editorTerminal asks the extension to run a command in a real VS Code
+// terminal — see Env.EditorTerminal and src/editorTerminal.ts. It is wired in
+// only when the extension announced that it has shell integration to offer, so
+// a nil hook and a failed call mean different things: nil is "no terminal
+// available, spawn it yourself", an error is "the terminal tried and could not".
+func (s *server) editorTerminal(ctx context.Context, cwd, command string, timeoutMS int) (tools.TerminalRun, error) {
+	var reply struct {
+		Output   string `json:"output"`
+		ExitCode *int   `json:"exitCode"`
+		TimedOut bool   `json:"timedOut"`
+	}
+	if err := s.conn.Call(ctx, "shell/exec", map[string]any{
+		"cwd": cwd, "command": command, "timeoutMs": timeoutMS,
+	}, &reply); err != nil {
+		return tools.TerminalRun{}, err
+	}
+	return tools.TerminalRun{
+		Output: reply.Output, ExitCode: reply.ExitCode, TimedOut: reply.TimedOut,
+	}, nil
 }
 
 func (s *server) editorEdit(ctx context.Context, path string, edits []tools.EditOp) (int, error) {
@@ -513,12 +514,7 @@ func (s *server) onToolsInvoke(ctx context.Context, params json.RawMessage) (any
 	if len(a.Input) == 0 {
 		a.Input = json.RawMessage(`{}`)
 	}
-	// The same gate the agent loop applies — a direct invocation must not be
-	// a way around it.
-	res, allowed := t.Confirm(ctx, s.env, a.Input)
-	if allowed {
-		res = t.Run(ctx, s.env, a.Input)
-	}
+	res := t.Run(ctx, s.env, a.Input)
 	return map[string]any{"output": res.Output, "isError": res.IsError, "meta": res.Meta}, nil
 }
 

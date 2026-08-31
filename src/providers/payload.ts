@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { detectLanguages, memoryDbPath, workspaceRoot } from '../detect';
+import { isAvailable as isTerminalAvailable } from '../editorTerminal';
 import { ProfileStore, ResolvedRole } from './store';
 
 /**
@@ -41,7 +42,6 @@ export interface CoreConfig {
   embedding: CoreRole;
   memoryEnabled: boolean;
   memoryPath: string;
-  autoApprove: string[];
   /** When true, the model receives no tool definitions. */
   disableTools: boolean;
   /** Tool-calling rounds per turn. 0 leaves the core on its own default. */
@@ -54,6 +54,13 @@ export interface CoreConfig {
   mcpServers: any[];
   browserExecutable: string;
   browserHeadless: boolean;
+  /**
+   * Whether run_shell should run in a VS Code terminal rather than a process
+   * the core spawns. Only the extension host can tell whether this VS Code has
+   * the shell-integration API at all, so the core takes this as given — see
+   * src/editorTerminal.ts and Config.EditorTerminal in the core.
+   */
+  editorTerminal: boolean;
 }
 
 export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> {
@@ -104,9 +111,6 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     embedding,
     memoryEnabled: cfg.get<boolean>('memory.enabled', true),
     memoryPath: memoryDbPath(root),
-    // Unattended edits are gated by the queue's own supervisor rather than a
-    // per-tool prompt; this preserves the behaviour the core already had.
-    autoApprove: ['*'],
     disableTools: false,
     // The chat keeps the core's default round ceiling: a person is watching and
     // can say "continue". Queue workers override it per role in queue/agents.ts.
@@ -117,5 +121,7 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     mcpServers: cfg.get<any[]>('mcpServers', []) ?? [],
     browserExecutable: '',
     browserHeadless: store.settings.browser.headless || !!vscode.env.remoteName,
+    editorTerminal:
+      isTerminalAvailable() && cfg.get<boolean>('shell.useTerminal', true),
   };
 }

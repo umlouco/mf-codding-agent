@@ -126,8 +126,8 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 	r.Add(&Tool{
 		Name:        "browser_click",
 		Description: "Click an element by CSS selector, then report the resulting page state.",
-		// Not gated: the user already approved opening this page, and a prompt
-		// per click would make browser testing unusable.
+		// Not mutating: a click changes the page, not the workspace, so it does
+		// not need to be sequenced against the file writes in the same batch.
 		Mutating: false,
 		Schema: obj(map[string]any{
 			"selector": str("CSS selector, ideally taken from browser_elements."),
@@ -186,7 +186,7 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 		Description: "Evaluate a JavaScript expression in the page and return the JSON result. " +
 			"Use for assertions and for reading state the visible text does not expose, " +
 			`e.g. "document.querySelectorAll('.row').length".`,
-		Mutating: true, // arbitrary code execution in the page stays gated
+		Mutating: true, // arbitrary code execution in the page, so sequence it
 		Schema: obj(map[string]any{
 			"expression": str("JavaScript expression evaluated in the page context."),
 		}, "expression"),

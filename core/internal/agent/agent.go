@@ -326,7 +326,7 @@ func (a *Agent) runTools(ctx context.Context, sessionID string, calls []llm.Bloc
 			}
 			continue
 		}
-		if t.Mutating {
+		if t.Mutates(c.Input) {
 			serial = append(serial, i)
 			continue
 		}
@@ -349,6 +349,10 @@ func (a *Agent) invoke(ctx context.Context, sessionID string, call llm.Block, t 
 	a.emit("stream/tool", map[string]any{
 		"sessionId": sessionID, "id": call.ID, "name": call.Name,
 		"status": "running", "input": json.RawMessage(call.Input),
+		// Nothing pauses for approval, so this line is the only warning the
+		// user gets that a write or a command is happening. It goes out before
+		// Run, not after, so it is on screen while the work is in flight.
+		"summary": t.Describe(call.Input),
 	})
 
 	start := time.Now()
@@ -357,19 +361,16 @@ func (a *Agent) invoke(ctx context.Context, sessionID string, call llm.Block, t 
 	})
 	defer stopBeat()
 
-	// One gate for every mutating tool, applied here rather than inside each
-	// tool so a new tool cannot ship without it.
-	res, allowed := t.Confirm(ctx, a.env, call.Input)
-	if allowed {
-		res = func() (r tools.Result) {
-			defer func() {
-				if p := recover(); p != nil {
-					r = tools.Errf("tool %s panicked: %v", call.Name, p)
-				}
-			}()
-			return t.Run(ctx, a.env, call.Input)
+	// A panicking tool must not take the whole turn down with it: the model
+	// can recover from an error result, and cannot recover from a dead core.
+	res := func() (r tools.Result) {
+		defer func() {
+			if p := recover(); p != nil {
+				r = tools.Errf("tool %s panicked: %v", call.Name, p)
+			}
 		}()
-	}
+		return t.Run(ctx, a.env, call.Input)
+	}()
 
 	status := "ok"
 	if res.IsError {

@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // ProviderConfig describes a single LLM provider entry.
@@ -57,7 +56,6 @@ type Config struct {
 	MemoryEnabled bool   `json:"memoryEnabled"`
 	MemoryPath    string `json:"memoryPath"`
 
-	AutoApprove []string `json:"autoApprove"`
 	// DisableTools creates a conclusion-only turn. Queue supervisors use it so
 	// verification commands, browser runs, and code inspection stay executor work.
 	DisableTools bool `json:"disableTools"`
@@ -88,6 +86,13 @@ type Config struct {
 
 	BrowserExecutable string `json:"browserExecutable"`
 	BrowserHeadless   bool   `json:"browserHeadless"`
+
+	// EditorTerminal is set by the extension when it can run run_shell in a
+	// real VS Code terminal — which needs both a recent enough VS Code and the
+	// user's shell integration actually working. The extension is the only
+	// side that can know that, so it decides and the core takes its word for
+	// it, falling back to spawning a shell itself when this is false.
+	EditorTerminal bool `json:"editorTerminal"`
 
 	Languages []string `json:"languages"`
 }
@@ -186,13 +191,4 @@ func (c *Config) ApplyDefaults() {
 	// We can't distinguish "explicitly false" from "missing" in JSON, so we
 	// only treat the first element specially — if it has no models but IS
 	// enabled, it's probably an incomplete config from the default.
-}
-
-func (c *Config) IsAutoApproved(tool string) bool {
-	for _, t := range c.AutoApprove {
-		if strings.EqualFold(t, tool) || t == "*" {
-			return true
-		}
-	}
-	return false
 }

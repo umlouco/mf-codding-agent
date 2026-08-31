@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { CoreClient, InitResult } from './core';
 import { registerEditorFsHandlers } from './editorFs';
+import { disposeTerminal, registerEditorTerminalHandlers } from './editorTerminal';
 import { ChatPanel } from './panel';
 import { queueDbPath, resolveMcpBinary } from './detect';
 import { TaskQueue } from './queue/db';
@@ -36,6 +37,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   core = new CoreClient(context, output);
   context.subscriptions.push(core);
   registerEditorFsHandlers(core);
+  registerEditorTerminalHandlers(core);
+  // The agent's terminal belongs to this activation, not to the workspace: a
+  // stale one left behind on deactivate would still be sitting there, detached
+  // from any core, the next time the extension started.
+  context.subscriptions.push({ dispose: disposeTerminal });
 
   chat = ChatPanel.createOrShow(context, core, output);
 

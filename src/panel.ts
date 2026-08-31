@@ -354,6 +354,10 @@ export class ChatPanel {
           id: params.id,
           name: params.name,
           status: params.status,
+          // One line saying what this call is about to do. Nothing pauses to
+          // ask first, so this is the user's only chance to see a write or a
+          // command coming rather than reading about it afterwards.
+          summary: params.summary,
           input: params.input,
           output: params.output,
           elapsedMs: params.elapsedMs,
