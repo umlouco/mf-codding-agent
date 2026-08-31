@@ -29,7 +29,16 @@ func (r *readState) mark(path string) {
 	}
 }
 
-func (r *readState) check(path string) error {
+// check reports whether path is safe to modify. display is the same file as
+// the model refers to it — a workspace-relative path it can paste straight
+// back into the next call.
+//
+// Both refusals name that next call on purpose. A refusal that states a policy
+// without stating the remedy is one the model has to invent a way around, and
+// the way it invents is the shell: it writes the bytes through `tee`, the write
+// succeeds, and it concludes the file tools were the broken ones. Saying "call
+// read_file, then retry" ends that in one round.
+func (r *readState) check(path, display string) error {
 	fi, err := os.Stat(path)
 	if os.IsNotExist(err) {
 		return nil // new file: nothing to clobber
@@ -41,10 +50,16 @@ func (r *readState) check(path string) error {
 	seenAt, ok := r.seen[path]
 	r.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("refusing to modify %s: read it first", filepath.Base(path))
+		return fmt.Errorf("refusing to modify %s without reading it first: "+
+			"call read_file with path %q, then retry this edit. "+
+			"The unix and run_shell tools reach these same files through the same "+
+			"workspace root, so writing the change through a shell instead is not a "+
+			"way around this check", display, display)
 	}
 	if fi.ModTime().After(seenAt) {
-		return fmt.Errorf("%s changed on disk since it was read; re-read before editing", filepath.Base(path))
+		return fmt.Errorf("%s changed on disk since it was last read: "+
+			"call read_file with path %q again and rebase the edit on what is there now",
+			display, display)
 	}
 	return nil
 }
@@ -103,22 +118,39 @@ func RegisterFS(r *Registry) {
 			if err != nil {
 				return Errf("%v", err)
 			}
+			// Every refusal below names the call that gets past it. They are
+			// the ones a model otherwise routes around with `cat`, and then
+			// reasons backwards from to conclude the shell can see files this
+			// tool cannot — so each says what to do next, and the ones that
+			// are a fact about the file rather than a limit of this tool say
+			// that too. See readState.check.
 			fi, err := os.Stat(abs)
 			if err != nil {
+				if os.IsNotExist(err) {
+					return Errf("%s does not exist. Use glob to find where it actually is "+
+						"(pattern %q), or list_dir on the directory you expected it in",
+						a.Path, "**/"+filepath.Base(a.Path))
+				}
 				return Errf("cannot read %s: %v", a.Path, err)
 			}
 			if fi.IsDir() {
 				return Errf("%s is a directory; use list_dir or glob", a.Path)
 			}
 			if fi.Size() > maxReadBytes && a.Limit == 0 {
-				return Errf("%s is %d bytes; pass offset/limit to read it in slices", a.Path, fi.Size())
+				return Errf("%s is %d bytes, over the %d-byte limit for reading a whole file at once. "+
+					"Page through it by passing offset and limit (start with offset 1, limit 500), "+
+					"or use grep to jump straight to the part you need",
+					a.Path, fi.Size(), maxReadBytes)
 			}
 			data, err := os.ReadFile(abs)
 			if err != nil {
 				return Errf("cannot read %s: %v", a.Path, err)
 			}
 			if looksBinary(data) {
-				return Errf("%s appears to be binary (%d bytes)", a.Path, len(data))
+				return Errf("%s is binary (%d bytes), so there is no text to return. "+
+					"That is a property of the file, not a limit of this tool — reading it "+
+					"through a shell will not produce text either",
+					a.Path, len(data))
 			}
 			reads.mark(abs)
 
@@ -171,7 +203,7 @@ func RegisterFS(r *Registry) {
 			if err != nil {
 				return Errf("%v", err)
 			}
-			if err := reads.check(abs); err != nil {
+			if err := reads.check(abs, env.Rel(abs)); err != nil {
 				return Errf("%v", err)
 			}
 			if env.EditorWrite != nil {
@@ -237,7 +269,7 @@ func RegisterFS(r *Registry) {
 			if err != nil {
 				return Errf("%v", err)
 			}
-			if err := reads.check(abs); err != nil {
+			if err := reads.check(abs, env.Rel(abs)); err != nil {
 				return Errf("%v", err)
 			}
 			var n int
@@ -308,7 +340,7 @@ func RegisterFS(r *Registry) {
 			if err != nil {
 				return Errf("%v", err)
 			}
-			if err := reads.check(abs); err != nil {
+			if err := reads.check(abs, env.Rel(abs)); err != nil {
 				return Errf("%v", err)
 			}
 

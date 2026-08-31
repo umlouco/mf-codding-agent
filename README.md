@@ -112,6 +112,24 @@ explained rather than failing silently.
 `php`/`ts`/`js`/`go`/`delphi`). Both skip `node_modules`, `vendor`, `__history` and
 friends, which is what makes them fast enough not to need a native ripgrep.
 
+`grep` answers "how many" and "which ones" as well as "where", so those questions
+don't have to be rebuilt as a shell pipeline. `output_mode` selects matching lines
+(default), the list of matching files, or a per-file count with an exact total that
+ignores the result limit. `capture` returns one regex group from every match on
+every line rather than the whole line, and `unique` deduplicates and sorts the
+result, reporting the distinct count alongside the raw one:
+
+```
+grep pattern="(\w[\w.]*) in '(src\\merge-package\\[^']*)'"
+     capture=1 unique=true output_mode="count"
+
+  → total: 182 matches across 3 file(s)
+    distinct: 170
+```
+
+That gap between 182 and 170 is the sort of thing that takes four disagreeing
+`grep | sort | uniq | wc` pipelines to notice, and one call to state.
+
 **`unix`** — a POSIX shell interpreted natively in Go: full `sh` syntax — pipes
 (`|`), `&&` and `||`, `for`/`while`/`if`, command substitution, globbing,
 here-documents and redirection (`>`, `>>`) — identical on Windows, macOS and Linux
@@ -137,6 +155,21 @@ find . -name "*.pas" -type f | sort > delphi-files.txt
 **`run_shell`** — the real shell (PowerShell on Windows, `sh` elsewhere) for builds,
 tests, package managers, compilers and git.
 
+It runs in a **real VS Code terminal** when your VS Code offers shell integration —
+the same terminal you'd type in, so it inherits your configured shell and profile:
+your `PATH`, your nvm/pyenv shims, your active virtualenv, your git credential
+helper, your proxy variables. "Works in my terminal, fails from the agent" is
+usually one of those, and this removes the class. It also means a long build scrolls
+in a tab you can watch, interrupt with Ctrl-C, and scroll back through afterwards,
+instead of resolving into whatever the model chose to quote.
+
+If shell integration isn't available, the agent spawns the shell itself and says so
+rather than guessing: a command whose exit status the terminal couldn't report comes
+back as `exit=unknown`, never as success. Turn it off with
+`mfagent.shell.useTerminal`. Background queue workers always spawn their own shell —
+several unattended agents sharing one visible terminal would interleave their output
+and steal your focus.
+
 **`project_info`** — detects languages, tooling, npm/composer scripts, and Delphi
 `.dpr`/`.dproj` projects.
 
@@ -155,19 +188,35 @@ different claims. Screenshots appear inline in chat.
 
 ## Permissions
 
-Anything that writes, executes or navigates goes through one confirmation prompt.
-The gate lives in the agent loop, not in the individual tools, so a new tool cannot
-ship without it.
+**There are none. The agent runs everything it decides to run.**
 
-Gated: `write_file`, `edit_file`, `multi_edit`, `run_shell`, `browser_open`,
-`browser_eval`, every MCP tool, and `unix` pipelines that mutate or redirect.
+Every edit, command and deletion happens the moment the model calls the tool —
+no confirmation prompt, no approval step, nothing to click. This is deliberate:
+an agent that stops every few seconds is an agent you supervise instead of one
+that works, and a prompt you answer fifty times an hour is one you stop reading
+by the tenth. If you want a machine that asks first, this is the wrong tool.
 
-Not gated: reads, searches, read-only `unix` pipelines, and `browser_click` /
-`browser_fill` — you already approved opening that page, and prompting per click
-makes browser testing unusable.
+What you get instead is **visibility, not consent**. Each call appears in the
+chat as it runs, with a one-line summary of what it is doing — `write_file ·
+Write src/app.ts (128 lines)`, `unix · runs rm — rm -rf build` — written by the
+tool itself rather than inferred from the raw arguments. Shell commands run in a
+[real VS Code terminal](#tools) you can watch and interrupt with Ctrl-C.
 
-"Always allow this tool" is persisted to workspace settings. A declined tool is
-reported to the model as a decision, not a failure, so it adapts instead of retrying.
+What still constrains the agent:
+
+- **Workspace confinement.** Every path a tool resolves, including shell
+  redirections and the `mkdir`/`rm`/`cp`/`mv`/`tee` builtins, goes through a
+  check that refuses anything outside the workspace root — `..`, absolute paths
+  and symlinks pointing out of the tree included. A mistake is confined to this
+  project. Everything *in* this project is reachable.
+- **A small denylist** of catastrophic literals (`rm -rf /`, `mkfs`, fork bombs).
+  A denylist of strings is a guardrail against a slip, not a security boundary,
+  and it should not be trusted as one.
+- **Read-before-write.** Overwriting a file the agent hasn't read, or that
+  changed on disk since it read it, is refused.
+- **Git.** Work on a branch and commit often. This is the real undo.
+
+Use this on code you have under version control, and read what it does.
 
 ---
 

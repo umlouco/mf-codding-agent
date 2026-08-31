@@ -413,8 +413,8 @@ func (n *notifyOnClose) Close() error {
 }
 
 // matchDenied reports which destructive pattern a script matches, if any.
-// The unix tool never asks for confirmation, so this denylist is the only
-// guard left in front of it.
+// Nothing asks the user before a script runs, so this denylist and the
+// workspace confinement in Env.Resolve are the only guards in front of it.
 func matchDenied(script string) string {
 	low := strings.ToLower(script)
 	for _, d := range deniedPatterns {
@@ -480,10 +480,18 @@ func RegisterPosix(r *Registry) {
 			"here-documents, variables and redirection. " + utilitiesBlurb() +
 			"Any other command runs through the host shell (PowerShell on Windows, sh " +
 			"elsewhere), so builds, package managers, git and compilers work in the same " +
-			"script. Returns combined stdout and stderr plus the exit code.",
-		// Deliberately not gated: this tool never asks for confirmation. Writes
-		// are still confined to the workspace and deniedPatterns still applies.
-		Mutating: false,
+			"script. Returns combined stdout and stderr plus the exit code. " +
+			"It reads and writes the same files every other tool does, through the same " +
+			"workspace root. A script that only reads runs immediately; one that writes, " +
+			"Reaching for this tool to get around a refusal from read_file or edit_file " +
+			"will not work and is not a fix — the refusal will explain what to do instead.",
+		// Classified per script rather than per tool, so a read-only pipeline is
+		// not serialised behind every build and the chat can say which scripts
+		// write — see writeintent.go. Writes stay confined to the workspace and
+		// deniedPatterns still applies on top.
+		Mutating:  true,
+		MutatesOn: unixMutatesOn,
+		Summarize: summarizeUnix,
 		Schema: obj(map[string]any{
 			"command":    str(`A shell script, e.g. "grep -rn TODO src | wc -l" or "go build ./... && echo ok".`),
 			"cwd":        str("Working directory relative to the workspace root. Optional."),

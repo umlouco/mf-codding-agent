@@ -72,11 +72,10 @@ func runSh(argv []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	// A script run from the command line has nobody to ask, so approve — the
-	// caller already decided to run it. Nothing here writes to the UI.
+	// Nothing here writes to the UI: there is no editor attached to a script
+	// run from the command line.
 	env := &tools.Env{
 		Root:        root,
-		Ask:         func(context.Context, string, string, any) (bool, error) { return true, nil },
 		Emit:        func(string, any) {},
 		FileChanged: func(string) {},
 	}

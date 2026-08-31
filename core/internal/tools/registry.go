@@ -30,46 +30,51 @@ type Tool struct {
 	Name        string
 	Description string
 	Schema      map[string]any
-	// Mutating marks a tool that writes, executes or navigates. The agent
-	// loop gates every mutating tool through Env.Ask before running it, and
-	// runs them serially so the user sees one prompt at a time. Tools do not
-	// implement the gate themselves — one central gate cannot be forgotten.
+	// Mutating marks a tool that writes, executes or navigates. Nothing asks
+	// the user before running one — this is a scheduling fact, not a policy.
+	// The agent loop runs mutating calls serially, in the order the model
+	// asked for, while read-only calls go in parallel. Two edits to the same
+	// file, or a build and the edit it depends on, produce different results
+	// depending on which lands first.
 	Mutating bool
-	// Summarize renders a one-line description of a specific invocation for
-	// the confirmation prompt. Optional; the tool name is used if absent.
+	// MutatesOn, when set, decides that per invocation instead of per tool.
+	// It exists for the shells: `unix` can write, but most scripts only read,
+	// and treating the whole tool as mutating would serialise every `grep`
+	// behind every build for no reason. See scriptMutates in writeintent.go.
+	MutatesOn func(input json.RawMessage) bool
+	// Summarize renders a one-line description of a specific invocation, shown
+	// in the chat as the call runs. Optional; the tool name is used if absent.
 	Summarize func(input json.RawMessage) string
 	Run       func(ctx context.Context, env *Env, input json.RawMessage) Result
 }
 
-// Confirm asks the user to approve this invocation. It returns a ready-made
-// error Result when the answer is no, so callers can return it directly.
-func (t *Tool) Confirm(ctx context.Context, env *Env, input json.RawMessage) (Result, bool) {
-	if !t.Mutating || env == nil || env.Ask == nil {
-		return Result{}, true
+// Mutates reports whether this specific invocation changes state, which is
+// what decides whether it runs serially with the other mutating calls in its
+// batch or in parallel with the reads.
+func (t *Tool) Mutates(input json.RawMessage) bool {
+	if t.MutatesOn != nil {
+		return t.MutatesOn(input)
 	}
-	summary := t.Name
-	if t.Summarize != nil {
-		if s := t.Summarize(input); s != "" {
-			summary = s
-		}
+	return t.Mutating
+}
+
+// Describe renders a one-line account of this invocation for the UI, falling
+// back to the tool's name. Every tool call is reported to the user as it runs;
+// none of them stops to ask permission first.
+func (t *Tool) Describe(input json.RawMessage) string {
+	if t.Summarize == nil {
+		return t.Name
 	}
-	ok, err := env.Ask(ctx, t.Name, summary, json.RawMessage(input))
-	if err != nil {
-		return Errf("could not ask for permission to run %s: %v", t.Name, err), false
+	if s := t.Summarize(input); s != "" {
+		return s
 	}
-	if !ok {
-		return Errf("The user declined to run %s (%s). Do not retry the same call — "+
-			"take a different approach or ask them what they would prefer.", t.Name, summary), false
-	}
-	return Result{}, true
+	return t.Name
 }
 
 // Env is the ambient context every tool receives.
 type Env struct {
 	Root string
 
-	// Ask requests user confirmation. Returns true to proceed.
-	Ask func(ctx context.Context, tool, summary string, input any) (bool, error)
 	// Emit pushes a progress line to the UI.
 	Emit func(kind string, payload any)
 
@@ -89,8 +94,35 @@ type Env struct {
 	// same way, to an in-process read/replace/write.
 	EditorEdit func(ctx context.Context, path string, edits []EditOp) (int, error)
 
+	// EditorTerminal, when set, asks the editor to run a command in a real
+	// terminal it owns and report back what happened — see run_shell in
+	// shell.go and src/editorTerminal.ts.
+	//
+	// The command runs in the user's own shell, with their profile, PATH,
+	// virtualenv and credential helpers, and stays on screen in a tab they can
+	// scroll back through. A command spawned out of this process has none of
+	// that: it runs under a bare environment nobody configured, and the only
+	// trace it leaves is whatever the model chose to quote back.
+	//
+	// Nil when the editor has no shell integration to offer, or in any process
+	// with no live editor connection (`mfcore sh`, unit tests). run_shell then
+	// falls back to spawning the shell itself.
+	EditorTerminal func(ctx context.Context, cwd, command string, timeoutMS int) (TerminalRun, error)
+
 	rootOnce sync.Once
 	rootReal string
+}
+
+// TerminalRun is the outcome of one command run through Env.EditorTerminal.
+type TerminalRun struct {
+	Output string
+	// ExitCode is nil when the terminal could not report one. That is not the
+	// same as zero and must not be rendered as success: VS Code only knows the
+	// exit status of a command when shell integration is active for that
+	// shell, and a command whose result is unknown is a command the model has
+	// to verify some other way before believing it worked.
+	ExitCode *int
+	TimedOut bool
 }
 
 // EditOp is one find/replace instruction handed to Env.EditorEdit — the same

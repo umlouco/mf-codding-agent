@@ -63,11 +63,16 @@ async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<Core
       enabled: true,
     }],
     coding: { providerId: `queue-${role}`, model: rc.model, effort: rc.effort },
-    autoApprove: ['*'],
     // Supervisors only validate the executor's persisted conclusion. They are
     // intentionally unable to inspect files, execute commands, or drive a browser.
     disableTools: role === 'supervisor',
     ...(role === 'supervisor' ? { memoryEnabled: false, mcpServers: [] } : {}),
+    // Queue workers spawn their own core processes and run unattended, often
+    // several at once. The editor terminal is a single visible tab shared by
+    // everything in the window: handing it to background work would steal focus
+    // from whatever the user is doing and interleave several agents' output in
+    // one scrollback. They spawn their own shell instead.
+    editorTerminal: false,
     maxIterations,
   };
 }
@@ -179,8 +184,6 @@ async function runOnce(
     }
     onEvent?.(method, params);
   });
-  // An unattended core must never block on a permission round-trip.
-  client.onRequest('permission/request', async () => ({ approved: true, alwaysAllow: true }));
 
   const started = Date.now();
   try {

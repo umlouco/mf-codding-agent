@@ -15,7 +15,7 @@
   },
   "homepage": "https://github.com/umlouco/mf-codding-agent#readme",
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.93.0"
   },
   "categories": [
     "AI",
@@ -195,6 +195,11 @@
           "default": true,
           "description": "Enable the persistent graph memory for this workspace. The database lives at .mfagent/memory.db."
         },
+        "mfagent.shell.useTerminal": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run the agent's shell commands in a visible VS Code terminal, using your own configured shell, profile and PATH, instead of a process the agent spawns on its own. Requires terminal shell integration; the agent falls back to spawning a shell when it is unavailable. Background queue workers always spawn their own shell regardless of this setting."
+        },
         "mfagent.mcpServers": {
           "type": "array",
           "default": [],
@@ -290,7 +295,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^20.14.0",
-    "@types/vscode": "^1.90.0",
+    "@types/vscode": "^1.93.0",
     "esbuild": "^0.23.0",
     "typescript": "^5.5.0"
   }

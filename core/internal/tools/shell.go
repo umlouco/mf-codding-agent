@@ -77,11 +77,61 @@ func encodePowerShell(cmd string) string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-// deniedPatterns are refused outright. This is a guardrail against obvious
-// footguns, not a security boundary — the permission prompt is the boundary.
+// deniedPatterns are refused outright.
+//
+// Nothing asks the user before a command runs, so this list and the workspace
+// confinement in Env.Resolve are the whole guard. It is still only a guardrail
+// against the obvious footguns — a denylist of literal strings cannot be a
+// security boundary, and treating it as one is how it ends up trusted for
+// something it was never able to do.
 var deniedPatterns = []string{
 	"rm -rf /", "rm -rf /*", ":(){", "mkfs", "dd if=/dev/zero of=/dev",
 	"format c:", "Remove-Item -Path C:\\ -Recurse",
+}
+
+// runInTerminal runs one command through the editor's terminal and renders the
+// result in exactly the shape the spawned path produces, so which one handled a
+// call is not something the model has to reason about.
+//
+// The one difference it cannot hide is a missing exit code. VS Code only knows
+// how a command ended when shell integration is active for that shell, and
+// reporting an unknown status as 0 would turn "we could not tell" into "it
+// worked" — the single most expensive lie this tool could tell, since every
+// verification step downstream is built on it.
+func runInTerminal(ctx context.Context, env *Env, dir, command string, timeout time.Duration) Result {
+	run, err := env.EditorTerminal(ctx, dir, command, int(timeout.Milliseconds()))
+	if err != nil {
+		return Errf("could not run %q in the editor terminal: %v", command, err)
+	}
+
+	body := clamp(strings.TrimRight(run.Output, "\r\n"), 60000)
+	if strings.TrimSpace(body) == "" {
+		body = "(no output)"
+	}
+	if run.TimedOut {
+		return Result{
+			Output: fmt.Sprintf("Command timed out after %s. It may still be running in the "+
+				"terminal — check there before running it again.\n\n%s", timeout, clamp(body, 30000)),
+			IsError: true,
+		}
+	}
+
+	meta := map[string]any{"terminal": true}
+	if run.ExitCode == nil {
+		return Result{
+			Output: fmt.Sprintf("exit=unknown cwd=%s\n%s\n\n"+
+				"The terminal could not report an exit status for this command, so whether it "+
+				"succeeded is not established — read the output above, or verify another way "+
+				"before relying on it.", env.Rel(dir), body),
+			Meta: meta,
+		}
+	}
+	meta["exitCode"] = *run.ExitCode
+	return Result{
+		Output:  fmt.Sprintf("exit=%d cwd=%s\n%s", *run.ExitCode, env.Rel(dir), body),
+		IsError: *run.ExitCode != 0,
+		Meta:    meta,
+	}
 }
 
 func RegisterShell(r *Registry) {
@@ -90,6 +140,9 @@ func RegisterShell(r *Registry) {
 		Description: "Run a shell command in the workspace (PowerShell on Windows, sh elsewhere). " +
 			"Use for builds, test suites, package managers, git and compilers — " +
 			"composer, npm/pnpm, go build/test, dcc32/msbuild, php. " +
+			"When the editor offers a terminal this runs there, in the user's own " +
+			"configured shell and visible in a tab they can scroll back through, so " +
+			"a long build can be watched rather than waited on. " +
 			"Prefer the unix tool for plain file inspection and text processing. " +
 			"Returns combined stdout and stderr plus the exit code.",
 		Mutating: true,
@@ -97,7 +150,7 @@ func RegisterShell(r *Registry) {
 			"command":     str("The command line to execute."),
 			"cwd":         str("Working directory relative to the workspace root. Optional."),
 			"timeout_ms":  num("Timeout in milliseconds. Default 120000, maximum 600000."),
-			"description": str("One short sentence describing what this does, shown in the approval prompt."),
+			"description": str("One short sentence describing what this does, shown in the chat while it runs."),
 		}, "command"),
 		Summarize: func(in json.RawMessage) string {
 			var a struct {
@@ -147,6 +200,14 @@ func RegisterShell(r *Registry) {
 			}
 			cctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
+
+			// The editor's terminal is preferred whenever there is one: it runs
+			// the command in the shell the user actually configured and leaves
+			// it on screen. Spawning below is the fallback for when there is no
+			// editor listening at all.
+			if env.EditorTerminal != nil {
+				return runInTerminal(cctx, env, dir, a.Command, timeout)
+			}
 
 			name, args, cleanup := shellFor(a.Command)
 			defer cleanup()
