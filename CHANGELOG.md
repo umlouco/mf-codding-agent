@@ -14,5 +14,7 @@ Initial release.
   or rolls back tasks until every one verifies — no attempt limit, no terminal failure
 - Executor-owned validation: executors run code, commands, tests, and browser checks,
   persist structured evidence in SQLite, and tool-less supervisors only judge that evidence
+- Bundled task-queue MCP now exposes an atomic, schema-rich plan writer with dry-run,
+  append/replace modes, verification criteria, annotations, and structured results
 - Project instructions from `AGENTS.md`, `CLAUDE.md`, or `.mfagent/instructions.md`
 - Optional notify command on autonomous-run completion

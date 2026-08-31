@@ -580,12 +580,23 @@ function registerCommands(context: vscode.ExtensionContext): void {
     await vscode.env.clipboard.writeText(json);
 
     const pick = await vscode.window.showInformationMessage(
-      'MCP configuration copied to clipboard. Paste it into your Claude Code config (.claude.json or .mcp.json).',
+      'Task Queue MCP JSON copied. Use it with Claude Code, Kilocode, or another JSON-configured MCP client.',
       'Show config',
     );
     if (pick === 'Show config') {
       const doc = await vscode.workspace.openTextDocument({
-        content: `// Paste this into your Claude Code config file:\n//   - .claude.json (global, in your home directory)\n//   - .mcp.json (per-project, at the workspace root)\n//\n// If the workspace path changes per project, remove the --workspace arg\n// and the server will use the current working directory.\n\n${json}\n`,
+        content: `// Claude Code / Kilocode / JSON-based MCP clients:
+// Paste the object below into the client MCP configuration.
+// Claude Code accepts .claude.json (global) or .mcp.json (per-project).
+//
+// If the workspace path changes per project, remove the --workspace arg
+// and the server will use the current working directory.
+//
+// Codex CLI equivalent:
+// codex mcp add mfagent-task-queue -- "${mcpBin}" --workspace "${workspaceRoot}"
+
+${json}
+`,
         language: 'jsonc',
       });
       await vscode.window.showTextDocument(doc);

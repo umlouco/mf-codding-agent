@@ -95,7 +95,7 @@
       },
       {
         "command": "mfagent.copyMcpConfig",
-        "title": "MF Agent: Copy MCP Config for Claude Code"
+        "title": "MF Agent: Copy Task Queue MCP Config"
       },
       {
         "command": "mfagent.openSettings",

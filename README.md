@@ -247,6 +247,16 @@ match wins; nothing is required and nothing merges, so pick one.
 Both stdio and streamable HTTP transports are supported. Servers connect in parallel
 at startup; one that fails is reported as a warning rather than blocking activation.
 
+The extension also bundles `mfagent-mcp`, a stdio MCP server for Claude Code,
+Codex, Kilocode, and other MCP clients. Run **MF Agent: Copy Task Queue MCP
+Config** to copy a workspace-aware configuration. Its primary tool is
+`task_queue_write_plan`, which validates and atomically writes an ordered plan
+to `.mfagent/queue.db`. Every task carries self-contained instructions, an
+implementation check, a behavior check, and an optional deterministic test
+command. The tool supports replace/append modes and a dry run, and returns both
+text and MCP `structuredContent`. Read-only list and statistics tools, a
+single-task append tool, and a compatibility generate tool are also exposed.
+
 ---
 
 ## Settings

@@ -31,7 +31,14 @@ import (
 
 var version = "0.0.0"
 
-const protocolVersion = "2025-06-18"
+const protocolVersion = "2025-11-25"
+
+var supportedProtocolVersions = map[string]bool{
+	"2024-11-05": true,
+	"2025-03-26": true,
+	"2025-06-18": true,
+	"2025-11-25": true,
+}
 
 // ---- MCP wire types -------------------------------------------------------
 
@@ -59,10 +66,12 @@ type rpcError struct {
 type toolHandler func(ctx context.Context, params json.RawMessage) (string, bool, error)
 
 type registeredTool struct {
-	Name        string
-	Description string
-	InputSchema map[string]any
-	Handler     toolHandler
+	Name         string
+	Description  string
+	InputSchema  map[string]any
+	OutputSchema map[string]any
+	Annotations  map[string]any
+	Handler      toolHandler
 }
 
 // ---- server ---------------------------------------------------------------
@@ -121,64 +130,6 @@ func main() {
 	}
 }
 
-func (s *server) registerTools() {
-	s.tools = []registeredTool{
-		{
-			Name:        "task_queue_create",
-			Description: "Add a task to the queue. title and description are required.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"title":       map[string]any{"type": "string", "description": "Short task title."},
-					"description": map[string]any{"type": "string", "description": "What this task should accomplish."},
-				},
-				"required": []string{"title", "description"},
-			},
-			Handler: s.onCreate,
-		},
-		{
-			Name:        "task_queue_list",
-			Description: "List all tasks currently in the queue, ordered by sequence.",
-			InputSchema: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			},
-			Handler: s.onList,
-		},
-		{
-			Name:        "task_queue_stats",
-			Description: "Return aggregate statistics: counts by status, token usage, and run state.",
-			InputSchema: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			},
-			Handler: s.onStats,
-		},
-		{
-			Name:        "task_queue_generate",
-			Description: "Replace the entire task queue with a new plan. Clears all existing tasks and inserts the provided list.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"tasks": map[string]any{
-						"type": "array",
-						"items": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"title":       map[string]any{"type": "string"},
-								"description": map[string]any{"type": "string"},
-							},
-							"required": []string{"title", "description"},
-						},
-					},
-				},
-				"required": []string{"tasks"},
-			},
-			Handler: s.onGenerate,
-		},
-	}
-}
-
 // ---- MCP protocol handlers ------------------------------------------------
 
 func (s *server) serve(ctx context.Context) error {
@@ -222,29 +173,40 @@ func (s *server) dispatch(ctx context.Context, req *rpcRequest) {
 }
 
 func (s *server) handleInitialize(_ context.Context, req *rpcRequest) {
-	// Per MCP 2025-06-18 §3.3.1: the server must report its capabilities.
+	var in struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	_ = json.Unmarshal(req.Params, &in)
+	negotiated := protocolVersion
+	if supportedProtocolVersions[in.ProtocolVersion] {
+		negotiated = in.ProtocolVersion
+	}
 	result := map[string]any{
-		"protocolVersion": protocolVersion,
+		"protocolVersion": negotiated,
 		"capabilities": map[string]any{
 			"tools": map[string]any{},
 		},
 		"serverInfo": map[string]any{
 			"name":    "mfagent-mcp",
+			"title":   "MF Agent Task Queue",
 			"version": "0.1.0",
 		},
+		"instructions": "Use task_queue_write_plan to create task lists. Include ordered, self-contained tasks with implementation and behavior checks. Use dryRun before writing when requirements are uncertain.",
 	}
 	s.sendResult(req.ID, result)
 }
 
 func (s *server) handleToolsList(_ context.Context, req *rpcRequest) {
 	type toolEntry struct {
-		Name        string         `json:"name"`
-		Description string         `json:"description"`
-		InputSchema map[string]any `json:"inputSchema"`
+		Name         string         `json:"name"`
+		Description  string         `json:"description"`
+		InputSchema  map[string]any `json:"inputSchema"`
+		OutputSchema map[string]any `json:"outputSchema,omitempty"`
+		Annotations  map[string]any `json:"annotations,omitempty"`
 	}
 	entries := make([]toolEntry, len(s.tools))
 	for i, t := range s.tools {
-		entries[i] = toolEntry{t.Name, t.Description, t.InputSchema}
+		entries[i] = toolEntry{t.Name, t.Description, t.InputSchema, t.OutputSchema, t.Annotations}
 	}
 	result := map[string]any{"tools": entries}
 	s.sendResult(req.ID, result)
@@ -283,83 +245,16 @@ func (s *server) handleToolsCall(ctx context.Context, req *rpcRequest) {
 				"content": json.RawMessage(content),
 				"isError": isError,
 			}
+			var structured any
+			if json.Unmarshal([]byte(text), &structured) == nil {
+				result["structuredContent"] = structured
+			}
 			s.sendResult(req.ID, result)
 			return
 		}
 	}
 
 	s.sendError(req.ID, -32602, "unknown tool: "+call.Name)
-}
-
-// ---- tool handlers --------------------------------------------------------
-
-func (s *server) onCreate(_ context.Context, params json.RawMessage) (string, bool, error) {
-	var in struct {
-		Title       string `json:"title"`
-		Description string `json:"description"`
-	}
-	if err := json.Unmarshal(params, &in); err != nil {
-		return "", true, fmt.Errorf("invalid arguments: %w", err)
-	}
-	if in.Title == "" {
-		return "", true, fmt.Errorf("title is required")
-	}
-
-	id, err := queue.CreateTask(s.db, in.Title, in.Description)
-	if err != nil {
-		return "", true, fmt.Errorf("create failed: %w", err)
-	}
-	out, _ := json.Marshal(map[string]any{"id": id, "title": in.Title})
-	return string(out), false, nil
-}
-
-func (s *server) onList(_ context.Context, _ json.RawMessage) (string, bool, error) {
-	tasks, err := queue.ListTasks(s.db)
-	if err != nil {
-		return "", true, fmt.Errorf("list failed: %w", err)
-	}
-	if tasks == nil {
-		tasks = []queue.Task{}
-	}
-	out, _ := json.Marshal(tasks)
-	return string(out), false, nil
-}
-
-func (s *server) onStats(_ context.Context, _ json.RawMessage) (string, bool, error) {
-	stats, err := queue.Stats(s.db)
-	if err != nil {
-		return "", true, fmt.Errorf("stats failed: %w", err)
-	}
-	out, _ := json.Marshal(stats)
-	return string(out), false, nil
-}
-
-func (s *server) onGenerate(_ context.Context, params json.RawMessage) (string, bool, error) {
-	var in struct {
-		Tasks []struct {
-			Title       string `json:"title"`
-			Description string `json:"description"`
-		} `json:"tasks"`
-	}
-	if err := json.Unmarshal(params, &in); err != nil {
-		return "", true, fmt.Errorf("invalid arguments: %w", err)
-	}
-	if len(in.Tasks) == 0 {
-		return "", true, fmt.Errorf("tasks array must not be empty")
-	}
-
-	nt := make([]queue.NewTask, len(in.Tasks))
-	for i, t := range in.Tasks {
-		nt[i] = queue.NewTask{Title: t.Title, Description: t.Description}
-	}
-
-	if err := queue.ReplaceAll(s.db, nt); err != nil {
-		return "", true, fmt.Errorf("generate failed: %w", err)
-	}
-
-	result := map[string]any{"replaced": true, "count": len(nt)}
-	out, _ := json.Marshal(result)
-	return string(out), false, nil
 }
 
 // ---- wire helpers ---------------------------------------------------------
