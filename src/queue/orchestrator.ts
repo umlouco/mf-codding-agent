@@ -632,29 +632,22 @@ export class Orchestrator implements vscode.Disposable {
 
       case 'RETRY':
       default: {
-        // No exhaustion branch, and no terminal state. `attempts` still counts —
-        // the supervisor is told the number and is expected to change tactics as
-        // it climbs — but it is not a countdown to giving up. The task goes back
-        // to PENDING with instructions that differ from the ones that just
-        // failed, which superviseTask guarantees.
+        const exhausted = task.attempts >= Math.max(1, task.maxAttempts);
         this.queue.update(task.id, {
-          status: 'PENDING',
+          status: exhausted ? 'FAILED' : 'PENDING',
           supervisorFeedback: decision.feedback,
           errorLog: appendAttempt(
             task.errorLog,
             `[attempt ${task.attempts}] ${decision.feedback}`,
           ),
-          finishedAt: null,
+          finishedAt: exhausted ? Date.now() : null,
         });
-        this.log(`task ${task.seq} back to PENDING for attempt ${task.attempts + 1}`);
-        // maxAttempts no longer retires anything; it marks the point where a
-        // task has taken longer than the plan expected. Nothing changes, but an
-        // unattended run should still say out loud which task it is grinding on.
-        if (task.attempts >= task.maxAttempts) {
-          this.log(
-            `note: task ${task.seq} has now taken ${task.attempts} attempts. It will keep ` +
-              'being retried with rewritten instructions; stop the queue if that is not what you want.',
-          );
+        if (exhausted) {
+          this.disarm();
+          this.queue.setRunState('STOPPED');
+          this.log(`task ${task.seq} FAILED after ${task.attempts} attempts; run stopped for review`);
+        } else {
+          this.log(`task ${task.seq} back to PENDING for attempt ${task.attempts + 1}`);
         }
         break;
       }
