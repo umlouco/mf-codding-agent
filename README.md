@@ -320,7 +320,7 @@ VS Code settings editor is genuinely good at:
 | `mfagent.mcpServers` | `[]` | See above |
 | `mfagent.queue.mode` | `lockstep` | or `continuous` |
 | `mfagent.queue.cronIntervalSeconds` | `60` | Default supervisor wake-up interval. A task list that picks its own in the Task Queue view wins |
-| `mfagent.queue.maxRounds` | `80` | Tool-calling rounds per unattended turn — the only budget a task has; retries get 50% more each |
+| `mfagent.queue.maxRounds` | `80` | Maximum tool-calling rounds per unattended turn; retries keep the same ceiling and repeated identical failures stop early |
 | `mfagent.queue.maxFilesPerRegion` | `150` | Largest file count one region of the workspace may hold before the deterministic scan splits it further — bounds how much a phase's expansion agent explores in one sitting, regardless of project size |
 | `mfagent.queue.workerSilentMinutes` | `10` | How long a worker may write nothing before it counts as dead |
 | `mfagent.activityIntervalSeconds` | `30` | How often a working agent records what it is doing |

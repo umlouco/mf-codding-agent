@@ -126,3 +126,46 @@ export function validationForSupervisor(serialized: string): string {
     return JSON.stringify(incomplete('The stored executor validation is invalid JSON.', serialized), null, 2);
   }
 }
+
+/**
+ * Returns a verification explanation when the executor supplied a complete,
+ * internally consistent PASS report. This is intentionally strict enough to
+ * reject prose-only confidence, but deterministic: a second LLM must not turn
+ * successful command evidence into another expensive attempt because it
+ * prefers a different presentation of the same facts.
+ */
+export function autoVerificationFeedback(
+  serialized: string,
+  requiredCommand: string,
+): string | undefined {
+  let report: ExecutorValidation;
+  try {
+    report = JSON.parse(serialized) as ExecutorValidation;
+  } catch {
+    return undefined;
+  }
+
+  if (
+    report.conclusion !== 'PASS' ||
+    !report.summary?.trim() ||
+    !report.implementationEvidence?.trim() ||
+    !report.behaviorEvidence?.trim() ||
+    report.remaining?.trim() ||
+    !Array.isArray(report.checks) ||
+    report.checks.length === 0 ||
+    report.checks.some((check) => !check.passed || !check.evidence?.trim())
+  ) {
+    return undefined;
+  }
+
+  if (
+    requiredCommand.trim() &&
+    !report.checks.some((check) =>
+      (check.kind === 'command' || check.kind === 'test') && check.passed)
+  ) {
+    return undefined;
+  }
+
+  return `Automatically verified from the executor's structured PASS report: ` +
+    `${report.checks.length} evidenced check(s) passed and nothing remains.`;
+}

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Stop an executor after three identical tool failures instead of allowing a malformed call to consume the full round budget.
+- Automatically accept complete structured PASS evidence, avoiding a second LLM rejecting successful checks for presentation-only reasons.
+- Keep retry round ceilings fixed and show detailed live activity plus cache reads separately in task rows.
+
 Tool-surface changes aimed at one failure mode: the agent routing work through
 shell scripts and Python heredocs instead of the tools built for it, then
 explaining the detour with invented facts about the tools.

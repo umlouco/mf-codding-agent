@@ -112,6 +112,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	// the result. A planner that writes its JSON array then calls read_file
 	// in the same turn would produce a final result with no JSON at all.
 	var accumulated strings.Builder
+	var failures toolFailureLoop
 
 	for iter := 1; iter <= maxIterations; iter++ {
 		select {
@@ -187,6 +188,12 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		a.mu.Lock()
 		sess.Messages = append(sess.Messages, llm.Message{Role: llm.RoleUser, Blocks: results})
 		a.mu.Unlock()
+
+		if repeated, detail := failures.observe(calls, results); repeated {
+			a.activity(req.SessionID, PhaseError, detail+"; stopping the tool loop")
+			return a.repeatedFailureReport(
+				ctx, req, sess, system, iter, accumulated.String(), detail)
+		}
 	}
 
 	// The round budget is spent. Do not throw away what the agent learned: spend
@@ -346,14 +353,16 @@ func (a *Agent) runTools(ctx context.Context, sessionID string, calls []llm.Bloc
 }
 
 func (a *Agent) invoke(ctx context.Context, sessionID string, call llm.Block, t *tools.Tool) llm.Block {
+	summary := t.Describe(call.Input)
 	a.emit("stream/tool", map[string]any{
 		"sessionId": sessionID, "id": call.ID, "name": call.Name,
 		"status": "running", "input": json.RawMessage(call.Input),
 		// Nothing pauses for approval, so this line is the only warning the
 		// user gets that a write or a command is happening. It goes out before
 		// Run, not after, so it is on screen while the work is in flight.
-		"summary": t.Describe(call.Input),
+		"summary": summary,
 	})
+	a.activity(sessionID, PhaseTool, fmt.Sprintf("%s: %s", call.Name, summary))
 
 	start := time.Now()
 	stopBeat := a.beat(sessionID, PhaseTool, func(d time.Duration) string {

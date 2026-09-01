@@ -258,7 +258,7 @@
           "type": "number",
           "default": 80,
           "minimum": 10,
-          "markdownDescription": "Tool-calling rounds an unattended executor gets per turn — the only budget a task has. Retries get 50% more per attempt (capped at 3× the base)."
+          "markdownDescription": "Maximum tool-calling rounds an unattended executor gets per turn. Retries keep the same ceiling, and repeated identical tool failures stop after three occurrences."
         },
         "mfagent.queue.maxFilesPerRegion": {
           "type": "number",

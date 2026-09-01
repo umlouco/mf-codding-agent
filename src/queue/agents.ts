@@ -5,7 +5,12 @@ import { resolveCoreBinary, workspaceRoot } from '../detect';
 import { registerEditorFsHandlers } from '../editorFs';
 import { getStore } from '../providers/instance';
 import { NewTask, Task, TaskQueue, Usage } from './db';
-import { parseExecutorValidation, serializeValidation, validationForSupervisor } from './validation';
+import {
+  autoVerificationFeedback,
+  parseExecutorValidation,
+  serializeValidation,
+  validationForSupervisor,
+} from './validation';
 
 /**
  * Agent runners for autonomous runs.
@@ -971,11 +976,10 @@ Rules:
   }
 }`;
 
-  // Rounds are the only budget an attempt has, and a retry gets more of them —
-  // capped so token spend cannot run away across attempts. How long those
-  // rounds take is not this code's business.
-  const scale = Math.min(1 + 0.5 * Math.max(0, task.attempts - 1), 3);
-  const rounds = Math.round(baseRounds() * scale);
+  // A retry gets better instructions, not a larger blank cheque. Growing this
+  // budget used to turn the default 80 rounds into 240 precisely when a task
+  // was already proving difficult, multiplying repeated prompts and failures.
+  const rounds = baseRounds();
 
   const { text, stopReason, usage } = await runOnce(context, output, 'executor', prompt, {
     maxIterations: rounds,
@@ -983,12 +987,13 @@ Rules:
     onEvent,
     onAbort,
   });
-  const validation = parseExecutorValidation(text, stopReason === 'max_iterations');
+  const interrupted = stopReason === 'max_iterations' || stopReason === 'repeated_tool_error';
+  const validation = parseExecutorValidation(text, interrupted);
   return {
     text,
     validationReport: serializeValidation(validation),
     ok: text.trim().length > 0,
-    cutOff: stopReason === 'max_iterations',
+    cutOff: interrupted,
     stopReason,
     rounds,
     usage,
@@ -1044,6 +1049,20 @@ export async function superviseTask(
   rewrites: number,
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
 ): Promise<SupervisorDecision> {
+  const automatic = autoVerificationFeedback(
+    task.validationReport,
+    task.solutionVerifyCommand,
+  );
+  if (automatic) {
+    output.appendLine(`[queue:supervisor] ${automatic}`);
+    return {
+      verdict: 'VERIFIED',
+      feedback: automatic,
+      taskEdits: [],
+      usage: { ...NO_USAGE },
+    };
+  }
+
   const prompt = `You are the supervisor of an autonomous coding run. Make a lightweight
 accept/reject decision from the executor validation stored in the queue database.
 
