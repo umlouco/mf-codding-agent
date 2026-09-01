@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -61,24 +60,4 @@ func terminalError(output string) string {
 		}
 	}
 	return "unknown error"
-}
-
-func (a *Agent) repeatedFailureReport(
-	ctx context.Context,
-	req SendRequest,
-	sess *Session,
-	system string,
-	rounds int,
-	accumulated string,
-	detail string,
-) (*SendResult, error) {
-	result, err := a.finalReport(ctx, req, sess, system, rounds, accumulated)
-	if result == nil || err != nil {
-		return result, err
-	}
-	result.StopReason = "repeated_tool_error"
-	result.Text = fmt.Sprintf(
-		"[stopped a repeated tool failure after %d rounds: %s]\n\n%s",
-		rounds, detail, result.Text)
-	return result, nil
 }

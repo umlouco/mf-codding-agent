@@ -1036,7 +1036,13 @@ export interface SupervisorDecision {
   /** Only meaningful for SPLIT: the tasks that replace this one, in order. */
   splitInto?: NewTask[];
   /** Optional edits the supervisor wants applied to upcoming tasks. */
-  taskEdits?: { seq: number; description?: string; solutionVerifyCommand?: string }[];
+  taskEdits?: {
+    seq: number;
+    description?: string;
+    implVerifyPrompt?: string;
+    solutionVerifyPrompt?: string;
+    solutionVerifyCommand?: string;
+  }[];
   /** What the review itself cost — part of the task's bill like any other run. */
   usage: Usage;
 }
@@ -1053,15 +1059,6 @@ export async function superviseTask(
     task.validationReport,
     task.solutionVerifyCommand,
   );
-  if (automatic) {
-    output.appendLine(`[queue:supervisor] ${automatic}`);
-    return {
-      verdict: 'VERIFIED',
-      feedback: automatic,
-      taskEdits: [],
-      usage: { ...NO_USAGE },
-    };
-  }
 
   const prompt = `You are the supervisor of an autonomous coding run. Make a lightweight
 accept/reject decision from the executor validation stored in the queue database.
@@ -1070,6 +1067,18 @@ You have no tools and must not inspect files, execute commands, rerun tests, or 
 That verification belongs exclusively to the executor. Check only whether its conclusion is
 consistent, whether every required check has concrete evidence, and whether failures or missing
 evidence require another attempt.
+
+A task is never terminally failed. When the evidence is not sufficient, make exactly one
+recovery decision: RETRY with a materially rewritten task description and verification, or
+SPLIT into several smaller ordered tasks. Use SPLIT only when scope is the obstacle; use RETRY
+when requirements or verification are contradictory, ambiguous, invalid, or poorly expressed.
+The task is already at attempt ${task.attempts} of its expected ${task.maxAttempts}; crossing
+that threshold increases the need for a decisive rewrite or split, but never permits giving up.
+
+Judge the structured current-attempt evidence, not its presentation. A successful command check
+with concrete output does not need the same command duplicated verbatim in another evidence field.
+An allowed-value list does not mean every allowed value must occur unless the requirement explicitly
+says so. Do not reject current exact checks solely because an older attempt reported different data.
 
 TASK ${task.seq}: ${task.title}
 Attempt ${task.attempts}.
@@ -1092,20 +1101,20 @@ ${attemptHistory(task)}
 
 Reply with ONE JSON object and nothing else:
 {
-  "verdict": "VERIFIED" | "RETRY" | "SPLIT" | "RESET_FROM",
+  "verdict": "VERIFIED" | "RETRY" | "SPLIT",
   "feedback": "why the stored validation is or is not sufficient",
-  "resetFromSeq": <number, only with RESET_FROM>,
   "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
-  "taskEdits": [{ "seq": <number>, "description": "...", "solutionVerifyCommand": "..." }]
+  "taskEdits": [{ "seq": <number>, "description": "...", "implVerifyPrompt": "...",
+                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
 Choose VERIFIED only when the executor concluded PASS and its database report contains concrete
 implementation and behaviour evidence plus successful required commands/tests. Do not independently
 repeat the checks. Choose RETRY for FAIL, INCOMPLETE, contradictory conclusions, or missing evidence;
 include a materially rewritten description for task ${task.seq}. Choose SPLIT after repeated cutoffs
-or when the remaining work is too large for one executor turn. RESET_FROM is only for evidence that
-earlier completed work must be redone. There is no give-up verdict.`;
+or when the remaining work is too large for one executor turn. For an unsuccessful task these are
+the only two decisions: rewrite it or split it. There is no fail or give-up verdict.`;
 
   const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
     maxIterations: supervisorRounds(),
@@ -1146,7 +1155,7 @@ earlier completed work must be redone. There is no give-up verdict.`;
   // FAIL is no longer in the protocol. A model that has seen it elsewhere still
   // emits it, and it means "I have run out of ideas" — which is a reason to
   // rewrite the task, never a reason to end the run.
-  const verdict: Verdict = (['VERIFIED', 'RETRY', 'SPLIT', 'RESET_FROM'] as string[]).includes(named)
+  const verdict: Verdict = (['VERIFIED', 'RETRY', 'SPLIT'] as string[]).includes(named)
     ? (named as Verdict)
     : 'RETRY';
 
@@ -1178,6 +1187,19 @@ earlier completed work must be redone. There is no give-up verdict.`;
     usage: total,
   };
 
+  // The LLM always reviews the task, but it may not turn complete structured
+  // PASS evidence into another attempt over formatting or placement alone.
+  if (automatic && settled !== 'VERIFIED') {
+    const feedback = `Supervisor review completed. ${automatic}`;
+    output.appendLine(`[queue:supervisor] ${feedback}`);
+    return {
+      verdict: 'VERIFIED',
+      feedback,
+      taskEdits: [],
+      usage: total,
+    };
+  }
+
   if (settled !== 'RETRY') {
     return decision;
   }
@@ -1206,6 +1228,8 @@ earlier completed work must be redone. There is no give-up verdict.`;
         {
           seq: task.seq,
           description: repair.description,
+          implVerifyPrompt: repair.implVerifyPrompt || own?.implVerifyPrompt,
+          solutionVerifyPrompt: repair.solutionVerifyPrompt || own?.solutionVerifyPrompt,
           solutionVerifyCommand: repair.solutionVerifyCommand || own?.solutionVerifyCommand,
         },
       ],
@@ -1280,16 +1304,16 @@ ${rawReply.slice(0, 4000)}
 Restate the SAME judgement — do not reconsider it, do not change your mind, just put it in the
 required shape — as ONE JSON object and nothing else:
 {
-  "verdict": "VERIFIED" | "RETRY" | "SPLIT" | "RESET_FROM",
+  "verdict": "VERIFIED" | "RETRY" | "SPLIT",
   "feedback": "what you found, and for a retry exactly what to do differently",
-  "resetFromSeq": <number, only with RESET_FROM>,
   "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
-  "taskEdits": [{ "seq": <number>, "description": "...", "solutionVerifyCommand": "..." }]
+  "taskEdits": [{ "seq": <number>, "description": "...", "implVerifyPrompt": "...",
+                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
 If your reply above reached a clear conclusion — the work is correct, it needs another attempt,
-it is too big to finish in one sitting, or the project needs to roll back — that conclusion,
+it is too big to finish in one sitting — that conclusion,
 and nothing else, is what "verdict" should say. If it was VERIFIED, say so; do not turn a pass
 into a retry just because the first reply was not formatted correctly. If your conclusion really
 was that this task needs another attempt, "taskEdits" must include a rewritten "description" for
@@ -1320,7 +1344,14 @@ async function demandRewrite(
   feedback: string,
   rawReply: string,
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'>,
-): Promise<{ description: string; solutionVerifyCommand: string; feedback: string; usage: Usage }> {
+): Promise<{
+  description: string;
+  implVerifyPrompt: string;
+  solutionVerifyPrompt: string;
+  solutionVerifyCommand: string;
+  feedback: string;
+  usage: Usage;
+}> {
   const prompt = `You judged task ${task.seq} and asked for another attempt, but you did not supply the
 rewritten description that a retry requires. Supply it now.
 
@@ -1345,6 +1376,8 @@ Reply with ONE JSON object and nothing else:
   "description": "the full replacement description — self-contained, naming the files,
                   functions and exact changes, and stating what the previous attempt got
                   wrong so it is not repeated. Not a diff or a note: the whole thing.",
+  "implVerifyPrompt": "a precise replacement implementation inspection",
+  "solutionVerifyPrompt": "a precise replacement behavioral success condition",
   "solutionVerifyCommand": "a corrected check command, or \\"\\" to keep the current one",
   "feedback": "one or two sentences of standing instruction for the executor"
 }`;
@@ -1357,12 +1390,21 @@ Reply with ONE JSON object and nothing else:
     const d = extractJson<any>(text);
     return {
       description: String(d?.description ?? '').trim(),
+      implVerifyPrompt: String(d?.implVerifyPrompt ?? '').trim(),
+      solutionVerifyPrompt: String(d?.solutionVerifyPrompt ?? '').trim(),
       solutionVerifyCommand: String(d?.solutionVerifyCommand ?? '').trim(),
       feedback: String(d?.feedback ?? '').trim(),
       usage,
     };
   } catch {
-    return { description: '', solutionVerifyCommand: '', feedback: '', usage: { ...NO_USAGE } };
+    return {
+      description: '',
+      implVerifyPrompt: '',
+      solutionVerifyPrompt: '',
+      solutionVerifyCommand: '',
+      feedback: '',
+      usage: { ...NO_USAGE },
+    };
   }
 }
 

@@ -191,7 +191,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 
 		if repeated, detail := failures.observe(calls, results); repeated {
 			a.activity(req.SessionID, PhaseError, detail+"; stopping the tool loop")
-			return a.repeatedFailureReport(
+			return a.finalReport(
 				ctx, req, sess, system, iter, accumulated.String(), detail)
 		}
 	}
@@ -205,7 +205,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	// way, and "nothing reported" is indistinguishable from "nothing done" — so
 	// the supervisor retries a task that may already be half-built, and the next
 	// attempt starts from zero with the same budget.
-	return a.finalReport(ctx, req, sess, system, maxIterations, accumulated.String())
+	return a.finalReport(ctx, req, sess, system, maxIterations, accumulated.String(), "")
 }
 
 func (a *Agent) maxIterations() int {
@@ -230,20 +230,29 @@ func (a *Agent) finalReport(
 	system string,
 	rounds int,
 	accumulated string,
+	haltReason string,
 ) (*SendResult, error) {
-	result := &SendResult{SessionID: req.SessionID, Iterations: rounds, StopReason: "max_iterations"}
-	a.activity(req.SessionID, PhaseReport, fmt.Sprintf(
-		"round budget spent after %d rounds — asking for a handoff report", rounds))
+	stopReason := "max_iterations"
+	stopLabel := fmt.Sprintf("cut off after %d tool-calling rounds", rounds)
+	stopExplanation := fmt.Sprintf("the %d-round tool-calling budget was exhausted", rounds)
+	if haltReason != "" {
+		stopReason = "repeated_tool_error"
+		stopLabel = fmt.Sprintf("stopped a repeated tool failure after %d rounds: %s", rounds, haltReason)
+		stopExplanation = haltReason
+	}
+	result := &SendResult{SessionID: req.SessionID, Iterations: rounds, StopReason: stopReason}
+	a.activity(req.SessionID, PhaseReport, stopLabel+"; asking for a handoff report")
 
 	nudge := fmt.Sprintf(
-		"You have used all %d tool-calling rounds for this turn, so no more tools are "+
-			"available to you. Do not plan further work and do not ask to continue.\n\n"+
+		"Tool use has stopped because %s. No more tools are available in this turn. "+
+			"Do not claim that a command succeeded unless its successful output is already "+
+			"present in the conversation. Do not plan further work and do not ask to continue.\n\n"+
 			"Report now, plainly:\n"+
 			"- what you changed, naming every file you actually created or edited\n"+
 			"- what you verified, and how you verified it\n"+
 			"- what is still missing, precisely enough for the next agent to finish it "+
 			"without repeating your work",
-		rounds)
+		stopExplanation)
 
 	a.mu.Lock()
 	msgs := make([]llm.Message, len(sess.Messages), len(sess.Messages)+1)
@@ -271,10 +280,10 @@ func (a *Agent) finalReport(
 			prefix = accumulated + "\n\n"
 		}
 		result.Text = fmt.Sprintf(
-			"%sStopped after %d tool-calling rounds, and the closing summary could not be "+
-				"produced: %v. Treat any work from this turn as unverified.", prefix, rounds, err)
+			"%s[%s]\n\nThe closing summary could not be produced: %v. "+
+				"Treat any work from this turn as unverified.", prefix, stopLabel, err)
 		a.emit("stream/done", map[string]any{
-			"sessionId": req.SessionID, "stopReason": "max_iterations",
+			"sessionId": req.SessionID, "stopReason": result.StopReason,
 			"usage": result.Usage, "iterations": rounds,
 		})
 		return result, nil
@@ -294,10 +303,10 @@ func (a *Agent) finalReport(
 		prefix = accumulated + "\n\n"
 	}
 	result.Text = fmt.Sprintf(
-		"%s[cut off after %d tool-calling rounds — this is a partial-progress report, not a "+
-			"finished task]\n\n%s", prefix, rounds, turn.Text())
+		"%s[%s; this is a partial-progress report, not a finished task]\n\n%s",
+		prefix, stopLabel, turn.Text())
 	a.emit("stream/done", map[string]any{
-		"sessionId": req.SessionID, "stopReason": "max_iterations",
+		"sessionId": req.SessionID, "stopReason": result.StopReason,
 		"usage": result.Usage, "iterations": rounds,
 	})
 	return result, nil

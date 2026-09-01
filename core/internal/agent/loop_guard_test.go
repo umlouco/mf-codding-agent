@@ -51,4 +51,7 @@ func TestRepeatedToolFailureStopsEarly(t *testing.T) {
 	if !strings.Contains(res.Text, "repeated tool failure") {
 		t.Errorf("Text=%q, want stop reason in report", res.Text)
 	}
+	if strings.Contains(res.Text, "cut off after") {
+		t.Errorf("Text=%q contains the unrelated round-budget label", res.Text)
+	}
 }

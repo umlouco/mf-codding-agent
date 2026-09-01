@@ -632,23 +632,19 @@ export class Orchestrator implements vscode.Disposable {
 
       case 'RETRY':
       default: {
-        const exhausted = task.attempts >= Math.max(1, task.maxAttempts);
         this.queue.update(task.id, {
-          status: exhausted ? 'FAILED' : 'PENDING',
+          status: 'PENDING',
           supervisorFeedback: decision.feedback,
           errorLog: appendAttempt(
             task.errorLog,
             `[attempt ${task.attempts}] ${decision.feedback}`,
           ),
-          finishedAt: exhausted ? Date.now() : null,
+          finishedAt: null,
         });
-        if (exhausted) {
-          this.disarm();
-          this.queue.setRunState('STOPPED');
-          this.log(`task ${task.seq} FAILED after ${task.attempts} attempts; run stopped for review`);
-        } else {
-          this.log(`task ${task.seq} back to PENDING for attempt ${task.attempts + 1}`);
-        }
+        this.log(
+          `task ${task.seq} rewritten by the supervisor; ` +
+          `back to PENDING for attempt ${task.attempts + 1}`,
+        );
         break;
       }
     }
@@ -680,6 +676,8 @@ export class Orchestrator implements vscode.Disposable {
       const description = edit.description?.trim() || target.description;
       this.queue.update(target.id, {
         description,
+        implVerifyPrompt: edit.implVerifyPrompt ?? target.implVerifyPrompt,
+        solutionVerifyPrompt: edit.solutionVerifyPrompt ?? target.solutionVerifyPrompt,
         solutionVerifyCommand: edit.solutionVerifyCommand ?? target.solutionVerifyCommand,
       });
       if (description !== target.description) {
