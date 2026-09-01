@@ -962,6 +962,8 @@ Rules:
 - Inspect the final code and diff yourself. Run relevant builds and tests. For UI/browser
   work, use the browser tools (including Playwright-style interaction) and record what happened.
 - Do not claim PASS from expectation. Every required check needs concrete observed evidence.
+- In each check, "passed" means the stated requirement was satisfied, not that a searched-for
+  value was present. An absence requirement passes when inspection confirms the value is absent.
 - Finish with ONE JSON object and nothing else, in this exact shape:
 {
   "report": "short summary of changes and files",

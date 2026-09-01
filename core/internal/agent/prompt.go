@@ -141,8 +141,9 @@ past a refusal does not work and is not a fix.
 The two shells take different syntax. Write POSIX sh for unix — that is true on
 every platform, including this one.
 
-run_shell is PowerShell: ";" or "if ($?) { ... }" instead of "&&", "$env:VAR"
-instead of "$VAR", "2>$null" instead of "2>/dev/null", "Get-ChildItem" and
+run_shell is PowerShell. Simple "command && next" chains are normalized for
+Windows PowerShell 5, but use "$env:VAR" instead of "$VAR", "2>$null" instead
+of "2>/dev/null", "Get-ChildItem" and
 "Select-Object -First" instead of "ls" and "head". Native executables — git, npm,
 go, composer, php, msbuild — take their usual arguments. Quote any path containing
 a space.

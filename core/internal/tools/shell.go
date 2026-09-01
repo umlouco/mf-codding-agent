@@ -140,6 +140,7 @@ func RegisterShell(r *Registry) {
 		Description: "Run a shell command in the workspace (PowerShell on Windows, sh elsewhere). " +
 			"Use for builds, test suites, package managers, git and compilers — " +
 			"composer, npm/pnpm, go build/test, dcc32/msbuild, php. " +
+			"Simple && command chains are accepted on Windows and retain stop-on-error semantics. " +
 			"When the editor offers a terminal this runs there, in the user's own " +
 			"configured shell and visible in a tab they can scroll back through, so " +
 			"a long build can be watched rather than waited on. " +
@@ -209,7 +210,11 @@ func RegisterShell(r *Registry) {
 				return runInTerminal(cctx, env, dir, a.Command, timeout)
 			}
 
-			name, args, cleanup := shellFor(a.Command)
+			command := a.Command
+			if runtime.GOOS == "windows" {
+				command = powerShellCompatible(command)
+			}
+			name, args, cleanup := shellFor(command)
 			defer cleanup()
 			cmd := exec.CommandContext(cctx, name, args...)
 			cmd.Dir = dir
@@ -225,6 +230,9 @@ func RegisterShell(r *Registry) {
 			elapsed := time.Since(start).Round(time.Millisecond)
 
 			out := strings.TrimRight(buf.String(), "\r\n")
+			if runtime.GOOS == "windows" {
+				out = cleanPowerShellOutput(out)
+			}
 			exitCode := 0
 			if err != nil {
 				if ee, ok := err.(*exec.ExitError); ok {

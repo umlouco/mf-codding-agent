@@ -6,6 +6,7 @@
 - Automatically accept complete structured PASS evidence, avoiding a second LLM rejecting successful checks for presentation-only reasons.
 - Keep retry round ceilings fixed and show detailed live activity plus cache reads separately in task rows.
 - Treat maximum attempts as an escalation signal; tasks are rewritten or split by the supervisor and never terminally failed.
+- Accept simple `&&` chains in Windows `run_shell` calls and decode PowerShell CLIXML errors into actionable text.
 
 Tool-surface changes aimed at one failure mode: the agent routing work through
 shell scripts and Python heredocs instead of the tools built for it, then
