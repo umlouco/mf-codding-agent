@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/xml"
+	"io"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -59,17 +60,39 @@ var powerShellEscapedRune = regexp.MustCompile(`(?i)_x([0-9a-f]{4})_`)
 // repeated failures much more likely.
 func cleanPowerShellOutput(output string) string {
 	trimmed := strings.TrimSpace(output)
+	if strings.HasPrefix(trimmed, "#< CLIXML") {
+		if start := strings.Index(trimmed, "<Objs "); start >= 0 {
+			trimmed = trimmed[start:]
+		}
+	}
 	if !strings.HasPrefix(trimmed, "<Objs ") {
 		return output
 	}
-	var doc struct {
-		Strings []string `xml:"S"`
+	var values []string
+	decoder := xml.NewDecoder(strings.NewReader(trimmed))
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return output
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok || start.Name.Local != "S" {
+			continue
+		}
+		var value string
+		if err := decoder.DecodeElement(&value, &start); err != nil {
+			return output
+		}
+		values = append(values, value)
 	}
-	if err := xml.Unmarshal([]byte(trimmed), &doc); err != nil || len(doc.Strings) == 0 {
+	if len(values) == 0 {
 		return output
 	}
-	lines := make([]string, 0, len(doc.Strings))
-	for _, value := range doc.Strings {
+	lines := make([]string, 0, len(values))
+	for _, value := range values {
 		value = powerShellEscapedRune.ReplaceAllStringFunc(value, func(token string) string {
 			var n rune
 			for _, ch := range token[2:6] {

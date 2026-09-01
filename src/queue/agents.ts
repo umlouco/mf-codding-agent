@@ -11,6 +11,7 @@ import {
   serializeValidation,
   validationForSupervisor,
 } from './validation';
+import { queueTasksFromPhasedRewrite } from './recovery';
 
 /**
  * Agent runners for autonomous runs.
@@ -1074,6 +1075,9 @@ A task is never terminally failed. When the evidence is not sufficient, make exa
 recovery decision: RETRY with a materially rewritten task description and verification, or
 SPLIT into several smaller ordered tasks. Use SPLIT only when scope is the obstacle; use RETRY
 when requirements or verification are contradictory, ambiguous, invalid, or poorly expressed.
+RETRY must remain one atomic executor task. Never put "Phase 1", "Phase 2", numbered steps, or
+several independently verifiable stages into a rewritten description; return SPLIT so they become
+real ordered queue tasks instead.
 The task is already at attempt ${task.attempts} of its expected ${task.maxAttempts}; crossing
 that threshold increases the need for a decisive rewrite or split, but never permits giving up.
 
@@ -1215,14 +1219,14 @@ the only two decisions: rewrite it or split it. There is no fail or give-up verd
   // long as anyone lets it.
   const own = decision.taskEdits!.find((e) => e.seq === task.seq);
   if (rewritten(own?.description, task.description)) {
-    return decision;
+    return promotePhasedRetry(task, decision);
   }
 
   const repair = await demandRewrite(context, output, task, feedback, parsed ? text : '', opts);
   addUsage(total, repair.usage);
   if (rewritten(repair.description, task.description)) {
     const rest = decision.taskEdits!.filter((e) => e.seq !== task.seq);
-    return {
+    return promotePhasedRetry(task, {
       ...decision,
       feedback: repair.feedback || feedback,
       taskEdits: [
@@ -1236,14 +1240,14 @@ the only two decisions: rewrite it or split it. There is no fail or give-up verd
         },
       ],
       usage: total,
-    };
+    });
   }
 
   // Both passes declined to write one. The executor still must not be handed
   // the same page twice, so the correction goes in as its own section: less
   // considered than a real rewrite, but it is new information, prominently
   // placed, and it is what the supervisor actually said to do.
-  return {
+  return promotePhasedRetry(task, {
     ...decision,
     taskEdits: [
       ...decision.taskEdits!.filter((e) => e.seq !== task.seq),
@@ -1254,6 +1258,27 @@ the only two decisions: rewrite it or split it. There is no fail or give-up verd
       },
     ],
     usage: total,
+  });
+}
+
+function promotePhasedRetry(task: Task, decision: SupervisorDecision): SupervisorDecision {
+  if (decision.verdict !== 'RETRY') {
+    return decision;
+  }
+  const own = decision.taskEdits?.find((edit) => edit.seq === task.seq);
+  if (!own?.description) {
+    return decision;
+  }
+  const parts = queueTasksFromPhasedRewrite(task, own.description, own);
+  if (!parts) {
+    return decision;
+  }
+  return {
+    ...decision,
+    verdict: 'SPLIT',
+    feedback: `${decision.feedback}\nThe proposed numbered phases were promoted to ${parts.length} real queue tasks.`.trim(),
+    splitInto: parts,
+    taskEdits: decision.taskEdits?.filter((edit) => edit.seq !== task.seq),
   };
 }
 
