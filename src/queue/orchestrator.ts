@@ -777,6 +777,7 @@ export class Orchestrator implements vscode.Disposable {
         this.context,
         this.output,
         task,
+        this.queue.instructions,
         (a) => {
           if (this.queue.recordActivity(task.id, a.phase, a.detail)) {
             this.changed();
@@ -844,6 +845,11 @@ export class Orchestrator implements vscode.Disposable {
           res.text.slice(0, 4000),
         );
         this.queue.log(task.id, 'executor', 'validation', res.validationReport.slice(0, 8000));
+        // The hand-off to every later task — see TaskQueue.instructions.
+        if (res.notes) {
+          this.queue.appendInstruction(res.notes);
+          this.queue.log(task.id, 'executor', 'notes-added', res.notes);
+        }
         this.log(
           res.cutOff
             ? `task ${task.seq} cut off after ${res.rounds} rounds; awaiting supervision`

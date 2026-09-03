@@ -96,6 +96,93 @@ func TestPrimaryToolAdvertisesVerificationFields(t *testing.T) {
 	}
 }
 
+func TestUpdateDeleteReorderTools(t *testing.T) {
+	s := testServer(t)
+
+	create := func(title string) int64 {
+		text, isError, err := s.onCreate(context.Background(), []byte(`{
+			"title": "`+title+`",
+			"description": "A self-contained description of the work to do.",
+			"implementationCheck": "Inspect the resulting files.",
+			"behaviorCheck": "Exercise the happy path."
+		}`))
+		if err != nil || isError {
+			t.Fatalf("create %s: text=%s isError=%v err=%v", title, text, isError, err)
+		}
+		var out struct {
+			ID int64 `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(text), &out); err != nil {
+			t.Fatalf("decode create response: %v", err)
+		}
+		return out.ID
+	}
+
+	idA := create("Task A")
+	idB := create("Task B")
+	_ = create("Task C")
+
+	// task_queue_update changes only the fields supplied.
+	updateParams, _ := json.Marshal(map[string]any{
+		"id":     idA,
+		"title":  "Task A renamed",
+		"status": "PAUSED",
+	})
+	text, isError, err := s.onUpdate(context.Background(), updateParams)
+	if err != nil || isError {
+		t.Fatalf("update: text=%s isError=%v err=%v", text, isError, err)
+	}
+	task, ok, err := queue.GetTask(s.db, idA)
+	if err != nil || !ok {
+		t.Fatalf("GetTask after update: ok=%v err=%v", ok, err)
+	}
+	if task.Title != "Task A renamed" || task.Status != queue.StatusPaused {
+		t.Fatalf("update did not apply: %+v", task)
+	}
+
+	// An empty update (unknown id) is reported as a tool error, not an RPC error.
+	missingParams, _ := json.Marshal(map[string]any{"id": idA + 1000, "title": "Won't stick"})
+	text, isError, err = s.onUpdate(context.Background(), missingParams)
+	if err != nil || !isError {
+		t.Fatalf("update missing id: text=%s isError=%v err=%v", text, isError, err)
+	}
+
+	// task_queue_delete removes the task and closes the seq gap.
+	deleteParams, _ := json.Marshal(map[string]any{"id": idB})
+	text, isError, err = s.onDelete(context.Background(), deleteParams)
+	if err != nil || isError {
+		t.Fatalf("delete: text=%s isError=%v err=%v", text, isError, err)
+	}
+	if _, ok, _ := queue.GetTask(s.db, idB); ok {
+		t.Fatal("expected task B to be deleted")
+	}
+
+	// Deleting the same id again is a tool error, not an RPC error.
+	text, isError, err = s.onDelete(context.Background(), deleteParams)
+	if err != nil || !isError {
+		t.Fatalf("re-delete: text=%s isError=%v err=%v", text, isError, err)
+	}
+
+	// task_queue_reorder renumbers the remaining tasks.
+	remaining, err := queue.ListTasks(s.db)
+	if err != nil || len(remaining) != 2 {
+		t.Fatalf("expected 2 remaining tasks, got %d (err=%v)", len(remaining), err)
+	}
+	reversedIDs := []int64{remaining[1].ID, remaining[0].ID}
+	reorderParams, _ := json.Marshal(map[string]any{"ids": reversedIDs})
+	text, isError, err = s.onReorder(context.Background(), reorderParams)
+	if err != nil || isError {
+		t.Fatalf("reorder: text=%s isError=%v err=%v", text, isError, err)
+	}
+	reordered, err := queue.ListTasks(s.db)
+	if err != nil {
+		t.Fatalf("ListTasks after reorder: %v", err)
+	}
+	if reordered[0].ID != reversedIDs[0] || reordered[1].ID != reversedIDs[1] {
+		t.Fatalf("reorder did not apply: %+v", reordered)
+	}
+}
+
 func TestInitializeNegotiatesClientVersion(t *testing.T) {
 	var out bytes.Buffer
 	s := &server{out: &out}

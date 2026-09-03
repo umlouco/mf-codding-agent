@@ -6,6 +6,7 @@ import { registerEditorFsHandlers } from './editorFs';
 import { disposeTerminal, registerEditorTerminalHandlers } from './editorTerminal';
 import { ChatPanel } from './panel';
 import { queueDbPath, resolveMcpBinary } from './detect';
+import { registerMcpProvider, writeProjectMcpJson } from './mcp';
 import { TaskQueue } from './queue/db';
 import { Orchestrator } from './queue/orchestrator';
 import { QueueViewProvider } from './queue/panel';
@@ -54,6 +55,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   registerCommands(context);
   registerTaskQueue(context);
+  registerMcpProvider(context);
 
   // The browser path is worked out, never configured. On remote workspaces
   // this may download Chromium into the extension cache.
@@ -559,6 +561,47 @@ function registerCommands(context: vscode.ExtensionContext): void {
     }
   });
 
+  reg('mfagent.registerMcpServers', async () => {
+    const mcpBin = resolveMcpBinary(context);
+    if (!mcpBin) {
+      void vscode.window.showErrorMessage(
+        `mfagent-mcp binary not found. Build it first: cd core && go build -o ../bin/ ./cmd/mfagent-mcp`,
+      );
+      return;
+    }
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!folder) {
+      void vscode.window.showErrorMessage('Open a workspace folder first — registration is project-scoped.');
+      return;
+    }
+
+    // The project-root `.mcp.json` is the shared standard: Claude Code, Cursor
+    // and the VS Code Agent Host all read it natively, so writing it here (and
+    // merging with anything already in it) covers every JSON-configured client
+    // without depending on a CLI being on PATH. VS Code itself sees the server
+    // through `registerMcpProvider` at activation, so this file is only for
+    // tools outside the editor.
+    const file = writeProjectMcpJson(folder, mcpBin);
+
+    // Codex keeps its MCP servers in ~/.codex/config.toml, which has no JSON
+    // equivalent, so it still gets its own `codex mcp add` line. Running it in
+    // a visible terminal means an uninstalled CLI just prints "command not
+    // found" instead of this command having to guess at PATH resolution.
+    const term = vscode.window.createTerminal({
+      name: 'MF Agent: MCP Setup',
+      cwd: folder,
+      iconPath: new vscode.ThemeIcon('plug'),
+    });
+    term.show();
+    term.sendText(`codex mcp add mfagent-task-queue -- "${mcpBin}" --workspace "${folder}"`);
+
+    void vscode.window.showInformationMessage(
+      `Wrote ${vscode.workspace.asRelativePath(file)} — Claude Code, Cursor and other .mcp.json tools ` +
+        'will offer "mfagent-task-queue" (approve it once when prompted). A "codex mcp add" command was ' +
+        'sent to the terminal for Codex. VS Code and Copilot Chat see the server automatically.',
+    );
+  });
+
   reg('mfagent.copyMcpConfig', async () => {
     const mcpBin = resolveMcpBinary(context);
     if (!mcpBin) {
@@ -576,6 +619,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
     const config = {
       mcpServers: {
         'mfagent-task-queue': {
+          type: 'stdio',
           command: mcpBin,
           args: ['--workspace', workspaceRoot],
         },
@@ -586,20 +630,22 @@ function registerCommands(context: vscode.ExtensionContext): void {
     await vscode.env.clipboard.writeText(json);
 
     const pick = await vscode.window.showInformationMessage(
-      'Task Queue MCP JSON copied. Use it with Claude Code, Kilocode, or another JSON-configured MCP client.',
+      'Task Queue MCP JSON copied. VS Code and Copilot Chat already see this server automatically; ' +
+        'use this for a JSON-configured MCP client (e.g. Kilo/other) or to hand-edit a .mcp.json / ' +
+        '.vscode/mcp.json file.',
       'Show config',
     );
     if (pick === 'Show config') {
       const doc = await vscode.workspace.openTextDocument({
-        content: `// Claude Code / Kilocode / JSON-based MCP clients:
-// Paste the object below into the client MCP configuration.
-// Claude Code accepts .claude.json (global) or .mcp.json (per-project).
+        content: `// Any JSON-configured MCP client (e.g. Kilo) — or paste into
+// .mcp.json (project root) or .vscode/mcp.json.
 //
 // If the workspace path changes per project, remove the --workspace arg
 // and the server will use the current working directory.
 //
-// Codex CLI equivalent:
-// codex mcp add mfagent-task-queue -- "${mcpBin}" --workspace "${workspaceRoot}"
+// Claude Code / Cursor read the project-root .mcp.json that
+// "MF Agent: Register Task Queue MCP Server" writes for you; VS Code and
+// Copilot Chat see the server automatically at activation.
 
 ${json}
 `,

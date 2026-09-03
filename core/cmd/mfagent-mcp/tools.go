@@ -60,6 +60,33 @@ func (s *server) registerTools() {
 			Annotations:  toolAnnotations("Replace task queue (legacy)", false, true, true),
 			Handler:      s.onGenerate,
 		},
+		{
+			Name: "task_queue_update",
+			Description: "Edit one or more fields of an existing task by id (title, description, " +
+				"implementationCheck, behaviorCheck, verificationCommand, maxAttempts, status, seq). " +
+				"Only the fields supplied are changed. Use task_queue_reorder to resequence more than one task.",
+			InputSchema:  updateInputSchema(),
+			OutputSchema: updateOutputSchema(),
+			Annotations:  toolAnnotations("Update task", false, false, true),
+			Handler:      s.onUpdate,
+		},
+		{
+			Name:         "task_queue_delete",
+			Description:  "Delete a task by id and close the sequence gap it leaves behind.",
+			InputSchema:  deleteInputSchema(),
+			OutputSchema: deleteOutputSchema(),
+			Annotations:  toolAnnotations("Delete task", false, true, true),
+			Handler:      s.onDelete,
+		},
+		{
+			Name: "task_queue_reorder",
+			Description: "Renumber the queue's execution order to match the given id list. " +
+				"Pass every task id from task_queue_list, in the desired order.",
+			InputSchema:  reorderInputSchema(),
+			OutputSchema: reorderOutputSchema(),
+			Annotations:  toolAnnotations("Reorder tasks", false, false, true),
+			Handler:      s.onReorder,
+		},
 	}
 }
 
@@ -104,6 +131,69 @@ func legacyOutputSchema() map[string]any {
 		"replaced": map[string]any{"type": "boolean"}, "count": map[string]any{"type": "integer"},
 		"issues": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 	}, "required": []string{"replaced"}}
+}
+
+func statusEnum() []string {
+	return []string{"PENDING", "EXECUTING", "VERIFYING", "VERIFIED", "FAILED", "PAUSED"}
+}
+
+func updateInputSchema() map[string]any {
+	props := taskProperties()
+	props["id"] = map[string]any{"type": "integer", "minimum": 1,
+		"description": "Task id, as returned by task_queue_list or task_queue_create."}
+	props["status"] = map[string]any{"type": "string", "enum": statusEnum(),
+		"description": "Manually override the task's status."}
+	props["seq"] = map[string]any{"type": "integer", "minimum": 1,
+		"description": "1-based execution order. Prefer task_queue_reorder to resequence multiple tasks at once."}
+	return map[string]any{
+		"type": "object", "additionalProperties": false,
+		"properties": props,
+		"required":   []string{"id"},
+	}
+}
+
+func updateOutputSchema() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{
+		"updated": map[string]any{"type": "boolean"}, "id": map[string]any{"type": "integer"},
+		"task":   map[string]any{"type": "object", "additionalProperties": true},
+		"issues": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+	}, "required": []string{"updated"}}
+}
+
+func deleteInputSchema() map[string]any {
+	return map[string]any{
+		"type": "object", "additionalProperties": false,
+		"properties": map[string]any{
+			"id": map[string]any{"type": "integer", "minimum": 1,
+				"description": "Task id, as returned by task_queue_list."},
+		},
+		"required": []string{"id"},
+	}
+}
+
+func deleteOutputSchema() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{
+		"deleted": map[string]any{"type": "boolean"}, "id": map[string]any{"type": "integer"},
+		"issues": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+	}, "required": []string{"deleted"}}
+}
+
+func reorderInputSchema() map[string]any {
+	return map[string]any{
+		"type": "object", "additionalProperties": false,
+		"properties": map[string]any{
+			"ids": map[string]any{"type": "array", "minItems": 1,
+				"items":       map[string]any{"type": "integer"},
+				"description": "Every task id currently in the queue, in the desired execution order."},
+		},
+		"required": []string{"ids"},
+	}
+}
+
+func reorderOutputSchema() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{
+		"reordered": map[string]any{"type": "boolean"}, "count": map[string]any{"type": "integer"},
+	}, "required": []string{"reordered"}}
 }
 
 func taskProperties() map[string]any {
@@ -296,6 +386,106 @@ func (s *server) onStats(_ context.Context, _ json.RawMessage) (string, bool, er
 		return "", true, fmt.Errorf("stats failed: %w", err)
 	}
 	return jsonText(stats), false, nil
+}
+
+func (s *server) onUpdate(_ context.Context, params json.RawMessage) (string, bool, error) {
+	var in struct {
+		ID                  int64   `json:"id"`
+		Title               *string `json:"title"`
+		Description         *string `json:"description"`
+		ImplementationCheck *string `json:"implementationCheck"`
+		BehaviorCheck       *string `json:"behaviorCheck"`
+		VerificationCommand *string `json:"verificationCommand"`
+		MaxAttempts         *int    `json:"maxAttempts"`
+		Status              *string `json:"status"`
+		Seq                 *int    `json:"seq"`
+	}
+	if err := json.Unmarshal(params, &in); err != nil {
+		return "", true, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if in.ID <= 0 {
+		return "", true, fmt.Errorf("id is required")
+	}
+
+	var issues []string
+	patch := queue.TaskPatch{
+		Description:           in.Description,
+		ImplVerifyPrompt:      in.ImplementationCheck,
+		SolutionVerifyPrompt:  in.BehaviorCheck,
+		SolutionVerifyCommand: in.VerificationCommand,
+		Seq:                   in.Seq,
+	}
+	if in.Title != nil {
+		trimmed := strings.TrimSpace(*in.Title)
+		if len(trimmed) < 3 || len(trimmed) > 200 {
+			issues = append(issues, "title must be between 3 and 200 characters")
+		}
+		patch.Title = &trimmed
+	}
+	if in.MaxAttempts != nil {
+		if *in.MaxAttempts < 1 || *in.MaxAttempts > 20 {
+			issues = append(issues, "maxAttempts must be between 1 and 20")
+		}
+		patch.MaxAttempts = in.MaxAttempts
+	}
+	if in.Status != nil {
+		st := queue.TaskStatus(*in.Status)
+		patch.Status = &st
+	}
+	if len(issues) > 0 {
+		return jsonText(map[string]any{"updated": false, "issues": issues}), true, nil
+	}
+
+	updated, err := queue.UpdateTask(s.db, in.ID, patch)
+	if err != nil {
+		return "", true, fmt.Errorf("update failed: %w", err)
+	}
+	if !updated {
+		return jsonText(map[string]any{"updated": false,
+			"issues": []string{fmt.Sprintf("task %d not found, or no fields were supplied", in.ID)}}), true, nil
+	}
+	result := map[string]any{"updated": true, "id": in.ID}
+	if task, ok, err := queue.GetTask(s.db, in.ID); err == nil && ok {
+		result["task"] = task
+	}
+	return jsonText(result), false, nil
+}
+
+func (s *server) onDelete(_ context.Context, params json.RawMessage) (string, bool, error) {
+	var in struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(params, &in); err != nil {
+		return "", true, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if in.ID <= 0 {
+		return "", true, fmt.Errorf("id is required")
+	}
+	deleted, err := queue.DeleteTask(s.db, in.ID)
+	if err != nil {
+		return "", true, fmt.Errorf("delete failed: %w", err)
+	}
+	if !deleted {
+		return jsonText(map[string]any{"deleted": false,
+			"issues": []string{fmt.Sprintf("task %d not found", in.ID)}}), true, nil
+	}
+	return jsonText(map[string]any{"deleted": true, "id": in.ID}), false, nil
+}
+
+func (s *server) onReorder(_ context.Context, params json.RawMessage) (string, bool, error) {
+	var in struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.Unmarshal(params, &in); err != nil {
+		return "", true, fmt.Errorf("invalid arguments: %w", err)
+	}
+	if len(in.IDs) == 0 {
+		return "", true, fmt.Errorf("ids must not be empty")
+	}
+	if err := queue.ReorderTasks(s.db, in.IDs); err != nil {
+		return "", true, fmt.Errorf("reorder failed: %w", err)
+	}
+	return jsonText(map[string]any{"reordered": true, "count": len(in.IDs)}), false, nil
 }
 
 func (s *server) onGenerate(_ context.Context, params json.RawMessage) (string, bool, error) {

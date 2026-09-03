@@ -5,7 +5,12 @@ import { resolveCoreBinary, workspaceRoot } from '../detect';
 import { registerEditorFsHandlers } from '../editorFs';
 import { getStore } from '../providers/instance';
 import { NewTask, Task, TaskQueue, Usage } from './db';
-import { parseExecutorValidation, serializeValidation, validationForSupervisor } from './validation';
+import {
+  extractExecutorNotes,
+  parseExecutorValidation,
+  serializeValidation,
+  validationForSupervisor,
+} from './validation';
 
 /**
  * Agent runners for autonomous runs.
@@ -851,6 +856,12 @@ export interface ExecutionOutcome {
   rounds: number;
   /** What this attempt cost, spent whether or not it produced anything. */
   usage: Usage;
+  /**
+   * A durable fact this task wants every later task to know, straight from
+   * its own JSON report — see TaskQueue.appendInstruction. Empty when the
+   * executor had nothing to add.
+   */
+  notes: string;
 }
 
 const MAX_LOG_ENTRIES = 4;
@@ -929,15 +940,25 @@ export async function executeTask(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   task: Task,
+  /** TaskQueue.instructions — see its doc comment for why this crosses the
+   * task-isolation boundary when nothing else does. */
+  instructions: string,
   onActivity?: (a: ActivityRecord) => void,
   onEvent?: (method: string, params: any) => void,
   onAbort?: (abort: () => void) => void,
 ): Promise<ExecutionOutcome> {
   const retry = retryBriefing(task);
+  const notes = instructions.trim()
+    ? `PROJECT NOTES — standing conventions and facts for this whole project, written by the
+project owner and by earlier tasks. Apply these to your work:
+${instructions.trim()}
+
+`
+    : '';
 
   const prompt = `You are an execution agent. Complete exactly one task, then stop.
 
-TASK ${task.seq}: ${task.title}
+${notes}TASK ${task.seq}: ${task.title}
 
 ${task.description}
 ${retry}
@@ -957,6 +978,10 @@ Rules:
 - Inspect the final code and diff yourself. Run relevant builds and tests. For UI/browser
   work, use the browser tools (including Playwright-style interaction) and record what happened.
 - Do not claim PASS from expectation. Every required check needs concrete observed evidence.
+- If you learned something every later task should know — where something lives, a convention
+  to follow, how to build or test this project — put it in "notes" below. This is the only way
+  that fact reaches later tasks: they run with no memory of this attempt. Leave "notes" empty if
+  there is nothing new, and do not repeat what PROJECT NOTES above already says.
 - Finish with ONE JSON object and nothing else, in this exact shape:
 {
   "report": "short summary of changes and files",
@@ -968,7 +993,8 @@ Rules:
     "checks": [{ "kind": "inspection" | "command" | "test" | "browser" | "other",
                  "name": "command or check name", "passed": true, "evidence": "observed output" }],
     "remaining": "anything unverified or still broken; empty only when nothing remains"
-  }
+  },
+  "notes": "a durable fact for later tasks, or \\"\\" if there is nothing new"
 }`;
 
   // Rounds are the only budget an attempt has, and a retry gets more of them —
@@ -992,6 +1018,7 @@ Rules:
     stopReason,
     rounds,
     usage,
+    notes: extractExecutorNotes(text),
   };
 }
 

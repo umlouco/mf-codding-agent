@@ -34,6 +34,27 @@ explaining the detour with invented facts about the tools.
   available. New setting: `mfagent.shell.useTerminal`. Requires VS Code 1.93.
 - The system prompt no longer suggests a Python script for questions that `grep`
   answers, and asks for a disagreeing count to be reported rather than re-derived.
+- `mfagent-mcp` gains `task_queue_update`, `task_queue_delete`, and
+  `task_queue_reorder`, so Claude Code, Codex, and other MCP clients can edit an
+  existing plan in place — retitle a task, change its status, drop one, or
+  resequence — instead of rewriting the whole queue through
+  `task_queue_write_plan`.
+- New command **MF Agent: Register Task Queue MCP Server (Claude Code /
+  Codex)** actually registers `mfagent-mcp` with both CLIs — running
+  `claude mcp add --scope project` and `codex mcp add` in a terminal — instead
+  of leaving it to a clipboard paste the user had to act on themselves. This
+  is the fix for the server existing but never actually showing up in either
+  tool. **MF Agent: Copy Task Queue MCP Config** remains for Kilocode and other
+  JSON-configured clients.
+- New **Project notes** field on the Task Queue's Plan tab — free text
+  prepended to every execution agent's prompt. This is the one deliberate hole
+  in task isolation: every task otherwise runs in a fresh process with no
+  memory of any other, so a fact task 1 establishes (stack, test framework,
+  where something lives, how to build) would never reach task 3 except by
+  task 3 rediscovering it on disk. Seed it with standing conventions, and it
+  also grows on its own: the executor's JSON report gains an optional `notes`
+  field, and anything a task puts there is appended for every later task to
+  see. Stored in `queue_meta`, so it survives regenerating the plan.
 
 ## 0.1.0
 

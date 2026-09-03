@@ -420,6 +420,45 @@ export class TaskQueue {
     this.log(null, 'system', 'run-state', state);
   }
 
+  /**
+   * Free-text project conventions and facts, prepended to every executor's
+   * prompt — see executeTask in agents.ts.
+   *
+   * This is the one deliberate exception to task isolation: every task
+   * otherwise runs in a fresh process with no memory of any other task (see
+   * the doc comment atop agents.ts), so a fact task 1 establishes — where
+   * something lives, what stack or test framework to use, how to build —
+   * would otherwise never reach task 3 except by task 3 rediscovering it on
+   * disk. Starts with whatever is typed into the Plan tab; grows on its own
+   * as executors report durable facts worth keeping, via appendInstruction.
+   *
+   * Lives in queue_meta rather than settings.json because it is project
+   * knowledge that accumulates over a run, not a preference — and unlike
+   * `tasks`, replaceAll leaves queue_meta alone, so it survives regenerating
+   * the plan.
+   */
+  get instructions(): string {
+    return this.getMeta('instructions', '');
+  }
+
+  setInstructions(text: string): void {
+    this.setMeta('instructions', text.trim());
+  }
+
+  /**
+   * Appends one more fact, for an executor that learns something every later
+   * task should know. A no-op for a blank line, so a task with nothing to add
+   * can pass one through unconditionally.
+   */
+  appendInstruction(line: string): void {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
+    }
+    const current = this.instructions;
+    this.setInstructions(current ? `${current}\n${trimmed}` : trimmed);
+  }
+
   // ---- reads -----------------------------------------------------------
 
   list(): Task[] {

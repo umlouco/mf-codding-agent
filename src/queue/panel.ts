@@ -107,6 +107,13 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
         case 'generate':
           await this.generate(msg.goal, !!msg.append);
           break;
+        case 'setInstructions': {
+          const text = String(msg.text ?? '');
+          queue.setInstructions(text);
+          queue.log(null, 'user', 'instructions-set', text.trim() ? `${text.trim().length} char(s)` : 'cleared');
+          this.render();
+          break;
+        }
 
         case 'start':
           if (await this.confirmAutonomy(queue)) {
@@ -328,6 +335,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       generating: this.generating,
       dbPath: queue.path,
       driver: queue.impl,
+      instructions: queue.instructions,
       models: { planner: '', supervisor: '', executor: '' },
     });
     // Role models come from the profile store, which is async. Push them as a
@@ -402,6 +410,10 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     </div>
     <button id="generate" class="primary">Generate plan</button>
     <p class="hint">The workspace is scanned and split into regions first, then the planner scopes phases over them — each phase is explored and turned into verifiable tasks with a test command once you press Start, so planning stays fast no matter how large the project is.</p>
+
+    <label class="lbl" for="instructions">Project notes (sent to every task)</label>
+    <textarea id="instructions" rows="6" placeholder="e.g. Use Go with Wails; test with Playwright.&#10;The class list lives in classes.md.&#10;Build with build.ps1."></textarea>
+    <p class="hint">Every task otherwise runs in its own process with no memory of any other — this is the one thing every execution agent sees regardless. Start it with standing conventions for the project; it also grows on its own as agents report durable facts worth keeping, so a fact task 1 establishes can reach task 3 without task 3 rediscovering it.</p>
   </section>
 
   <section id="pane-run" class="pane">

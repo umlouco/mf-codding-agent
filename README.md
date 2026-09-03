@@ -297,14 +297,30 @@ Both stdio and streamable HTTP transports are supported. Servers connect in para
 at startup; one that fails is reported as a warning rather than blocking activation.
 
 The extension also bundles `mfagent-mcp`, a stdio MCP server for Claude Code,
-Codex, Kilocode, and other MCP clients. Run **MF Agent: Copy Task Queue MCP
-Config** to copy a workspace-aware configuration. Its primary tool is
+Codex, Kilocode, and other MCP clients. Run **MF Agent: Register Task Queue
+MCP Server (Claude Code / Codex)** to wire it up automatically — it runs
+`claude mcp add --scope project` and `codex mcp add` in a terminal, so each
+CLI registers the server in its own config (Claude Code's project-local
+`.mcp.json`, which it will ask you to approve once via `/mcp`; Codex's global
+`~/.codex/config.toml`) instead of you hand-editing either file. A CLI that
+isn't installed just prints "command not found" in that terminal and can be
+ignored. For Kilocode or another JSON-configured client, **MF Agent: Copy Task
+Queue MCP Config** copies the equivalent JSON to the clipboard instead.
+
+Its primary tool is
 `task_queue_write_plan`, which validates and atomically writes an ordered plan
 to `.mfagent/queue.db`. Every task carries self-contained instructions, an
 implementation check, a behavior check, and an optional deterministic test
 command. The tool supports replace/append modes and a dry run, and returns both
-text and MCP `structuredContent`. Read-only list and statistics tools, a
-single-task append tool, and a compatibility generate tool are also exposed.
+text and MCP `structuredContent`. Beyond that, the server exposes read tools
+(`task_queue_list`, `task_queue_stats`) and edit tools for changing the queue
+in place without rewriting the whole plan: `task_queue_create` appends a single
+task, `task_queue_update` edits any field of an existing task by id (including
+its `status`), `task_queue_delete` removes one, and `task_queue_reorder`
+renumbers execution order. A compatibility `task_queue_generate` alias is also
+exposed. Because Claude Code, Codex, and the extension's own autonomous run all
+read and write the same SQLite file, edits made by one are visible to the
+others immediately.
 
 ---
 

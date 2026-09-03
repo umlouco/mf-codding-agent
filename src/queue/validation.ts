@@ -20,6 +20,8 @@ export interface ExecutorValidation {
 interface ExecutorEnvelope {
   report?: unknown;
   validation?: unknown;
+  /** Durable facts worth telling every later task — see extractExecutorNotes. */
+  notes?: unknown;
 }
 
 function isEnvelope(value: unknown): boolean {
@@ -110,6 +112,23 @@ function incomplete(summary: string, raw: string): ExecutorValidation {
     checks: [],
     remaining: clean(raw, 4000),
   };
+}
+
+/**
+ * Pulls the executor's optional "notes" field out of its JSON report — see
+ * ExecutorEnvelope and TaskQueue.appendInstruction in db.ts.
+ *
+ * Best-effort and separate from parseExecutorValidation on purpose: a reply
+ * that fails to parse, or omits the field, has simply chosen to add nothing
+ * to the shared project notes — that must never read as a validation failure.
+ */
+export function extractExecutorNotes(text: string): string {
+  try {
+    const envelope = extractEnvelope(text);
+    return clean(envelope.notes, 2000);
+  } catch {
+    return '';
+  }
 }
 
 export function serializeValidation(report: ExecutorValidation): string {

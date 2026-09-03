@@ -3,12 +3,16 @@
 // 2.0 over stdio, matching the 2025-06-18 MCP specification.
 //
 // The server opens .mfagent/queue.db under the workspace root (the current
-// working directory) and exposes four tools:
+// working directory) and exposes these tools:
 //
-//   - task_queue_create:  add a single task
-//   - task_queue_list:    list all tasks with their status
-//   - task_queue_stats:   aggregate counts and token usage
-//   - task_queue_generate: replace the entire queue with a new plan
+//   - task_queue_write_plan: atomically write or extend an ordered plan
+//   - task_queue_create:     add a single task
+//   - task_queue_list:       list all tasks with their status
+//   - task_queue_stats:      aggregate counts and token usage
+//   - task_queue_update:     edit fields of an existing task
+//   - task_queue_delete:     delete a task
+//   - task_queue_reorder:    change execution order
+//   - task_queue_generate:   compatibility alias that replaces the queue
 package main
 
 import (
@@ -191,7 +195,7 @@ func (s *server) handleInitialize(_ context.Context, req *rpcRequest) {
 			"title":   "MF Agent Task Queue",
 			"version": "0.1.0",
 		},
-		"instructions": "Use task_queue_write_plan to create task lists. Include ordered, self-contained tasks with implementation and behavior checks. Use dryRun before writing when requirements are uncertain.",
+		"instructions": "Use task_queue_write_plan to create task lists. Include ordered, self-contained tasks with implementation and behavior checks. Use dryRun before writing when requirements are uncertain. Use task_queue_update/task_queue_delete/task_queue_reorder to edit the queue afterward instead of rewriting the whole plan.",
 	}
 	s.sendResult(req.ID, result)
 }

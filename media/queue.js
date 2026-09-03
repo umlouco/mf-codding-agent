@@ -42,6 +42,14 @@
     send({ type: 'setInterval', seconds: Number(/** @type {HTMLSelectElement} */ ($('cron')).value) }),
   );
 
+  // Commit on blur, like the per-task fields below: a re-render mid-edit —
+  // which an executor appending its own note can trigger at any time — would
+  // otherwise fight the caret.
+  $('instructions').addEventListener('blur', () => {
+    const el = /** @type {HTMLTextAreaElement} */ ($('instructions'));
+    if (el.value !== (state?.instructions || '')) send({ type: 'setInstructions', text: el.value });
+  });
+
   for (const [id, type] of [
     ['retry', 'retry'],
     ['openFolder', 'openFolder'],
@@ -123,6 +131,14 @@
     renderRunbar(st);
     renderCounts(state.stats);
     renderTasks(state.tasks, st);
+
+    // Not just on first render: an executor can append to this at any time
+    // while the run is going, so it has to stay live — but never while the
+    // user is mid-edit in the same box.
+    const notesEl = /** @type {HTMLTextAreaElement} */ ($('instructions'));
+    if (document.activeElement !== notesEl) {
+      notesEl.value = state.instructions || '';
+    }
 
     dbinfoEl.textContent = `${state.dbPath} · ${state.driver} · exec ${state.models.executor || 'default'} · supervisor ${state.models.supervisor || 'default'}`;
   }

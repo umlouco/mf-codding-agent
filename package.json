@@ -50,6 +50,12 @@
         }
       ]
     },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "mf-agent.mcp-servers",
+        "label": "MF Agent Task Queue"
+      }
+    ],
     "commands": [
       {
         "command": "mfagent.focusChat",
@@ -92,6 +98,10 @@
       {
         "command": "mfagent.showMcpStatus",
         "title": "MF Agent: Show MCP Server Status"
+      },
+      {
+        "command": "mfagent.registerMcpServers",
+        "title": "MF Agent: Register Task Queue MCP Server (Claude Code / Codex)"
       },
       {
         "command": "mfagent.copyMcpConfig",
