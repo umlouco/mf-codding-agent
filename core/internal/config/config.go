@@ -60,10 +60,23 @@ type Config struct {
 	// verification commands, browser runs, and code inspection stay executor work.
 	DisableTools bool `json:"disableTools"`
 
-	// Tool-calling rounds allowed in one turn. Zero means the built-in default.
-	// The editor raises it for unattended queue workers, which have nobody to
-	// tell them to continue, and raises it again on each retry.
+	// Tool-calling rounds allowed in one turn. Zero means the built-in default,
+	// and a negative number means no round ceiling at all. The editor raises it
+	// for unattended queue workers, which have nobody to tell them to continue,
+	// and removes it entirely where a supervisor decides when the turn ends.
 	MaxIterations int `json:"maxIterations"`
+
+	// Context tokens one round may carry before the turn is stopped and asked
+	// for a handoff report. Zero means the built-in default; negative disables
+	// the ceiling.
+	//
+	// This is the backstop for a turn that has no round ceiling. It is not a
+	// budget and not a judgement about the work: the conversation grows by every
+	// tool result, so a model that keeps calling tools without converging walks
+	// into the provider's own context limit and dies there, taking the account
+	// of what it did with it. Stopping just short of that turns a lost turn into
+	// a reported one.
+	MaxContextTokens int64 `json:"maxContextTokens"`
 
 	// Seconds a model reply may go without delivering a single byte before the
 	// connection is treated as dropped. Zero means the built-in default.

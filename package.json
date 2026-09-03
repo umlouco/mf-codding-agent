@@ -246,12 +246,6 @@
           "minimum": 1,
           "markdownDescription": "How long a running worker may write nothing before it is treated as dead and its task requeued. This is not a time limit on the task: a live worker writes an activity record every `#mfagent.activityIntervalSeconds#` even while it waits on the model, so only a process that has actually stopped goes quiet for this long. Raise it if you see healthy workers being requeued."
         },
-        "mfagent.queue.noReportEscalateAfter": {
-          "type": "number",
-          "default": 2,
-          "minimum": 1,
-          "markdownDescription": "How many times in a row a task's worker may fail to report back at all — go silent past `#mfagent.queue.workerSilentMinutes#`, or the process (or the window around it) die with it — before the task is sent to the supervisor instead of requeued again with nobody reviewing it. This is what lets a task whose worker keeps crashing or hanging eventually get split into smaller tasks or rewritten, instead of looping for hours with no one noticing."
-        },
         "mfagent.activityIntervalSeconds": {
           "type": "number",
           "default": 30,
@@ -264,11 +258,22 @@
           "minimum": 1,
           "description": "How long a model reply may deliver nothing at all before the connection is treated as dropped. This is not a limit on how long a reply may take — every byte received resets it, so a slow local model can stream for hours."
         },
+        "mfagent.llm.maxContextTokens": {
+          "type": "number",
+          "default": 200000,
+          "markdownDescription": "Context tokens (input plus cache) one round may carry before the core stops the tool loop and asks the agent for a handoff report. This is not a budget for the work: it is the backstop for a queue turn that runs with no round ceiling, and it exists so an agent that keeps calling tools without converging stops just short of the provider refusing the request — handing its supervisor an account of what it did instead of an API error. Raise it for a large-context model; set it to `-1` to switch it off."
+        },
+        "mfagent.queue.reviewIntervalSeconds": {
+          "type": "number",
+          "default": 300,
+          "minimum": 30,
+          "markdownDescription": "How often the supervisor may look in on a task that is still executing. Each look is a full model turn over the task's journal, so on a task that legitimately runs for hours a review on every `#mfagent.queue.cronIntervalSeconds#` tick is mostly re-reading evidence it has already judged. A review is skipped entirely when the journal has not grown since the last one, and this interval is never applied to a task that has stopped and is waiting on a decision."
+        },
         "mfagent.queue.maxRounds": {
           "type": "number",
           "default": 80,
           "minimum": 10,
-          "markdownDescription": "Tool-calling rounds an unattended executor gets per turn — the only budget a task has. Retries get 50% more per attempt (capped at 3× the base)."
+          "markdownDescription": "Tool-calling round budget for planning agents. Task execution and formal validation run until completion or a quality-based supervisor action; repeated identical tool failures still stop after three occurrences."
         },
         "mfagent.queue.maxFilesPerRegion": {
           "type": "number",

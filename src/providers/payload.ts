@@ -44,8 +44,17 @@ export interface CoreConfig {
   memoryPath: string;
   /** When true, the model receives no tool definitions. */
   disableTools: boolean;
-  /** Tool-calling rounds per turn. 0 leaves the core on its own default. */
+  /**
+   * Tool-calling rounds per turn. 0 leaves the core on its own default, and a
+   * negative number removes the ceiling for a turn something else ends.
+   */
   maxIterations: number;
+  /**
+   * Context tokens one round may carry before the core stops the tool loop and
+   * asks for a handoff report. 0 leaves the core on its own default, negative
+   * disables it. This is what bounds a turn that has no round ceiling.
+   */
+  maxContextTokens: number;
   /** Seconds a reply may deliver nothing before the connection counts as dropped. */
   llmIdleSeconds: number;
   /** How often a waiting turn writes an activity record. */
@@ -61,6 +70,21 @@ export interface CoreConfig {
    * src/editorTerminal.ts and Config.EditorTerminal in the core.
    */
   editorTerminal: boolean;
+}
+
+/**
+ * The context ceiling every core process gets, chat and queue alike.
+ *
+ * It is the same number everywhere on purpose. This is not a work budget to be
+ * tuned per role — it is the point past which a conversation is about to be
+ * refused by the provider, which is a property of the model, not of the job.
+ * Pass a negative value to switch it off for a model whose window is genuinely
+ * larger than the agent will ever fill.
+ */
+export function contextCeiling(): number {
+  return vscode.workspace
+    .getConfiguration('mfagent')
+    .get<number>('llm.maxContextTokens', 200_000);
 }
 
 export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> {
@@ -115,6 +139,7 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     // The chat keeps the core's default round ceiling: a person is watching and
     // can say "continue". Queue workers override it per role in queue/agents.ts.
     maxIterations: 0,
+    maxContextTokens: contextCeiling(),
     llmIdleSeconds: Math.max(1, cfg.get<number>('llm.idleMinutes', 30)) * 60,
     activitySeconds: Math.max(5, cfg.get<number>('activityIntervalSeconds', 30)),
     languages,

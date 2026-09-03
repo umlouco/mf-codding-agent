@@ -33,6 +33,13 @@ type fakeProvider struct {
 	// A reply that keeps delivering is slow; one that delivers nothing is dead,
 	// and this field is the difference between the two.
 	wireEvery time.Duration
+	// answerAfter returns finalText normally after this many tool rounds.
+	answerAfter int
+	// contextPerRound, when set, grows the reported context by this much every
+	// round — a model that keeps calling tools without converging. Half of it is
+	// reported as cache, because a provider that caches the prefix reports most
+	// of a large conversation as anything but Input.
+	contextPerRound int64
 }
 
 // wait burns `delay`, reporting wire activity if it was asked to, and gives up
@@ -83,6 +90,20 @@ func (f *fakeProvider) Stream(
 			Usage:      llm.Usage{Input: 1, Output: 1},
 		}, nil
 	}
+	if f.answerAfter > 0 && f.calls > f.answerAfter {
+		sink(llm.Event{Kind: llm.EventText, Text: f.finalText})
+		return &llm.Turn{
+			Blocks:     []llm.Block{{Type: llm.BlockText, Text: f.finalText}},
+			StopReason: "end_turn",
+			Usage:      llm.Usage{Input: 1, Output: 1},
+		}, nil
+	}
+
+	usage := llm.Usage{Input: 1, Output: 1}
+	if f.contextPerRound > 0 {
+		carried := int64(f.calls) * f.contextPerRound
+		usage = llm.Usage{Input: carried / 2, CacheRead: carried - carried/2, Output: 1}
+	}
 
 	return &llm.Turn{
 		Blocks: []llm.Block{{
@@ -92,7 +113,7 @@ func (f *fakeProvider) Stream(
 			Input: json.RawMessage(`{}`),
 		}},
 		StopReason: "tool_use",
-		Usage:      llm.Usage{Input: 1, Output: 1},
+		Usage:      usage,
 	}, nil
 }
 
@@ -354,5 +375,89 @@ func TestSendStopsAtFirstTextAnswer(t *testing.T) {
 	}
 	if res.Text != "done" {
 		t.Errorf("Text = %q, want %q", res.Text, "done")
+	}
+}
+
+func TestNegativeRoundLimitRunsUntilModelFinishes(t *testing.T) {
+	fake := &fakeProvider{answerAfter: 5, finalText: "ready for validation"}
+	a := newTestAgent(t, fake, -1)
+
+	res, err := a.Send(context.Background(), SendRequest{SessionID: "long", Text: "keep working"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if fake.calls != 6 {
+		t.Fatalf("provider calls=%d, want 6", fake.calls)
+	}
+	if res.StopReason == "max_iterations" || res.Text != fake.finalText {
+		t.Fatalf("result=%+v", res)
+	}
+}
+
+// The backstop for a turn with no round ceiling. A model that keeps calling
+// tools without converging is stopped by the size of the conversation it has
+// built — the one limit that is a fact rather than a judgement about the work —
+// and it is stopped just short of the provider's own limit, so the turn still
+// comes back with an account of what it did instead of an API error.
+func TestUnboundedTurnStopsOnContextPressure(t *testing.T) {
+	fake := &fakeProvider{contextPerRound: 400, finalText: "here is what I did"}
+	a := newTestAgent(t, fake, -1)
+	a.cfg.MaxContextTokens = 1000
+
+	res, err := a.Send(context.Background(), SendRequest{SessionID: "big", Text: "keep working"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// 400, then 800, then 1200 — the third round is the one that crosses.
+	if res.Iterations != 3 {
+		t.Errorf("Iterations = %d, want 3", res.Iterations)
+	}
+	if res.StopReason != "context_limit" {
+		t.Errorf("StopReason = %q, want context_limit", res.StopReason)
+	}
+	if fake.toolless != 1 {
+		t.Errorf("tool-less calls = %d, want exactly 1", fake.toolless)
+	}
+	// The whole point of stopping early rather than being stopped: the caller
+	// gets the model's own account, labelled with why tool use ended.
+	if !strings.Contains(res.Text, fake.finalText) {
+		t.Errorf("Text = %q, want it to carry %q", res.Text, fake.finalText)
+	}
+	if !strings.Contains(res.Text, "context tokens") {
+		t.Errorf("Text = %q, want it to say why tool use stopped", res.Text)
+	}
+}
+
+// Cache reads are context. A provider that caches the prefix reports a small
+// Input for a conversation that is anything but, so counting Input alone would
+// leave exactly the longest runs with no backstop.
+func TestContextPressureCountsCachedTokens(t *testing.T) {
+	fake := &fakeProvider{contextPerRound: 400, finalText: "done"}
+	a := newTestAgent(t, fake, -1)
+	// Input alone never reaches this; Input + CacheRead reaches it on round 3.
+	a.cfg.MaxContextTokens = 700
+
+	res, err := a.Send(context.Background(), SendRequest{SessionID: "cached", Text: "keep working"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if res.StopReason != "context_limit" || res.Iterations != 2 {
+		t.Fatalf("result=%+v, want context_limit on round 2", res)
+	}
+}
+
+// A negative ceiling turns the backstop off, for a caller that knows its model
+// better than the default does.
+func TestNegativeContextCeilingDisablesTheBackstop(t *testing.T) {
+	fake := &fakeProvider{contextPerRound: 10_000, answerAfter: 3, finalText: "finished"}
+	a := newTestAgent(t, fake, -1)
+	a.cfg.MaxContextTokens = -1
+
+	res, err := a.Send(context.Background(), SendRequest{SessionID: "uncapped", Text: "keep working"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if res.StopReason != "end_turn" || !strings.Contains(res.Text, fake.finalText) {
+		t.Fatalf("result=%+v, want the model's own end_turn", res)
 	}
 }

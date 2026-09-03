@@ -4,11 +4,12 @@ import { CoreClient, CoreConfig } from '../core';
 import { resolveCoreBinary, workspaceRoot } from '../detect';
 import { registerEditorFsHandlers } from '../editorFs';
 import { getStore } from '../providers/instance';
+import { contextCeiling } from '../providers/payload';
 import { NewTask, Task, TaskQueue, Usage } from './db';
 import {
+  CompletionClaim,
   extractExecutorNotes,
-  parseExecutorValidation,
-  serializeValidation,
+  parseCompletionClaim,
   validationForSupervisor,
 } from './validation';
 
@@ -79,6 +80,12 @@ async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<Core
     // one scrollback. They spawn their own shell instead.
     editorTerminal: false,
     maxIterations,
+    // An executor turn runs with no round ceiling (see executeTask), so this is
+    // the only limit the core itself still applies. It is not a work budget:
+    // past this point the next request is about to be refused for its size, and
+    // stopping just short of that is the difference between a handoff report
+    // the supervisor can act on and an API error that loses the whole turn.
+    maxContextTokens: contextCeiling(),
   };
 }
 
@@ -113,7 +120,7 @@ export interface ActivityRecord {
  * Spawns a throwaway core on `role`'s model, sends one prompt, and tears the
  * process down — including when the turn throws.
  */
-interface TurnResult {
+export interface TurnResult {
   text: string;
   /** `max_iterations` means the worker was cut off, not that it finished. */
   stopReason: string;
@@ -168,7 +175,7 @@ anyone is still working reads the journal rather than a stopwatch.
 What does still end a turn: the core dropping a connection that has gone silent,
 the core process dying (the request rejects), or an explicit cancel.
 */
-async function runOnce(
+export async function runOnce(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   role: Role,
@@ -845,15 +852,16 @@ Rules:
 
 export interface ExecutionOutcome {
   text: string;
-  /** JSON evidence produced by the executor after it performed the checks. */
-  validationReport: string;
+  /**
+   * What the agent says about its own work — see parseCompletionClaim. A claim,
+   * not evidence: it feeds the supervisor's decision, it never makes one.
+   */
+  completion: CompletionClaim;
   ok: boolean;
-  /** The worker hit the round ceiling; `text` is partial progress, not a result. */
+  /** The core stopped the turn itself; the supervisor must decide what follows. */
   cutOff: boolean;
-  /** `max_iterations`, or the model's own reason for stopping. */
+  /** The model/core reason for stopping. */
   stopReason: string;
-  /** Rounds this attempt was allowed, for the log. */
-  rounds: number;
   /** What this attempt cost, spent whether or not it produced anything. */
   usage: Usage;
   /**
@@ -862,6 +870,21 @@ export interface ExecutionOutcome {
    * executor had nothing to add.
    */
   notes: string;
+}
+
+/**
+ * Stop reasons that mean the core ended the turn, not the model.
+ *
+ * `repeated_tool_error` is a call failing the same way three times over;
+ * `context_limit` is the conversation growing to the point where the next
+ * request would be refused for its size. Both come back with a real handoff
+ * report rather than a canned line (see finalReport in the core), and both mean
+ * the same thing to the queue: the text describes partial progress, and it is
+ * the supervisor's job to say whether that progress continues, gets rewritten,
+ * or is ready to validate.
+ */
+export function coreHalted(stopReason: string): boolean {
+  return stopReason === 'repeated_tool_error' || stopReason === 'context_limit';
 }
 
 const MAX_LOG_ENTRIES = 4;
@@ -962,9 +985,9 @@ ${notes}TASK ${task.seq}: ${task.title}
 
 ${task.description}
 ${retry}
-You own both implementation AND verification. Before reporting, perform every
-applicable check yourself and record the evidence. The supervisor will not read
-files, run commands, or drive a browser; it only judges your stored conclusion.
+Own the implementation. Run ordinary development checks while you work, but do
+not make the final verification decision. A supervisor watches your database
+journal and will start a separate execution LLM to perform formal verification.
 
 Verification requirements:
 - Implementation check: ${task.implVerifyPrompt || 'the described code exists and is coherent'}
@@ -975,9 +998,8 @@ Rules:
 - Do the work. Read what you need, then edit the files for real — do not describe changes you have not made.
 - Stay inside this task. Do not start the next one, and do not refactor unrelated code.
 - If the task turns out to be impossible or already done, say so plainly and explain why.
-- Inspect the final code and diff yourself. Run relevant builds and tests. For UI/browser
-  work, use the browser tools (including Playwright-style interaction) and record what happened.
-- Do not claim PASS from expectation. Every required check needs concrete observed evidence.
+- Inspect the final code and diff yourself. Run useful development checks. For UI/browser work,
+  use the browser tools when needed and record what happened.
 - If you learned something every later task should know — where something lives, a convention
   to follow, how to build or test this project — put it in "notes" below. This is the only way
   that fact reaches later tasks: they run with no memory of this attempt. Leave "notes" empty if
@@ -985,38 +1007,30 @@ Rules:
 - Finish with ONE JSON object and nothing else, in this exact shape:
 {
   "report": "short summary of changes and files",
-  "validation": {
-    "conclusion": "PASS" | "FAIL" | "INCOMPLETE",
-    "summary": "overall validation conclusion",
-    "implementationEvidence": "what you inspected in the final code/diff",
-    "behaviorEvidence": "what behavior you actually exercised",
-    "checks": [{ "kind": "inspection" | "command" | "test" | "browser" | "other",
-                 "name": "command or check name", "passed": true, "evidence": "observed output" }],
-    "remaining": "anything unverified or still broken; empty only when nothing remains"
+  "completion": {
+    "status": "READY_FOR_VALIDATION" | "NEEDS_MORE_WORK",
+    "summary": "what is complete and why it is ready, or precisely what remains",
+    "filesChanged": ["relative/path"],
+    "developmentChecks": ["check and observed result"]
   },
   "notes": "a durable fact for later tasks, or \\"\\" if there is nothing new"
+}
 }`;
 
-  // Rounds are the only budget an attempt has, and a retry gets more of them —
-  // capped so token spend cannot run away across attempts. How long those
-  // rounds take is not this code's business.
-  const scale = Math.min(1 + 0.5 * Math.max(0, task.attempts - 1), 3);
-  const rounds = Math.round(baseRounds() * scale);
-
   const { text, stopReason, usage } = await runOnce(context, output, 'executor', prompt, {
-    maxIterations: rounds,
+    // Negative means the core runs until the model finishes or the supervisor
+    // stops it based on work quality. Time and round counts are not verdicts.
+    maxIterations: -1,
     onActivity,
     onEvent,
     onAbort,
   });
-  const validation = parseExecutorValidation(text, stopReason === 'max_iterations');
   return {
     text,
-    validationReport: serializeValidation(validation),
+    completion: parseCompletionClaim(text),
     ok: text.trim().length > 0,
-    cutOff: stopReason === 'max_iterations',
+    cutOff: coreHalted(stopReason),
     stopReason,
-    rounds,
     usage,
     notes: extractExecutorNotes(text),
   };
@@ -1058,7 +1072,13 @@ export interface SupervisorDecision {
   /** Only meaningful for SPLIT: the tasks that replace this one, in order. */
   splitInto?: NewTask[];
   /** Optional edits the supervisor wants applied to upcoming tasks. */
-  taskEdits?: { seq: number; description?: string; solutionVerifyCommand?: string }[];
+  taskEdits?: {
+    seq: number;
+    description?: string;
+    implVerifyPrompt?: string;
+    solutionVerifyPrompt?: string;
+    solutionVerifyCommand?: string;
+  }[];
   /** What the review itself cost — part of the task's bill like any other run. */
   usage: Usage;
 }
@@ -1072,12 +1092,28 @@ export async function superviseTask(
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
 ): Promise<SupervisorDecision> {
   const prompt = `You are the supervisor of an autonomous coding run. Make a lightweight
-accept/reject decision from the executor validation stored in the queue database.
+accept/reject decision from the validation report stored in the queue database.
+
+That report was NOT written by the agent that did the work. You already decided this task looked
+ready and started a separate verification agent on it, in its own process with its own context,
+instructed to distrust the implementation agent's claims and to check the workspace itself. What
+you are reading is that independent agent's findings.
 
 You have no tools and must not inspect files, execute commands, rerun tests, or drive a browser.
-That verification belongs exclusively to the executor. Check only whether its conclusion is
-consistent, whether every required check has concrete evidence, and whether failures or missing
-evidence require another attempt.
+Doing the checking yourself is what the verification agent was for. Check only whether its
+conclusion is consistent, whether every required check has concrete evidence, and whether failures
+or missing evidence require more work.
+
+A task is never terminally failed. When the evidence is not sufficient, make exactly one
+recovery decision: RETRY with a materially rewritten task description and verification, or
+SPLIT into several smaller ordered tasks. Use SPLIT only when scope is the obstacle; use RETRY
+when requirements or verification are contradictory, ambiguous, invalid, or poorly expressed.
+Base this decision on the quality and completeness of the recorded work, never on an attempt count.
+
+Judge the structured current-attempt evidence, not its presentation. A successful command check
+with concrete output does not need the same command duplicated verbatim in another evidence field.
+An allowed-value list does not mean every allowed value must occur unless the requirement explicitly
+says so. Do not reject current exact checks solely because an older attempt reported different data.
 
 TASK ${task.seq}: ${task.title}
 Attempt ${task.attempts}.
@@ -1092,7 +1128,7 @@ Required behaviour check:
 ${task.solutionVerifyPrompt || 'the described behaviour works'}
 ${task.solutionVerifyCommand ? `Required command: ${task.solutionVerifyCommand}` : ''}
 
-EXECUTOR VALIDATION READ FROM THE DATABASE:
+INDEPENDENT VERIFICATION AGENT'S REPORT, READ FROM THE DATABASE:
 ${validationForSupervisor(task.validationReport)}
 
 Earlier attempt outcomes:
@@ -1100,20 +1136,21 @@ ${attemptHistory(task)}
 
 Reply with ONE JSON object and nothing else:
 {
-  "verdict": "VERIFIED" | "RETRY" | "SPLIT" | "RESET_FROM",
+  "verdict": "VERIFIED" | "RETRY" | "SPLIT",
   "feedback": "why the stored validation is or is not sufficient",
-  "resetFromSeq": <number, only with RESET_FROM>,
   "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
-  "taskEdits": [{ "seq": <number>, "description": "...", "solutionVerifyCommand": "..." }]
+  "taskEdits": [{ "seq": <number>, "description": "...", "implVerifyPrompt": "...",
+                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
-Choose VERIFIED only when the executor concluded PASS and its database report contains concrete
-implementation and behaviour evidence plus successful required commands/tests. Do not independently
-repeat the checks. Choose RETRY for FAIL, INCOMPLETE, contradictory conclusions, or missing evidence;
-include a materially rewritten description for task ${task.seq}. Choose SPLIT after repeated cutoffs
-or when the remaining work is too large for one executor turn. RESET_FROM is only for evidence that
-earlier completed work must be redone. There is no give-up verdict.`;
+Choose VERIFIED only when the verification agent concluded PASS and its database report contains
+concrete implementation and behaviour evidence plus successful required commands/tests. Do not
+independently repeat the checks. Choose RETRY for FAIL, INCOMPLETE, contradictory conclusions, or
+missing evidence; include a materially rewritten description for task ${task.seq}. Choose SPLIT when
+the remaining work is more than one agent can hold at once — a report that reads as several
+unfinished threads rather than one unfinished thing. For an unsuccessful task these are the only two
+decisions: rewrite it or split it. There is no fail or give-up verdict.`;
 
   const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
     maxIterations: supervisorRounds(),
@@ -1154,7 +1191,7 @@ earlier completed work must be redone. There is no give-up verdict.`;
   // FAIL is no longer in the protocol. A model that has seen it elsewhere still
   // emits it, and it means "I have run out of ideas" — which is a reason to
   // rewrite the task, never a reason to end the run.
-  const verdict: Verdict = (['VERIFIED', 'RETRY', 'SPLIT', 'RESET_FROM'] as string[]).includes(named)
+  const verdict: Verdict = (['VERIFIED', 'RETRY', 'SPLIT'] as string[]).includes(named)
     ? (named as Verdict)
     : 'RETRY';
 
@@ -1214,6 +1251,8 @@ earlier completed work must be redone. There is no give-up verdict.`;
         {
           seq: task.seq,
           description: repair.description,
+          implVerifyPrompt: repair.implVerifyPrompt || own?.implVerifyPrompt,
+          solutionVerifyPrompt: repair.solutionVerifyPrompt || own?.solutionVerifyPrompt,
           solutionVerifyCommand: repair.solutionVerifyCommand || own?.solutionVerifyCommand,
         },
       ],
@@ -1288,16 +1327,16 @@ ${rawReply.slice(0, 4000)}
 Restate the SAME judgement — do not reconsider it, do not change your mind, just put it in the
 required shape — as ONE JSON object and nothing else:
 {
-  "verdict": "VERIFIED" | "RETRY" | "SPLIT" | "RESET_FROM",
+  "verdict": "VERIFIED" | "RETRY" | "SPLIT",
   "feedback": "what you found, and for a retry exactly what to do differently",
-  "resetFromSeq": <number, only with RESET_FROM>,
   "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
-  "taskEdits": [{ "seq": <number>, "description": "...", "solutionVerifyCommand": "..." }]
+  "taskEdits": [{ "seq": <number>, "description": "...", "implVerifyPrompt": "...",
+                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
 If your reply above reached a clear conclusion — the work is correct, it needs another attempt,
-it is too big to finish in one sitting, or the project needs to roll back — that conclusion,
+it is too big to finish in one sitting — that conclusion,
 and nothing else, is what "verdict" should say. If it was VERIFIED, say so; do not turn a pass
 into a retry just because the first reply was not formatted correctly. If your conclusion really
 was that this task needs another attempt, "taskEdits" must include a rewritten "description" for
@@ -1328,7 +1367,14 @@ async function demandRewrite(
   feedback: string,
   rawReply: string,
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'>,
-): Promise<{ description: string; solutionVerifyCommand: string; feedback: string; usage: Usage }> {
+): Promise<{
+  description: string;
+  implVerifyPrompt: string;
+  solutionVerifyPrompt: string;
+  solutionVerifyCommand: string;
+  feedback: string;
+  usage: Usage;
+}> {
   const prompt = `You judged task ${task.seq} and asked for another attempt, but you did not supply the
 rewritten description that a retry requires. Supply it now.
 
@@ -1353,6 +1399,8 @@ Reply with ONE JSON object and nothing else:
   "description": "the full replacement description — self-contained, naming the files,
                   functions and exact changes, and stating what the previous attempt got
                   wrong so it is not repeated. Not a diff or a note: the whole thing.",
+  "implVerifyPrompt": "a precise replacement implementation inspection",
+  "solutionVerifyPrompt": "a precise replacement behavioral success condition",
   "solutionVerifyCommand": "a corrected check command, or \\"\\" to keep the current one",
   "feedback": "one or two sentences of standing instruction for the executor"
 }`;
@@ -1365,12 +1413,21 @@ Reply with ONE JSON object and nothing else:
     const d = extractJson<any>(text);
     return {
       description: String(d?.description ?? '').trim(),
+      implVerifyPrompt: String(d?.implVerifyPrompt ?? '').trim(),
+      solutionVerifyPrompt: String(d?.solutionVerifyPrompt ?? '').trim(),
       solutionVerifyCommand: String(d?.solutionVerifyCommand ?? '').trim(),
       feedback: String(d?.feedback ?? '').trim(),
       usage,
     };
   } catch {
-    return { description: '', solutionVerifyCommand: '', feedback: '', usage: { ...NO_USAGE } };
+    return {
+      description: '',
+      implVerifyPrompt: '',
+      solutionVerifyPrompt: '',
+      solutionVerifyCommand: '',
+      feedback: '',
+      usage: { ...NO_USAGE },
+    };
   }
 }
 

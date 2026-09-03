@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Stop an executor after three identical tool failures instead of allowing a malformed call to consume the full round budget.
+- Split implementation from verification. The agent that does the work no longer grades it: it reports what it changed and whether it believes the task is ready, and the supervisor starts a separate verification agent — its own process, its own context, told to distrust those claims and check the workspace itself — whose findings are what the accept/reject decision is made on.
+- Show detailed live activity plus cache reads separately in task rows.
+- Remove attempt counts from every decision. Nothing escalates, retries, or gives up because a number got large; tasks are rewritten or split on the quality of the recorded work, and are never terminally failed.
+- Accept simple `&&` chains in Windows `run_shell` calls and decode PowerShell CLIXML errors into actionable text.
+- Bound a turn that runs with no round ceiling by the size of the conversation it has built, not by a round count: past `mfagent.llm.maxContextTokens` the core stops the tool loop and asks for a handoff report, so an agent that keeps calling tools without converging reaches its supervisor with an account of what it did instead of dying inside the provider's context limit.
+- Journal the worker's own reasoning and replies, not just its tool calls. The supervisor has no tools and judges live work from that journal alone, so what an agent never writes there is something nobody can review.
+- Look in on a running task on `mfagent.queue.reviewIntervalSeconds` rather than on every cron tick, and skip the look entirely when the journal has not grown since the last one. A task that has stopped is never gated — it is waiting on the decision, not being polled.
+- Record a verification run that could not complete, in the journal and in the task's error log, and show the supervisor how many times it has already happened. It is still a decision rather than a limit, but a supervisor that cannot see it will keep sending the same verification agent at the same wall.
+- Read the implementation agent's closing completion claim as structured data and put it in front of the supervisor as a claim, rather than leaving it as prose in a report nothing parsed.
+- Send a worker that died without reporting straight to the supervisor instead of counting how many times it has died first. Requiring a second identical crash before anyone looks is an attempt limit under another name; `mfagent.queue.noReportEscalateAfter` and the streak it counted are both gone.
+
 Tool-surface changes aimed at one failure mode: the agent routing work through
 shell scripts and Python heredocs instead of the tools built for it, then
 explaining the detour with invented facts about the tools.

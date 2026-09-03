@@ -245,7 +245,9 @@
 
   /** "waiting on the model · 12m ago" — the evidence the worker is still alive. */
   function liveLabel(t) {
-    const label = PHASE_LABELS[t.activityPhase] || t.activityPhase || '';
+    const phase = PHASE_LABELS[t.activityPhase] || t.activityPhase || '';
+    const detail = String(t.activityDetail || '').replace(/\s+/g, ' ').trim();
+    const label = detail || phase;
     if (!label) {
       return '';
     }
@@ -268,11 +270,17 @@
 
   /** "12.4k ↓ · 3.1k ↑" — what this task has cost so far, or nothing yet. */
   function tokenLabel(t) {
-    const total = (t.tokensIn || 0) + (t.tokensCacheRead || 0);
-    if (!total && !t.tokensOut) {
+    // Show cache reads separately. OpenAI counts them inside prompt_tokens,
+    // while Anthropic reports them beside input_tokens, so combining the two
+    // into one unlabeled number is misleading for at least one provider.
+    const input = t.tokensIn || 0;
+    const cached = t.tokensCacheRead || 0;
+    if (!input && !cached && !t.tokensOut) {
       return '';
     }
-    return `${compact(total)} ↓ · ${compact(t.tokensOut || 0)} ↑`;
+    const bits = [`${compact(input)} ↓`, `${compact(t.tokensOut || 0)} ↑`];
+    if (cached) bits.push(`${compact(cached)} cached`);
+    return bits.join(' · ');
   }
 
   /** The paths and file count a phase was scoped to — see TaskKind in db.ts. */
