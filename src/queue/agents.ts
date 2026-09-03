@@ -4,14 +4,9 @@ import { CoreClient, CoreConfig } from '../core';
 import { resolveCoreBinary, workspaceRoot } from '../detect';
 import { registerEditorFsHandlers } from '../editorFs';
 import { getStore } from '../providers/instance';
+import { contextCeiling } from '../providers/payload';
 import { NewTask, Task, TaskQueue, Usage } from './db';
-import {
-  autoVerificationFeedback,
-  parseExecutorValidation,
-  serializeValidation,
-  validationForSupervisor,
-} from './validation';
-import { queueTasksFromPhasedRewrite } from './recovery';
+import { CompletionClaim, parseCompletionClaim, validationForSupervisor } from './validation';
 
 /**
  * Agent runners for autonomous runs.
@@ -80,6 +75,12 @@ async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<Core
     // one scrollback. They spawn their own shell instead.
     editorTerminal: false,
     maxIterations,
+    // An executor turn runs with no round ceiling (see executeTask), so this is
+    // the only limit the core itself still applies. It is not a work budget:
+    // past this point the next request is about to be refused for its size, and
+    // stopping just short of that is the difference between a handoff report
+    // the supervisor can act on and an API error that loses the whole turn.
+    maxContextTokens: contextCeiling(),
   };
 }
 
@@ -114,7 +115,7 @@ export interface ActivityRecord {
  * Spawns a throwaway core on `role`'s model, sends one prompt, and tears the
  * process down — including when the turn throws.
  */
-interface TurnResult {
+export interface TurnResult {
   text: string;
   /** `max_iterations` means the worker was cut off, not that it finished. */
   stopReason: string;
@@ -169,7 +170,7 @@ anyone is still working reads the journal rather than a stopwatch.
 What does still end a turn: the core dropping a connection that has gone silent,
 the core process dying (the request rejects), or an explicit cancel.
 */
-async function runOnce(
+export async function runOnce(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   role: Role,
@@ -846,17 +847,33 @@ Rules:
 
 export interface ExecutionOutcome {
   text: string;
-  /** JSON evidence produced by the executor after it performed the checks. */
-  validationReport: string;
+  /**
+   * What the agent says about its own work — see parseCompletionClaim. A claim,
+   * not evidence: it feeds the supervisor's decision, it never makes one.
+   */
+  completion: CompletionClaim;
   ok: boolean;
-  /** The worker hit the round ceiling; `text` is partial progress, not a result. */
+  /** The core stopped the turn itself; the supervisor must decide what follows. */
   cutOff: boolean;
-  /** `max_iterations`, or the model's own reason for stopping. */
+  /** The model/core reason for stopping. */
   stopReason: string;
-  /** Rounds this attempt was allowed, for the log. */
-  rounds: number;
   /** What this attempt cost, spent whether or not it produced anything. */
   usage: Usage;
+}
+
+/**
+ * Stop reasons that mean the core ended the turn, not the model.
+ *
+ * `repeated_tool_error` is a call failing the same way three times over;
+ * `context_limit` is the conversation growing to the point where the next
+ * request would be refused for its size. Both come back with a real handoff
+ * report rather than a canned line (see finalReport in the core), and both mean
+ * the same thing to the queue: the text describes partial progress, and it is
+ * the supervisor's job to say whether that progress continues, gets rewritten,
+ * or is ready to validate.
+ */
+export function coreHalted(stopReason: string): boolean {
+  return stopReason === 'repeated_tool_error' || stopReason === 'context_limit';
 }
 
 const MAX_LOG_ENTRIES = 4;
@@ -947,9 +964,9 @@ TASK ${task.seq}: ${task.title}
 
 ${task.description}
 ${retry}
-You own both implementation AND verification. Before reporting, perform every
-applicable check yourself and record the evidence. The supervisor will not read
-files, run commands, or drive a browser; it only judges your stored conclusion.
+Own the implementation. Run ordinary development checks while you work, but do
+not make the final verification decision. A supervisor watches your database
+journal and will start a separate execution LLM to perform formal verification.
 
 Verification requirements:
 - Implementation check: ${task.implVerifyPrompt || 'the described code exists and is coherent'}
@@ -960,45 +977,33 @@ Rules:
 - Do the work. Read what you need, then edit the files for real — do not describe changes you have not made.
 - Stay inside this task. Do not start the next one, and do not refactor unrelated code.
 - If the task turns out to be impossible or already done, say so plainly and explain why.
-- Inspect the final code and diff yourself. Run relevant builds and tests. For UI/browser
-  work, use the browser tools (including Playwright-style interaction) and record what happened.
-- Do not claim PASS from expectation. Every required check needs concrete observed evidence.
-- In each check, "passed" means the stated requirement was satisfied, not that a searched-for
-  value was present. An absence requirement passes when inspection confirms the value is absent.
+- Inspect the final code and diff yourself. Run useful development checks. For UI/browser work,
+  use the browser tools when needed and record what happened.
 - Finish with ONE JSON object and nothing else, in this exact shape:
 {
   "report": "short summary of changes and files",
-  "validation": {
-    "conclusion": "PASS" | "FAIL" | "INCOMPLETE",
-    "summary": "overall validation conclusion",
-    "implementationEvidence": "what you inspected in the final code/diff",
-    "behaviorEvidence": "what behavior you actually exercised",
-    "checks": [{ "kind": "inspection" | "command" | "test" | "browser" | "other",
-                 "name": "command or check name", "passed": true, "evidence": "observed output" }],
-    "remaining": "anything unverified or still broken; empty only when nothing remains"
+  "completion": {
+    "status": "READY_FOR_VALIDATION" | "NEEDS_MORE_WORK",
+    "summary": "what is complete and why it is ready, or precisely what remains",
+    "filesChanged": ["relative/path"],
+    "developmentChecks": ["check and observed result"]
   }
 }`;
 
-  // A retry gets better instructions, not a larger blank cheque. Growing this
-  // budget used to turn the default 80 rounds into 240 precisely when a task
-  // was already proving difficult, multiplying repeated prompts and failures.
-  const rounds = baseRounds();
-
   const { text, stopReason, usage } = await runOnce(context, output, 'executor', prompt, {
-    maxIterations: rounds,
+    // Negative means the core runs until the model finishes or the supervisor
+    // stops it based on work quality. Time and round counts are not verdicts.
+    maxIterations: -1,
     onActivity,
     onEvent,
     onAbort,
   });
-  const interrupted = stopReason === 'max_iterations' || stopReason === 'repeated_tool_error';
-  const validation = parseExecutorValidation(text, interrupted);
   return {
     text,
-    validationReport: serializeValidation(validation),
+    completion: parseCompletionClaim(text),
     ok: text.trim().length > 0,
-    cutOff: interrupted,
+    cutOff: coreHalted(stopReason),
     stopReason,
-    rounds,
     usage,
   };
 }
@@ -1058,28 +1063,24 @@ export async function superviseTask(
   rewrites: number,
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
 ): Promise<SupervisorDecision> {
-  const automatic = autoVerificationFeedback(
-    task.validationReport,
-    task.solutionVerifyCommand,
-  );
-
   const prompt = `You are the supervisor of an autonomous coding run. Make a lightweight
-accept/reject decision from the executor validation stored in the queue database.
+accept/reject decision from the validation report stored in the queue database.
+
+That report was NOT written by the agent that did the work. You already decided this task looked
+ready and started a separate verification agent on it, in its own process with its own context,
+instructed to distrust the implementation agent's claims and to check the workspace itself. What
+you are reading is that independent agent's findings.
 
 You have no tools and must not inspect files, execute commands, rerun tests, or drive a browser.
-That verification belongs exclusively to the executor. Check only whether its conclusion is
-consistent, whether every required check has concrete evidence, and whether failures or missing
-evidence require another attempt.
+Doing the checking yourself is what the verification agent was for. Check only whether its
+conclusion is consistent, whether every required check has concrete evidence, and whether failures
+or missing evidence require more work.
 
 A task is never terminally failed. When the evidence is not sufficient, make exactly one
 recovery decision: RETRY with a materially rewritten task description and verification, or
 SPLIT into several smaller ordered tasks. Use SPLIT only when scope is the obstacle; use RETRY
 when requirements or verification are contradictory, ambiguous, invalid, or poorly expressed.
-RETRY must remain one atomic executor task. Never put "Phase 1", "Phase 2", numbered steps, or
-several independently verifiable stages into a rewritten description; return SPLIT so they become
-real ordered queue tasks instead.
-The task is already at attempt ${task.attempts} of its expected ${task.maxAttempts}; crossing
-that threshold increases the need for a decisive rewrite or split, but never permits giving up.
+Base this decision on the quality and completeness of the recorded work, never on an attempt count.
 
 Judge the structured current-attempt evidence, not its presentation. A successful command check
 with concrete output does not need the same command duplicated verbatim in another evidence field.
@@ -1099,7 +1100,7 @@ Required behaviour check:
 ${task.solutionVerifyPrompt || 'the described behaviour works'}
 ${task.solutionVerifyCommand ? `Required command: ${task.solutionVerifyCommand}` : ''}
 
-EXECUTOR VALIDATION READ FROM THE DATABASE:
+INDEPENDENT VERIFICATION AGENT'S REPORT, READ FROM THE DATABASE:
 ${validationForSupervisor(task.validationReport)}
 
 Earlier attempt outcomes:
@@ -1115,12 +1116,13 @@ Reply with ONE JSON object and nothing else:
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
-Choose VERIFIED only when the executor concluded PASS and its database report contains concrete
-implementation and behaviour evidence plus successful required commands/tests. Do not independently
-repeat the checks. Choose RETRY for FAIL, INCOMPLETE, contradictory conclusions, or missing evidence;
-include a materially rewritten description for task ${task.seq}. Choose SPLIT after repeated cutoffs
-or when the remaining work is too large for one executor turn. For an unsuccessful task these are
-the only two decisions: rewrite it or split it. There is no fail or give-up verdict.`;
+Choose VERIFIED only when the verification agent concluded PASS and its database report contains
+concrete implementation and behaviour evidence plus successful required commands/tests. Do not
+independently repeat the checks. Choose RETRY for FAIL, INCOMPLETE, contradictory conclusions, or
+missing evidence; include a materially rewritten description for task ${task.seq}. Choose SPLIT when
+the remaining work is more than one agent can hold at once — a report that reads as several
+unfinished threads rather than one unfinished thing. For an unsuccessful task these are the only two
+decisions: rewrite it or split it. There is no fail or give-up verdict.`;
 
   const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
     maxIterations: supervisorRounds(),
@@ -1193,19 +1195,6 @@ the only two decisions: rewrite it or split it. There is no fail or give-up verd
     usage: total,
   };
 
-  // The LLM always reviews the task, but it may not turn complete structured
-  // PASS evidence into another attempt over formatting or placement alone.
-  if (automatic && settled !== 'VERIFIED') {
-    const feedback = `Supervisor review completed. ${automatic}`;
-    output.appendLine(`[queue:supervisor] ${feedback}`);
-    return {
-      verdict: 'VERIFIED',
-      feedback,
-      taskEdits: [],
-      usage: total,
-    };
-  }
-
   if (settled !== 'RETRY') {
     return decision;
   }
@@ -1219,14 +1208,14 @@ the only two decisions: rewrite it or split it. There is no fail or give-up verd
   // long as anyone lets it.
   const own = decision.taskEdits!.find((e) => e.seq === task.seq);
   if (rewritten(own?.description, task.description)) {
-    return promotePhasedRetry(task, decision);
+    return decision;
   }
 
   const repair = await demandRewrite(context, output, task, feedback, parsed ? text : '', opts);
   addUsage(total, repair.usage);
   if (rewritten(repair.description, task.description)) {
     const rest = decision.taskEdits!.filter((e) => e.seq !== task.seq);
-    return promotePhasedRetry(task, {
+    return {
       ...decision,
       feedback: repair.feedback || feedback,
       taskEdits: [
@@ -1240,14 +1229,14 @@ the only two decisions: rewrite it or split it. There is no fail or give-up verd
         },
       ],
       usage: total,
-    });
+    };
   }
 
   // Both passes declined to write one. The executor still must not be handed
   // the same page twice, so the correction goes in as its own section: less
   // considered than a real rewrite, but it is new information, prominently
   // placed, and it is what the supervisor actually said to do.
-  return promotePhasedRetry(task, {
+  return {
     ...decision,
     taskEdits: [
       ...decision.taskEdits!.filter((e) => e.seq !== task.seq),
@@ -1258,27 +1247,6 @@ the only two decisions: rewrite it or split it. There is no fail or give-up verd
       },
     ],
     usage: total,
-  });
-}
-
-function promotePhasedRetry(task: Task, decision: SupervisorDecision): SupervisorDecision {
-  if (decision.verdict !== 'RETRY') {
-    return decision;
-  }
-  const own = decision.taskEdits?.find((edit) => edit.seq === task.seq);
-  if (!own?.description) {
-    return decision;
-  }
-  const parts = queueTasksFromPhasedRewrite(task, own.description, own);
-  if (!parts) {
-    return decision;
-  }
-  return {
-    ...decision,
-    verdict: 'SPLIT',
-    feedback: `${decision.feedback}\nThe proposed numbered phases were promoted to ${parts.length} real queue tasks.`.trim(),
-    splitInto: parts,
-    taskEdits: decision.taskEdits?.filter((edit) => edit.seq !== task.seq),
   };
 }
 

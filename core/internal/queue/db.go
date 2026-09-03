@@ -51,23 +51,17 @@ type Task struct {
 	SupervisorFeedback    string     `json:"supervisorFeedback"`
 	Attempts              int        `json:"attempts"`
 	MaxAttempts           int        `json:"maxAttempts"`
-	// NoReportStreak counts consecutive times this task's worker has failed
-	// to report back at all (gone silent, or died outright) since the last
-	// time it actually reported something. Written only by the extension's
-	// queue orchestrator — see the doc comment on Task.noReportStreak in
-	// src/queue/db.ts.
-	NoReportStreak   int    `json:"noReportStreak"`
-	LastActivityAt   *int64 `json:"lastActivityAt"`
-	ActivityPhase    string `json:"activityPhase"`
-	ActivityDetail   string `json:"activityDetail"`
-	TokensIn         int64  `json:"tokensIn"`
-	TokensOut        int64  `json:"tokensOut"`
-	TokensCacheRead  int64  `json:"tokensCacheRead"`
-	TokensCacheWrite int64  `json:"tokensCacheWrite"`
-	CreatedAt        int64  `json:"createdAt"`
-	UpdatedAt        int64  `json:"updatedAt"`
-	StartedAt        *int64 `json:"startedAt"`
-	FinishedAt       *int64 `json:"finishedAt"`
+	LastActivityAt        *int64     `json:"lastActivityAt"`
+	ActivityPhase         string     `json:"activityPhase"`
+	ActivityDetail        string     `json:"activityDetail"`
+	TokensIn              int64      `json:"tokensIn"`
+	TokensOut             int64      `json:"tokensOut"`
+	TokensCacheRead       int64      `json:"tokensCacheRead"`
+	TokensCacheWrite      int64      `json:"tokensCacheWrite"`
+	CreatedAt             int64      `json:"createdAt"`
+	UpdatedAt             int64      `json:"updatedAt"`
+	StartedAt             *int64     `json:"startedAt"`
+	FinishedAt            *int64     `json:"finishedAt"`
 	// Kind is "task" (the default) or "phase" — a phase is a coarse slice of
 	// the plan awaiting expansion into real tasks by the extension's queue
 	// orchestrator, not something this server creates. It is mirrored here
@@ -254,7 +248,6 @@ func (d *DB) migrate() error {
 	}
 	d.addColumn("kind", "TEXT NOT NULL DEFAULT 'task'")
 	d.addColumn("region", "TEXT NOT NULL DEFAULT ''")
-	d.addColumn("no_report_streak", "INTEGER NOT NULL DEFAULT 0")
 	d.addColumn("validation_report", "TEXT NOT NULL DEFAULT ''")
 
 	return nil
@@ -439,7 +432,7 @@ SELECT id, title, description,
        status, seq, output,
        validation_report,
        error_log, supervisor_feedback,
-       attempts, max_attempts, no_report_streak,
+       attempts, max_attempts,
        last_activity_at, activity_phase, activity_detail,
        tokens_in, tokens_out, tokens_cache_read, tokens_cache_write,
        created_at, updated_at, started_at, finished_at,
@@ -457,7 +450,7 @@ func scanTasks(rows *sql.Rows) ([]Task, error) {
 			&t.Status, &t.Seq, &t.Output,
 			&t.ValidationReport,
 			&t.ErrorLog, &t.SupervisorFeedback,
-			&t.Attempts, &t.MaxAttempts, &t.NoReportStreak,
+			&t.Attempts, &t.MaxAttempts,
 			&t.LastActivityAt, &t.ActivityPhase, &t.ActivityDetail,
 			&t.TokensIn, &t.TokensOut, &t.TokensCacheRead, &t.TokensCacheWrite,
 			&t.CreatedAt, &t.UpdatedAt, &t.StartedAt, &t.FinishedAt,

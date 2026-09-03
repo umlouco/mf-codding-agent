@@ -21,6 +21,24 @@ import (
 // editor can raise it per role, and per retry.
 const defaultMaxIterations = 40
 
+// Context tokens one round may carry, when the config does not set a ceiling.
+//
+// Deliberately far above any honest turn: this is not a work budget, it is the
+// last thing standing between an uncapped tool loop and the provider rejecting
+// the request outright. See config.MaxContextTokens.
+const defaultMaxContextTokens = 200_000
+
+// halt says why a tool loop stopped before the model answered on its own.
+//
+// The zero value means the round budget simply ran out. Anything else is a
+// condition the loop detected and chose to stop on, and both fields matter:
+// `reason` is what the editor switches on, `detail` is what the model and the
+// operator are told.
+type halt struct {
+	reason string
+	detail string
+}
+
 // Emitter pushes streaming updates back to the editor.
 type Emitter func(method string, payload any)
 
@@ -114,16 +132,22 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	var accumulated strings.Builder
 	var failures toolFailureLoop
 
-	for iter := 1; iter <= maxIterations; iter++ {
+	for iter := 1; maxIterations == 0 || iter <= maxIterations; iter++ {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
 		result.Iterations = iter
-		a.activity(req.SessionID, PhaseModel, fmt.Sprintf(
-			"round %d of %d — sending %d messages to %s",
-			iter, maxIterations, len(sess.Messages), a.provider.Model()))
+		if maxIterations == 0 {
+			a.activity(req.SessionID, PhaseModel, fmt.Sprintf(
+				"round %d — sending %d messages to %s",
+				iter, len(sess.Messages), a.provider.Model()))
+		} else {
+			a.activity(req.SessionID, PhaseModel, fmt.Sprintf(
+				"round %d of %d — sending %d messages to %s",
+				iter, maxIterations, len(sess.Messages), a.provider.Model()))
+		}
 
 		a.mu.Lock()
 		msgs := make([]llm.Message, len(sess.Messages))
@@ -191,12 +215,30 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 
 		if repeated, detail := failures.observe(calls, results); repeated {
 			a.activity(req.SessionID, PhaseError, detail+"; stopping the tool loop")
-			return a.finalReport(
-				ctx, req, sess, system, iter, accumulated.String(), detail)
+			return a.finalReport(ctx, req, sess, system, iter, accumulated.String(),
+				halt{reason: "repeated_tool_error", detail: detail})
+		}
+
+		// Cache reads and writes are context too — a provider that caches the
+		// prefix reports a small Input for a conversation that is anything but,
+		// so counting Input alone would leave a cached run with no backstop at
+		// all. A provider that reports no usage fails open, as it does
+		// everywhere else usage is read.
+		if limit := a.maxContextTokens(); limit > 0 {
+			carried := turn.Usage.Input + turn.Usage.CacheRead + turn.Usage.CacheWrite
+			if carried >= limit {
+				detail := fmt.Sprintf(
+					"the conversation reached %d context tokens, this run's ceiling, "+
+						"without the model finishing", carried)
+				a.activity(req.SessionID, PhaseError, detail+"; stopping the tool loop")
+				return a.finalReport(ctx, req, sess, system, iter, accumulated.String(),
+					halt{reason: "context_limit", detail: detail})
+			}
 		}
 	}
 
-	// The round budget is spent. Do not throw away what the agent learned: spend
+	// The round budget is spent (an unbounded turn never reaches this line — it
+	// leaves through one of the returns above). Do not throw away what the agent learned: spend
 	// one more call with no tools attached, so the model cannot ask for another
 	// round and has to say what it actually did.
 	//
@@ -205,14 +247,28 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	// way, and "nothing reported" is indistinguishable from "nothing done" — so
 	// the supervisor retries a task that may already be half-built, and the next
 	// attempt starts from zero with the same budget.
-	return a.finalReport(ctx, req, sess, system, maxIterations, accumulated.String(), "")
+	return a.finalReport(ctx, req, sess, system, maxIterations, accumulated.String(), halt{})
 }
 
 func (a *Agent) maxIterations() int {
+	if a.cfg.MaxIterations < 0 {
+		return 0
+	}
 	if n := a.cfg.MaxIterations; n > 0 {
 		return n
 	}
 	return defaultMaxIterations
+}
+
+// maxContextTokens is the round ceiling on carried context, 0 meaning none.
+func (a *Agent) maxContextTokens() int64 {
+	if a.cfg.MaxContextTokens < 0 {
+		return 0
+	}
+	if n := a.cfg.MaxContextTokens; n > 0 {
+		return n
+	}
+	return defaultMaxContextTokens
 }
 
 /*
@@ -230,15 +286,15 @@ func (a *Agent) finalReport(
 	system string,
 	rounds int,
 	accumulated string,
-	haltReason string,
+	h halt,
 ) (*SendResult, error) {
 	stopReason := "max_iterations"
 	stopLabel := fmt.Sprintf("cut off after %d tool-calling rounds", rounds)
 	stopExplanation := fmt.Sprintf("the %d-round tool-calling budget was exhausted", rounds)
-	if haltReason != "" {
-		stopReason = "repeated_tool_error"
-		stopLabel = fmt.Sprintf("stopped a repeated tool failure after %d rounds: %s", rounds, haltReason)
-		stopExplanation = haltReason
+	if h.reason != "" {
+		stopReason = h.reason
+		stopLabel = fmt.Sprintf("stopped after %d rounds: %s", rounds, h.detail)
+		stopExplanation = h.detail
 	}
 	result := &SendResult{SessionID: req.SessionID, Iterations: rounds, StopReason: stopReason}
 	a.activity(req.SessionID, PhaseReport, stopLabel+"; asking for a handoff report")

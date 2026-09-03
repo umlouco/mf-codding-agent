@@ -130,22 +130,20 @@ export interface Task {
   seq: number;
   /** Whatever the Execution agent reported back on its last run. */
   output: string;
-  /** Structured verification evidence written by that same executor attempt. */
+  /**
+   * Structured evidence from the independent verification agent the supervisor
+   * started on this task — never from the agent that did the work.
+   *
+   * Empty is meaningful, and it is the difference between the two things the
+   * supervisor can be asked to do: an empty report means nothing has been
+   * verified yet, so the task gets a progress review; a filled one means there
+   * is a finding to rule on. See the orchestrator's tick.
+   */
   validationReport: string;
   errorLog: string;
   supervisorFeedback: string;
   attempts: number;
   maxAttempts: number;
-  /**
-   * Consecutive times in a row this task's worker has failed to report back
-   * at all — gone silent, or the process itself died — since the last time it
-   * actually reported something. Reset to 0 whenever it does. See
-   * `requeueStale`'s `escalateAfter` and the orchestrator's `sweepSilentWorkers`:
-   * once this crosses the configured threshold the task is routed to the
-   * supervisor instead of requeued blindly again, so a task whose worker keeps
-   * dying before writing anything eventually gets a chance to be split.
-   */
-  noReportStreak: number;
   /**
    * When the worker on this task last wrote anything at all.
    *
@@ -221,7 +219,6 @@ const COLUMNS = `
   error_log           AS errorLog,
   supervisor_feedback AS supervisorFeedback,
   attempts, max_attempts AS maxAttempts,
-  no_report_streak AS noReportStreak,
   last_activity_at AS lastActivityAt,
   activity_phase   AS activityPhase,
   activity_detail  AS activityDetail,
@@ -330,10 +327,15 @@ export class TaskQueue {
     this.addColumn('kind', "TEXT NOT NULL DEFAULT 'task'");
     this.addColumn('region', "TEXT NOT NULL DEFAULT ''");
 
-    // See the Task.noReportStreak doc comment — counts a worker's consecutive
-    // failures to report back at all, independent of `attempts`.
-    this.addColumn('no_report_streak', 'INTEGER NOT NULL DEFAULT 0');
-    // Executors persist their own checks here; supervisors only consume them.
+    // A database written before this build may still carry `no_report_streak`.
+    // Nothing reads it: a worker that dies without reporting now goes to the
+    // supervisor on the first occurrence, so there is no streak to count. The
+    // column is left where it is rather than dropped — it is NOT NULL with a
+    // default, so an INSERT that ignores it is valid, and rewriting the table
+    // to remove one dead integer is not worth the risk to a live queue.
+
+    // Where the independent verification agent's findings land — see the
+    // Task.validationReport doc comment.
     this.addColumn('validation_report', "TEXT NOT NULL DEFAULT ''");
   }
 
@@ -495,6 +497,23 @@ export class TaskQueue {
     return taskId === null ? stmt.all(limit) : stmt.all(taskId, limit);
   }
 
+  /**
+   * How many times `kind` was recorded against a task, over its whole life.
+   *
+   * Counting these off the end of `events` instead only works while the journal
+   * is short. It is not: a worker streams its reasoning and every tool call into
+   * the same table, so the handful of entries anyone counts — rewrites, say —
+   * fall out of any fixed window within one long attempt, and the count quietly
+   * reads zero. `idx_events_task` makes asking the database cheaper than the
+   * window scan was anyway.
+   */
+  countEvents(taskId: number, kind: string): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = ?')
+      .get(taskId, kind);
+    return row.n as number;
+  }
+
   log(taskId: number | null, actor: string, kind: string, message = ''): void {
     this.db
       .prepare(
@@ -584,12 +603,29 @@ export class TaskQueue {
     });
   }
 
+  /**
+   * Appends a plan after everything already queued.
+   *
+   * A `seq` carried on an incoming task is a *relative* ordering within its
+   * own batch — the planner numbers its phases 1..n without knowing, or being
+   * able to know, what is already in the queue (see planGoal) — so it says
+   * nothing about where those rows belong in this table. Honouring it
+   * literally wrote the new plan straight on top of the old one: two lists
+   * sharing one seq space, which `claimNext` then interleaves by `ORDER BY
+   * seq, id` and, on a tie, resolves *towards the older row*. Appending a
+   * second list that way meant the next worker picked up the previous plan's
+   * task instead of the new plan's first one.
+   *
+   * Appending therefore always allocates fresh numbers after `maxSeq()`, in
+   * the order the caller supplied — the same contract `WritePlan` applies on
+   * the Go side.
+   */
   addAll(tasks: NewTask[]): number {
     return this.tx(() => {
       let seq = this.maxSeq();
       let n = 0;
       for (const t of tasks) {
-        this.insert(t, t.seq ?? ++seq);
+        this.insert(t, ++seq);
         n++;
       }
       return n;
@@ -600,6 +636,14 @@ export class TaskQueue {
     return this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM tasks').get().m as number;
   }
 
+  /**
+   * Inserts one row at `seq`, which is the position this table has decided on
+   * — never `t.seq`. Every caller works out the absolute position first
+   * (`replaceAll` renumbers from 1, `addAll` continues past the end,
+   * `splitTask` and `expandTask` place parts at the row they replace), and a
+   * `t.seq` left over from whoever built the object is at best a duplicate of
+   * that and at worst a number from an unrelated plan.
+   */
   private insert(t: NewTask, seq: number): number {
     const now = Date.now();
     const info = this.db
@@ -617,7 +661,7 @@ export class TaskQueue {
         t.solutionVerifyPrompt ?? '',
         t.solutionVerifyCommand ?? '',
         t.status ?? 'PENDING',
-        t.seq ?? seq,
+        seq,
         t.maxAttempts ?? 3,
         now,
         now,
@@ -641,7 +685,6 @@ export class TaskQueue {
     supervisorFeedback: 'supervisor_feedback',
     attempts: 'attempts',
     maxAttempts: 'max_attempts',
-    noReportStreak: 'no_report_streak',
     startedAt: 'started_at',
     finishedAt: 'finished_at',
     kind: 'kind',
@@ -946,19 +989,22 @@ export class TaskQueue {
    * Recovers tasks orphaned by a crashed worker or a window reload. Anything
    * still EXECUTING at startup has no live process behind it.
    *
-   * `escalateAfter` turns a blind requeue into an escalation: once a task
-   * (never a phase — see TaskKind) has now failed to report back this many
-   * times in a row, for any reason, it goes to VERIFYING instead of straight
-   * back to PENDING, the same route a task takes when it genuinely finishes an
-   * attempt. Without this, a task whose worker keeps dying or whose host keeps
-   * reloading before it can write anything never once reaches the supervisor,
-   * so nobody ever gets a chance to notice it and split it into something
-   * smaller — which is exactly how a task can spin for hours with nothing to
-   * show for it. Pass 0 (the default) to keep the old unconditional requeue,
-   * for callers where an orphaned task says nothing about the work itself —
-   * a deliberate stop or pause, say.
+   * `escalate` says what an orphan means. A crash during a deliberate stop or
+   * pause says nothing about the work — the extension killed the process — so
+   * that caller passes `false` and the task simply goes back to PENDING. A
+   * crash nobody asked for is different: it is the one thing the supervisor
+   * cannot see, because there is no report to read, so the task goes to
+   * VERIFYING instead — the same route it takes when it genuinely finishes —
+   * and the supervisor decides what to do from the journal.
+   *
+   * This is deliberately not counted. Requiring a task to die twice before
+   * anyone looks at it is an attempt limit wearing a different hat, and the one
+   * thing it reliably buys is a second identical crash.
+   *
+   * A phase (see TaskKind) is never escalated: it carries no report to judge
+   * and no verification contract to rewrite, so it just goes back in the queue.
    */
-  requeueStale(olderThanMs: number, escalateAfter = 0): number {
+  requeueStale(olderThanMs: number, escalate = false): number {
     const cutoff = Date.now() - olderThanMs;
     // `<=` rather than `<`: with olderThanMs of 0 the caller means "everything
     // currently EXECUTING", and a task claimed in the same millisecond as the
@@ -974,23 +1020,21 @@ export class TaskQueue {
       // Attempts still count against the task the same as any other requeue —
       // see `attempts` on Task — so this only changes where it lands, not
       // whether it is retried at all.
-      const streak = t.kind === 'task' ? t.noReportStreak + 1 : t.noReportStreak;
-      if (escalateAfter > 0 && t.kind === 'task' && streak >= escalateAfter) {
+      if (escalate && t.kind === 'task') {
         this.update(t.id, {
           status: 'VERIFYING',
           finishedAt: null,
-          noReportStreak: 0,
+          // Nothing verified anything: the worker died before it could. An
+          // empty report is what routes this to a progress review rather than
+          // to a verdict — see the orchestrator's tick.
+          validationReport: '',
           errorLog:
-            `${note} This has now happened ${streak} time(s) in a row without the task ` +
-            'ever finishing an attempt — escalating to the supervisor instead of retrying blindly.',
+            `${note} No report was produced, so there is nothing to judge — the supervisor ` +
+            'must decide the next action from the journal.',
         });
-        this.log(t.id, 'system', 'escalated', `${streak} consecutive no-report failures`);
+        this.log(t.id, 'system', 'escalated', 'worker died without reporting; sent to supervisor');
       } else {
-        this.update(t.id, {
-          status: 'PENDING',
-          errorLog: note,
-          ...(escalateAfter > 0 && t.kind === 'task' ? { noReportStreak: streak } : {}),
-        });
+        this.update(t.id, { status: 'PENDING', errorLog: note });
         this.log(t.id, 'system', 'recovered', 'requeued');
       }
     }
@@ -1025,7 +1069,7 @@ export class TaskQueue {
           error_log = '', supervisor_feedback = '', started_at = NULL,
           finished_at = NULL, last_activity_at = NULL, activity_phase = '',
           activity_detail = '', tokens_in = 0, tokens_out = 0,
-          tokens_cache_read = 0, tokens_cache_write = 0, no_report_streak = 0,
+          tokens_cache_read = 0, tokens_cache_write = 0,
           updated_at = ${Date.now()}
       `);
       this.setMeta('runState', 'IDLE');
@@ -1039,7 +1083,7 @@ export class TaskQueue {
       const info = this.db
         .prepare(
           `UPDATE tasks SET status = 'PENDING', attempts = 0, output = '', validation_report = '',
-             started_at = NULL, finished_at = NULL, no_report_streak = 0,
+             started_at = NULL, finished_at = NULL,
              supervisor_feedback = ?, updated_at = ?
            WHERE seq >= ?`,
         )

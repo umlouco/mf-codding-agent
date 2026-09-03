@@ -14,6 +14,9 @@ import {
   withinRegion,
 } from './agents';
 import { NewTask, QueueStats, Task, TaskQueue } from './db';
+import { JOURNAL_EVENTS, ProgressDecision, reviewProgress, VALIDATION_FAILED } from './monitor';
+import { completionForSupervisor } from './validation';
+import { runVerification } from './verification';
 
 /**
  * The cron engine.
@@ -24,12 +27,18 @@ import { NewTask, QueueStats, Task, TaskQueue } from './db';
  *                    writes the result back, and stops. Spawning the next
  *                    worker is a fresh process with a fresh context window.
  *
- *   supervision pump fires on the cron interval, reads executor validation
- *                    reports from rows sitting in VERIFYING, and rules on them.
+ *   supervision pump fires on the cron interval and does two different jobs,
+ *                    told apart by whether a row has a validation report yet.
+ *                    With none, nothing has been verified: it reviews the work
+ *                    from the journal and picks a control action — carry on,
+ *                    rewrite the task, rewrite the checks, or start an
+ *                    independent verification agent on it. With one, there is a
+ *                    finding to rule on, and it returns a verdict.
  *
  * Neither pump holds state between ticks — if the window reloads mid-run, the
  * database still knows exactly what was happening, and `requeueStale` recovers
- * whatever was orphaned.
+ * whatever was orphaned. The one exception is `reviewed`, which decides only how
+ * often to spend money looking, never what happens to a task.
  */
 
 export type RunMode = 'lockstep' | 'continuous';
@@ -120,6 +129,16 @@ export class Orchestrator implements vscode.Disposable {
   private supervising = false;
   private review: Review | null = null;
   private reviewGen = 0;
+  /**
+   * The last time each task's live work was reviewed, and how far the journal
+   * had got when it was — see shouldReview.
+   *
+   * In memory rather than in the row on purpose: it decides how often to spend
+   * money looking, and losing it on a reload costs one extra review, not
+   * correctness. Everything that decides what actually *happens* to a task
+   * still comes off the row.
+   */
+  private readonly reviewed = new Map<number, { attempt: number; at: number; eventId: number }>();
   /**
    * Kills the execution worker currently in flight, if any.
    *
@@ -218,13 +237,13 @@ export class Orchestrator implements vscode.Disposable {
    * and also directly on activation, before the run may even be RUNNING, so
    * a workspace that was left orphaned is fixed before anyone reads it.
    *
-   * Uses `noReportEscalateAfter`: this is the actual crash-recovery moment,
-   * so a task that keeps ending up here is a task whose worker keeps dying
-   * before writing anything, and it is escalated to the supervisor rather
-   * than silently requeued again — see requeueStale.
+   * Escalates rather than requeuing: this is the actual crash-recovery moment,
+   * and a worker that died before writing anything is the one failure the
+   * supervisor cannot otherwise see. It goes to VERIFYING with no report, which
+   * the tick reads as "review this from the journal" — see requeueStale.
    */
   recoverOrphaned(): number {
-    const recovered = this.queue.requeueStale(0, this.noReportEscalateAfter);
+    const recovered = this.queue.requeueStale(0, true);
     if (recovered > 0) {
       this.log(`recovered ${recovered} orphaned task(s) from a previous session`);
     }
@@ -286,6 +305,9 @@ export class Orchestrator implements vscode.Disposable {
     this.abandonReview();
     this.abandonExecution();
     this.queue.resetAll();
+    // resetAll zeroes `attempts`, so a stale entry here would read as a review
+    // of the attempt about to start rather than of the run just thrown away.
+    this.reviewed.clear();
     this.changed();
     this.log('reset — every task back to PENDING');
   }
@@ -344,12 +366,27 @@ export class Orchestrator implements vscode.Disposable {
     try {
       this.sweepSilentWorkers();
 
+      const active = this.queue.activeTask();
+      if (active?.kind === 'task') {
+        await this.reviewWork(active);
+      }
+
       const pending = this.queue.awaitingVerification();
       for (const task of pending) {
         if (this.disposed || this.queue.runState !== 'RUNNING' || this.cycle !== cycle) {
           break;
         }
-        await this.supervise(task);
+        let current = this.queue.get(task.id);
+        if (!current || current.status !== 'VERIFYING') {
+          continue;
+        }
+        if (!current.validationReport.trim()) {
+          await this.reviewWork(current);
+          current = this.queue.get(task.id);
+        }
+        if (current?.status === 'VERIFYING' && current.validationReport.trim()) {
+          await this.supervise(current);
+        }
       }
 
       if (this.cycle === cycle && this.queue.isComplete()) {
@@ -388,17 +425,6 @@ export class Orchestrator implements vscode.Disposable {
    */
   private get silentMs(): number {
     return Math.max(1, this.cfg<number>('queue.workerSilentMinutes', 10)) * 60_000;
-  }
-
-  /**
-   * How many consecutive times a task's worker may fail to report back at
-   * all — go silent, or the process (or the host around it) die outright —
-   * before the task is routed to the supervisor instead of requeued again
-   * with nobody looking at it. See requeueStale's `escalateAfter` and
-   * sweepSilentWorkers below; this is the threshold both apply.
-   */
-  private get noReportEscalateAfter(): number {
-    return Math.max(1, this.cfg<number>('queue.noReportEscalateAfter', 2));
   }
 
   /**
@@ -488,49 +514,354 @@ export class Orchestrator implements vscode.Disposable {
 
   private sweepSilentWorkers(): void {
     const silentMs = this.silentMs;
-    const escalateAfter = this.noReportEscalateAfter;
     for (const task of this.queue.silentWorkers(silentMs)) {
       const quiet = Math.round((Date.now() - (task.lastActivityAt ?? task.startedAt ?? 0)) / 60_000);
       const note =
         `the worker went silent for ${quiet} minute(s) while ${task.activityPhase || 'starting up'}` +
         (task.activityDetail ? ` (${task.activityDetail})` : '');
 
-      // A dead process is not evidence that the task is wrong, so on its own
-      // this requeues without asking the supervisor to rewrite anything —
-      // unlike a worker that died with a message, this one never said
-      // goodbye, and there is no report to judge. But enough of them in a row
-      // (a phase never counts — see TaskKind) is itself evidence the
-      // supervisor has never had a chance to see: a task whose worker cannot
-      // even finish one attempt, over and over, may simply be too big for one
-      // sitting. Past `escalateAfter`, it goes to VERIFYING instead — the
-      // same route a task takes when it genuinely finishes — so the
-      // supervisor can retry it with better instructions, split it, or roll
-      // it back, rather than it spinning forever with nobody looking.
-      const streak = task.kind === 'task' ? task.noReportStreak + 1 : task.noReportStreak;
-      if (task.kind === 'task' && streak >= escalateAfter) {
-        this.queue.update(task.id, {
+      if (task.kind === 'task') {
+        this.stopForDecision(task, {
           status: 'VERIFYING',
           finishedAt: null,
-          noReportStreak: 0,
+          validationReport: '',
           errorLog: appendAttempt(
             task.errorLog,
-            `[attempt ${task.attempts}] ${note}. This is the ${streak}th time in a row a worker has ` +
-              'failed to even finish this task — escalating to the supervisor instead of retrying blindly.',
+            `[attempt ${task.attempts}] ${note}. The supervisor must decide the next action from the journal.`,
           ),
         });
-        this.queue.log(task.id, 'system', 'escalated', `${note}; ${streak} consecutive no-report failures`);
-        this.log(`task ${task.seq} — ${note}; escalated to the supervisor after ${streak} silent attempt(s)`);
+        this.queue.log(task.id, 'system', 'silent', `${note}; sent to supervisor`);
+        this.log(`task ${task.seq} — ${note}; sent directly to the supervisor`);
       } else {
         this.queue.update(task.id, {
           status: 'PENDING',
           errorLog: appendAttempt(task.errorLog, `[attempt ${task.attempts}] ${note}.`),
           finishedAt: null,
-          ...(task.kind === 'task' ? { noReportStreak: streak } : {}),
         });
         this.queue.log(task.id, 'system', 'silent', note);
         this.log(`task ${task.seq} — ${note}; requeued`);
       }
       this.changed();
+    }
+  }
+
+  /**
+   * How often the supervisor may look in on a task that is still executing.
+   *
+   * Separate from the cron interval, and much longer than it. The cron exists to
+   * notice things quickly — a finished task, a dead worker — and a minute is
+   * right for that. A live agent is a different subject: reviewing it is a full
+   * model turn over its journal, and a task that now legitimately runs for
+   * hours does not change its mind every minute. Judging it on every tick
+   * mostly re-reads evidence the supervisor already ruled on.
+   */
+  private get reviewIntervalMs(): number {
+    return Math.max(30, this.cfg<number>('queue.reviewIntervalSeconds', 300)) * 1000;
+  }
+
+  /**
+   * Whether looking in on this task again would show the supervisor anything.
+   *
+   * A live task needs both halves: enough time since the last look, and new
+   * evidence since the last look. Either alone is not enough — an agent that
+   * has written nothing has nothing new to judge no matter how long it has
+   * been, and an agent mid-tool-call has not finished the thought that the last
+   * review was already reading.
+   *
+   * A task that has *stopped* is not a poll at all. Nothing further will be
+   * written to its journal, and the queue does not move until someone decides
+   * what happens next, so that decision is never delayed or skipped.
+   */
+  private shouldReview(task: Task, latestEventId: number): boolean {
+    if (task.status !== 'EXECUTING') {
+      return true;
+    }
+    const last = this.reviewed.get(task.id);
+    // A fresh attempt is a fresh subject: whatever was judged last time was
+    // judged about a worker that is no longer running.
+    if (!last || last.attempt !== task.attempts) {
+      return true;
+    }
+    return Date.now() - last.at >= this.reviewIntervalMs && latestEventId > last.eventId;
+  }
+
+  /** Lets the supervisor judge live work and choose one fixed control action. */
+  private async reviewWork(task: Task): Promise<void> {
+    const events = this.queue.events(task.id, JOURNAL_EVENTS);
+    const latestEventId = events[0]?.id ?? 0;
+    if (!this.shouldReview(task, latestEventId)) {
+      return;
+    }
+    // Recorded before the turn, not after: this is a rate, and a review that
+    // fails or is abandoned still means the supervisor has just looked.
+    this.reviewed.set(task.id, { attempt: task.attempts, at: Date.now(), eventId: latestEventId });
+
+    this.log(`reviewing live work on task ${task.seq} — ${task.title}`);
+    const gen = ++this.reviewGen;
+    const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now() };
+    this.review = review;
+
+    try {
+      const decision = await reviewProgress(
+        this.context,
+        this.output,
+        task,
+        events,
+        this.queue.countEvents(task.id, VALIDATION_FAILED),
+        {
+          onAbort: (abort) => {
+            review.abort = abort;
+          },
+          onActivity: (activity) => {
+            review.lastActivityAt = activity.at;
+          },
+        },
+      );
+      if (gen !== this.reviewGen) {
+        this.log(`task ${task.seq} — abandoned progress decision ignored`);
+        return;
+      }
+      this.queue.addUsage(task.id, decision.usage);
+      this.queue.log(task.id, 'supervisor', `action:${decision.action}`, decision.reason);
+      await this.applyProgressDecision(task, decision, review);
+    } catch (error: any) {
+      const message = String(error?.message ?? error);
+      this.queue.log(task.id, 'supervisor', 'monitor-error', message);
+      this.log(`task ${task.seq} — progress review failed: ${message}; execution preserved`);
+    } finally {
+      if (this.review === review) {
+        this.review = null;
+      }
+    }
+  }
+
+  private async applyProgressDecision(
+    snapshot: Task,
+    decision: ProgressDecision,
+    review: Review,
+  ): Promise<void> {
+    const task = this.queue.get(snapshot.id);
+    if (!task || !['EXECUTING', 'VERIFYING'].includes(task.status)) {
+      this.log(`task ${snapshot.seq} moved while its progress was reviewed; action ignored`);
+      return;
+    }
+
+    switch (decision.action) {
+      case 'CONTINUE_EXECUTION':
+        if (task.status === 'VERIFYING' && !task.validationReport.trim()) {
+          this.queue.update(task.id, {
+            status: 'PENDING',
+            finishedAt: null,
+            supervisorFeedback: decision.reason,
+          });
+          this.log(`task ${task.seq} needs more implementation work; returned to PENDING`);
+        } else {
+          this.log(`task ${task.seq} is progressing in the right direction; continuing`);
+        }
+        return;
+
+      case 'STOP_AND_REWRITE_TASK': {
+        const description = decision.rewrittenDescription?.trim();
+        if (!description || description.length < 40) {
+          this.log(`task ${task.seq} — supervisor omitted the required task rewrite; continuing safely`);
+          return;
+        }
+        if (!this.stopForDecision(task, {
+          status: 'PENDING',
+          description,
+          validationReport: '',
+          finishedAt: null,
+          supervisorFeedback: decision.reason,
+        })) {
+          return;
+        }
+        this.queue.log(task.id, 'supervisor', 'task-edited', description.slice(0, 8000));
+        this.log(`task ${task.seq} stopped and rewritten from live quality evidence`);
+        return;
+      }
+
+      case 'STOP_AND_REWRITE_VALIDATION': {
+        const hasRewrite = !!(
+          decision.implVerifyPrompt || decision.solutionVerifyPrompt || decision.solutionVerifyCommand
+        );
+        if (!hasRewrite) {
+          this.log(`task ${task.seq} — supervisor omitted replacement validation; continuing safely`);
+          return;
+        }
+        if (!this.stopForDecision(task, {
+          status: 'PENDING',
+          implVerifyPrompt: decision.implVerifyPrompt ?? task.implVerifyPrompt,
+          solutionVerifyPrompt: decision.solutionVerifyPrompt ?? task.solutionVerifyPrompt,
+          solutionVerifyCommand: decision.solutionVerifyCommand ?? task.solutionVerifyCommand,
+          validationReport: '',
+          finishedAt: null,
+          supervisorFeedback: decision.reason,
+        })) {
+          return;
+        }
+        this.queue.log(task.id, 'supervisor', 'validation-edited', decision.reason.slice(0, 8000));
+        this.log(`task ${task.seq} stopped and its validation contract was rewritten`);
+        return;
+      }
+
+      case 'START_VALIDATION':
+        if (!this.stopForDecision(task, {
+          status: 'VERIFYING',
+          validationReport: '',
+          finishedAt: null,
+          supervisorFeedback: decision.reason,
+        })) {
+          return;
+        }
+        await this.verifyWithExecutor(this.queue.get(task.id) ?? task, review);
+        return;
+    }
+  }
+
+  /** Fences a running executor before killing it, so its late result cannot land. */
+  private stopForDecision(task: Task, patch: Partial<Task>): boolean {
+    if (task.status === 'EXECUTING') {
+      if (!this.queue.finishExecution(task.id, task.attempts, patch)) {
+        return false;
+      }
+      const abort = this.executionAbort;
+      this.executionAbort = null;
+      try {
+        abort?.();
+      } catch {
+        /* the executor already stopped after the supervisor's snapshot */
+      }
+      return true;
+    }
+    this.queue.update(task.id, patch);
+    return true;
+  }
+
+  /**
+   * Journals one agent's stream into the task as it happens.
+   *
+   * Both the worker and the validator write through this, and it exists because
+   * that journal is now the only thing `reviewProgress` gets to look at — the
+   * supervisor has no tools and cannot read the workspace, so an agent whose
+   * reasoning never lands here is an agent the supervisor is judging blind. Tool
+   * calls alone do not carry a wrong premise or a rabbit hole; the model saying
+   * what it thinks it is doing does.
+   *
+   * Text is buffered rather than written per delta: a token is not a journal
+   * entry, and one row per token would bury the tool trail it sits beside. The
+   * buffer is flushed when the agent switches between thinking and answering,
+   * when it starts a tool call, and by the caller when the turn ends — that last
+   * one is not optional, or the tail of every reply is lost.
+   */
+  private streamJournal(taskId: number, actor: 'executor' | 'validator') {
+    const pendingTools = new Map<string, { name: string; input: unknown }>();
+    let kind = '';
+    let buffer = '';
+
+    const flush = (): void => {
+      if (!buffer.trim()) {
+        buffer = '';
+        return;
+      }
+      this.queue.log(taskId, actor, kind || 'stream', buffer.slice(0, 8000));
+      buffer = '';
+    };
+
+    const onEvent = (method: string, params: any): void => {
+      if (method === 'stream/text' || method === 'stream/thinking') {
+        const next = method === 'stream/thinking' ? 'reasoning' : 'response';
+        if (kind && kind !== next) {
+          flush();
+        }
+        kind = next;
+        buffer += String(params?.delta ?? '');
+        if (buffer.length >= 1200) {
+          flush();
+        }
+        return;
+      }
+      // stream/tool fires twice per call — once on "running" (carries the
+      // input, not the output), once on completion (carries the output, not
+      // the input) — matched by id. Correlating them here is what turns the
+      // liveness pings elsewhere into a diagnostic trail with actual content:
+      // which file, which command, and what came back.
+      if (method !== 'stream/tool' || !params?.id) {
+        return;
+      }
+      if (params.status === 'running') {
+        flush();
+        pendingTools.set(params.id, { name: String(params.name ?? 'tool'), input: params.input });
+        return;
+      }
+      const started = pendingTools.get(params.id);
+      pendingTools.delete(params.id);
+      this.queue.log(taskId, actor, 'tool', formatToolEvent(
+        started?.name ?? String(params.name ?? 'tool'),
+        started?.input,
+        String(params.status ?? ''),
+        params.output,
+        params.elapsedMs,
+      ));
+    };
+
+    return { flush, onEvent };
+  }
+
+  /** Delegates formal verification to a fresh execution LLM and persists its response. */
+  private async verifyWithExecutor(task: Task, review: Review): Promise<void> {
+    this.log(`task ${task.seq} — supervisor started independent verification`);
+    this.queue.log(task.id, 'supervisor', 'validation-started', 'delegated to execution LLM');
+    const journal = this.streamJournal(task.id, 'validator');
+    try {
+      const result = await runVerification(
+        this.context,
+        this.output,
+        task,
+        (activity) => {
+          review.lastActivityAt = activity.at;
+          if (this.queue.recordActivity(task.id, activity.phase, activity.detail, 'validator')) {
+            this.changed();
+          }
+        },
+        journal.onEvent,
+        (abort) => {
+          review.abort = abort;
+        },
+      );
+      journal.flush();
+      if (this.queue.get(task.id)?.status !== 'VERIFYING') {
+        this.log(`task ${task.seq} moved while validation ran; validator response ignored`);
+        return;
+      }
+      this.queue.addUsage(task.id, result.usage);
+      this.queue.update(task.id, {
+        output: result.text,
+        validationReport: result.validationReport,
+        finishedAt: Date.now(),
+      });
+      this.queue.log(task.id, 'validator', 'response', result.text.slice(0, 8000));
+      this.queue.log(task.id, 'validator', 'validation', result.validationReport.slice(0, 8000));
+      this.log(`task ${task.seq} — independent verification response stored`);
+    } catch (error: any) {
+      journal.flush();
+      const message = String(error?.message ?? error);
+      // Recorded twice on purpose, because two different readers need it. The
+      // journal entry is what `failedValidations` counts, so the next progress
+      // review knows this has already been tried; the error log is what
+      // `attemptHistory` shows a later supervision verdict, which never sees
+      // the journal at all. Without either, a validator that fails the same way
+      // every time is re-launched forever by a supervisor with no way to know.
+      this.queue.log(task.id, 'validator', VALIDATION_FAILED, message);
+      const current = this.queue.get(task.id);
+      if (current) {
+        this.queue.update(task.id, {
+          errorLog: appendAttempt(
+            current.errorLog,
+            `[attempt ${current.attempts}] independent validation did not complete: ${message}.`,
+          ),
+        });
+      }
+      this.log(`task ${task.seq} — validator stopped: ${message}; supervisor will reassess`);
     }
   }
 
@@ -653,7 +984,7 @@ export class Orchestrator implements vscode.Disposable {
 
   /** How many times the supervisor has already rewritten this task. */
   private rewrites(task: Task): number {
-    return this.queue.events(task.id, 200).filter((e) => e.kind === 'task-edited').length;
+    return this.queue.countEvents(task.id, 'task-edited');
   }
 
   /**
@@ -752,12 +1083,7 @@ export class Orchestrator implements vscode.Disposable {
 
     this.log(`executing task ${task.seq} — ${task.title} (attempt ${task.attempts})`);
 
-    // stream/tool fires twice per call — once on "running" (carries the
-    // input, not the output), once on completion (carries the output, not
-    // the input) — matched by id. Correlating them here is what turns the
-    // liveness pings elsewhere into a diagnostic trail with actual content:
-    // which file, which command, and what came back.
-    const pendingTools = new Map<string, { name: string; input: unknown }>();
+    const journal = this.streamJournal(task.id, 'executor');
 
     try {
       // Every record the worker writes lands in the database as it happens, so
@@ -773,44 +1099,23 @@ export class Orchestrator implements vscode.Disposable {
             this.changed();
           }
         },
-        (method, params) => {
-          if (method !== 'stream/tool' || !params?.id) {
-            return;
-          }
-          if (params.status === 'running') {
-            pendingTools.set(params.id, { name: String(params.name ?? 'tool'), input: params.input });
-            return;
-          }
-          const started = pendingTools.get(params.id);
-          pendingTools.delete(params.id);
-          this.queue.log(
-            task.id,
-            'executor',
-            'tool',
-            formatToolEvent(
-              started?.name ?? String(params.name ?? 'tool'),
-              started?.input,
-              String(params.status ?? ''),
-              params.output,
-              params.elapsedMs,
-            ),
-          );
-        },
+        journal.onEvent,
         (abort) => {
           this.executionAbort = abort;
         },
       );
+      journal.flush();
 
-      // A cut-off worker reports partial progress, not a finished task. Record
-      // that in the error log: the retry prompt feeds it back, so the next
-      // attempt continues from what was built instead of starting over. Being
-      // cut off twice is the supervisor's signal that the task is too big and
-      // should be split rather than retried.
+      // The core stopped this turn itself rather than the model finishing it —
+      // see coreHalted. The report is partial progress, so say which limit it
+      // ran into: the retry prompt feeds this back, and it is the difference
+      // between a task that needs splitting and one whose tool calls are broken.
       const cutOffNote = res.cutOff
         ? appendAttempt(
             task.errorLog,
-            `[attempt ${task.attempts}] cut off — used all ${res.rounds} tool-calling rounds. ` +
-              'The report is partial progress, not a finished task.',
+            `[attempt ${task.attempts}] the core stopped the turn (${res.stopReason}). ` +
+              'The report is partial progress. The supervisor must decide whether to ' +
+              'continue, rewrite, split, or validate.',
           )
         : undefined;
 
@@ -818,11 +1123,8 @@ export class Orchestrator implements vscode.Disposable {
       const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'VERIFYING',
         output: res.text,
-        // This is the hand-off contract: verification evidence crosses the
-        // executor/supervisor boundary only through the queue database.
-        validationReport: res.validationReport,
-        // The worker reported, whatever it reported — see noReportStreak.
-        noReportStreak: 0,
+        // Empty means the supervisor has not delegated formal verification yet.
+        validationReport: '',
         ...(cutOffNote ? { errorLog: cutOffNote } : {}),
       });
       if (!applied) {
@@ -834,14 +1136,24 @@ export class Orchestrator implements vscode.Disposable {
           res.cutOff ? 'cut-off' : 'completed',
           res.text.slice(0, 4000),
         );
-        this.queue.log(task.id, 'executor', 'validation', res.validationReport.slice(0, 8000));
+        // Recorded separately from the raw reply, and normalised: this is the
+        // one thing in the reply the supervisor's next decision turns on, and
+        // it should not depend on the supervisor finding it inside prose.
+        this.queue.log(
+          task.id,
+          'executor',
+          'completion-claim',
+          completionForSupervisor(res.completion),
+        );
         this.log(
           res.cutOff
-            ? `task ${task.seq} cut off after ${res.rounds} rounds; awaiting supervision`
-            : `task ${task.seq} done; awaiting supervision`,
+            ? `task ${task.seq} — the core stopped the turn (${res.stopReason}); awaiting a supervisor action`
+            : `task ${task.seq} implementation agent stopped claiming ${res.completion.status}; ` +
+              'awaiting a supervisor action',
         );
       }
     } catch (e: any) {
+      journal.flush();
       const msg = String(e?.message ?? e);
       // A worker that died mid-turn — a dropped connection, a crashed core, or
       // abandonExecution killing it on purpose — still edited real files. Send
@@ -851,9 +1163,6 @@ export class Orchestrator implements vscode.Disposable {
       const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'VERIFYING',
         output: '',
-        // The supervisor is about to look at this attempt directly, so it is
-        // not the kind of unseen failure the streak exists to catch.
-        noReportStreak: 0,
         errorLog: appendAttempt(
           task.errorLog,
           `[attempt ${task.attempts}] the worker stopped before reporting: ${msg}. ` +
