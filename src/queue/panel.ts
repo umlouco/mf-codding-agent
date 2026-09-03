@@ -1,6 +1,9 @@
 import * as vscode from 'vscode';
+import { scheduleRestart } from '../coreRestart';
+import { discoverMcpServers } from '../mcp';
 import { getStore } from '../providers/instance';
-import { planGoal } from './agents';
+import { discoverInstalledSkills } from '../skills';
+import { editTasks, planGoal } from './agents';
 import { Task, TaskQueue } from './db';
 import { Orchestrator } from './orchestrator';
 
@@ -107,6 +110,9 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
         case 'generate':
           await this.generate(msg.goal, !!msg.append);
           break;
+        case 'editTasks':
+          await this.applyTaskEditPrompt(String(msg.instruction ?? ''));
+          break;
         case 'setInstructions': {
           const text = String(msg.text ?? '');
           queue.setInstructions(text);
@@ -114,6 +120,20 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           this.render();
           break;
         }
+
+        // Both toggles restart the core (debounced) so the change reaches the
+        // long-lived Chat session too, not just the next ephemeral queue run —
+        // that one rebuilds its config fresh every time regardless.
+        case 'setMcpEnabled':
+          queue.setMcpServerEnabled(String(msg.name), !!msg.enabled);
+          this.render();
+          scheduleRestart('MCP server toggled from the Task Queue', this.output);
+          break;
+        case 'setSkillGroupEnabled':
+          queue.setSkillGroupEnabled(String(msg.id), !!msg.enabled);
+          this.render();
+          scheduleRestart('skill group toggled from the Task Queue', this.output);
+          break;
 
         case 'start':
           if (await this.confirmAutonomy(queue)) {
@@ -234,6 +254,81 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * Edits, adds to, or removes from the existing task list from a free-text
+   * instruction — as opposed to `generate`, which only ever produces a brand
+   * new list. Applies the result through the exact same primitives
+   * (`update`/`remove`/`addAll`, matched by `seq`, skipping VERIFIED tasks)
+   * `orchestrator.ts`'s `applyTaskEdits` already uses for the supervisor's
+   * own rewrites, so a prompt-driven edit shows up in task history the same
+   * way a supervisor rewrite does.
+   */
+  private async applyTaskEditPrompt(instruction: string): Promise<void> {
+    const queue = this.queue;
+    if (!queue) {
+      void vscode.window.showWarningMessage(
+        `The task queue is unavailable: ${this.problem ?? 'not open'}`,
+      );
+      return;
+    }
+    if (!instruction.trim()) {
+      void vscode.window.showInformationMessage('Describe the change to make first.');
+      return;
+    }
+    if (this.generating) {
+      return;
+    }
+    this.generating = true;
+    this.render();
+
+    try {
+      const result = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Editing the task list…' },
+        () => editTasks(this.context, this.output, queue.list(), instruction),
+      );
+
+      const bySeq = new Map(queue.list().map((t) => [t.seq, t]));
+      let changed = 0;
+      for (const edit of result.edits) {
+        const target = bySeq.get(edit.seq);
+        if (!target || target.status === 'VERIFIED') {
+          continue;
+        }
+        queue.update(target.id, {
+          title: edit.title ?? target.title,
+          description: edit.description ?? target.description,
+          implVerifyPrompt: edit.implVerifyPrompt ?? target.implVerifyPrompt,
+          solutionVerifyPrompt: edit.solutionVerifyPrompt ?? target.solutionVerifyPrompt,
+          solutionVerifyCommand: edit.solutionVerifyCommand ?? target.solutionVerifyCommand,
+        });
+        queue.log(target.id, 'user', 'task-edited', 'edited by prompt');
+        changed++;
+      }
+      for (const seq of result.deletes) {
+        const target = bySeq.get(seq);
+        if (!target || target.status === 'VERIFIED') {
+          continue;
+        }
+        queue.remove(target.id);
+        changed++;
+      }
+      if (result.adds.length) {
+        queue.addAll(result.adds);
+        changed += result.adds.length;
+      }
+      queue.log(null, 'user', 'tasks-edited-by-prompt', result.summary);
+
+      void vscode.window.showInformationMessage(
+        changed ? result.summary : 'Nothing changed — the plan may already match your instruction.',
+      );
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Could not edit tasks: ${e?.message ?? e}`);
+    } finally {
+      this.generating = false;
+      this.render();
+    }
+  }
+
   // ---- confirmations ---------------------------------------------------
 
   /**
@@ -327,6 +422,9 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       });
       return;
     }
+    const disabledMcp = new Set(queue.disabledMcpServers);
+    const enabledSkillGroups = new Set(queue.enabledSkillGroups);
+
     this.post({
       type: 'state',
       tasks: queue.list() as Task[],
@@ -337,6 +435,29 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       driver: queue.impl,
       instructions: queue.instructions,
       models: { planner: '', supervisor: '', executor: '' },
+      mcpServers: discoverMcpServers(this.context).map((s) => ({
+        name: s.name,
+        source: s.source,
+        configured: !!(s.command || s.url),
+        enabled: !disabledMcp.has(s.name),
+      })),
+      skillGroups: [
+        ...getStore().settings.skillGroups.map((g) => ({
+          id: g.id,
+          name: g.name,
+          skillCount: g.skillIds.length,
+          enabled: enabledSkillGroups.has(g.id),
+          source: 'authored' as const,
+        })),
+        ...discoverInstalledSkills().map((d) => ({
+          id: d.group.id,
+          name: d.group.name,
+          skillCount: 1,
+          enabled: enabledSkillGroups.has(d.group.id),
+          source: 'installed' as const,
+          description: d.skill.description,
+        })),
+      ],
     });
     // Role models come from the profile store, which is async. Push them as a
     // follow-up so the rest of the view is not held up by a keychain read.
@@ -400,7 +521,18 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   <nav class="tabs">
     <button class="tab active" data-pane="run">Run</button>
     <button class="tab" data-pane="plan">Plan</button>
+    <button class="tab" data-pane="context">Context</button>
   </nav>
+
+  <section id="pane-context" class="pane" hidden>
+    <h3 class="section-title">MCP servers</h3>
+    <p class="hint">Checked servers are connected and their tools offered to the agent — in Chat and in every Task Queue run alike. Discovered from your VS Code user <code>mcp.json</code> and the <code>mfagent.mcpServers</code> setting.</p>
+    <div id="mcpList" class="checklist"></div>
+
+    <h3 class="section-title">Skill groups</h3>
+    <p class="hint">Checked groups are injected into the agent's system prompt. Author skills and groups from Settings, or use "MF Agent: Install Skill Pack" (or <code>npx skills add &lt;repo&gt; -g -a &lt;agent&gt;</code> directly) — installed packs appear here automatically.</p>
+    <div id="skillGroupList" class="checklist"></div>
+  </section>
 
   <section id="pane-plan" class="pane" hidden>
     <label class="lbl" for="goal">What should the agents build?</label>
@@ -410,6 +542,11 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     </div>
     <button id="generate" class="primary">Generate plan</button>
     <p class="hint">The workspace is scanned and split into regions first, then the planner scopes phases over them — each phase is explored and turned into verifiable tasks with a test command once you press Start, so planning stays fast no matter how large the project is.</p>
+
+    <label class="lbl" for="editInstruction">Edit the existing tasks</label>
+    <textarea id="editInstruction" rows="4" placeholder="e.g. Drop the caching task, and add integration tests for the new endpoint."></textarea>
+    <button id="applyEdit">Apply edit</button>
+    <p class="hint">The planner reads the current task list and your instruction, then edits, adds or removes tasks in place — nothing already VERIFIED is touched.</p>
 
     <label class="lbl" for="instructions">Project notes (sent to every task)</label>
     <textarea id="instructions" rows="6" placeholder="e.g. Use Go with Wails; test with Playwright.&#10;The class list lives in classes.md.&#10;Build with build.ps1."></textarea>

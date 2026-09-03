@@ -280,6 +280,7 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		BrowserReady:  true,
 		MCPServers:    mcpNames,
 		ProjectFacts:  agent.LoadProjectInstructions(cfg.WorkspaceRoot),
+		Skills:        cfg.SkillsText,
 	})
 
 	s.ag = agent.New(&cfg, provider, s.registry, s.env,

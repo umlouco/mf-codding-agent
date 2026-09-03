@@ -12,7 +12,25 @@
  * `/v1/chat/completions`.
  */
 
-export type ProviderKind = 'anthropic' | 'openai-compatible';
+export type ProviderKind = 'anthropic' | 'openai-compatible' | 'claude-cli';
+
+/**
+ * The six things a profile can be bound to. Lives here rather than in
+ * `store.ts` because a `ProviderDef` needs to say which of them it may serve
+ * (`rolesAllowed`) — and `store.ts` already imports from this module, so the
+ * dependency can only run one way. `store.ts` re-exports both names so every
+ * existing `import { Role } from '../providers/store'` keeps working.
+ */
+export const ROLES = [
+  'coding',
+  'vision',
+  'embedding',
+  'planner',
+  'supervisor',
+  'executor',
+] as const;
+
+export type Role = (typeof ROLES)[number];
 
 /** How to discover the models a provider offers. */
 export type ListStyle =
@@ -42,7 +60,7 @@ export interface ProviderDef {
   label: string;
   kind: ProviderKind;
   /** Grouping in the provider dropdown. */
-  group: 'Hosted' | 'Router' | 'Local' | 'Embeddings' | 'Custom';
+  group: 'Hosted' | 'Router' | 'Local' | 'Embeddings' | 'Custom' | 'CLI';
 
   /** Base URL used when the profile does not override it. */
   defaultBaseURL: string;
@@ -64,6 +82,13 @@ export interface ProviderDef {
 
   /** Roles this provider can serve. Drives filtering in the settings UI. */
   serves: { chat: boolean; vision: boolean; embedding: boolean };
+  /**
+   * Which of the six roles this provider may be bound to, beyond the
+   * chat/vision/embedding capability triple above. Absent means every
+   * chat-capable role — only a provider that is not a plain HTTP endpoint
+   * (see `kind: 'claude-cli'`) needs this.
+   */
+  rolesAllowed?: Role[];
 
   extraFields?: ExtraField[];
   docsURL?: string;
@@ -290,6 +315,36 @@ export const PROVIDERS: ProviderDef[] = [
     listStyle: 'openai',
     serves: { chat: true, vision: true, embedding: true },
     notes: 'Point this at any endpoint that speaks the OpenAI API.',
+  },
+  {
+    id: 'claude-cli',
+    label: 'Claude CLI',
+    kind: 'claude-cli',
+    group: 'CLI',
+    defaultBaseURL: '',
+    baseURLEditable: false,
+    apiKey: 'none',
+    listStyle: 'none',
+    staticModels: ['default', 'opus', 'sonnet', 'haiku', 'fable'],
+    serves: { chat: true, vision: false, embedding: false },
+    // Not an HTTP endpoint the Go core can dial — it's spawned as a
+    // subprocess directly by queue/agents.ts's runOnce, bypassing the core
+    // entirely, so it only makes sense for the two roles that run one
+    // ephemeral turn at a time.
+    rolesAllowed: ['planner', 'supervisor'],
+    extraFields: [
+      {
+        key: 'cliPath',
+        label: 'CLI command or path',
+        placeholder: 'claude',
+        required: false,
+        description: 'Leave blank to use "claude" on PATH.',
+      },
+    ],
+    docsURL: 'https://docs.claude.com/en/docs/claude-code',
+    notes:
+      'Runs the claude CLI as a subprocess, using whatever login it already has (subscription or ' +
+      'API key) — install and sign in with claude first. Planner and Supervisor only.',
   },
 ];
 

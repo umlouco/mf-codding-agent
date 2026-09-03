@@ -13,6 +13,7 @@ import { ProfileStore } from './store';
 
 let store: ProfileStore | undefined;
 let registry: ModelRegistry | undefined;
+let extContext: vscode.ExtensionContext | undefined;
 
 export function initProviders(
   context: vscode.ExtensionContext,
@@ -20,8 +21,16 @@ export function initProviders(
 ): { store: ProfileStore; models: ModelRegistry } {
   store = new ProfileStore(context);
   registry = new ModelRegistry(context, output);
+  extContext = context;
   context.subscriptions.push({ dispose: () => store?.dispose() });
   return { store, models: registry };
+}
+
+export function getContext(): vscode.ExtensionContext {
+  if (!extContext) {
+    throw new Error('MF Agent: the extension context was read before activation finished.');
+  }
+  return extContext;
 }
 
 export function getStore(): ProfileStore {

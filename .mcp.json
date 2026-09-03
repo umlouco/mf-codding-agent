@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mfagent-task-queue": {
+      "type": "stdio",
+      "command": "C:\\Users\\Mario Flores\\Documents\\mf-codding-agent\\bin\\mfagent-mcp.exe",
+      "args": [
+        "--workspace",
+        "C:\\Users\\Mario Flores\\Documents\\mf-codding-agent"
+      ]
+    }
+  }
+}

@@ -6,10 +6,12 @@ import { registerEditorFsHandlers } from './editorFs';
 import { disposeTerminal, registerEditorTerminalHandlers } from './editorTerminal';
 import { ChatPanel } from './panel';
 import { queueDbPath, resolveMcpBinary } from './detect';
-import { registerMcpProvider, writeProjectMcpJson } from './mcp';
+import { registerMcpProvider, writeProjectMcpJson, writeUserMcpJson } from './mcp';
 import { TaskQueue } from './queue/db';
 import { Orchestrator } from './queue/orchestrator';
 import { QueueViewProvider } from './queue/panel';
+import { setActiveQueue } from './queue/registry';
+import { SKILL_INSTALL_AGENTS } from './skills';
 import { resolveChromium } from './chromium';
 import { getModelRegistry, getStore, initProviders } from './providers/instance';
 import { ProfileStore } from './providers/store';
@@ -56,6 +58,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerCommands(context);
   registerTaskQueue(context);
   registerMcpProvider(context);
+  registerUserMcpJson(context);
 
   // The browser path is worked out, never configured. On remote workspaces
   // this may download Chromium into the extension cache.
@@ -227,6 +230,27 @@ async function bootstrap(restart: boolean, chromiumPath?: string): Promise<void>
 }
 
 /**
+ * Registers the task-queue MCP server in VS Code's own per-user `mcp.json`,
+ * so it shows up there even on a VS Code build too old for
+ * `registerMcpProvider`'s dynamic API (which silently no-ops below 1.99).
+ * Best-effort: a machine with no workspace open yet, a read-only `User`
+ * folder, or a not-yet-built `mfagent-mcp` binary should not stop the rest of
+ * activation.
+ */
+function registerUserMcpJson(context: vscode.ExtensionContext): void {
+  try {
+    const bin = resolveMcpBinary(context);
+    if (!bin) {
+      return;
+    }
+    const file = writeUserMcpJson(context, bin);
+    output.appendLine(`[ext] registered MCP server in ${file}`);
+  } catch (e: any) {
+    output.appendLine(`[ext] could not register user mcp.json: ${e?.message ?? e}`);
+  }
+}
+
+/**
  * Brings up the autonomous task queue.
  *
  * The queue is per-workspace and lives in a SQLite file, so it survives window
@@ -361,9 +385,17 @@ async function openTaskQueue(context: vscode.ExtensionContext): Promise<void> {
   }
 
   const q = queue;
+  // Read by buildCoreConfig so both Chat and every queue worker see this
+  // workspace's own picks — see queue/registry.ts.
+  setActiveQueue(q);
   orch = new Orchestrator(context, output, q);
   context.subscriptions.push(orch);
-  context.subscriptions.push({ dispose: () => q.close() });
+  context.subscriptions.push({
+    dispose: () => {
+      setActiveQueue(undefined);
+      q.close();
+    },
+  });
 
   // The chat's Planner agent writes into this same queue, so the sidebar has to
   // hear about it. Static on the panel: the chat can be closed and reopened,
@@ -653,6 +685,57 @@ ${json}
       });
       await vscode.window.showTextDocument(doc);
     }
+  });
+
+  reg('mfagent.installSkillPack', async () => {
+    const repo = await vscode.window.showInputBox({
+      prompt: 'Skill pack to install (GitHub shorthand or URL)',
+      placeHolder: 'e.g. WordPress/agent-skills',
+      validateInput: (v) => (v.trim() ? undefined : 'Required'),
+    });
+    if (!repo) {
+      return;
+    }
+    const skill = await vscode.window.showInputBox({
+      prompt: 'Specific skill to install (optional — leave blank to pick interactively in the terminal)',
+      placeHolder: 'e.g. wp-plugin-development',
+    });
+
+    // The CLI has no generic or MF-Agent-specific install target — it only
+    // writes to one of its own known agents' folders (see SKILL_INSTALL_AGENTS
+    // and the matching read side, globalSkillsDirs, in skills.ts) — so this
+    // extension has to name one. Asking rather than hardcoding claude-code
+    // means installing a skill pack never implies Claude Code has to be on
+    // this machine.
+    const agent = await vscode.window.showQuickPick(
+      SKILL_INSTALL_AGENTS.map((a) => ({ label: a.label, id: a.id })),
+      { title: 'Install for which agent? (any is discovered the same way afterward)' },
+    );
+    if (!agent) {
+      return;
+    }
+
+    // -g is what puts it in that agent's *global* skills folder rather than
+    // this workspace's own — the one discoverInstalledSkills() (src/skills.ts)
+    // reads, which is what makes it show up, with its own checkbox, in every
+    // workspace's Task Queue. -y is only added once a specific skill is
+    // named: with a bare repo, the CLI's own interactive picker is how you
+    // choose among a multi-skill pack.
+    let cmd = `npx skills add "${repo.trim()}" -g -a ${agent.id}`;
+    if (skill?.trim()) {
+      cmd += ` --skill "${skill.trim()}" -y`;
+    }
+
+    const term = vscode.window.createTerminal({
+      name: 'MF Agent: Install Skill',
+      iconPath: new vscode.ThemeIcon('gift'),
+    });
+    term.show();
+    term.sendText(cmd);
+
+    void vscode.window.showInformationMessage(
+      "Once it finishes, open the Task Queue's Context tab — installed skill packs appear there automatically with their own checkbox, no reload needed.",
+    );
   });
 
   reg('mfagent.generateDocumentation', async () => {

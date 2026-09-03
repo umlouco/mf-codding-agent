@@ -32,6 +32,14 @@ export class ChatPanel {
   private sessionId = 's1';
   private busy = false;
   private init?: InitResult;
+  /**
+   * Set once the panel's webview is torn down. `ChatPanel` instances can
+   * outlive their panel: `extension.ts` keeps its own `chat` reference that
+   * only gets reassigned when a command recreates the panel, so a restart
+   * triggered by a settings change can still call into an instance whose tab
+   * was already closed. `post()` checks this instead of throwing.
+   */
+  private disposed = false;
   /** True from the moment a planner turn is accepted until it settles. */
   private planning = false;
   /** Stops the planner's turn. Only available once its core has come up. */
@@ -44,7 +52,7 @@ export class ChatPanel {
     private readonly output: vscode.OutputChannel,
   ) {
     this.panel = panel;
-    core.onNotification((method, params) => this.onCoreNotification(method, params));
+    const notifySub = core.onNotification((method, params) => this.onCoreNotification(method, params));
 
     panel.webview.options = {
       enableScripts: true,
@@ -96,6 +104,8 @@ export class ChatPanel {
 
     panel.onDidDispose(() => {
       ChatPanel.current = undefined;
+      this.disposed = true;
+      notifySub.dispose();
     });
   }
 
@@ -415,7 +425,16 @@ export class ChatPanel {
   }
 
   private post(msg: unknown): void {
-    void this.panel.webview.postMessage(msg);
+    if (this.disposed) {
+      return;
+    }
+    try {
+      void this.panel.webview.postMessage(msg).then(undefined, () => {
+        // Disposed between the check above and this call; nothing to do.
+      });
+    } catch {
+      // Same race, thrown synchronously instead of rejected.
+    }
   }
 
   private async openFile(rel: string, line?: number): Promise<void> {

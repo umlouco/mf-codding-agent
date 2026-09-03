@@ -3,6 +3,7 @@ import { Detected, clearLanguageCache, detect, detectLanguages } from '../detect
 import { PROVIDERS, providerOrFallback } from '../providers/catalog';
 import { ModelList, ModelRegistry } from '../providers/models';
 import { ROLES, ROLE_LABELS, Role, ProfileStore } from '../providers/store';
+import { testClaudeCliBinary } from '../queue/claudeCli';
 
 /**
  * The MF Agent settings page.
@@ -140,9 +141,14 @@ export class SettingsPanel {
             break;
           }
           const def = providerOrFallback(profile.providerId);
-          const key = await this.store.effectiveApiKey(profile.id, def);
           this.post({ type: 'testing', profileId: profile.id });
-          const result = await this.models.test(profile.providerId, profile.baseURL, key);
+          // Not an HTTP endpoint — nothing to ping. The one thing that
+          // actually varies machine-to-machine is whether the binary
+          // resolves at all.
+          const result =
+            def.kind === 'claude-cli'
+              ? await testClaudeCliBinary(profile.extra?.cliPath)
+              : await this.models.test(profile.providerId, profile.baseURL, await this.store.effectiveApiKey(profile.id, def));
           this.post({ type: 'testResult', profileId: profile.id, ...result });
           break;
         }
@@ -166,6 +172,42 @@ export class SettingsPanel {
               list: Array.isArray(msg.list) ? msg.list.map(String) : [],
             },
           });
+          break;
+
+        case 'addSkill': {
+          const skill = await this.store.addSkill(String(msg.name ?? ''));
+          await this.pushState(undefined, skill.id);
+          break;
+        }
+        case 'updateSkill':
+          await this.store.updateSkill(String(msg.id), msg.patch ?? {});
+          await this.pushState();
+          break;
+        case 'removeSkill': {
+          const skill = this.store.skill(String(msg.id));
+          const pick = await vscode.window.showWarningMessage(
+            `Delete the skill "${skill?.name ?? msg.id}"?`,
+            { modal: true, detail: 'It is also removed from any skill group that includes it.' },
+            'Delete',
+          );
+          if (pick === 'Delete') {
+            await this.store.removeSkill(String(msg.id));
+            await this.pushState();
+          }
+          break;
+        }
+
+        case 'addSkillGroup':
+          await this.store.addSkillGroup(String(msg.name ?? ''));
+          await this.pushState();
+          break;
+        case 'updateSkillGroup':
+          await this.store.updateSkillGroup(String(msg.id), msg.patch ?? {});
+          await this.pushState();
+          break;
+        case 'removeSkillGroup':
+          await this.store.removeSkillGroup(String(msg.id));
+          await this.pushState();
           break;
 
         case 'setHeadless':
@@ -210,7 +252,7 @@ export class SettingsPanel {
 
   // ---- state -----------------------------------------------------------
 
-  private async pushState(selectProfileId?: string): Promise<void> {
+  private async pushState(selectProfileId?: string, selectSkillId?: string): Promise<void> {
     const settings = this.store.settings;
     const detectedLanguages = await detectLanguages();
     const detected: Detected = await detect(this.context, detectedLanguages, this.chromium);
@@ -219,6 +261,7 @@ export class SettingsPanel {
       type: 'state',
       settings,
       selectProfileId,
+      selectSkillId,
       providers: PROVIDERS.map((p) => ({
         id: p.id,
         label: p.label,
@@ -231,6 +274,7 @@ export class SettingsPanel {
         apiKeyEnv: p.apiKeyEnv ?? [],
         listStyle: p.listStyle,
         serves: p.serves,
+        rolesAllowed: p.rolesAllowed,
         extraFields: p.extraFields ?? [],
         docsURL: p.docsURL,
         notes: p.notes,
@@ -381,6 +425,7 @@ export class SettingsPanel {
   <nav id="tabs">
     <button class="tab active" data-tab="providers">Providers</button>
     <button class="tab" data-tab="roles">Roles</button>
+    <button class="tab" data-tab="skills">Skills</button>
     <button class="tab" data-tab="workspace">Workspace</button>
     <button class="tab" data-tab="detected">Detected</button>
   </nav>
@@ -405,6 +450,24 @@ export class SettingsPanel {
       embeddings model, so it never inherits.
     </p>
     <div id="roleList" class="role-list"></div>
+  </section>
+
+  <section class="panel" data-panel="skills" hidden>
+    <p class="hint">
+      A skill is a block of instruction text the agent can be given — conventions, a
+      checklist, domain knowledge for one kind of project. Group skills and pick which
+      groups apply to a project from the Task Queue view's Context tab.
+    </p>
+    <div class="split">
+      <aside class="list-col">
+        <div id="skillList" class="profile-list"></div>
+        <div class="add-row">
+          <button id="addSkillBtn">Add skill</button>
+        </div>
+      </aside>
+      <div id="skillEditor" class="editor-col"></div>
+    </div>
+    <div id="skillGroups" class="skill-groups"></div>
   </section>
 
   <section class="panel" data-panel="workspace" hidden>

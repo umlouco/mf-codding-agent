@@ -1,5 +1,4 @@
 import * as cp from 'child_process';
-import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import * as vscode from 'vscode';
@@ -65,8 +64,14 @@ export class CoreClient implements vscode.Disposable {
     private readonly output: vscode.OutputChannel,
   ) {}
 
-  onNotification(h: NotificationHandler): void {
+  onNotification(h: NotificationHandler): vscode.Disposable {
     this.notifyHandlers.push(h);
+    return new vscode.Disposable(() => {
+      const i = this.notifyHandlers.indexOf(h);
+      if (i !== -1) {
+        this.notifyHandlers.splice(i, 1);
+      }
+    });
   }
 
   /** Register a handler for requests the core makes of us (permission prompts). */
@@ -89,36 +94,13 @@ export class CoreClient implements vscode.Disposable {
     );
   }
 
-  /**
-   * Restores the executable bit on the core binary.
-   *
-   * A VSIX is a zip, and one packaged on Windows carries no Unix permission
-   * bits — every file in it extracts as non-executable on Linux and macOS, so
-   * the core cannot be spawned at all on a remote host. Fixing it here rather
-   * than at package time keeps it fixed however the extension was built.
-   */
-  private ensureExecutable(bin: string): void {
-    if (process.platform === 'win32') {
-      return;
-    }
-    try {
-      const mode = fs.statSync(bin).mode;
-      if ((mode & 0o100) === 0) {
-        fs.chmodSync(bin, mode | 0o755);
-        this.output.appendLine(`[core] added the executable bit to ${bin}`);
-      }
-    } catch (e: any) {
-      // Read-only install, or someone else owns it. Let the spawn report it.
-      this.output.appendLine(`[core] could not make ${bin} executable: ${e?.message ?? e}`);
-    }
-  }
-
   async start(): Promise<void> {
     if (this.running) {
       return;
     }
+    // resolveCoreBinary already restores the executable bit lost when a VSIX
+    // built on Windows extracts on Linux/macOS — see detect.ts's ensureExecutable.
     const bin = this.resolveBinary();
-    this.ensureExecutable(bin);
     const cwd =
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? path.dirname(bin);
 

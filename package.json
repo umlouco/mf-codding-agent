@@ -108,6 +108,10 @@
         "title": "MF Agent: Copy Task Queue MCP Config"
       },
       {
+        "command": "mfagent.installSkillPack",
+        "title": "MF Agent: Install Skill Pack (npx skills)"
+      },
+      {
         "command": "mfagent.openSettings",
         "title": "MF Agent: Settings — Providers & Models",
         "icon": "$(settings-gear)"
@@ -213,7 +217,7 @@
         "mfagent.mcpServers": {
           "type": "array",
           "default": [],
-          "markdownDescription": "MCP servers to connect. Each entry takes either `command` + `args` (stdio) or `url` (streamable HTTP).",
+          "markdownDescription": "MCP servers to connect. Each entry takes either `command` + `args` (stdio) or `url` (streamable HTTP). Merged with any servers in your VS Code user `mcp.json`, which needs no entry here at all — pick which of either source are active for a project from the Task Queue view's Context tab.",
           "items": {
             "type": "object",
             "required": ["name"],
@@ -291,6 +295,12 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Command run when an autonomous run finishes, with a JSON summary (`event`, `verified`, `total`, `usage`, `workspaceRoot`, `at`) as its one argument — e.g. a script that sends a desktop or Slack notification. Left empty (the default), nothing runs; the queue still shows an in-editor notification either way, which is only useful if someone is watching the editor when it lands."
+        },
+        "mfagent.queue.claudeCli.maxBudgetUsd": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "markdownDescription": "Dollar cap passed as `--max-budget-usd` to each Planner/Supervisor turn run through the Claude CLI provider — it has no round-count ceiling of its own the way mfcore turns do (`#mfagent.queue.maxRounds#`). Set to 0 to remove the cap."
         }
       }
     }

@@ -1,7 +1,11 @@
 import * as vscode from 'vscode';
 import { detectLanguages, memoryDbPath, workspaceRoot } from '../detect';
 import { isAvailable as isTerminalAvailable } from '../editorTerminal';
-import { ProfileStore, ResolvedRole } from './store';
+import { discoverMcpServers } from '../mcp';
+import { getActiveQueue } from '../queue/registry';
+import { discoverInstalledSkills } from '../skills';
+import { ProfileStore, ResolvedRole, Skill, SkillGroup } from './store';
+import { getContext } from './instance';
 
 /**
  * Translation from the profile store to the payload the Go core expects.
@@ -61,6 +65,13 @@ export interface CoreConfig {
   activitySeconds: number;
   languages: string[];
   mcpServers: any[];
+  /**
+   * Pre-formatted skill content, spliced into the system prompt like project
+   * instructions — see the core's PromptInput.Skills. Built from whichever
+   * skill groups the active workspace's task queue has switched on; empty
+   * when no queue is open yet or nothing is enabled.
+   */
+  skillsText: string;
   browserExecutable: string;
   browserHeadless: boolean;
   /**
@@ -87,10 +98,43 @@ export function contextCeiling(): number {
     .get<number>('llm.maxContextTokens', 200_000);
 }
 
+/**
+ * Concatenates the skills belonging to `enabledGroupIds`, in group order,
+ * each skill counted once even if more than one enabled group includes it.
+ * Blank-content skills are dropped rather than sent as an empty section.
+ */
+function buildSkillsText(
+  skills: Skill[],
+  groups: SkillGroup[],
+  enabledGroupIds: ReadonlySet<string>,
+): string {
+  const byId = new Map(skills.map((s) => [s.id, s]));
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (const g of groups) {
+    if (!enabledGroupIds.has(g.id)) {
+      continue;
+    }
+    for (const skillId of g.skillIds) {
+      if (seen.has(skillId)) {
+        continue;
+      }
+      const skill = byId.get(skillId);
+      if (!skill || !skill.content.trim()) {
+        continue;
+      }
+      seen.add(skillId);
+      parts.push(`## ${skill.name}\n\n${skill.content.trim()}`);
+    }
+  }
+  return parts.length ? `# Skills\n\n${parts.join('\n\n')}` : '';
+}
+
 export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> {
   const cfg = vscode.workspace.getConfiguration('mfagent');
   const root = workspaceRoot();
   const resolved = await store.resolveAll();
+  const activeQueue = getActiveQueue();
 
   const providers = new Map<string, CoreProvider>();
 
@@ -127,6 +171,18 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     ? await detectLanguages(root)
     : store.settings.languages.list;
 
+  const disabledMcp = new Set(activeQueue?.disabledMcpServers ?? []);
+  const mcpServers = discoverMcpServers(getContext()).map((s) => ({
+    ...s,
+    enabled: !disabledMcp.has(s.name),
+  }));
+
+  const installed = discoverInstalledSkills();
+  const skills = [...store.settings.skills, ...installed.map((d) => d.skill)];
+  const skillGroups = [...store.settings.skillGroups, ...installed.map((d) => d.group)];
+  const enabledSkillGroups = new Set(activeQueue?.enabledSkillGroups ?? []);
+  const skillsText = buildSkillsText(skills, skillGroups, enabledSkillGroups);
+
   return {
     workspaceRoot: root,
     providers: [...providers.values()],
@@ -143,7 +199,8 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     llmIdleSeconds: Math.max(1, cfg.get<number>('llm.idleMinutes', 30)) * 60,
     activitySeconds: Math.max(5, cfg.get<number>('activityIntervalSeconds', 30)),
     languages,
-    mcpServers: cfg.get<any[]>('mcpServers', []) ?? [],
+    mcpServers,
+    skillsText,
     browserExecutable: '',
     browserHeadless: store.settings.browser.headless || !!vscode.env.remoteName,
     editorTerminal:

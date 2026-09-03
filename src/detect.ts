@@ -65,7 +65,11 @@ export function screenshotDir(root = workspaceRoot()): string {
 export function resolveCoreBinary(context: vscode.ExtensionContext): CoreBinary {
   const fromEnv = process.env.MFAGENT_CORE_PATH?.trim();
   if (fromEnv) {
-    return { path: fs.existsSync(fromEnv) ? fromEnv : undefined, source: 'env', searched: [fromEnv] };
+    const found = fs.existsSync(fromEnv);
+    if (found) {
+      ensureExecutable(fromEnv);
+    }
+    return { path: found ? fromEnv : undefined, source: 'env', searched: [fromEnv] };
   }
 
   const exe = process.platform === 'win32' ? 'mfcore.exe' : 'mfcore';
@@ -80,10 +84,40 @@ export function resolveCoreBinary(context: vscode.ExtensionContext): CoreBinary 
 
   for (const [candidate, source] of candidates) {
     if (fs.existsSync(candidate)) {
+      ensureExecutable(candidate);
       return { path: candidate, source, searched: candidates.map(([c]) => c) };
     }
   }
   return { source: 'bundled', searched: candidates.map(([c]) => c) };
+}
+
+/**
+ * Restores the executable bit, if missing.
+ *
+ * A VSIX is a zip, and one packaged on Windows carries no Unix permission
+ * bits — every file in it extracts as non-executable on Linux and macOS, so
+ * neither binary can be spawned at all on a remote host straight after
+ * install. Fixed here, inside both resolvers, rather than at each spawn site:
+ * `mfcore` alone has three of those (`CoreClient.start`, `queue/agents.ts`'s
+ * `runScanCommand`, and the queue's per-role throwaway cores), and
+ * `mfagent-mcp` is spawned by VS Code's own MCP host directly from
+ * `registerMcpProvider`'s definition — never through code in this extension
+ * at all — so there is no single call site to fix it at even in principle.
+ * Best-effort: a read-only install just surfaces as a normal spawn failure
+ * instead of a chmod one.
+ */
+function ensureExecutable(bin: string): void {
+  if (process.platform === 'win32') {
+    return;
+  }
+  try {
+    const mode = fs.statSync(bin).mode;
+    if ((mode & 0o100) === 0) {
+      fs.chmodSync(bin, mode | 0o755);
+    }
+  } catch {
+    // Read-only install, or someone else owns it.
+  }
 }
 
 /**
@@ -99,6 +133,7 @@ export function resolveMcpBinary(context: vscode.ExtensionContext): string | und
   ];
   for (const c of candidates) {
     if (fs.existsSync(c)) {
+      ensureExecutable(c);
       return c;
     }
   }

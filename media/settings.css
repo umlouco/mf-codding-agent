@@ -288,6 +288,14 @@ label.check input { width: auto; }
   .role { grid-template-columns: 1fr; }
 }
 
+/* ---- skills ---- */
+
+.skill-groups { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+
+.skill-group .card-head input[type="text"] { flex: 1; min-width: 0; }
+
+.skill-check-list { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+
 /* ---- detected ---- */
 
 table.kv { border-collapse: collapse; width: 100%; font-size: 12px; }

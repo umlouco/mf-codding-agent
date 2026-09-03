@@ -97,6 +97,13 @@ type Config struct {
 
 	MCPServers []MCPServer `json:"mcpServers"`
 
+	// SkillsText is pre-formatted skill content, chosen by the editor from
+	// whichever skill groups the active workspace's task queue has switched
+	// on (see AgentSettings.skillGroups and TaskQueue.enabledSkillGroups on
+	// the TypeScript side). Spliced into the system prompt the same way
+	// ProjectFacts is — see agent.PromptInput.Skills.
+	SkillsText string `json:"skillsText"`
+
 	BrowserExecutable string `json:"browserExecutable"`
 	BrowserHeadless   bool   `json:"browserHeadless"`
 

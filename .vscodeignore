@@ -1,5 +1,6 @@
 .vscode/**
 .github/**
+.claude/**
 core/**
 scripts/**
 src/**
@@ -10,6 +11,7 @@ out/**/*.map
 esbuild.mjs
 .gitignore
 .env
+.mcp.json
 .mfagent/**
 
 # Keep only the binary for the target platform when packaging per-platform.

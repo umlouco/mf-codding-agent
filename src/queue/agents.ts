@@ -5,6 +5,7 @@ import { resolveCoreBinary, workspaceRoot } from '../detect';
 import { registerEditorFsHandlers } from '../editorFs';
 import { getStore } from '../providers/instance';
 import { contextCeiling } from '../providers/payload';
+import { runClaudeCliTurn } from './claudeCli';
 import { NewTask, Task, TaskQueue, Usage } from './db';
 import {
   CompletionClaim,
@@ -147,7 +148,7 @@ export interface RunOptions {
 }
 
 /** Stops a spawned command and its descendants. */
-function killTree(pid: number | undefined): void {
+export function killTree(pid: number | undefined): void {
   if (!pid) {
     return;
   }
@@ -182,6 +183,18 @@ export async function runOnce(
   prompt: string,
   opts: RunOptions = {},
 ): Promise<TurnResult> {
+  // Claude CLI is a complete agent on its own — its own tool loop, its own
+  // permission handling — so it is never routed through mfcore's agent loop
+  // the way an HTTP provider is; see providers/store.ts's rolesAllowed guard
+  // for why this can only be planner/supervisor. Branching here, before the
+  // core is even spawned, means every caller downstream (orchestrator.ts,
+  // monitor.ts, every prompt builder in this file) needs no changes: they
+  // only ever see RunOptions in, TurnResult out.
+  const resolved = await getStore().resolve(role);
+  if (resolved.kind === 'claude-cli') {
+    return runClaudeCliTurn(output, role, resolved, prompt, opts);
+  }
+
   const client = new CoreClient(context, output);
   registerEditorFsHandlers(client);
   const { maxIterations = 0, onEvent, onCancellable, onAbort, onActivity } = opts;
@@ -694,6 +707,122 @@ export async function planGoal(
   const phases = await generatePhases(context, output, goal, regions, maxPerRegion, onEvent, onCancellable);
   queue.setMeta('goal', goal);
   return phases;
+}
+
+// ---- task editing ----------------------------------------------------
+
+/** Upper bound on how much one edit prompt may touch in a single pass. */
+const MAX_TASK_EDIT_ITEMS = 40;
+
+export interface TaskEditResult {
+  summary: string;
+  edits: {
+    seq: number;
+    title?: string;
+    description?: string;
+    implVerifyPrompt?: string;
+    solutionVerifyPrompt?: string;
+    solutionVerifyCommand?: string;
+  }[];
+  deletes: number[];
+  adds: NewTask[];
+  usage: Usage;
+}
+
+/** True for a value shaped like a task-edit reply rather than something quoted along the way. */
+function isTaskEditResult(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const v = value as Record<string, unknown>;
+  return 'edits' in v || 'deletes' in v || 'adds' in v || 'summary' in v;
+}
+
+/**
+ * Turns a free-text instruction plus the queue's current tasks into a set of
+ * edits, deletions and additions, applied by the caller through the same
+ * `TaskQueue.update`/`remove`/`addAll` primitives the supervisor's own
+ * `taskEdits` already use (see orchestrator.ts's `applyTaskEdits`) — this
+ * just supplies a second way to produce that same shape, from a prompt
+ * instead of a verification report. Runs through `runOnce('planner', ...)`,
+ * so it works identically whichever provider Planner is bound to.
+ */
+export async function editTasks(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+  tasks: Task[],
+  instruction: string,
+  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
+): Promise<TaskEditResult> {
+  const list = tasks
+    .slice()
+    .sort((a, b) => a.seq - b.seq)
+    .map((t) => `#${t.seq} [${t.status}] ${t.title}\n${t.description}`)
+    .join('\n\n');
+
+  const prompt = `You are the planner for an autonomous task queue. The queue currently has ${tasks.length} task(s):
+
+${list || '(no tasks yet)'}
+
+The user asked for this change:
+"""
+${instruction}
+"""
+
+Reply with ONE JSON object and nothing else:
+{
+  "summary": "one sentence describing what you changed",
+  "edits": [{ "seq": <number>, "title": "...", "description": "...", "implVerifyPrompt": "...",
+              "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
+  "deletes": [<seq>, ...],
+  "adds": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
+             "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
+}
+
+Only include fields you are actually changing on an "edits" entry; omit a field to leave it as-is.
+Do not edit or delete a VERIFIED task unless the instruction explicitly asks to redo finished work.
+Tasks in "adds" are appended after the current end of the queue, in the order given. Leave any of
+the three arrays empty when the instruction does not call for that kind of change.`;
+
+  const { text, usage } = await runOnce(context, output, 'planner', prompt, opts);
+  const parsed = extractJson<Partial<TaskEditResult>>(text, isTaskEditResult);
+
+  const edits = (Array.isArray(parsed.edits) ? parsed.edits : [])
+    .filter((e: any) => e && typeof e === 'object' && typeof e.seq === 'number')
+    .slice(0, MAX_TASK_EDIT_ITEMS)
+    .map((e: any) => ({
+      seq: e.seq,
+      title: typeof e.title === 'string' ? e.title.trim() : undefined,
+      description: typeof e.description === 'string' ? e.description.trim() : undefined,
+      implVerifyPrompt: typeof e.implVerifyPrompt === 'string' ? e.implVerifyPrompt.trim() : undefined,
+      solutionVerifyPrompt:
+        typeof e.solutionVerifyPrompt === 'string' ? e.solutionVerifyPrompt.trim() : undefined,
+      solutionVerifyCommand:
+        typeof e.solutionVerifyCommand === 'string' ? e.solutionVerifyCommand.trim() : undefined,
+    }));
+
+  const deletes = (Array.isArray(parsed.deletes) ? parsed.deletes : [])
+    .filter((s: any) => typeof s === 'number')
+    .slice(0, MAX_TASK_EDIT_ITEMS);
+
+  const adds: NewTask[] = (Array.isArray(parsed.adds) ? parsed.adds : [])
+    .filter((a: any) => a && typeof a === 'object' && String(a.title ?? '').trim())
+    .slice(0, MAX_TASK_EDIT_ITEMS)
+    .map((a: any) => ({
+      title: String(a.title).trim().slice(0, 200),
+      description: String(a.description ?? '').trim(),
+      implVerifyPrompt: String(a.implVerifyPrompt ?? '').trim(),
+      solutionVerifyPrompt: String(a.solutionVerifyPrompt ?? '').trim(),
+      solutionVerifyCommand: String(a.solutionVerifyCommand ?? '').trim(),
+    }));
+
+  return {
+    summary: String(parsed.summary ?? '').trim() || 'Applied the requested changes.',
+    edits,
+    deletes,
+    adds,
+    usage,
+  };
 }
 
 // ---- phase expansion -----------------------------------------------------

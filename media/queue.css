@@ -422,3 +422,51 @@ pre.out.err { color: var(--vscode-errorForeground); }
   font-size: 12px;
   line-height: 1.5;
 }
+
+/* ---- context tab: MCP servers + skill groups ---- */
+
+.section-title {
+  margin: 4px 0 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.checklist-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 6px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.checklist-row:hover { background: var(--vscode-list-hoverBackground); }
+
+.checklist-row input[type="checkbox"] { flex: none; }
+
+.cl-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.cl-name {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cl-sub {
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+}

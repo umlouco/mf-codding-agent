@@ -23,6 +23,7 @@
       const want = tab.getAttribute('data-pane');
       $('pane-run').hidden = want !== 'run';
       $('pane-plan').hidden = want !== 'plan';
+      $('pane-context').hidden = want !== 'context';
     });
   }
 
@@ -35,6 +36,13 @@
       type: 'generate',
       goal: /** @type {HTMLTextAreaElement} */ ($('goal')).value,
       append: /** @type {HTMLInputElement} */ ($('append')).checked,
+    }),
+  );
+
+  $('applyEdit').addEventListener('click', () =>
+    send({
+      type: 'editTasks',
+      instruction: /** @type {HTMLTextAreaElement} */ ($('editInstruction')).value,
     }),
   );
 
@@ -79,6 +87,7 @@
     $('pane-unavailable').hidden = false;
     $('pane-run').hidden = true;
     $('pane-plan').hidden = true;
+    $('pane-context').hidden = true;
     document.querySelector('.tabs').hidden = true;
     $('reason').textContent = m.reason || 'The task queue is not open in this window.';
     $('host').textContent = m.host || '';
@@ -93,6 +102,7 @@
     const want = active ? active.getAttribute('data-pane') : 'run';
     $('pane-run').hidden = want !== 'run';
     $('pane-plan').hidden = want !== 'plan';
+    $('pane-context').hidden = want !== 'context';
   }
 
   window.addEventListener('message', (e) => {
@@ -120,6 +130,10 @@
     /** @type {HTMLButtonElement} */ ($('generate')).textContent = state.generating
       ? 'Generating…'
       : 'Generate plan';
+    /** @type {HTMLButtonElement} */ ($('applyEdit')).disabled = state.generating;
+    /** @type {HTMLButtonElement} */ ($('applyEdit')).textContent = state.generating
+      ? 'Working…'
+      : 'Apply edit';
 
     const st = state.status;
     /** @type {HTMLButtonElement} */ ($('start')).disabled = st.running;
@@ -131,6 +145,8 @@
     renderRunbar(st);
     renderCounts(state.stats);
     renderTasks(state.tasks, st);
+    renderMcpList(state.mcpServers || []);
+    renderSkillGroups(state.skillGroups || []);
 
     // Not just on first render: an executor can append to this at any time
     // while the run is going, so it has to stay live — but never while the
@@ -216,6 +232,84 @@
         `${(u.cacheWrite || 0).toLocaleString()} cache write`;
       span.textContent = bits.join(' · ');
       countsEl.appendChild(span);
+    }
+  }
+
+  // ---- context tab: MCP servers + skill groups ----
+
+  /** One checkbox row: a name, an optional subtitle, and a change handler. */
+  function checkRow(name, subtitle, checked, onChange) {
+    const row = document.createElement('label');
+    row.className = 'checklist-row';
+
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = checked;
+    box.addEventListener('change', () => onChange(box.checked));
+    row.appendChild(box);
+
+    const text = document.createElement('span');
+    text.className = 'cl-text';
+    const title = document.createElement('span');
+    title.className = 'cl-name';
+    title.textContent = name;
+    text.appendChild(title);
+    if (subtitle) {
+      const sub = document.createElement('span');
+      sub.className = 'cl-sub';
+      sub.textContent = subtitle;
+      text.appendChild(sub);
+    }
+    row.appendChild(text);
+    return row;
+  }
+
+  function emptyRow(text) {
+    const n = document.createElement('div');
+    n.className = 'empty';
+    n.textContent = text;
+    return n;
+  }
+
+  function renderMcpList(servers) {
+    const host = $('mcpList');
+    host.textContent = '';
+    if (!servers.length) {
+      host.appendChild(
+        emptyRow('No MCP servers found. Add one under mfagent.mcpServers or in your VS Code user mcp.json.'),
+      );
+      return;
+    }
+    for (const s of servers) {
+      const bits = [s.source === 'user' ? 'user mcp.json' : 'mfagent.mcpServers'];
+      if (!s.configured) bits.push('missing command/url');
+      host.appendChild(
+        checkRow(s.name, bits.join(' · '), s.enabled, (checked) =>
+          send({ type: 'setMcpEnabled', name: s.name, enabled: checked }),
+        ),
+      );
+    }
+  }
+
+  function renderSkillGroups(groups) {
+    const host = $('skillGroupList');
+    host.textContent = '';
+    if (!groups.length) {
+      host.appendChild(
+        emptyRow('No skill groups yet. Create skills in Settings, or use "MF Agent: Install Skill Pack".'),
+      );
+      return;
+    }
+    for (const g of groups) {
+      const bits =
+        g.source === 'installed'
+          ? [g.description || 'installed via npx skills']
+          : [`${g.skillCount} skill(s)`];
+      host.appendChild(
+        checkRow(g.name, bits.join(' · '), g.enabled, (checked) =>
+          send({ type: 'setSkillGroupEnabled', id: g.id, enabled: checked }),
+        ),
+      );
     }
   }
 

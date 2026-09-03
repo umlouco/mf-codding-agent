@@ -461,6 +461,66 @@ export class TaskQueue {
     this.setInstructions(current ? `${current}\n${trimmed}` : trimmed);
   }
 
+  /** Parses a `queue_meta` value as a JSON string array, tolerating garbage. */
+  private metaList(key: string): string[] {
+    try {
+      const arr = JSON.parse(this.getMeta(key, '[]'));
+      return Array.isArray(arr) ? arr.map(String) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * MCP server names explicitly switched off for this workspace's agent
+   * runs — see `discoverMcpServers` in mcp.ts and `buildCoreConfig` in
+   * providers/payload.ts, which is where this is actually applied.
+   *
+   * Opt-out on purpose: absence from this set means enabled, matching the Go
+   * core's own `MCPServer.IsEnabled()` default. A server neither this queue
+   * nor anyone else has an opinion on should just work, including one
+   * discovered for the first time after this queue was created.
+   */
+  get disabledMcpServers(): string[] {
+    return this.metaList('mcpDisabledServers');
+  }
+
+  setMcpServerEnabled(name: string, enabled: boolean): void {
+    const set = new Set(this.disabledMcpServers);
+    if (enabled) {
+      set.delete(name);
+    } else {
+      set.add(name);
+    }
+    this.setMeta('mcpDisabledServers', JSON.stringify([...set]));
+    this.log(null, 'user', 'mcp-server', `${name} ${enabled ? 'enabled' : 'disabled'}`);
+  }
+
+  /**
+   * Skill group ids switched on for this workspace's agent runs — see
+   * `Skill`/`SkillGroup` in providers/store.ts.
+   *
+   * Opt-in, unlike the MCP list above: a skill group is shared, global
+   * content someone wrote for a particular kind of project, and it should not
+   * start reaching every prompt in every workspace just because it exists in
+   * the library. A newly created group has to be picked here before it does
+   * anything.
+   */
+  get enabledSkillGroups(): string[] {
+    return this.metaList('enabledSkillGroups');
+  }
+
+  setSkillGroupEnabled(id: string, enabled: boolean): void {
+    const set = new Set(this.enabledSkillGroups);
+    if (enabled) {
+      set.add(id);
+    } else {
+      set.delete(id);
+    }
+    this.setMeta('enabledSkillGroups', JSON.stringify([...set]));
+    this.log(null, 'user', 'skill-group', `${id} ${enabled ? 'enabled' : 'disabled'}`);
+  }
+
   // ---- reads -----------------------------------------------------------
 
   list(): Task[] {

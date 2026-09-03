@@ -1,5 +1,8 @@
 import * as vscode from 'vscode';
-import { ProviderDef, effectiveBaseURL, providerOrFallback } from './catalog';
+import { ProviderDef, Role, ROLES, effectiveBaseURL, providerOrFallback } from './catalog';
+
+export type { Role };
+export { ROLES };
 
 /**
  * Where MF Agent's LLM configuration actually lives.
@@ -15,17 +18,6 @@ import { ProviderDef, effectiveBaseURL, providerOrFallback } from './catalog';
  * Export/import covers the one thing settings.json gave us for free: moving a
  * setup to another machine.
  */
-
-export const ROLES = [
-  'coding',
-  'vision',
-  'embedding',
-  'planner',
-  'supervisor',
-  'executor',
-] as const;
-
-export type Role = (typeof ROLES)[number];
 
 /** Roles that fall back to `coding` when left unset. */
 const INHERITS_CODING: ReadonlySet<Role> = new Set<Role>([
@@ -86,6 +78,29 @@ export interface RoleBinding {
   effort: string;
 }
 
+/**
+ * A reusable block of instruction text the agent can be given — conventions,
+ * a checklist, domain knowledge for one kind of project. Authored once here
+ * and picked per workspace from the Task Queue's Context tab (see
+ * `SkillGroup` and `TaskQueue.enabledSkillGroups` in queue/db.ts), rather than
+ * always being present the way `AGENTS.md` is.
+ */
+export interface Skill {
+  id: string;
+  name: string;
+  /** Short blurb shown in lists; not sent to the model. */
+  description?: string;
+  /** Injected into the system prompt verbatim when an enabling group is on. */
+  content: string;
+}
+
+/** A named collection of skills, switched on or off together per workspace. */
+export interface SkillGroup {
+  id: string;
+  name: string;
+  skillIds: string[];
+}
+
 export interface AgentSettings {
   version: 2;
   profiles: Profile[];
@@ -93,6 +108,8 @@ export interface AgentSettings {
   /** Auto-detect the workspace languages, or use the explicit list. */
   languages: { auto: boolean; list: string[] };
   browser: { headless: boolean };
+  skills: Skill[];
+  skillGroups: SkillGroup[];
 }
 
 /** A role resolved all the way down to something the Go core can dial. */
@@ -129,6 +146,8 @@ export function defaultSettings(): AgentSettings {
     roles: emptyRoles(),
     languages: { auto: true, list: [] },
     browser: { headless: false },
+    skills: [],
+    skillGroups: [],
   };
 }
 
@@ -225,6 +244,60 @@ export class ProfileStore {
     }
     await this.context.secrets.delete(SECRET_PREFIX + id);
     await this.write({ ...this.cache, profiles, roles });
+  }
+
+  // ---- skills ------------------------------------------------------------
+
+  skill(id: string): Skill | undefined {
+    return this.cache.skills.find((s) => s.id === id);
+  }
+
+  async addSkill(name?: string): Promise<Skill> {
+    const skill: Skill = {
+      id: newId(),
+      name: uniqueName(this.cache.skills, name || 'New skill'),
+      description: '',
+      content: '',
+    };
+    await this.write({ ...this.cache, skills: [...this.cache.skills, skill] });
+    return skill;
+  }
+
+  async updateSkill(id: string, patch: Partial<Omit<Skill, 'id'>>): Promise<void> {
+    const skills = this.cache.skills.map((s) => (s.id === id ? { ...s, ...patch } : s));
+    await this.write({ ...this.cache, skills });
+  }
+
+  /** Removing a skill also drops it out of every group that included it. */
+  async removeSkill(id: string): Promise<void> {
+    const skills = this.cache.skills.filter((s) => s.id !== id);
+    const skillGroups = this.cache.skillGroups.map((g) => ({
+      ...g,
+      skillIds: g.skillIds.filter((sid) => sid !== id),
+    }));
+    await this.write({ ...this.cache, skills, skillGroups });
+  }
+
+  // ---- skill groups --------------------------------------------------------
+
+  async addSkillGroup(name?: string): Promise<SkillGroup> {
+    const group: SkillGroup = {
+      id: newId(),
+      name: uniqueName(this.cache.skillGroups, name || 'New group'),
+      skillIds: [],
+    };
+    await this.write({ ...this.cache, skillGroups: [...this.cache.skillGroups, group] });
+    return group;
+  }
+
+  async updateSkillGroup(id: string, patch: Partial<Omit<SkillGroup, 'id'>>): Promise<void> {
+    const skillGroups = this.cache.skillGroups.map((g) => (g.id === id ? { ...g, ...patch } : g));
+    await this.write({ ...this.cache, skillGroups });
+  }
+
+  async removeSkillGroup(id: string): Promise<void> {
+    const skillGroups = this.cache.skillGroups.filter((g) => g.id !== id);
+    await this.write({ ...this.cache, skillGroups });
   }
 
   // ---- secrets ---------------------------------------------------------
@@ -330,6 +403,20 @@ export class ProfileStore {
     }
 
     const def = providerOrFallback(profile.providerId);
+    if (def.rolesAllowed && !def.rolesAllowed.includes(role)) {
+      // Bound directly, or inherited from `coding`, into a role this
+      // provider can't serve (e.g. Claude CLI as `coding`) — treat exactly
+      // like nothing bound rather than handing a caller an invalid combination.
+      return {
+        role,
+        kind: 'openai-compatible',
+        model: '',
+        effort: '',
+        baseURL: '',
+        apiKey: '',
+        inherited: false,
+      };
+    }
     return {
       role,
       profile,
@@ -460,6 +547,8 @@ export class ProfileStore {
         roles,
         languages: { auto: languages.length === 0, list: languages },
         browser: { headless: cfg.get<boolean>('browser.headless', false) },
+        skills: this.cache.skills,
+        skillGroups: this.cache.skillGroups,
       });
 
       for (const [id, key] of secrets) {
@@ -517,7 +606,7 @@ function newId(): string {
   return `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function uniqueName(existing: Profile[], want: string): string {
+function uniqueName(existing: { name: string }[], want: string): string {
   const taken = new Set(existing.map((p) => p.name));
   if (!taken.has(want)) {
     return want;
@@ -562,6 +651,30 @@ function normalise(raw: unknown): AgentSettings {
     };
   }
 
+  const skills: Skill[] = Array.isArray(r.skills)
+    ? r.skills
+        .filter((s): s is Skill => !!s && typeof s === 'object' && typeof s.id === 'string')
+        .map((s) => ({
+          id: s.id,
+          name: String(s.name ?? 'Unnamed'),
+          description: s.description ? String(s.description) : undefined,
+          content: String(s.content ?? ''),
+        }))
+    : [];
+
+  const knownSkills = new Set(skills.map((s) => s.id));
+  const skillGroups: SkillGroup[] = Array.isArray(r.skillGroups)
+    ? r.skillGroups
+        .filter((g): g is SkillGroup => !!g && typeof g === 'object' && typeof g.id === 'string')
+        .map((g) => ({
+          id: g.id,
+          name: String(g.name ?? 'Unnamed'),
+          skillIds: Array.isArray(g.skillIds)
+            ? g.skillIds.map(String).filter((id) => knownSkills.has(id))
+            : [],
+        }))
+    : [];
+
   return {
     version: 2,
     profiles,
@@ -571,5 +684,7 @@ function normalise(raw: unknown): AgentSettings {
       list: Array.isArray(r.languages?.list) ? r.languages!.list.map(String) : [],
     },
     browser: { headless: !!r.browser?.headless },
+    skills,
+    skillGroups,
   };
 }

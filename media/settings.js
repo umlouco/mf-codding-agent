@@ -12,6 +12,7 @@
   /** Test-connection results keyed by profile id. */
   const testByProfile = {};
   let selectedId = null;
+  let selectedSkillId = null;
 
   // ---- tabs -------------------------------------------------------------
 
@@ -33,6 +34,7 @@
     const sel = /** @type {HTMLSelectElement} */ ($('addProvider'));
     if (sel.value) send({ type: 'addProfile', providerId: sel.value });
   });
+  $('addSkillBtn').addEventListener('click', () => send({ type: 'addSkill' }));
 
   // ---- messages ---------------------------------------------------------
 
@@ -51,6 +53,10 @@
         if (m.selectProfileId) selectedId = m.selectProfileId;
         if (!S.settings.profiles.some((p) => p.id === selectedId)) {
           selectedId = S.settings.profiles.length ? S.settings.profiles[0].id : null;
+        }
+        if (m.selectSkillId) selectedSkillId = m.selectSkillId;
+        if (!S.settings.skills.some((s) => s.id === selectedSkillId)) {
+          selectedSkillId = S.settings.skills.length ? S.settings.skills[0].id : null;
         }
         render();
         break;
@@ -180,6 +186,9 @@
     renderProfileList();
     renderProfileEditor();
     renderRoles();
+    renderSkillList();
+    renderSkillEditor();
+    renderSkillGroups();
     renderWorkspace();
     renderDetected();
 
@@ -202,7 +211,7 @@
     if (sel.options.length) return; // static list; build it once
     const groups = {};
     for (const p of S.providers) (groups[p.group] = groups[p.group] || []).push(p);
-    for (const group of ['Hosted', 'Router', 'Local', 'Embeddings', 'Custom']) {
+    for (const group of ['Hosted', 'Router', 'Local', 'CLI', 'Embeddings', 'Custom']) {
       if (!groups[group]) continue;
       const og = el('optgroup', { label: group });
       for (const p of groups[group]) og.appendChild(el('option', { value: p.id, text: p.label }));
@@ -302,7 +311,7 @@
     });
     const groups = {};
     for (const d of S.providers) (groups[d.group] = groups[d.group] || []).push(d);
-    for (const group of ['Hosted', 'Router', 'Local', 'Embeddings', 'Custom']) {
+    for (const group of ['Hosted', 'Router', 'Local', 'CLI', 'Embeddings', 'Custom']) {
       if (!groups[group]) continue;
       const og = el('optgroup', { label: group });
       for (const d of groups[group]) {
@@ -516,6 +525,7 @@
 
   /** Can this provider serve this role at all? */
   function serves(def, roleId) {
+    if (def.rolesAllowed && !def.rolesAllowed.includes(roleId)) return false;
     if (roleId === 'embedding') return def.serves.embedding;
     if (roleId === 'vision') return def.serves.vision;
     return def.serves.chat;
@@ -699,6 +709,171 @@
     ]);
   }
 
+  // ---- skills -------------------------------------------------------------
+
+  function renderSkillList() {
+    const host = $('skillList');
+    host.textContent = '';
+
+    if (!S.settings.skills.length) {
+      host.appendChild(el('div', { class: 'hint', text: 'No skills yet. Add one below.' }));
+      return;
+    }
+
+    for (const s of S.settings.skills) {
+      host.appendChild(
+        el(
+          'button',
+          {
+            class: 'profile-item' + (s.id === selectedSkillId ? ' active' : ''),
+            onclick: () => {
+              selectedSkillId = s.id;
+              render();
+            },
+          },
+          [
+            el('span', { class: 'pi-text' }, [
+              el('span', { class: 'pi-name', text: s.name }),
+              s.description ? el('span', { class: 'pi-sub', text: s.description }) : null,
+            ]),
+          ],
+        ),
+      );
+    }
+  }
+
+  function renderSkillEditor() {
+    const host = $('skillEditor');
+    host.textContent = '';
+
+    const s = selectedSkillId ? S.settings.skills.find((x) => x.id === selectedSkillId) : null;
+    if (!s) {
+      host.appendChild(
+        el('div', { class: 'empty' }, ['Pick a skill on the left, or add one.']),
+      );
+      return;
+    }
+
+    const head = el('div', { class: 'card-head' }, [
+      el('h2', { text: 'Skill' }),
+      el('span', { class: 'spacer' }),
+      el('button', {
+        class: 'danger',
+        text: 'Delete',
+        onclick: () => send({ type: 'removeSkill', id: s.id }),
+      }),
+    ]);
+
+    const nameInput = el('input', {
+      type: 'text',
+      'data-k': `skill:${s.id}:name`,
+      value: s.name,
+      onchange: (e) => send({ type: 'updateSkill', id: s.id, patch: { name: e.target.value } }),
+    });
+
+    const descInput = el('input', {
+      type: 'text',
+      'data-k': `skill:${s.id}:desc`,
+      value: s.description || '',
+      placeholder: 'Optional — shown in lists, not sent to the model',
+      onchange: (e) =>
+        send({ type: 'updateSkill', id: s.id, patch: { description: e.target.value } }),
+    });
+
+    const contentInput = el('textarea', {
+      rows: 12,
+      'data-k': `skill:${s.id}:content`,
+      value: s.content,
+      placeholder:
+        "Markdown or plain text — injected into the agent's system prompt when an enabling group is switched on.",
+      onchange: (e) => send({ type: 'updateSkill', id: s.id, patch: { content: e.target.value } }),
+    });
+
+    host.appendChild(
+      el('div', { class: 'card' }, [
+        head,
+        labeled('Name', nameInput),
+        labeled('Description', descInput),
+        labeled('Content', contentInput, `${(s.content || '').length} character(s)`),
+      ]),
+    );
+  }
+
+  function renderSkillGroups() {
+    const host = $('skillGroups');
+    host.textContent = '';
+
+    host.appendChild(
+      el('div', { class: 'card-head' }, [
+        el('h2', { text: 'Skill groups' }),
+        el('span', { class: 'spacer' }),
+        el('button', {
+          class: 'ghost',
+          text: 'Add group',
+          onclick: () => send({ type: 'addSkillGroup' }),
+        }),
+      ]),
+    );
+
+    if (!S.settings.skillGroups.length) {
+      host.appendChild(
+        el('p', {
+          class: 'hint',
+          text: 'A group is what gets switched on or off per project, from the Task Queue view’s Context tab.',
+        }),
+      );
+      return;
+    }
+
+    for (const g of S.settings.skillGroups) {
+      host.appendChild(renderSkillGroup(g));
+    }
+  }
+
+  function renderSkillGroup(g) {
+    const nameInput = el('input', {
+      type: 'text',
+      'data-k': `skillgroup:${g.id}:name`,
+      value: g.name,
+      onchange: (e) =>
+        send({ type: 'updateSkillGroup', id: g.id, patch: { name: e.target.value } }),
+    });
+
+    const head = el('div', { class: 'card-head' }, [
+      nameInput,
+      el('span', { class: 'spacer' }),
+      el('button', {
+        class: 'danger',
+        text: 'Delete',
+        onclick: () => send({ type: 'removeSkillGroup', id: g.id }),
+      }),
+    ]);
+
+    const checks = !S.settings.skills.length
+      ? el('p', { class: 'hint', text: 'No skills to add yet.' })
+      : el(
+          'div',
+          { class: 'skill-check-list' },
+          S.settings.skills.map((s) =>
+            el('label', { class: 'check' }, [
+              el('input', {
+                type: 'checkbox',
+                checked: g.skillIds.includes(s.id),
+                onchange: (e) => {
+                  const skillIds = e.target.checked
+                    ? [...g.skillIds, s.id]
+                    : g.skillIds.filter((id) => id !== s.id);
+                  send({ type: 'updateSkillGroup', id: g.id, patch: { skillIds } });
+                },
+              }),
+              s.name,
+            ]),
+          ),
+        );
+
+    return el('div', { class: 'card skill-group' }, [head, checks]);
+  }
+
   // ---- workspace --------------------------------------------------------
 
   function renderWorkspace() {
@@ -789,7 +964,7 @@
         el('h2', { text: 'Elsewhere' }),
         el('p', {
           class: 'hint',
-          text: 'Memory, MCP servers and the autonomous-run timings are plain values, so they stay in the VS Code settings editor where it can validate them.',
+          text: 'Memory and the autonomous-run timings are plain values, so they stay in the VS Code settings editor where it can validate them. MCP servers are configured there too (mfagent.mcpServers), plus anything in your VS Code user mcp.json — pick which ones are active for a project from the Task Queue view’s Context tab.',
         }),
         el('div', { class: 'row' }, [
           el('button', {
