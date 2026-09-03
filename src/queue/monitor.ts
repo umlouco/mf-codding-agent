@@ -194,8 +194,8 @@ Allowed action values: ${SUPERVISOR_ACTIONS.join(', ')}.`;
       return normalize(extractJson(second.text, isDecision), usage);
     } catch {
       return {
-        action: 'CONTINUE_EXECUTION',
-        reason: 'The supervisor response was unreadable; preserving the running work is the safe action.',
+        action: 'START_VALIDATION',
+        reason: 'The supervisor response was unreadable; running verification is the safe action when work is already done.',
         usage: usage ?? emptyUsage(),
       };
     }

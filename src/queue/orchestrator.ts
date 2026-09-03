@@ -649,12 +649,8 @@ export class Orchestrator implements vscode.Disposable {
     switch (decision.action) {
       case 'CONTINUE_EXECUTION':
         if (task.status === 'VERIFYING' && !task.validationReport.trim()) {
-          this.queue.update(task.id, {
-            status: 'PENDING',
-            finishedAt: null,
-            supervisorFeedback: decision.reason,
-          });
-          this.log(`task ${task.seq} needs more implementation work; returned to PENDING`);
+          this.log(`task ${task.seq} in VERIFYING with no report — cannot continue executing; running verification instead`);
+          await this.verifyWithExecutor(task, review);
         } else {
           this.log(`task ${task.seq} is progressing in the right direction; continuing`);
         }
@@ -663,6 +659,11 @@ export class Orchestrator implements vscode.Disposable {
       case 'STOP_AND_REWRITE_TASK': {
         const description = decision.rewrittenDescription?.trim();
         if (!description || description.length < 40) {
+          if (task.status === 'VERIFYING') {
+            this.log(`task ${task.seq} — supervisor wanted a rewrite but provided none; running verification instead`);
+            await this.verifyWithExecutor(task, review);
+            return;
+          }
           this.log(`task ${task.seq} — supervisor omitted the required task rewrite; continuing safely`);
           return;
         }
@@ -685,6 +686,11 @@ export class Orchestrator implements vscode.Disposable {
           decision.implVerifyPrompt || decision.solutionVerifyPrompt || decision.solutionVerifyCommand
         );
         if (!hasRewrite) {
+          if (task.status === 'VERIFYING') {
+            this.log(`task ${task.seq} — supervisor wanted a validation rewrite but provided none; running verification instead`);
+            await this.verifyWithExecutor(task, review);
+            return;
+          }
           this.log(`task ${task.seq} — supervisor omitted replacement validation; continuing safely`);
           return;
         }
