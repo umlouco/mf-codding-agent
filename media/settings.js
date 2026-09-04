@@ -13,6 +13,7 @@
   const testByProfile = {};
   let selectedId = null;
   let selectedSkillId = null;
+  let selectedMcpId = null;
 
   // ---- tabs -------------------------------------------------------------
 
@@ -35,6 +36,7 @@
     if (sel.value) send({ type: 'addProfile', providerId: sel.value });
   });
   $('addSkillBtn').addEventListener('click', () => send({ type: 'addSkill' }));
+  $('addMcpBtn').addEventListener('click', () => send({ type: 'addMcpServer' }));
 
   // ---- messages ---------------------------------------------------------
 
@@ -57,6 +59,10 @@
         if (m.selectSkillId) selectedSkillId = m.selectSkillId;
         if (!S.settings.skills.some((s) => s.id === selectedSkillId)) {
           selectedSkillId = S.settings.skills.length ? S.settings.skills[0].id : null;
+        }
+        if (m.selectMcpId) selectedMcpId = m.selectMcpId;
+        if (!(S.settings.mcpServers || []).some((s) => s.id === selectedMcpId)) {
+          selectedMcpId = (S.settings.mcpServers || []).length ? S.settings.mcpServers[0].id : null;
         }
         render();
         break;
@@ -189,6 +195,8 @@
     renderSkillList();
     renderSkillEditor();
     renderSkillGroups();
+    renderMcpList();
+    renderMcpEditor();
     renderWorkspace();
     renderDetected();
 
@@ -211,7 +219,7 @@
     if (sel.options.length) return; // static list; build it once
     const groups = {};
     for (const p of S.providers) (groups[p.group] = groups[p.group] || []).push(p);
-    for (const group of ['Hosted', 'Router', 'Local', 'CLI', 'Embeddings', 'Custom']) {
+    for (const group of ['Editor', 'Hosted', 'Router', 'Local', 'CLI', 'Embeddings', 'Custom']) {
       if (!groups[group]) continue;
       const og = el('optgroup', { label: group });
       for (const p of groups[group]) og.appendChild(el('option', { value: p.id, text: p.label }));
@@ -311,7 +319,7 @@
     });
     const groups = {};
     for (const d of S.providers) (groups[d.group] = groups[d.group] || []).push(d);
-    for (const group of ['Hosted', 'Router', 'Local', 'CLI', 'Embeddings', 'Custom']) {
+    for (const group of ['Editor', 'Hosted', 'Router', 'Local', 'CLI', 'Embeddings', 'Custom']) {
       if (!groups[group]) continue;
       const og = el('optgroup', { label: group });
       for (const d of groups[group]) {
@@ -874,6 +882,276 @@
     return el('div', { class: 'card skill-group' }, [head, checks]);
   }
 
+  // ---- mcp servers --------------------------------------------------------
+
+  function renderMcpList() {
+    const host = $('mcpList');
+    host.textContent = '';
+    const servers = S.settings.mcpServers || [];
+    if (!servers.length) {
+      host.appendChild(el('div', { class: 'hint', text: 'No servers defined here yet. Add one below.' }));
+      return;
+    }
+    for (const s of servers) {
+      host.appendChild(
+        el(
+          'button',
+          {
+            class: 'profile-item' + (s.id === selectedMcpId ? ' active' : ''),
+            onclick: () => {
+              selectedMcpId = s.id;
+              render();
+            },
+          },
+          [
+            el('span', { class: 'pi-text' }, [
+              el('span', { class: 'pi-name', text: s.name }),
+              el('span', {
+                class: 'pi-sub',
+                text:
+                  s.transport === 'http'
+                    ? s.url || 'http — no URL yet'
+                    : s.command || 'stdio — no command yet',
+              }),
+            ]),
+            s.enabled === false ? el('span', { class: 'pill muted', text: 'off' }) : null,
+          ],
+        ),
+      );
+    }
+  }
+
+  /** "KEY<sep>value" lines ↔ an object, for a server's env and headers. */
+  function parseKv(text, sep) {
+    const out = {};
+    for (const line of String(text || '').split(/\r?\n/)) {
+      const i = line.indexOf(sep);
+      if (i <= 0) continue;
+      const k = line.slice(0, i).trim();
+      if (k) out[k] = line.slice(i + 1).trim();
+    }
+    return out;
+  }
+
+  function formatKv(obj, sep) {
+    return Object.entries(obj || {})
+      .map(([k, v]) => `${k}${sep}${v}`)
+      .join('\n');
+  }
+
+  function opt(value, text, selected) {
+    const o = el('option', { value, text });
+    if (selected) o.selected = true;
+    return o;
+  }
+
+  function renderMcpEditor() {
+    const host = $('mcpEditor');
+    host.textContent = '';
+
+    const s = selectedMcpId ? (S.settings.mcpServers || []).find((x) => x.id === selectedMcpId) : null;
+    if (!s) {
+      host.appendChild(
+        el('div', { class: 'empty' }, [
+          'Pick a server on the left, or add one.',
+          el('br', {}),
+          'Keys go to the OS keychain — never to a file.',
+        ]),
+      );
+      return;
+    }
+
+    const patch = (p) => send({ type: 'updateMcpServer', id: s.id, patch: p });
+    const http = s.transport === 'http';
+    const hasKey = !!(S.mcpKeyStatus || {})[s.id];
+
+    // --- server card ---
+    const head = el('div', { class: 'card-head' }, [
+      el('h2', { text: 'Server' }),
+      el('span', { class: 'spacer' }),
+      el('label', { class: 'check' }, [
+        el('input', {
+          type: 'checkbox',
+          checked: s.enabled !== false,
+          onchange: (e) => patch({ enabled: e.target.checked }),
+        }),
+        'Enabled',
+      ]),
+      el('button', {
+        class: 'danger',
+        text: 'Delete',
+        onclick: () => send({ type: 'removeMcpServer', id: s.id }),
+      }),
+    ]);
+
+    const fields = [
+      labeled(
+        'Name',
+        el('input', {
+          type: 'text',
+          'data-k': `mcp:${s.id}:name`,
+          value: s.name,
+          onchange: (e) => patch({ name: e.target.value.trim() }),
+        }),
+        'How the server is listed, and the prefix its tools carry.',
+      ),
+      labeled(
+        'Transport',
+        el('select', { onchange: (e) => patch({ transport: e.target.value }) }, [
+          opt('stdio', 'stdio — a local process', !http),
+          opt('http', 'http — streamable HTTP', http),
+        ]),
+      ),
+    ];
+
+    if (http) {
+      fields.push(
+        labeled(
+          'URL',
+          el('input', {
+            type: 'text',
+            'data-k': `mcp:${s.id}:url`,
+            value: s.url || '',
+            placeholder: 'https://…/mcp',
+            onchange: (e) => patch({ url: e.target.value.trim() }),
+          }),
+        ),
+      );
+      fields.push(
+        labeled(
+          'Headers',
+          el('textarea', {
+            rows: 3,
+            'data-k': `mcp:${s.id}:headers`,
+            value: formatKv(s.headers, ': '),
+            placeholder: 'X-Client: mfagent',
+            onchange: (e) => patch({ headers: parseKv(e.target.value, ':') }),
+          }),
+          'One per line, as Name: value. Not the key — that has its own card below.',
+        ),
+      );
+    } else {
+      fields.push(
+        labeled(
+          'Command',
+          el('input', {
+            type: 'text',
+            'data-k': `mcp:${s.id}:command`,
+            value: s.command || '',
+            placeholder: 'npx',
+            onchange: (e) => patch({ command: e.target.value.trim() }),
+          }),
+        ),
+      );
+      fields.push(
+        labeled(
+          'Arguments',
+          el('textarea', {
+            rows: 3,
+            'data-k': `mcp:${s.id}:args`,
+            value: (s.args || []).join('\n'),
+            placeholder: '-y\n@bytebase/dbhub',
+            onchange: (e) =>
+              patch({
+                args: e.target.value
+                  .split(/\r?\n/)
+                  .map((a) => a.trim())
+                  .filter(Boolean),
+              }),
+          }),
+          'One argument per line.',
+        ),
+      );
+      fields.push(
+        labeled(
+          'Environment',
+          el('textarea', {
+            rows: 3,
+            'data-k': `mcp:${s.id}:env`,
+            value: formatKv(s.env, '='),
+            placeholder: 'LOG_LEVEL=info',
+            onchange: (e) => patch({ env: parseKv(e.target.value, '=') }),
+          }),
+          'One per line, as NAME=value. Not the key — that has its own card below.',
+        ),
+      );
+    }
+
+    host.appendChild(el('div', { class: 'card' }, [head].concat(fields)));
+
+    // --- key card ---
+    const keyInput = el('input', {
+      type: 'password',
+      'data-k': `mcp:${s.id}:key`,
+      placeholder: hasKey ? '•••••••••••• stored in the keychain' : 'paste the key',
+      onkeydown: (e) => {
+        if (e.key === 'Enter') saveKey();
+      },
+    });
+    const saveKey = () => {
+      send({ type: 'setMcpKey', id: s.id, key: keyInput.value });
+      keyInput.value = '';
+    };
+
+    const keyFields = [
+      labeled(
+        http ? 'Header the key goes in' : 'Environment variable the key goes in',
+        el('input', {
+          type: 'text',
+          'data-k': `mcp:${s.id}:keyName`,
+          value: s.keyName || '',
+          placeholder: http ? 'Authorization' : 'API_KEY',
+          onchange: (e) => patch({ keyName: e.target.value.trim() }),
+        }),
+        'Leave blank for a server that takes no key.',
+      ),
+    ];
+    if (http) {
+      keyFields.push(
+        labeled(
+          'Prefix',
+          el('input', {
+            type: 'text',
+            'data-k': `mcp:${s.id}:keyPrefix`,
+            value: s.keyPrefix || '',
+            placeholder: 'Bearer ',
+            onchange: (e) => patch({ keyPrefix: e.target.value }),
+          }),
+          'Put in front of the key inside the header — almost always "Bearer ".',
+        ),
+      );
+    }
+    keyFields.push(
+      labeled(
+        'Key',
+        el('div', { class: 'row' }, [
+          keyInput,
+          el('button', { text: 'Save', onclick: saveKey }),
+          hasKey
+            ? el('button', {
+                class: 'ghost',
+                text: 'Clear',
+                onclick: () => send({ type: 'setMcpKey', id: s.id, key: '' }),
+              })
+            : null,
+        ]),
+        hasKey
+          ? 'Stored in the OS keychain. Type a new key to replace it.'
+          : 'Stored in the OS keychain and injected only when the server starts.',
+      ),
+    );
+
+    host.appendChild(
+      el('div', { class: 'card' }, [
+        el('div', { class: 'card-head' }, [
+          el('h2', { text: 'API key' }),
+          el('span', { class: 'spacer' }),
+          el('span', { class: 'pill ' + (hasKey ? 'ok' : 'muted'), text: hasKey ? 'key stored' : 'no key' }),
+        ]),
+      ].concat(keyFields)),
+    );
+  }
+
   // ---- workspace --------------------------------------------------------
 
   function renderWorkspace() {
@@ -964,7 +1242,7 @@
         el('h2', { text: 'Elsewhere' }),
         el('p', {
           class: 'hint',
-          text: 'Memory and the autonomous-run timings are plain values, so they stay in the VS Code settings editor where it can validate them. MCP servers are configured there too (mfagent.mcpServers), plus anything in your VS Code user mcp.json — pick which ones are active for a project from the Task Queue view’s Context tab.',
+          text: 'Memory and the autonomous-run timings are plain values, so they stay in the VS Code settings editor where it can validate them. MCP servers have their own tab here; the mfagent.mcpServers setting and your VS Code user mcp.json are read as well — pick which are active for a project from the Task Queue view’s Context tab.',
         }),
         el('div', { class: 'row' }, [
           el('button', {

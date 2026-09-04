@@ -210,6 +210,33 @@ export class SettingsPanel {
           await this.pushState();
           break;
 
+        case 'addMcpServer': {
+          const server = await this.store.addMcpServer(String(msg.name ?? ''));
+          await this.pushState(undefined, undefined, server.id);
+          break;
+        }
+        case 'updateMcpServer':
+          await this.store.updateMcpServer(String(msg.id), msg.patch ?? {});
+          await this.pushState();
+          break;
+        case 'removeMcpServer': {
+          const server = this.store.mcpServer(String(msg.id));
+          const pick = await vscode.window.showWarningMessage(
+            `Delete the MCP server "${server?.name ?? msg.id}"?`,
+            { modal: true, detail: 'Its key is removed from the keychain too.' },
+            'Delete',
+          );
+          if (pick === 'Delete') {
+            await this.store.removeMcpServer(String(msg.id));
+            await this.pushState();
+          }
+          break;
+        }
+        case 'setMcpKey':
+          await this.store.setMcpKey(String(msg.id), String(msg.key ?? ''));
+          await this.pushState(undefined, undefined, String(msg.id));
+          break;
+
         case 'setHeadless':
           await this.store.update({ browser: { headless: !!msg.headless } });
           break;
@@ -252,7 +279,11 @@ export class SettingsPanel {
 
   // ---- state -----------------------------------------------------------
 
-  private async pushState(selectProfileId?: string, selectSkillId?: string): Promise<void> {
+  private async pushState(
+    selectProfileId?: string,
+    selectSkillId?: string,
+    selectMcpId?: string,
+  ): Promise<void> {
     const settings = this.store.settings;
     const detectedLanguages = await detectLanguages();
     const detected: Detected = await detect(this.context, detectedLanguages, this.chromium);
@@ -262,6 +293,7 @@ export class SettingsPanel {
       settings,
       selectProfileId,
       selectSkillId,
+      selectMcpId,
       providers: PROVIDERS.map((p) => ({
         id: p.id,
         label: p.label,
@@ -281,6 +313,7 @@ export class SettingsPanel {
       })),
       roles: ROLES.map((r) => ({ id: r, ...ROLE_LABELS[r] })),
       keyStatus: await this.store.keyStatus(),
+      mcpKeyStatus: await this.store.mcpKeyStatus(),
       cachedModels: Object.fromEntries(
         settings.profiles.map((p) => [
           p.id,
@@ -426,6 +459,7 @@ export class SettingsPanel {
     <button class="tab active" data-tab="providers">Providers</button>
     <button class="tab" data-tab="roles">Roles</button>
     <button class="tab" data-tab="skills">Skills</button>
+    <button class="tab" data-tab="mcp">MCP Servers</button>
     <button class="tab" data-tab="workspace">Workspace</button>
     <button class="tab" data-tab="detected">Detected</button>
   </nav>
@@ -468,6 +502,26 @@ export class SettingsPanel {
       <div id="skillEditor" class="editor-col"></div>
     </div>
     <div id="skillGroups" class="skill-groups"></div>
+  </section>
+
+  <section class="panel" data-panel="mcp" hidden>
+    <p class="hint">
+      An MCP server defined here can carry an API key: the key goes to the OS keychain and is put
+      back into the server's environment or headers only when the server starts — never into a
+      file. Servers from your VS Code user <code>mcp.json</code> and the <code>mfagent.mcpServers</code>
+      setting are picked up as well. Every server is offered to the agent core and published to
+      VS Code's own MCP engine; choose which are active for a project from the Task Queue view's
+      Context tab.
+    </p>
+    <div class="split">
+      <aside class="list-col">
+        <div id="mcpList" class="profile-list"></div>
+        <div class="add-row">
+          <button id="addMcpBtn">Add server</button>
+        </div>
+      </aside>
+      <div id="mcpEditor" class="editor-col"></div>
+    </div>
   </section>
 
   <section class="panel" data-panel="workspace" hidden>

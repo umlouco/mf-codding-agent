@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { CoreClient, InitResult } from './core';
 import { planGoal } from './queue/agents';
 import { TaskQueue } from './queue/db';
+import { LiveLog } from './queue/liveLog';
 
 /** Which agent handles the next message from the composer. */
 export type ChatAgent = 'coder' | 'planner';
@@ -294,6 +295,10 @@ export class ChatPanel {
         'press Start in the Task Queue view.',
     });
 
+    // The same stream the Plan tab's own planner writes, so the Task Queue
+    // view's Planner terminal shows this run too — see queue/liveLog.ts.
+    const live = new LiveLog(target.queue, null, 'planner');
+    live.note('plan', `planning from the chat: ${goal.trim()}`);
     let cancelled = false;
     try {
       const phases = await planGoal(
@@ -301,7 +306,10 @@ export class ChatPanel {
         this.output,
         target.queue,
         goal,
-        (method, params) => this.onPlannerEvent(method, params),
+        (method, params) => {
+          live.onEvent(method, params);
+          this.onPlannerEvent(method, params);
+        },
         (cancel) => {
           this.cancelPlan = () => {
             cancelled = true;
@@ -311,6 +319,7 @@ export class ChatPanel {
       );
 
       const n = append ? target.queue.addAll(phases) : target.queue.replaceAll(phases);
+      live.note('plan', `${n} phase(s) written to the queue`);
       target.changed();
       this.post({ type: 'done' });
       this.post({
@@ -331,7 +340,9 @@ export class ChatPanel {
         text: cancelled ? 'Planning stopped.' : `Planning failed: ${e?.message ?? e}`,
         level: cancelled ? 'warn' : 'error',
       });
+      live.note('error', cancelled ? 'planning stopped' : `planning failed: ${e?.message ?? e}`);
     } finally {
+      live.close();
       this.cancelPlan = undefined;
       this.planning = false;
       this.busy = false;

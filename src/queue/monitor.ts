@@ -114,7 +114,7 @@ export async function reviewProgress(
   task: Task,
   events: TaskEvent[],
   failedValidations: number,
-  opts: Pick<RunOptions, 'onActivity' | 'onAbort'> = {},
+  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
 ): Promise<ProgressDecision> {
   const state = task.status === 'EXECUTING'
     ? 'The execution agent is still running.'

@@ -105,7 +105,12 @@ function extractEnvelope<T>(text: string, key: 'validation' | 'completion' | 'no
   const candidates = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((m) => m[1]);
   candidates.push(text);
   for (const candidate of candidates.reverse()) {
-    for (let start = candidate.lastIndexOf('{'); start >= 0; start = candidate.lastIndexOf('{', start - 1)) {
+    // Walk the opening braces from the end. The step has to stop explicitly
+    // at index 0: `lastIndexOf('{', -1)` clamps its start to 0 and finds the
+    // brace at 0 again, so a reply that *begins* with `{` — the normal shape
+    // of a JSON report — and does not parse, or lacks the key, looped here
+    // forever and froze the extension host.
+    for (let start = candidate.lastIndexOf('{'); start >= 0; start = start === 0 ? -1 : candidate.lastIndexOf('{', start - 1)) {
       try {
         const value = JSON.parse(candidate.slice(start).trim());
         if (!!value && typeof value === 'object' && !Array.isArray(value) &&

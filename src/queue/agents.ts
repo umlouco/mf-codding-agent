@@ -3,6 +3,8 @@ import * as vscode from 'vscode';
 import { CoreClient, CoreConfig } from '../core';
 import { resolveCoreBinary, workspaceRoot } from '../detect';
 import { registerEditorFsHandlers } from '../editorFs';
+import { getRouter } from '../llm/router';
+import { getBridge } from '../mcpBridge';
 import { getStore } from '../providers/instance';
 import { contextCeiling } from '../providers/payload';
 import { runClaudeCliTurn } from './claudeCli';
@@ -43,11 +45,15 @@ export interface RoleConfig {
  */
 export async function roleConfig(role: Role): Promise<RoleConfig> {
   const r = await getStore().resolve(role);
+  // The router decides what the core actually dials: a role on one of the
+  // editor's own models gets the loopback proxy, every other kind is what the
+  // store already said — see llm/router.ts.
+  const ep = await getRouter().endpointFor(r);
   return {
-    provider: r.kind,
+    provider: ep.type,
     model: r.model,
-    baseURL: r.baseURL,
-    apiKey: r.apiKey,
+    baseURL: ep.baseURL,
+    apiKey: ep.apiKey,
     effort: r.effort,
   };
 }
@@ -197,6 +203,7 @@ export async function runOnce(
 
   const client = new CoreClient(context, output);
   registerEditorFsHandlers(client);
+  getBridge().attach(client);
   const { maxIterations = 0, onEvent, onCancellable, onAbort, onActivity } = opts;
 
   client.onNotification((method, params) => {
@@ -590,6 +597,14 @@ export async function generatePhases(
     .map((r) => `- ${r.path}  (${r.fileCount} file(s)${languageSummary(r.languages)})`)
     .join('\n');
 
+  // Tools VS Code itself provides to every agent in this run — see
+  // McpBridge.toolsSummary. Named so the plan can lean on them, the way it
+  // already leans on the file, search, shell and browser tools.
+  const editorTools = getBridge().toolsSummary();
+  const editorToolsNote = editorTools
+    ? `\nVS CODE TOOLS every agent in this run also has, beyond files, search, shell and browser:\n${editorTools}\n`
+    : '';
+
   const prompt = `You are planning an autonomous coding run over a large workspace. The workspace has
 already been scanned and split into regions small enough for one agent to explore in a
 single sitting — you are not exploring the tree yourself, you are deciding which regions
@@ -601,7 +616,7 @@ ${goal}
 
 REGIONS (path, file count, language mix — not file contents)
 ${regionList || '(none — the workspace appears to be empty)'}
-
+${editorToolsNote}
 Break the goal into at most ${MAX_PHASES} phases. Reply with ONE JSON array and nothing else.
 Each element must be an object with exactly these keys:
   "title"        short imperative summary of this phase, under 80 characters

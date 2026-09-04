@@ -22,11 +22,12 @@ import { CoreClient } from './core';
  * output, not a summary of it.
  *
  * This needs VS Code's shell integration, which is what supplies the command's
- * output stream and its exit code. It activates asynchronously and can fail to
- * activate at all for an unusual shell, so everything here is conditional:
- * `isAvailable` decides at startup whether the core is even told the terminal
- * exists, and a command that starts but cannot be tracked reports an unknown
- * exit code rather than guessing zero.
+ * output stream and its exit code. The API is always present on the VS Code
+ * this extension targets; what is not guaranteed is that integration activates
+ * for the user's shell — it does so asynchronously and can fail for an unusual
+ * one — so a command that starts but cannot be tracked reports an unknown exit
+ * code rather than guessing zero, and `mfagent.shell.useTerminal` is the one
+ * switch that decides whether the core is told the terminal exists at all.
  */
 
 /** How long to wait for shell integration to come up in a fresh terminal. */
@@ -43,17 +44,6 @@ interface ExecResult {
   /** Null when the terminal could not report one — never coerce this to 0. */
   exitCode: number | null;
   timedOut: boolean;
-}
-
-/**
- * Whether this VS Code can run commands for us. `executeCommand` on
- * `shellIntegration` is the API the whole path is built on; it was finalized in
- * 1.93, and on an older host the property is simply absent. Checking for the
- * capability rather than comparing version strings means a user on an
- * unexpected build gets the fallback instead of a crash.
- */
-export function isAvailable(): boolean {
-  return typeof vscode.window.onDidChangeTerminalShellIntegration === 'function';
 }
 
 let terminal: vscode.Terminal | undefined;

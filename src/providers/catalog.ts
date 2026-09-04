@@ -12,7 +12,7 @@
  * `/v1/chat/completions`.
  */
 
-export type ProviderKind = 'anthropic' | 'openai-compatible' | 'claude-cli';
+export type ProviderKind = 'anthropic' | 'openai-compatible' | 'claude-cli' | 'vscode-lm';
 
 /**
  * The six things a profile can be bound to. Lives here rather than in
@@ -60,7 +60,7 @@ export interface ProviderDef {
   label: string;
   kind: ProviderKind;
   /** Grouping in the provider dropdown. */
-  group: 'Hosted' | 'Router' | 'Local' | 'Embeddings' | 'Custom' | 'CLI';
+  group: 'Editor' | 'Hosted' | 'Router' | 'Local' | 'Embeddings' | 'Custom' | 'CLI';
 
   /** Base URL used when the profile does not override it. */
   defaultBaseURL: string;
@@ -101,6 +101,26 @@ export function trimBase(url: string): string {
 }
 
 export const PROVIDERS: ProviderDef[] = [
+  {
+    id: 'vscode-lm',
+    label: 'VS Code Language Models',
+    kind: 'vscode-lm',
+    group: 'Editor',
+    defaultBaseURL: '',
+    baseURLEditable: false,
+    apiKey: 'none',
+    // The list comes from `vscode.lm.selectChatModels`, not from HTTP — see
+    // ModelRegistry.listEditorModels and llm/router.ts.
+    listStyle: 'none',
+    serves: { chat: true, vision: true, embedding: false },
+    docsURL: 'https://code.visualstudio.com/api/extension-guides/ai/language-model',
+    notes:
+      'The models VS Code itself offers — GitHub Copilot’s, and any other vendor an installed ' +
+      'extension registers — through the vscode.lm API, with no key of your own. VS Code asks once ' +
+      'for consent the first time a model is used; "Test connection" triggers that prompt. The agent ' +
+      'core reaches these models through a loopback proxy this extension runs, so every tool works ' +
+      'exactly as it does on an HTTP provider. No embeddings endpoint.',
+  },
   {
     id: 'anthropic',
     label: 'Anthropic',

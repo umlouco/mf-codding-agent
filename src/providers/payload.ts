@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import { detectLanguages, memoryDbPath, workspaceRoot } from '../detect';
-import { isAvailable as isTerminalAvailable } from '../editorTerminal';
-import { discoverMcpServers } from '../mcp';
+import { getRouter } from '../llm/router';
+import { resolveMcpServers } from '../mcp';
+import { EditorToolDef, getBridge } from '../mcpBridge';
 import { getActiveQueue } from '../queue/registry';
 import { discoverInstalledSkills } from '../skills';
 import { ProfileStore, ResolvedRole, Skill, SkillGroup } from './store';
@@ -66,6 +67,12 @@ export interface CoreConfig {
   languages: string[];
   mcpServers: any[];
   /**
+   * The `vscode.lm.tools` the active workspace has switched on, registered by
+   * the core as `editor__<name>` and run by the editor on request — see
+   * mcpBridge.ts and registerEditorTools in the core.
+   */
+  editorTools: EditorToolDef[];
+  /**
    * Pre-formatted skill content, spliced into the system prompt like project
    * instructions — see the core's PromptInput.Skills. Built from whichever
    * skill groups the active workspace's task queue has switched on; empty
@@ -76,9 +83,9 @@ export interface CoreConfig {
   browserHeadless: boolean;
   /**
    * Whether run_shell should run in a VS Code terminal rather than a process
-   * the core spawns. Only the extension host can tell whether this VS Code has
-   * the shell-integration API at all, so the core takes this as given — see
-   * src/editorTerminal.ts and Config.EditorTerminal in the core.
+   * the core spawns — the `mfagent.shell.useTerminal` setting, which only the
+   * extension host can read. See src/editorTerminal.ts and
+   * Config.EditorTerminal in the core.
    */
   editorTerminal: boolean;
 }
@@ -137,22 +144,26 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
   const activeQueue = getActiveQueue();
 
   const providers = new Map<string, CoreProvider>();
+  const router = getRouter();
 
   /** Registers the role's provider (once) and returns the core-side binding. */
-  const bind = (r: ResolvedRole): CoreRole => {
+  const bind = async (r: ResolvedRole): Promise<CoreRole> => {
     if (!r.profile) {
       return { providerId: '', model: '', effort: '' };
     }
     let entry = providers.get(r.profile.id);
     if (!entry) {
+      // The router decides what the core actually dials: an editor model
+      // becomes the loopback proxy, everything else is the store's own answer.
+      const ep = await router.endpointFor(r);
       entry = {
         id: r.profile.id,
         label: r.profile.name,
-        type: r.kind,
-        apiKey: r.apiKey,
-        baseURL: r.baseURL,
+        type: ep.type,
+        apiKey: ep.apiKey,
+        baseURL: ep.baseURL,
         models: [],
-        reasoning: r.kind === 'anthropic',
+        reasoning: ep.type === 'anthropic',
         enabled: true,
       };
       providers.set(r.profile.id, entry);
@@ -163,19 +174,27 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     return { providerId: r.profile.id, model: r.model, effort: r.effort };
   };
 
-  const coding = bind(resolved.coding);
-  const vision = bind(resolved.vision);
-  const embedding = bind(resolved.embedding);
+  const coding = await bind(resolved.coding);
+  const vision = await bind(resolved.vision);
+  const embedding = await bind(resolved.embedding);
 
   const languages = store.settings.languages.auto
     ? await detectLanguages(root)
     : store.settings.languages.list;
 
   const disabledMcp = new Set(activeQueue?.disabledMcpServers ?? []);
-  const mcpServers = discoverMcpServers(getContext()).map((s) => ({
-    ...s,
-    enabled: !disabledMcp.has(s.name),
-  }));
+  // resolveMcpServers, not discoverMcpServers: this is the one place the keys
+  // are needed, and it is the last step before the config reaches the core.
+  // A server the editor alone can resolve (see DiscoveredMcpServer.problem)
+  // is left out rather than sent with a placeholder where its key should be.
+  const mcpServers = (await resolveMcpServers(getContext(), store))
+    .filter((s) => !s.problem)
+    .map((s) => ({
+      ...s,
+      // Two independent switches. `s.enabled` is the server's own, from the
+      // MCP Servers tab; `disabledMcp` is this workspace's, from the Context tab.
+      enabled: s.enabled !== false && !disabledMcp.has(s.name),
+    }));
 
   const installed = discoverInstalledSkills();
   const skills = [...store.settings.skills, ...installed.map((d) => d.skill)];
@@ -200,10 +219,10 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     activitySeconds: Math.max(5, cfg.get<number>('activityIntervalSeconds', 30)),
     languages,
     mcpServers,
+    editorTools: getBridge().editorToolDefs(),
     skillsText,
     browserExecutable: '',
     browserHeadless: store.settings.browser.headless || !!vscode.env.remoteName,
-    editorTerminal:
-      isTerminalAvailable() && cfg.get<boolean>('shell.useTerminal', true),
+    editorTerminal: cfg.get<boolean>('shell.useTerminal', true),
   };
 }

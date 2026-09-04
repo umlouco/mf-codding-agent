@@ -2,7 +2,7 @@
   "name": "mf-agent",
   "displayName": "MF Agent",
   "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
-  "version": "0.1.0",
+  "version": "0.1.7",
   "publisher": "mflores",
   "license": "MIT",
   "pricing": "Free",
@@ -15,7 +15,7 @@
   },
   "homepage": "https://github.com/umlouco/mf-codding-agent#readme",
   "engines": {
-    "vscode": "^1.93.0"
+    "vscode": "^1.136.0"
   },
   "categories": [
     "AI",
@@ -53,7 +53,7 @@
     "mcpServerDefinitionProviders": [
       {
         "id": "mf-agent.mcp-servers",
-        "label": "MF Agent Task Queue"
+        "label": "MF Agent"
       }
     ],
     "commands": [
@@ -220,29 +220,57 @@
           "markdownDescription": "MCP servers to connect. Each entry takes either `command` + `args` (stdio) or `url` (streamable HTTP). Merged with any servers in your VS Code user `mcp.json`, which needs no entry here at all — pick which of either source are active for a project from the Task Queue view's Context tab.",
           "items": {
             "type": "object",
-            "required": ["name"],
+            "required": [
+              "name"
+            ],
             "properties": {
-              "name": { "type": "string" },
-              "command": { "type": "string" },
-              "args": { "type": "array", "items": { "type": "string" } },
-              "env": { "type": "object" },
-              "url": { "type": "string" },
-              "headers": { "type": "object" },
-              "enabled": { "type": "boolean" }
+              "name": {
+                "type": "string"
+              },
+              "command": {
+                "type": "string"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "env": {
+                "type": "object"
+              },
+              "url": {
+                "type": "string"
+              },
+              "headers": {
+                "type": "object"
+              },
+              "enabled": {
+                "type": "boolean"
+              }
             }
           }
         },
         "mfagent.queue.mode": {
           "type": "string",
-          "enum": ["lockstep", "continuous"],
+          "enum": [
+            "lockstep",
+            "continuous"
+          ],
           "default": "lockstep",
           "description": "lockstep = validate before next task. continuous = executors run ahead while conclusion checks follow."
         },
         "mfagent.queue.cronIntervalSeconds": {
           "type": "number",
-          "default": 60,
-          "minimum": 10,
-          "description": "Default supervisor wake-up interval in seconds. A task list that sets its own interval in the Task Queue view overrides this."
+          "default": 10,
+          "minimum": 5,
+          "markdownDescription": "How often, in seconds, the supervisor loop wakes to read the `tasks` and `agent_logs` tables: picking up finished work, noticing a worker that has gone quiet, and deciding whether a task continues, stops, is broken down, or goes to verification. A tick that finds nothing new costs a few database reads; a full review of live work is rate-limited separately by `#mfagent.queue.reviewIntervalSeconds#`. A task list that sets its own interval in the Task Queue view overrides this."
+        },
+        "mfagent.queue.liveLogKeep": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 200,
+          "markdownDescription": "Live-output rows kept per task in the `agent_logs` table — the streamed text, reasoning and tool calls the Task Queue view shows as each agent works. Older rows are pruned as new ones arrive; the durable journal the supervisor reads (`task_events`) is not affected."
         },
         "mfagent.queue.workerSilentMinutes": {
           "type": "number",
@@ -320,7 +348,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^20.14.0",
-    "@types/vscode": "^1.93.0",
+    "@types/vscode": "1.136.0",
     "esbuild": "^0.23.0",
     "typescript": "^5.5.0"
   }

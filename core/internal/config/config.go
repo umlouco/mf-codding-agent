@@ -39,9 +39,26 @@ type MCPServer struct {
 	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Enabled *bool             `json:"enabled,omitempty"`
+	// Source says where the editor found this definition — "user" for VS
+	// Code's own mcp.json, "settings" for the mfagent.mcpServers setting,
+	// "store" for the MF Agent settings page — so a connection failure can
+	// point at the place to fix it. See DiscoveredMcpServer in src/mcp.ts.
+	Source string `json:"source,omitempty"`
 }
 
 func (s MCPServer) IsEnabled() bool { return s.Enabled == nil || *s.Enabled }
+
+// EditorToolDef is one tool VS Code's language-model API offers (`vscode.lm.tools`):
+// a tool another extension registered, or one of an MCP server the editor runs
+// itself. The core cannot see that API, so the extension sends the definitions
+// here and answers each call over JSON-RPC (`lm/invokeTool`) — see
+// registerEditorTools in cmd/mfcore and src/mcpBridge.ts.
+type EditorToolDef struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	InputSchema map[string]any `json:"inputSchema"`
+	Tags        []string       `json:"tags"`
+}
 
 type Config struct {
 	WorkspaceRoot string `json:"workspaceRoot"`
@@ -96,6 +113,11 @@ type Config struct {
 	ActivitySeconds int `json:"activitySeconds"`
 
 	MCPServers []MCPServer `json:"mcpServers"`
+
+	// EditorTools are the `vscode.lm.tools` this workspace has switched on for
+	// its agents, registered as `editor__<name>` and run by the editor on the
+	// core's behalf. Empty in any process with no editor behind it.
+	EditorTools []EditorToolDef `json:"editorTools"`
 
 	// SkillsText is pre-formatted skill content, chosen by the editor from
 	// whichever skill groups the active workspace's task queue has switched

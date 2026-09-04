@@ -1,56 +1,24 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { resolveMcpBinary } from './detect';
+// Type-only: mcp.ts is imported by providers/payload.ts, so a value import of
+// the store here would close a cycle.
+import type { ProfileStore } from './providers/store';
+
+/**
+ * MCP server discovery: what servers exist, and where each came from.
+ *
+ * Publishing them to VS Code's own MCP engine, and pulling the editor's tools
+ * back into the core, both live in mcpBridge.ts. Registering with standalone
+ * tools that never read the editor's registry — Claude Code, Cursor — is the
+ * project-root `.mcp.json` written by `writeProjectMcpJson` below.
+ */
 
 /** Must match the `mcpServerDefinitionProviders` entry in package.json. */
 export const MCP_PROVIDER_ID = 'mf-agent.mcp-servers';
 export const MCP_SERVER_LABEL = 'MF Agent Task Queue';
 export const MCP_SERVER_NAME = 'mfagent-task-queue';
-
-/**
- * Makes the task-queue MCP server visible to VS Code's native MCP system: the
- * Extensions view "MCP SERVERS" list, GitHub Copilot Chat, and any extension
- * that reads the editor's MCP registry. This is the mechanism the VS Code
- * "MCP developer guide" prescribes for extensions.
- *
- * Standalone tools (Claude Code, Cursor, etc.) do not read VS Code's registry,
- * so they are covered separately by a project-root `.mcp.json` — see
- * `writeProjectMcpJson`.
- *
- * `registerMcpServerDefinitionProvider` shipped in VS Code 1.99; on older
- * editors the whole registration is skipped and only the JSON-based paths
- * remain.
- */
-export function registerMcpProvider(context: vscode.ExtensionContext): void {
-  const register = vscode.lm?.registerMcpServerDefinitionProvider;
-  if (typeof register !== 'function') {
-    return;
-  }
-
-  context.subscriptions.push(
-    register(MCP_PROVIDER_ID, {
-      provideMcpServerDefinitions: (): vscode.McpServerDefinition[] => {
-        const bin = resolveMcpBinary(context);
-        if (!bin) {
-          return [];
-        }
-        const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        const def = new vscode.McpStdioServerDefinition(
-          MCP_SERVER_LABEL,
-          bin,
-          root ? ['--workspace', root] : [],
-          undefined,
-          '0.1.0',
-        );
-        if (root) {
-          def.cwd = vscode.Uri.file(root);
-        }
-        return [def];
-      },
-    }),
-  );
-}
 
 // ---- discovery -----------------------------------------------------------
 
@@ -62,14 +30,66 @@ export interface DiscoveredMcpServer {
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
-  /** 'user' = VS Code's own per-user mcp.json; 'settings' = mfagent.mcpServers. */
-  source: 'user' | 'settings';
+  /**
+   * 'user' = VS Code's own per-user mcp.json; 'settings' = mfagent.mcpServers;
+   * 'store' = defined in the settings page's MCP Servers tab, which is the only
+   * source that can carry an API key without writing it to a file.
+   */
+  source: 'user' | 'settings' | 'store';
+  /** Store-defined servers only: the id their key is filed under. */
+  id?: string;
+  /** Store-defined servers only: false when switched off in the editor. */
+  enabled?: boolean;
+  /**
+   * Why this server cannot be connected as configured: a `${input:…}` or
+   * `${command:…}` reference in VS Code's mcp.json, which only the editor can
+   * resolve. Shown on the Context tab; a server carrying one is never handed
+   * to the core, since the literal text would reach the server as a nonsense
+   * header or argument.
+   */
+  problem?: string;
+}
+
+/**
+ * Expands the variables VS Code allows in an mcp.json value.
+ *
+ * `${env:NAME}`, `${workspaceFolder}` and `${userHome}` are plain facts this
+ * process knows as well as the editor does. `${input:id}` is a value VS Code
+ * prompted for and keeps in its own secret storage, and `${command:id}` is
+ * whatever some extension command returns — neither is reachable from here,
+ * so the reference is reported instead of expanded.
+ *
+ * A bare `${NAME}` is Claude Code's spelling of the same environment
+ * reference, and a server block is often copied between the two files; it
+ * is honoured when a variable of that name exists, and reported otherwise
+ * rather than sent to a server as literal text.
+ */
+function expandVariables(value: string, root: string): { value: string; unresolved?: string } {
+  let unresolved: string | undefined;
+  const out = value.replace(/\$\{([^}]+)\}/g, (whole, inner: string) => {
+    if (inner.startsWith('env:')) {
+      return process.env[inner.slice(4)] ?? '';
+    }
+    if (inner === 'workspaceFolder' || inner.startsWith('workspaceFolder:')) {
+      return root;
+    }
+    if (inner === 'userHome') {
+      return os.homedir();
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(inner) && process.env[inner] !== undefined) {
+      return process.env[inner] ?? '';
+    }
+    unresolved = unresolved ?? whole;
+    return whole;
+  });
+  return { value: out, unresolved };
 }
 
 /**
  * VS Code's own per-user MCP registry file — the one edited from the command
  * palette's "MCP: Open User Configuration", shared with Copilot Chat and any
- * other MCP-aware extension.
+ * other MCP-aware extension. Read so the Go core can connect to the same
+ * servers the editor does; never written.
  *
  * There is no VS Code API that hands back this path directly, so it is derived
  * from `globalStorageUri` instead of assuming "Code" anywhere in it — that
@@ -103,15 +123,36 @@ export function readUserMcpServers(context: vscode.ExtensionContext): Discovered
     if (!servers || typeof servers !== 'object') {
       return [];
     }
-    return Object.entries(servers as Record<string, any>).map(([name, s]) => ({
-      name,
-      command: s?.command ? String(s.command) : undefined,
-      args: Array.isArray(s?.args) ? s.args.map(String) : undefined,
-      env: s?.env && typeof s.env === 'object' ? s.env : undefined,
-      url: s?.url ? String(s.url) : undefined,
-      headers: s?.headers && typeof s.headers === 'object' ? s.headers : undefined,
-      source: 'user' as const,
-    }));
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+    return Object.entries(servers as Record<string, any>).map(([name, s]) => {
+      const problems: string[] = [];
+      const expand = (v: unknown): string => {
+        const r = expandVariables(String(v), root);
+        if (r.unresolved) {
+          problems.push(r.unresolved);
+        }
+        return r.value;
+      };
+      const expandMap = (m: unknown): Record<string, string> | undefined =>
+        m && typeof m === 'object'
+          ? Object.fromEntries(Object.entries(m as Record<string, unknown>).map(([k, v]) => [k, expand(v)]))
+          : undefined;
+      const server: DiscoveredMcpServer = {
+        name,
+        command: s?.command ? expand(s.command) : undefined,
+        args: Array.isArray(s?.args) ? s.args.map((a: unknown) => expand(a)) : undefined,
+        env: expandMap(s?.env),
+        url: s?.url ? expand(s.url) : undefined,
+        headers: expandMap(s?.headers),
+        source: 'user',
+      };
+      if (problems.length) {
+        server.problem =
+          `uses ${[...new Set(problems)].join(', ')}, which only VS Code can resolve — define the ` +
+          'server on the MF Agent settings page (MCP Servers tab) to give the agent its own key';
+      }
+      return server;
+    });
   } catch {
     return [];
   }
@@ -127,7 +168,10 @@ export function readUserMcpServers(context: vscode.ExtensionContext): Discovered
  * `buildCoreConfig` in providers/payload.ts) — this function only says what
  * servers exist, not which are currently switched on for a given workspace.
  */
-export function discoverMcpServers(context: vscode.ExtensionContext): DiscoveredMcpServer[] {
+export function discoverMcpServers(
+  context: vscode.ExtensionContext,
+  store?: ProfileStore,
+): DiscoveredMcpServer[] {
   const merged = new Map<string, DiscoveredMcpServer>();
   for (const s of readUserMcpServers(context)) {
     merged.set(s.name, s);
@@ -148,49 +192,61 @@ export function discoverMcpServers(context: vscode.ExtensionContext): Discovered
       source: 'settings',
     });
   }
+  // Last, so a server you edited on the MCP Servers tab wins over one of the
+  // same name in either file: that tab is where you went to change it.
+  for (const s of store?.mcpServers ?? []) {
+    const name = s.name.trim();
+    if (!name) {
+      continue;
+    }
+    merged.set(name, {
+      name,
+      command: s.transport === 'stdio' && s.command ? s.command : undefined,
+      args: s.transport === 'stdio' && s.args?.length ? [...s.args] : undefined,
+      env: s.transport === 'stdio' && s.env ? { ...s.env } : undefined,
+      url: s.transport === 'http' && s.url ? s.url : undefined,
+      headers: s.transport === 'http' && s.headers ? { ...s.headers } : undefined,
+      source: 'store',
+      id: s.id,
+      enabled: s.enabled,
+    });
+  }
   return [...merged.values()];
 }
 
 /**
- * Merge-writes this server into VS Code's own per-user `mcp.json`
- * (`userMcpJsonPath`), so it is registered before `registerMcpProvider`'s
- * dynamic path even applies — that API needs VS Code ≥1.99 and silently
- * no-ops otherwise, so this file is the one thing that reaches every VS Code
- * version. Called once at activation; safe to call again; existing servers
- * and unrelated content are preserved.
+ * `discoverMcpServers` with each store-defined server's key put back where the
+ * server expects it — an env var for stdio, a header for http.
  *
- * Deliberately does not pin `--workspace`: unlike the project-root
- * `.mcp.json` below, this file is not tied to any one folder, so it cannot
- * know which workspace will be open when VS Code eventually launches the
- * process. The binary defaults `--workspace` to its own cwd when the flag is
- * omitted (see `core/cmd/mfagent-mcp/main.go`), which is the best a
- * workspace-agnostic registration can do.
+ * Kept apart from discovery because reading the keychain is async and most
+ * callers only want to *list* servers. The key exists in this process for the
+ * length of one core handshake and is never written to any file; the settings
+ * page shows only whether one is stored, never its value.
  */
-export function writeUserMcpJson(context: vscode.ExtensionContext, bin: string): string {
-  const file = userMcpJsonPath(context);
-
-  let doc: any = {};
-  if (fs.existsSync(file)) {
-    try {
-      doc = JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch {
-      doc = {};
+export async function resolveMcpServers(
+  context: vscode.ExtensionContext,
+  store: ProfileStore,
+): Promise<DiscoveredMcpServer[]> {
+  const out: DiscoveredMcpServer[] = [];
+  for (const server of discoverMcpServers(context, store)) {
+    const def = server.source === 'store' && server.id ? store.mcpServer(server.id) : undefined;
+    const keyName = def?.keyName?.trim();
+    if (!def || !keyName) {
+      out.push(server);
+      continue;
     }
+    const key = await store.getMcpKey(def.id);
+    if (!key) {
+      out.push(server);
+      continue;
+    }
+    out.push(
+      def.transport === 'http'
+        ? { ...server, headers: { ...(server.headers ?? {}), [keyName]: `${def.keyPrefix ?? ''}${key}` } }
+        : { ...server, env: { ...(server.env ?? {}), [keyName]: key } },
+    );
   }
-  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
-    doc = {};
-  }
-
-  // VS Code's own mcp.json keys servers under "servers", not "mcpServers" —
-  // see the schema note on readUserMcpServers above.
-  const servers =
-    doc.servers && typeof doc.servers === 'object' && !Array.isArray(doc.servers) ? doc.servers : {};
-  servers[MCP_SERVER_NAME] = { type: 'stdio', command: bin, args: [] };
-  doc.servers = servers;
-
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(doc, null, 2) + '\n');
-  return file;
+  return out;
 }
 
 /**

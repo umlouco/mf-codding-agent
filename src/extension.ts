@@ -2,18 +2,21 @@ import * as cp from 'child_process';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CoreClient, InitResult } from './core';
+import { recordCoreInit } from './coreStatus';
 import { registerEditorFsHandlers } from './editorFs';
 import { disposeTerminal, registerEditorTerminalHandlers } from './editorTerminal';
 import { ChatPanel } from './panel';
 import { queueDbPath, resolveMcpBinary } from './detect';
-import { registerMcpProvider, writeProjectMcpJson, writeUserMcpJson } from './mcp';
+import { initRouter } from './llm/router';
+import { discoverMcpServers, writeProjectMcpJson } from './mcp';
+import { initBridge } from './mcpBridge';
 import { TaskQueue } from './queue/db';
 import { Orchestrator } from './queue/orchestrator';
 import { QueueViewProvider } from './queue/panel';
 import { setActiveQueue } from './queue/registry';
 import { SKILL_INSTALL_AGENTS } from './skills';
 import { resolveChromium } from './chromium';
-import { getModelRegistry, getStore, initProviders } from './providers/instance';
+import { getContext, getModelRegistry, getStore, initProviders } from './providers/instance';
 import { ProfileStore } from './providers/store';
 import { SettingsPanel } from './settings/panel';
 
@@ -37,10 +40,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   store = initProviders(context, output).store;
   await migrateLegacySettings(store);
 
+  // The editor's own language models and tools, reachable only from this
+  // process: the router carries turns to them (llm/router.ts); the bridge
+  // publishes this extension's MCP servers to VS Code and hands the editor's
+  // tools to the core (mcpBridge.ts).
+  context.subscriptions.push(initRouter(context, output));
+  const bridge = initBridge(context, store, output);
+  context.subscriptions.push(bridge);
+
   core = new CoreClient(context, output);
   context.subscriptions.push(core);
   registerEditorFsHandlers(core);
   registerEditorTerminalHandlers(core);
+  bridge.attach(core);
   // The agent's terminal belongs to this activation, not to the workspace: a
   // stale one left behind on deactivate would still be sitting there, detached
   // from any core, the next time the extension started.
@@ -57,8 +69,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   registerCommands(context);
   registerTaskQueue(context);
-  registerMcpProvider(context);
-  registerUserMcpJson(context);
 
   // The browser path is worked out, never configured. On remote workspaces
   // this may download Chromium into the extension cache.
@@ -191,8 +201,11 @@ async function bootstrap(restart: boolean, chromiumPath?: string): Promise<void>
       (init.embeddingModel ? `, embedding ${init.embeddingModel}` : ''),
     );
     for (const w of init.warnings ?? []) {
-      output.appendLine(`[ext] warning: ${w}`);
+      output.appendLine(`[ext] warning: ${w}${mcpWarningHint(w)}`);
     }
+    // The Context tab shows each server's verdict next to its checkbox.
+    recordCoreInit(init);
+    queueView?.render();
 
     // A core with no model starts cleanly and then fails on the first message.
     // Say so now, once, with the way to fix it.
@@ -230,24 +243,33 @@ async function bootstrap(restart: boolean, chromiumPath?: string): Promise<void>
 }
 
 /**
- * Registers the task-queue MCP server in VS Code's own per-user `mcp.json`,
- * so it shows up there even on a VS Code build too old for
- * `registerMcpProvider`'s dynamic API (which silently no-ops below 1.99).
- * Best-effort: a machine with no workspace open yet, a read-only `User`
- * folder, or a not-yet-built `mfagent-mcp` binary should not stop the rest of
- * activation.
+ * What to do about an MCP server the core could not sign in to.
+ *
+ * A 401 has two common causes that look identical in the server's reply: a
+ * key the server no longer accepts, and a right key sent the wrong way — a
+ * bare token in the Authorization header where the server wants `Bearer
+ * <token>`. The header is in this process's hands, so the second case can be
+ * told apart and named; for the first, the Context tab is where a key of the
+ * extension's own goes.
  */
-function registerUserMcpJson(context: vscode.ExtensionContext): void {
-  try {
-    const bin = resolveMcpBinary(context);
-    if (!bin) {
-      return;
-    }
-    const file = writeUserMcpJson(context, bin);
-    output.appendLine(`[ext] registered MCP server in ${file}`);
-  } catch (e: any) {
-    output.appendLine(`[ext] could not register user mcp.json: ${e?.message ?? e}`);
+function mcpWarningHint(warning: string): string {
+  if (!/http 40[13]\b/.test(warning)) {
+    return '';
   }
+  const name = /^MCP server "([^"]+)"/.exec(warning)?.[1];
+  let bareToken = false;
+  if (name) {
+    try {
+      const server = discoverMcpServers(getContext(), store).find((s) => s.name === name);
+      const auth = server?.headers?.Authorization ?? server?.headers?.authorization;
+      bareToken = typeof auth === 'string' && auth.trim() !== '' && !/\s/.test(auth.trim());
+    } catch {
+      // No workspace yet, or the store is not up — the generic hint still applies.
+    }
+  }
+  return bareToken
+    ? ' — its Authorization header carries a bare token with no scheme; the server expects "Bearer <token>"'
+    : " — the server rejected the credentials it was given; set a key for it on the Task Queue view's Context tab";
 }
 
 /**
@@ -576,7 +598,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
       const list: any[] = (await core.request('mcp/status')) ?? [];
       if (list.length === 0) {
         void vscode.window.showInformationMessage(
-          'No MCP servers configured. Add them under mfagent.mcpServers.',
+          'No MCP servers configured. Add one on the settings page (MCP Servers tab) or under mfagent.mcpServers.',
         );
         return;
       }

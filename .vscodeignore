@@ -9,6 +9,7 @@ out/**/*.map
 **/*.ts
 **/tsconfig.json
 esbuild.mjs
+**/*.ps1
 .gitignore
 .env
 .mcp.json
@@ -18,3 +19,6 @@ esbuild.mjs
 !out/extension.js
 !media/**
 !bin/**
+
+# Kilocode's agent-manager folder, with its own node_modules — never part of the extension.
+.kilo/**

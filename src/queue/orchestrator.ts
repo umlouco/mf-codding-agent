@@ -14,6 +14,7 @@ import {
   withinRegion,
 } from './agents';
 import { NewTask, QueueStats, Task, TaskQueue } from './db';
+import { LiveLog } from './liveLog';
 import { JOURNAL_EVENTS, ProgressDecision, reviewProgress, VALIDATION_FAILED } from './monitor';
 import { completionForSupervisor } from './validation';
 import { runVerification } from './verification';
@@ -276,6 +277,20 @@ export class Orchestrator implements vscode.Disposable {
     }
     this.changed();
     this.log(`started — cron every ${Math.round(this.intervalMs / 1000)}s, mode ${this.mode}`);
+    // A task already waiting on the supervisor should not sit out a whole
+    // interval before the first tick — a start is the one moment nobody minds
+    // a review running straight away, and in lockstep nothing else can move
+    // until it has. The tick pumps for itself when it ends, so it replaces
+    // the pump below rather than doubling it.
+    //
+    // Deferred, not inline: start() also runs from activation, when a run
+    // was in progress before the window reloaded, and a review builds its
+    // prompt synchronously before the first await. Whatever that costs, it
+    // must be paid after activate() has returned, not inside it.
+    if (this.queue.awaitingVerification().length > 0) {
+      setTimeout(() => void this.tick(), 1000);
+      return;
+    }
     void this.pump();
   }
 
@@ -600,6 +615,9 @@ export class Orchestrator implements vscode.Disposable {
     const gen = ++this.reviewGen;
     const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now() };
     this.review = review;
+    // The supervisor's reasoning streams to the view like everyone else's —
+    // into the live table only, never into the journal it will read next time.
+    const live = new LiveLog(this.queue, task.id, 'supervisor');
 
     try {
       const decision = await reviewProgress(
@@ -612,8 +630,20 @@ export class Orchestrator implements vscode.Disposable {
           onAbort: (abort) => {
             review.abort = abort;
           },
+          onEvent: live.onEvent,
           onActivity: (activity) => {
             review.lastActivityAt = activity.at;
+            live.activity(activity);
+            // On the row as well, as supervise() does — but only for a task
+            // that has stopped. A running executor's own records are what
+            // the silent-worker sweep reads, and a review must not refresh
+            // them on a worker that is actually gone.
+            if (
+              task.status !== 'EXECUTING' &&
+              this.queue.recordActivity(task.id, activity.phase, activity.detail, 'supervisor')
+            ) {
+              this.changed();
+            }
           },
         },
       );
@@ -627,8 +657,16 @@ export class Orchestrator implements vscode.Disposable {
     } catch (error: any) {
       const message = String(error?.message ?? error);
       this.queue.log(task.id, 'supervisor', 'monitor-error', message);
+      // In the row and the terminal too: a supervisor that fails on every
+      // tick otherwise looks, from the list, exactly like one that never ran.
+      if (task.status !== 'EXECUTING') {
+        this.queue.recordActivity(task.id, 'error', `supervisor: ${message}`, 'supervisor');
+        this.changed();
+      }
+      live.note('error', `supervisor failed: ${message}`);
       this.log(`task ${task.seq} — progress review failed: ${message}; execution preserved`);
     } finally {
+      live.close();
       if (this.review === review) {
         this.review = null;
       }
@@ -763,8 +801,11 @@ export class Orchestrator implements vscode.Disposable {
     const pendingTools = new Map<string, { name: string; input: unknown }>();
     let kind = '';
     let buffer = '';
+    // The same stream at token granularity, for the view — see liveLog.ts.
+    const live = new LiveLog(this.queue, taskId, actor);
 
     const flush = (): void => {
+      live.flush();
       if (!buffer.trim()) {
         buffer = '';
         return;
@@ -774,6 +815,7 @@ export class Orchestrator implements vscode.Disposable {
     };
 
     const onEvent = (method: string, params: any): void => {
+      live.onEvent(method, params);
       if (method === 'stream/text' || method === 'stream/thinking') {
         const next = method === 'stream/thinking' ? 'reasoning' : 'response';
         if (kind && kind !== next) {
@@ -810,7 +852,7 @@ export class Orchestrator implements vscode.Disposable {
       ));
     };
 
-    return { flush, onEvent };
+    return { flush, onEvent, live };
   }
 
   /** Delegates formal verification to a fresh execution LLM and persists its response. */
@@ -825,6 +867,7 @@ export class Orchestrator implements vscode.Disposable {
         task,
         (activity) => {
           review.lastActivityAt = activity.at;
+          journal.live.activity(activity);
           if (this.queue.recordActivity(task.id, activity.phase, activity.detail, 'validator')) {
             this.changed();
           }
@@ -868,6 +911,14 @@ export class Orchestrator implements vscode.Disposable {
         });
       }
       this.log(`task ${task.seq} — validator stopped: ${message}; supervisor will reassess`);
+    } finally {
+      // Both paths above have written to the task -- tokens at least, usually
+      // a report as well -- and neither had any other reason to redraw. The
+      // executor fires this from its own finally (see runExecution) and
+      // supervise() ends with it, so a validator that stayed silent was the
+      // one turn whose cost and verdict reached the database without ever
+      // reaching the view.
+      this.changed();
     }
   }
 
@@ -881,25 +932,35 @@ export class Orchestrator implements vscode.Disposable {
     const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now() };
     this.review = review;
 
+    // See reviewWork: the verdict is watchable while it is being reached.
+    const live = new LiveLog(this.queue, task.id, 'supervisor');
     let decision: SupervisorDecision;
     try {
       decision = await superviseTask(this.context, this.output, task, this.rewrites(task), {
         onAbort: (abort) => {
           review.abort = abort;
         },
+        onEvent: live.onEvent,
         onActivity: (a) => {
           review.lastActivityAt = a.at;
+          live.activity(a);
           if (this.queue.recordActivity(task.id, a.phase, a.detail, 'supervisor')) {
             this.changed();
           }
         },
       });
     } catch (e: any) {
-      this.log(`supervisor failed on task ${task.seq}: ${e?.message ?? e}`);
-      this.queue.log(task.id, 'supervisor', 'error', String(e?.message ?? e));
+      const message = String(e?.message ?? e);
+      this.log(`supervisor failed on task ${task.seq}: ${message}`);
+      this.queue.log(task.id, 'supervisor', 'error', message);
+      // See reviewWork: the failure has to reach the row, not just the log.
+      this.queue.recordActivity(task.id, 'error', `supervisor: ${message}`, 'supervisor');
+      live.note('error', `supervisor failed: ${message}`);
+      this.changed();
       // Leave it in VERIFYING; the next tick tries again.
       return;
     } finally {
+      live.close();
       if (this.review === review) {
         this.review = null;
       }
@@ -1090,6 +1151,7 @@ export class Orchestrator implements vscode.Disposable {
     this.log(`executing task ${task.seq} — ${task.title} (attempt ${task.attempts})`);
 
     const journal = this.streamJournal(task.id, 'executor');
+    journal.live.note('attempt', `attempt ${task.attempts} started`);
 
     try {
       // Every record the worker writes lands in the database as it happens, so
@@ -1102,6 +1164,7 @@ export class Orchestrator implements vscode.Disposable {
         task,
         this.queue.instructions,
         (a) => {
+          journal.live.activity(a);
           if (this.queue.recordActivity(task.id, a.phase, a.detail)) {
             this.changed();
           }
@@ -1167,6 +1230,7 @@ export class Orchestrator implements vscode.Disposable {
     } catch (e: any) {
       journal.flush();
       const msg = String(e?.message ?? e);
+      journal.live.note('error', `stopped: ${msg}`);
       // A worker that died mid-turn — a dropped connection, a crashed core, or
       // abandonExecution killing it on purpose — still edited real files. Send
       // it to the supervisor with an empty validation report. The supervisor
@@ -1213,6 +1277,7 @@ export class Orchestrator implements vscode.Disposable {
   private async runExpansion(task: Task, attempt: number): Promise<void> {
     this.log(`expanding phase ${task.seq} — ${task.title} (attempt ${task.attempts})`);
     const goal = this.queue.getMeta('goal');
+    const live = new LiveLog(this.queue, task.id, 'planner');
 
     let result: PhaseExpansion;
     try {
@@ -1222,16 +1287,18 @@ export class Orchestrator implements vscode.Disposable {
         task,
         goal,
         (a) => {
+          live.activity(a);
           if (this.queue.recordActivity(task.id, a.phase, a.detail)) {
             this.changed();
           }
         },
-        undefined,
+        live.onEvent,
         (abort) => {
           this.executionAbort = abort;
         },
       );
     } catch (e: any) {
+      live.close();
       const msg = String(e?.message ?? e);
       const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'PENDING',
@@ -1253,6 +1320,7 @@ export class Orchestrator implements vscode.Disposable {
       return;
     }
 
+    live.close();
     this.executionAbort = null;
     this.queue.addUsage(task.id, result.usage);
 

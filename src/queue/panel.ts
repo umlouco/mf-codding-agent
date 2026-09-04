@@ -1,10 +1,14 @@
 import * as vscode from 'vscode';
 import { scheduleRestart } from '../coreRestart';
+import { mcpConnection } from '../coreStatus';
 import { discoverMcpServers } from '../mcp';
+import { getBridge } from '../mcpBridge';
 import { getStore } from '../providers/instance';
+import type { Skill } from '../providers/store';
 import { discoverInstalledSkills } from '../skills';
 import { editTasks, planGoal } from './agents';
 import { Task, TaskQueue } from './db';
+import { LiveLog } from './liveLog';
 import { Orchestrator } from './orchestrator';
 
 /**
@@ -20,9 +24,21 @@ import { Orchestrator } from './orchestrator';
  * *something* resolves it, so failing to register is indistinguishable from
  * hanging — which is exactly how a missing SQLite driver or an unwritable
  * workspace used to present itself on a remote host.
+ *
+ * Two feeds reach the webview. A full `state` push whenever the orchestrator
+ * says something changed shape — a status, the task list, the run — which
+ * rebuilds the view. And, while the view is visible, a 200 ms poll of the
+ * `agent_logs` table (see liveLog.ts) that streams each agent's output into
+ * the per-task terminals and pulses each live row's activity and token
+ * counts in place, so the interface keeps moving for as long as an agent is
+ * working, and a reply that takes a minute reads as a minute of text arriving
+ * rather than a minute of nothing.
  */
 export class QueueViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'mfagent.queue';
+
+  /** How often the live table is read while the view is showing. */
+  private static readonly STREAM_MS = 200;
 
   private view?: vscode.WebviewView;
   private generating = false;
@@ -30,6 +46,11 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   private orch?: Orchestrator;
   /** Why the queue is unavailable, when it is. */
   private problem?: string;
+  /** The newest agent_logs row the webview has been sent. */
+  private lastLogId = 0;
+  private streamTimer?: NodeJS.Timeout;
+  /** What the last pulse said, so an unchanged one is not sent again. */
+  private pulseSig = '';
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -43,8 +64,12 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     this.queue = queue;
     this.orch = orch;
     this.problem = undefined;
+    // Start streaming from now: what came before is fetched per terminal as
+    // it is opened, not replayed wholesale into a view that just appeared.
+    this.lastLogId = queue.latestLogId();
     orch.onDidChange(() => this.render());
     this.render();
+    this.syncStreaming();
   }
 
   /** The queue could not be opened. The view says so instead of spinning. */
@@ -53,6 +78,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     this.orch = undefined;
     this.problem = reason;
     this.render();
+    this.syncStreaming();
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -63,6 +89,67 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     };
     view.webview.html = this.html(view.webview);
     view.webview.onDidReceiveMessage((msg) => void this.onMessage(msg));
+    // A hidden view has nobody reading it; the poll stops with it and picks
+    // up where the table is when it shows again.
+    view.onDidChangeVisibility(() => this.syncStreaming());
+    view.onDidDispose(() => {
+      this.view = undefined;
+      this.syncStreaming();
+    });
+    this.syncStreaming();
+  }
+
+  // ---- the live stream ---------------------------------------------------
+
+  private syncStreaming(): void {
+    const want = !!this.view?.visible && !!this.queue;
+    if (want && !this.streamTimer) {
+      this.streamTimer = setInterval(() => this.pumpLive(), QueueViewProvider.STREAM_MS);
+    } else if (!want && this.streamTimer) {
+      clearInterval(this.streamTimer);
+      this.streamTimer = undefined;
+    }
+  }
+
+  /**
+   * One poll: new log rows since the last one, and a pulse of what each live
+   * task is doing. Both are cheap indexed reads, and both are skipped when
+   * there is nothing new, so an idle queue costs a query per tick and nothing
+   * on the wire.
+   */
+  private pumpLive(): void {
+    const queue = this.queue;
+    if (!queue || !this.view) {
+      return;
+    }
+    try {
+      const rows = queue.logsSince(this.lastLogId, 400);
+      if (rows.length) {
+        this.lastLogId = rows[rows.length - 1].id;
+        this.post({ type: 'logs', rows });
+      }
+      const status = this.orch?.status();
+      const tasks = queue
+        .list()
+        .filter((t) => t.status === 'EXECUTING' || t.status === 'VERIFYING')
+        .map((t) => ({
+          id: t.id,
+          status: t.status,
+          activityPhase: t.activityPhase,
+          activityDetail: t.activityDetail,
+          lastActivityAt: t.lastActivityAt,
+          tokensIn: t.tokensIn,
+          tokensOut: t.tokensOut,
+          tokensCacheRead: t.tokensCacheRead,
+        }));
+      const sig = JSON.stringify([tasks, status?.executing, status?.supervising, status?.nextTickAt]);
+      if (sig !== this.pulseSig) {
+        this.pulseSig = sig;
+        this.post({ type: 'pulse', tasks, status });
+      }
+    } catch (e: any) {
+      this.output.appendLine(`[queue:ui] live poll failed: ${e?.message ?? e}`);
+    }
   }
 
   reveal(): void {
@@ -124,16 +211,54 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
         // Both toggles restart the core (debounced) so the change reaches the
         // long-lived Chat session too, not just the next ephemeral queue run —
         // that one rebuilds its config fresh every time regardless.
+        //
+        // Each carries a list, not a single name: the Context tab's picker
+        // switches a whole group — a capability set, an MCP server's tools —
+        // from one parent checkbox, and that has to be one write and one
+        // restart rather than forty.
         case 'setMcpEnabled':
-          queue.setMcpServerEnabled(String(msg.name), !!msg.enabled);
+          queue.setMcpServerEnabled(names(msg.names), !!msg.enabled);
           this.render();
           scheduleRestart('MCP server toggled from the Task Queue', this.output);
           break;
         case 'setSkillGroupEnabled':
-          queue.setSkillGroupEnabled(String(msg.id), !!msg.enabled);
+          queue.setSkillGroupEnabled(names(msg.ids), !!msg.enabled);
           this.render();
           scheduleRestart('skill group toggled from the Task Queue', this.output);
           break;
+        case 'setEditorToolEnabled': {
+          // The baseline is what is *in force*, which for a workspace that has
+          // never picked is the defaults — so switching one tool off keeps the
+          // other three sets on instead of wiping them.
+          const next = new Set(getBridge().enabledToolNames());
+          for (const name of names(msg.names)) {
+            if (msg.enabled) {
+              next.add(name);
+            } else {
+              next.delete(name);
+            }
+          }
+          queue.setEditorTools([...next]);
+          this.render();
+          scheduleRestart('editor tool toggled from the Task Queue', this.output);
+          break;
+        }
+        case 'resetEditorTools':
+          queue.setEditorTools(getBridge().defaultToolNames());
+          this.render();
+          scheduleRestart('editor tools reset from the Task Queue', this.output);
+          break;
+        case 'setMcpKey':
+          await this.setMcpKey(String(msg.name ?? ''));
+          break;
+
+        // A terminal being opened asks for what it missed: the newest rows of
+        // its own stream, replacing whatever the webview buffered.
+        case 'logTail': {
+          const taskId = msg.id === null || msg.id === undefined ? null : Number(msg.id);
+          this.post({ type: 'logs', rows: queue.logsTail(taskId, 300), reset: true, taskId });
+          break;
+        }
 
         case 'start':
           if (await this.confirmAutonomy(queue)) {
@@ -225,6 +350,10 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     this.generating = true;
     this.render();
 
+    // Planning has no task yet, so its stream is the queue's own — the
+    // Planner terminal on the Plan tab.
+    const live = new LiveLog(queue, null, 'planner');
+    live.note('plan', `planning: ${goal.trim()}`);
     try {
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'Scanning the workspace and scoping a plan…' },
@@ -235,20 +364,24 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
             queue,
             goal,
             (method, params) => {
+              live.onEvent(method, params);
               if (method === 'stream/tool' && params?.status === 'running') {
                 progress.report({ message: params.name });
               }
             },
           );
           const n = append ? queue.addAll(phases) : queue.replaceAll(phases);
+          live.note('plan', `${n} phase(s) written to the queue`);
           void vscode.window.showInformationMessage(
             `Generated ${n} phase(s). Press Start to expand and run them.`,
           );
         },
       );
     } catch (e: any) {
+      live.note('error', `planning failed: ${e?.message ?? e}`);
       void vscode.window.showErrorMessage(`Could not generate a plan: ${e?.message ?? e}`);
     } finally {
+      live.close();
       this.generating = false;
       this.render();
     }
@@ -281,10 +414,12 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     this.generating = true;
     this.render();
 
+    const live = new LiveLog(queue, null, 'planner');
+    live.note('plan', `editing the task list: ${instruction.trim()}`);
     try {
       const result = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'Editing the task list…' },
-        () => editTasks(this.context, this.output, queue.list(), instruction),
+        () => editTasks(this.context, this.output, queue.list(), instruction, { onEvent: live.onEvent }),
       );
 
       const bySeq = new Map(queue.list().map((t) => [t.seq, t]));
@@ -318,15 +453,104 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       }
       queue.log(null, 'user', 'tasks-edited-by-prompt', result.summary);
 
+      live.note('plan', result.summary);
       void vscode.window.showInformationMessage(
         changed ? result.summary : 'Nothing changed — the plan may already match your instruction.',
       );
     } catch (e: any) {
+      live.note('error', `edit failed: ${e?.message ?? e}`);
       void vscode.window.showErrorMessage(`Could not edit tasks: ${e?.message ?? e}`);
     } finally {
+      live.close();
       this.generating = false;
       this.render();
     }
+  }
+
+  /**
+   * Gives one discovered MCP server a key of its own, without touching the
+   * file it came from.
+   *
+   * A server from VS Code's user `mcp.json` or the `mfagent.mcpServers`
+   * setting carries whatever credential is written there, and when the
+   * server rejects it the only remedy used to be editing that file by hand —
+   * with a key in cleartext. This instead makes a copy on the settings page
+   * under the same name, which is what wins at discovery time, and files the
+   * key in the OS keychain where the copy's key belongs. The file is left as
+   * it is. A server that already lives on the settings page just gets its
+   * key replaced.
+   */
+  private async setMcpKey(name: string): Promise<void> {
+    const store = getStore();
+    const found = discoverMcpServers(this.context, store).find((s) => s.name === name);
+    if (!found) {
+      return;
+    }
+    const http = !!found.url;
+    let def = found.source === 'store' && found.id ? store.mcpServer(found.id) : undefined;
+    if (!def) {
+      const created = await store.addMcpServer(name);
+      await store.updateMcpServer(created.id, {
+        name,
+        transport: http ? 'http' : 'stdio',
+        url: found.url,
+        headers: found.headers ? { ...found.headers } : undefined,
+        command: found.command,
+        args: found.args ? [...found.args] : undefined,
+        env: found.env ? { ...found.env } : undefined,
+        enabled: true,
+        // The scheme the server itself names in its challenge. The key
+        // written at connect time replaces any header of the same name the
+        // copy inherited, which is the whole point when that one was wrong.
+        keyName: http ? 'Authorization' : '',
+        keyPrefix: http ? 'Bearer ' : undefined,
+      });
+      def = store.mcpServer(created.id);
+    }
+    if (!def) {
+      return;
+    }
+
+    let keyName = def.keyName?.trim() ?? '';
+    if (!keyName) {
+      const typed = await vscode.window.showInputBox({
+        title: `Key for MCP server "${name}"`,
+        prompt: http ? 'Which header carries the key?' : 'Which environment variable carries the key?',
+        value: http ? 'Authorization' : '',
+        placeHolder: http ? 'Authorization' : 'API_KEY',
+        ignoreFocusOut: true,
+      });
+      keyName = typed?.trim() ?? '';
+      if (!keyName) {
+        return;
+      }
+      await store.updateMcpServer(def.id, {
+        keyName,
+        keyPrefix: http && /^authorization$/i.test(keyName) ? (def.keyPrefix || 'Bearer ') : def.keyPrefix,
+      });
+      def = store.mcpServer(def.id) ?? def;
+    }
+
+    const typedKey = await vscode.window.showInputBox({
+      title: `Key for MCP server "${name}"`,
+      prompt: `Stored in the OS keychain and sent as ${keyName}${def.keyPrefix ? ` (${def.keyPrefix.trim()} …)` : ''}. Leave empty to clear.`,
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (typedKey === undefined) {
+      return;
+    }
+    let key = typedKey.trim();
+    // A key pasted with its scheme — "Bearer xyz" — would be sent as
+    // "Bearer Bearer xyz" once the prefix is added; keep just the key.
+    const prefix = def.keyPrefix?.trim();
+    if (prefix && key.toLowerCase().startsWith(`${prefix.toLowerCase()} `)) {
+      key = key.slice(prefix.length).trim();
+    }
+    await store.setMcpKey(def.id, key);
+    // The store's change event restarts the core, which is what tries the
+    // key; the row shows the result once that core has reported in.
+    this.render();
   }
 
   // ---- confirmations ---------------------------------------------------
@@ -337,19 +561,32 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
    */
   private async confirmAutonomy(queue: TaskQueue): Promise<boolean> {
     const stats = queue.stats();
-    const runnable = stats.byStatus.PENDING + stats.byStatus.PAUSED;
-    if (runnable === 0) {
-      void vscode.window.showInformationMessage('Nothing to run — no PENDING tasks in the queue.');
+    const pending = stats.byStatus.PENDING + stats.byStatus.PAUSED;
+    // A task awaiting verification is work too — the supervisor's — and the
+    // supervisor only ticks while the run is going. So is a task left
+    // EXECUTING by a process that no longer exists, which start() sends to
+    // verification. Counting only PENDING here refused to start a queue whose
+    // last task was VERIFYING, which left it with no way to ever finish.
+    const verifying = stats.byStatus.VERIFYING + stats.byStatus.EXECUTING;
+    if (pending + verifying === 0) {
+      void vscode.window.showInformationMessage(
+        'Nothing to run — no PENDING tasks and nothing awaiting verification.',
+      );
       return false;
     }
+    const title =
+      pending > 0
+        ? `Start the autonomous run over ${pending} task(s)` +
+          (verifying > 0 ? `, with ${verifying} awaiting verification?` : '?')
+        : `Resume supervision of ${verifying} task(s) awaiting verification?`;
     const pick = await vscode.window.showWarningMessage(
-      `Start the autonomous run over ${runnable} task(s)?`,
+      title,
       {
         modal: true,
         detail:
           'Execution and Supervisor agents will edit files and run shell commands in this ' +
-          'workspace without asking for confirmation. Only do this in a workspace you trust, ' +
-          'and with your work committed.',
+          'workspace without asking for confirmation — a task the supervisor sends back is ' +
+          'executed again. Only do this in a workspace you trust, and with your work committed.',
       },
       'Start run',
     );
@@ -435,27 +672,39 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       driver: queue.impl,
       instructions: queue.instructions,
       models: { planner: '', supervisor: '', executor: '' },
-      mcpServers: discoverMcpServers(this.context).map((s) => ({
+      mcpServers: discoverMcpServers(this.context, getStore()).map((s) => ({
         name: s.name,
         source: s.source,
         configured: !!(s.command || s.url),
         enabled: !disabledMcp.has(s.name),
+        // The server's own switch, from the settings page — separate from
+        // this workspace's pick above.
+        serverEnabled: s.enabled !== false,
+        problem: s.problem,
+        // What the last core start made of it — see coreStatus.ts.
+        connection: mcpConnection(s.name),
+        canSetKey: !!(s.url || s.command),
       })),
+      editorTools: getBridge().tree(),
       skillGroups: [
         ...getStore().settings.skillGroups.map((g) => ({
           id: g.id,
           name: g.name,
-          skillCount: g.skillIds.length,
           enabled: enabledSkillGroups.has(g.id),
           source: 'authored' as const,
+          // The skills themselves, so a group can be unfolded rather than
+          // taken on trust from a count.
+          skills: g.skillIds
+            .map((id) => getStore().settings.skills.find((s) => s.id === id))
+            .filter((s): s is Skill => !!s)
+            .map((s) => ({ name: s.name, description: s.description ?? '' })),
         })),
         ...discoverInstalledSkills().map((d) => ({
           id: d.group.id,
           name: d.group.name,
-          skillCount: 1,
           enabled: enabledSkillGroups.has(d.group.id),
           source: 'installed' as const,
-          description: d.skill.description,
+          skills: [{ name: d.skill.name, description: d.skill.description ?? '' }],
         })),
       ],
     });
@@ -525,13 +774,26 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   </nav>
 
   <section id="pane-context" class="pane" hidden>
+    <div class="picker-bar">
+      <input id="ctxFilter" class="picker-search" type="search" placeholder="Filter tools, servers and skills…" aria-label="Filter the context list" />
+      <span id="ctxCount" class="picker-count" title="Everything switched on for this workspace">0 selected</span>
+    </div>
+    <p class="hint">What is checked here is what every agent in this workspace gets, in Chat and in every Task Queue run alike. Check a group to take all of it.</p>
+
+    <h3 class="section-title">
+      Tools
+      <button id="ctxDefaults" class="ghost hdr-action" title="Back to the built-in edit, execute, read and search sets">Restore defaults</button>
+    </h3>
+    <p class="hint">Everything <code>vscode.lm.tools</code> offers, grouped by where it comes from. A checked tool reaches the agent as <code>editor__&lt;name&gt;</code> and the editor runs it. <code>edit</code>, <code>execute</code>, <code>read</code> and <code>search</code> start on; the rest is opt-in, because every definition travels with every request.</p>
+    <div id="editorToolTree" class="tree"></div>
+
     <h3 class="section-title">MCP servers</h3>
-    <p class="hint">Checked servers are connected and their tools offered to the agent — in Chat and in every Task Queue run alike. Discovered from your VS Code user <code>mcp.json</code> and the <code>mfagent.mcpServers</code> setting.</p>
-    <div id="mcpList" class="checklist"></div>
+    <p class="hint">Servers the agent's core dials itself, separately from the editor — from your VS Code user <code>mcp.json</code> and the <code>mfagent.mcpServers</code> setting.</p>
+    <div id="mcpList" class="tree"></div>
 
     <h3 class="section-title">Skill groups</h3>
-    <p class="hint">Checked groups are injected into the agent's system prompt. Author skills and groups from Settings, or use "MF Agent: Install Skill Pack" (or <code>npx skills add &lt;repo&gt; -g -a &lt;agent&gt;</code> directly) — installed packs appear here automatically.</p>
-    <div id="skillGroupList" class="checklist"></div>
+    <p class="hint">Injected into the agent's system prompt; unfold a group to read what it carries. Author them in Settings, or use "MF Agent: Install Skill Pack" (<code>npx skills add &lt;repo&gt; -g -a &lt;agent&gt;</code>) — installed packs appear here on their own.</p>
+    <div id="skillGroupList" class="tree"></div>
   </section>
 
   <section id="pane-plan" class="pane" hidden>
@@ -542,6 +804,10 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     </div>
     <button id="generate" class="primary">Generate plan</button>
     <p class="hint">The workspace is scanned and split into regions first, then the planner scopes phases over them — each phase is explored and turned into verifiable tasks with a test command once you press Start, so planning stays fast no matter how large the project is.</p>
+    <details class="termwrap" open>
+      <summary class="lbl">Planner output</summary>
+      <pre id="plannerTerm" class="term"></pre>
+    </details>
 
     <label class="lbl" for="editInstruction">Edit the existing tasks</label>
     <textarea id="editInstruction" rows="4" placeholder="e.g. Drop the caching task, and add integration tests for the new endpoint."></textarea>
@@ -597,4 +863,14 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
+}
+
+/**
+ * A webview message's list of names, taken as read but not on faith: the
+ * picker sends one name for a leaf and every name under a group for a parent,
+ * and either way the strings land in a database write.
+ */
+function names(value: unknown): string[] {
+  const list = Array.isArray(value) ? value : [value];
+  return list.filter((v) => typeof v === 'string' && v.length > 0) as string[];
 }

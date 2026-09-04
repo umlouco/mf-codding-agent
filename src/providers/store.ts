@@ -101,6 +101,39 @@ export interface SkillGroup {
   skillIds: string[];
 }
 
+/**
+ * An MCP server this extension owns, as opposed to one merely discovered in
+ * VS Code's user `mcp.json` or the `mfagent.mcpServers` setting.
+ *
+ * It exists because those two sources are plain JSON files, and an MCP server
+ * that needs an API key cannot be described in either without writing the key
+ * down in cleartext -- in `settings.json`, or worse in a project `.mcp.json`
+ * that is usually committed. A server defined here keeps its key in the OS
+ * keychain like a provider's, and only the name of the env var or header it
+ * belongs in is stored alongside the rest of the definition.
+ */
+export interface McpServer {
+  id: string;
+  name: string;
+  /** 'stdio' spawns command+args; 'http' dials url. */
+  transport: 'stdio' | 'http';
+  command?: string;
+  args?: string[];
+  /** Non-secret environment for a stdio server. The key is not in here. */
+  env?: Record<string, string>;
+  url?: string;
+  /** Non-secret headers for an http server. The key is not in here. */
+  headers?: Record<string, string>;
+  enabled: boolean;
+  /**
+   * Where the stored key is injected at connect time: the name of an env var
+   * for stdio, or of a header for http. Empty means this server takes no key.
+   */
+  keyName?: string;
+  /** Prepended to the key in a header -- almost always 'Bearer '. http only. */
+  keyPrefix?: string;
+}
+
 export interface AgentSettings {
   version: 2;
   profiles: Profile[];
@@ -110,6 +143,7 @@ export interface AgentSettings {
   browser: { headless: boolean };
   skills: Skill[];
   skillGroups: SkillGroup[];
+  mcpServers: McpServer[];
 }
 
 /** A role resolved all the way down to something the Go core can dial. */
@@ -117,7 +151,11 @@ export interface ResolvedRole {
   role: Role;
   profile?: Profile;
   def?: ProviderDef;
-  /** 'anthropic' or 'openai-compatible' — what the core switches on. */
+  /**
+   * The provider kind: 'anthropic', 'openai-compatible', 'claude-cli' or
+   * 'vscode-lm'. The last two are not endpoints the core can dial as they
+   * are — llm/router.ts decides how a turn on either is actually carried.
+   */
   kind: string;
   model: string;
   /** Reasoning-effort hint, or '' for the provider's own default. */
@@ -130,6 +168,7 @@ export interface ResolvedRole {
 
 const STATE_KEY = 'mfagent.settings.v2';
 const SECRET_PREFIX = 'mfagent.apiKey.';
+const MCP_SECRET_PREFIX = 'mfagent.mcpKey.';
 const MIGRATED_KEY = 'mfagent.migratedFromSettings';
 
 function emptyRoles(): Record<Role, RoleBinding> {
@@ -148,6 +187,7 @@ export function defaultSettings(): AgentSettings {
     browser: { headless: false },
     skills: [],
     skillGroups: [],
+    mcpServers: [],
   };
 }
 
@@ -298,6 +338,64 @@ export class ProfileStore {
   async removeSkillGroup(id: string): Promise<void> {
     const skillGroups = this.cache.skillGroups.filter((g) => g.id !== id);
     await this.write({ ...this.cache, skillGroups });
+  }
+
+  // ---- mcp servers -------------------------------------------------------
+
+  get mcpServers(): McpServer[] {
+    return this.cache.mcpServers;
+  }
+
+  mcpServer(id: string): McpServer | undefined {
+    return this.cache.mcpServers.find((s) => s.id === id);
+  }
+
+  async addMcpServer(name?: string): Promise<McpServer> {
+    const server: McpServer = {
+      id: newId(),
+      name: uniqueName(this.cache.mcpServers, name || 'New server'),
+      transport: 'stdio',
+      command: '',
+      args: [],
+      env: {},
+      enabled: true,
+      keyName: '',
+    };
+    await this.write({ ...this.cache, mcpServers: [...this.cache.mcpServers, server] });
+    return server;
+  }
+
+  async updateMcpServer(id: string, patch: Partial<Omit<McpServer, 'id'>>): Promise<void> {
+    const mcpServers = this.cache.mcpServers.map((s) => (s.id === id ? { ...s, ...patch } : s));
+    await this.write({ ...this.cache, mcpServers });
+  }
+
+  async removeMcpServer(id: string): Promise<void> {
+    const mcpServers = this.cache.mcpServers.filter((s) => s.id !== id);
+    await this.context.secrets.delete(MCP_SECRET_PREFIX + id);
+    await this.write({ ...this.cache, mcpServers });
+  }
+
+  async getMcpKey(id: string): Promise<string> {
+    return (await this.context.secrets.get(MCP_SECRET_PREFIX + id)) ?? '';
+  }
+
+  async setMcpKey(id: string, key: string): Promise<void> {
+    if (key) {
+      await this.context.secrets.store(MCP_SECRET_PREFIX + id, key);
+    } else {
+      await this.context.secrets.delete(MCP_SECRET_PREFIX + id);
+    }
+    this.changed.fire();
+  }
+
+  /** Which MCP servers have a key stored, for the settings UI's status pills. */
+  async mcpKeyStatus(): Promise<Record<string, boolean>> {
+    const out: Record<string, boolean> = {};
+    for (const s of this.cache.mcpServers) {
+      out[s.id] = !!(await this.getMcpKey(s.id));
+    }
+    return out;
   }
 
   // ---- secrets ---------------------------------------------------------
@@ -549,6 +647,7 @@ export class ProfileStore {
         browser: { headless: cfg.get<boolean>('browser.headless', false) },
         skills: this.cache.skills,
         skillGroups: this.cache.skillGroups,
+        mcpServers: this.cache.mcpServers,
       });
 
       for (const [id, key] of secrets) {
@@ -675,6 +774,26 @@ function normalise(raw: unknown): AgentSettings {
         }))
     : [];
 
+  const mcpServers: McpServer[] = Array.isArray(r.mcpServers)
+    ? r.mcpServers
+        .filter((s): s is McpServer => !!s && typeof s === 'object' && typeof s.id === 'string')
+        .map((s) => ({
+          id: s.id,
+          name: String(s.name ?? 'Unnamed'),
+          transport: s.transport === 'http' ? 'http' : 'stdio',
+          command: s.command ? String(s.command) : undefined,
+          args: Array.isArray(s.args) ? s.args.map(String) : undefined,
+          env: s.env && typeof s.env === 'object' ? { ...s.env } : undefined,
+          url: s.url ? String(s.url) : undefined,
+          headers: s.headers && typeof s.headers === 'object' ? { ...s.headers } : undefined,
+          // Absent means on: a server saved before this field existed, and a
+          // newly added one, should both be live rather than silently inert.
+          enabled: s.enabled !== false,
+          keyName: s.keyName ? String(s.keyName) : undefined,
+          keyPrefix: s.keyPrefix ? String(s.keyPrefix) : undefined,
+        }))
+    : [];
+
   return {
     version: 2,
     profiles,
@@ -686,5 +805,6 @@ function normalise(raw: unknown): AgentSettings {
     browser: { headless: !!r.browser?.headless },
     skills,
     skillGroups,
+    mcpServers,
   };
 }

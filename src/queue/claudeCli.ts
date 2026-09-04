@@ -78,8 +78,19 @@ export async function runClaudeCliTurn(
   const bin = resolved.profile?.extra?.cliPath?.trim() || 'claude';
   const cwd = workspaceRoot() || process.cwd();
 
+  /*
+   * The prompt goes in on stdin, never in argv.
+   *
+   * A planner prompt carries the whole queue — every task's title and full
+   * description (see agents.ts's editTasks) — and a supervisor's carries a
+   * task journal, so either runs to tens of thousands of characters on a real
+   * project. Windows caps an entire command line at 32,767, and cp.spawn does
+   * not degrade gracefully past it: it throws ENAMETOOLONG synchronously,
+   * before the CLI is ever started. `claude -p` with no prompt argument reads
+   * the prompt from stdin, which has no such limit.
+   */
   const args = [
-    '-p', prompt,
+    '-p',
     '--output-format', 'stream-json',
     '--verbose',
     '--include-partial-messages',
@@ -111,9 +122,22 @@ export async function runClaudeCliTurn(
   const proc = cp.spawn(bin, args, {
     cwd,
     env: { ...process.env },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
+
+  // Reported on 'close' below. Without a listener here, a failure to start at
+  // all -- no `claude` on PATH being the usual one -- reaches the extension
+  // host as an unhandled 'error' event instead of this turn's rejection.
+  let spawnError: Error | undefined;
+  proc.on('error', (err: Error) => {
+    spawnError = err;
+  });
+
+  // An aborted or crashed CLI closes stdin from its end mid-write; that EPIPE
+  // is the turn ending, not a fault to propagate.
+  proc.stdin.on('error', () => {});
+  proc.stdin.end(prompt);
 
   opts.onAbort?.(() => killTree(proc.pid));
   opts.onCancellable?.(() => killTree(proc.pid));
@@ -213,6 +237,9 @@ export async function runClaudeCliTurn(
   });
   rl.close();
 
+  if (spawnError) {
+    throw new Error(`could not start the claude CLI ("${bin}"): ${spawnError.message}`);
+  }
   if (!finalResult) {
     throw new Error(
       `claude CLI exited (code ${exitCode}) with no result` +

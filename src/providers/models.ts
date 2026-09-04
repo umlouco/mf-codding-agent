@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { getRouter } from '../llm/router';
 import {
   ListStyle,
   ProviderDef,
@@ -78,6 +79,9 @@ export class ModelRegistry {
     force = false,
   ): Promise<ModelList> {
     const def = providerOrFallback(providerId);
+    if (def.kind === 'vscode-lm') {
+      return this.listEditorModels(force);
+    }
     const base = effectiveBaseURL(providerId, baseURLOverride);
     const key = cacheKey(providerId, base);
 
@@ -127,6 +131,9 @@ export class ModelRegistry {
     apiKey: string,
   ): Promise<{ ok: boolean; message: string }> {
     const def = providerOrFallback(providerId);
+    if (def.kind === 'vscode-lm') {
+      return getRouter().testAccess();
+    }
     const base = effectiveBaseURL(providerId, baseURLOverride);
     if (def.listStyle === 'none') {
       return {
@@ -139,6 +146,33 @@ export class ModelRegistry {
       return { ok: true, message: `Connected — ${models.length} model(s) available.` };
     } catch (e) {
       return { ok: false, message: describeError(e) };
+    }
+  }
+
+  /**
+   * The editor's models, straight from `vscode.lm`. Never cached in
+   * globalState: the API is local and already knows when its set changes
+   * (the router listens for that), so a stale copy could only mislead.
+   */
+  private async listEditorModels(force: boolean): Promise<ModelList> {
+    try {
+      const models = await getRouter().listModels(force);
+      return {
+        models: models.map((m) => ({
+          id: m.id,
+          name: m.name && m.name !== m.id ? m.name : undefined,
+          contextWindow: m.maxInputTokens > 0 ? m.maxInputTokens : undefined,
+          vision: looksLikeVisionModel(m.id) || looksLikeVisionModel(m.family),
+          embedding: false,
+          description: [m.vendor, m.family].filter(Boolean).join(' · '),
+        })),
+        fetchedAt: Date.now(),
+        error: models.length
+          ? undefined
+          : 'No language models are available in this VS Code. Install and sign in to a provider such as GitHub Copilot.',
+      };
+    } catch (e) {
+      return { models: [], fetchedAt: 0, error: describeError(e) };
     }
   }
 

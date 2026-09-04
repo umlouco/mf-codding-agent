@@ -101,7 +101,7 @@ function parseSkillMd(raw: string): { name?: string; description?: string; body:
 /**
  * Scans every folder from `globalSkillsDirs()` for installed packs, each
  * becoming one read-only `Skill` plus a single-skill `SkillGroup` of the same
- * identity — so it shows up in the Task Queue's "Skill groups" checklist
+ * identity — so it shows up in the Task Queue's "Skill groups" picker
  * exactly like a hand-authored group, with its own enable/disable checkbox,
  * per workspace.
  *

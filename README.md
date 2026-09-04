@@ -1,14 +1,19 @@
 # MF Agent
 
-A lightweight coding agent for VS Code. Clean-room — no Copilot, no dependency on
-`vscode.lm`, no notebook support, no ecosystem you don't use.
+A lightweight coding agent for VS Code 1.136 and newer. Clean-room — no notebook
+support, no ecosystem you don't use — and built on the editor's own modern APIs:
+the models VS Code offers through `vscode.lm` are the default place its agents
+run, and the MCP servers the editor manages are shared in both directions.
 
 Built around four things: **graph memory that survives across sessions**, **strong
 editing tools**, **POSIX commands that work natively on Windows**, and **real browser
-testing**. Plus MCP, so you can plug in anything else.
+testing**. Plus MCP, so you can plug in anything else, and an autonomous task
+queue — planner, executors, verifiers and a supervisor loop — brokered through a
+SQLite database you can watch live.
 
-The whole extension is a **19 KB** JavaScript shim. Everything real happens in a
-single compiled Go binary.
+The extension host stays a thin shim: spawn the core, pump JSON-RPC, render the
+webviews, and adapt the editor's APIs for a process that cannot call them.
+Everything real happens in a single compiled Go binary.
 
 ---
 
@@ -21,21 +26,27 @@ as one static binary with no runtime dependencies — the same pattern `gopls` a
 `rust-analyzer` use.
 
 ```
-┌─ VS Code extension host ────────────┐
-│  extension.ts   commands, gating    │
-│  panel.ts       webview chat        │   19 KB of JS
-│  core.ts        JSON-RPC over stdio │
-└──────────────┬──────────────────────┘
+┌─ VS Code extension host ──────────────────────────────────┐
+│  extension.ts    commands, gating                         │
+│  panel.ts        webview chat                             │
+│  queue/          task store, orchestrator, supervisor     │
+│                  loop, live webview (200 ms SQLite poll)  │
+│  llm/router.ts   which transport carries a role           │
+│  llm/lmProxy.ts  vscode.lm behind an OpenAI endpoint      │
+│  mcpBridge.ts    MCP servers ⇄ VS Code, lm.tools ⇒ core   │
+│  core.ts         JSON-RPC over stdio                      │
+└──────────────┬────────────────────────────────────────────┘
                │ newline-delimited JSON-RPC 2.0
-┌──────────────▼──────────────────────┐
-│  mfcore  (single static Go binary)  │
-│                                     │
-│  agent loop ── tools ── graph memory│
-│       │         │        (SQLite)   │
-│       │         ├─ MCP clients      │
-│       │         └─ browser (CDP)    │
-│       └─ LLM: Anthropic / OpenAI-compatible
-└─────────────────────────────────────┘
+┌──────────────▼──────────────────────────────────────────┐
+│  mfcore  (single static Go binary)                      │
+│                                                         │
+│  agent loop ── tools ── graph memory (SQLite)           │
+│       │         ├─ MCP clients                          │
+│       │         ├─ editor tools ──▶ lm/invokeTool, host │
+│       │         └─ browser (CDP)                        │
+│       └─ LLM: vscode.lm via the proxy / Anthropic /     │
+│               any OpenAI-compatible endpoint            │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -222,7 +233,9 @@ Use this on code you have under version control, and read what it does.
 
 ## Setup
 
-Requires Go 1.24+ and Node 20+ to build.
+Requires VS Code 1.136 or newer to run, and Go 1.24+ and Node 20+ to build.
+Nothing in the extension carries a fallback for an older editor: the `vscode.lm`
+and MCP definition-provider APIs it is built on are assumed to be there.
 
 ```bash
 npm install
@@ -238,10 +251,22 @@ Run **MF Agent: Settings — Providers & Models** from the command palette (or t
 on the Task Queue view). Everything to do with LLMs lives there, not in
 `settings.json`.
 
-**Providers.** Pick from Anthropic, OpenAI, OpenRouter, Google Gemini, DeepSeek,
-Mistral, Groq, xAI, Together, Fireworks, Cerebras, Ollama, LM Studio, vLLM, Voyage,
-or any OpenAI-compatible endpoint. Each one asks for the fields it actually needs.
-You can keep several — a hosted account and a local server side by side.
+**Providers.** Start with **VS Code Language Models**: the models the editor
+itself offers through `vscode.lm` — GitHub Copilot's, and any other vendor an
+installed extension registers — with no key, endpoint or account beyond the one
+VS Code already has. VS Code asks once for consent the first time a model is
+used; **Test connection** on that provider triggers the prompt. The Go core
+cannot call editor APIs, so the extension runs a loopback proxy that presents
+those models as an OpenAI-compatible endpoint (`src/llm/lmProxy.ts`), and every
+tool — files, shells, browser, memory, MCP — works on them exactly as it does on
+an HTTP provider. Token counts on those turns come from the model's own
+tokenizer, since the API reports none.
+
+Or pick from Anthropic, OpenAI, OpenRouter, Google Gemini, DeepSeek, Mistral,
+Groq, xAI, Together, Fireworks, Cerebras, Ollama, LM Studio, vLLM, Voyage, any
+OpenAI-compatible endpoint, or the Claude Code CLI. Each one asks for the fields
+it actually needs. You can keep several — an editor model, a hosted account and a
+local server side by side.
 
 **API keys** go to the OS keychain via VS Code's `SecretStorage`. Leave a key blank
 to fall back to the provider's environment variable (`ANTHROPIC_API_KEY`,
@@ -251,7 +276,9 @@ to fall back to the provider's environment variable (`ANTHROPIC_API_KEY`,
 capabilities where it publishes them. Nothing is hard-coded, so a model released
 this morning shows up after **Refresh**.
 
-**Roles** bind a provider and model to a job:
+**Roles** bind a provider and model to a job. This is model selection per task
+type — the planner, supervisor and executor each get their own binding, and an
+editor model is picked here like any other:
 
 | Role | What it drives |
 |---|---|
@@ -296,6 +323,23 @@ match wins; nothing is required and nothing merges, so pick one.
 Both stdio and streamable HTTP transports are supported. Servers connect in parallel
 at startup; one that fails is reported as a warning rather than blocking activation.
 
+A server that needs an API key belongs on the settings page's **MCP Servers** tab
+instead: the key goes to the OS keychain and is put back into the server's
+environment (stdio) or headers (HTTP) only when the server starts — never into a
+file that might be committed.
+
+Every server from all three sources is also published to VS Code's own MCP engine
+through `vscode.lm.registerMcpServerDefinitionProvider`, so it appears in the
+editor's MCP Servers view and Copilot Chat can use it. The editor's language-model
+tools flow the other way: the Task Queue's **Context** tab shows everything in
+`vscode.lm.tools` — tools other extensions register, and the tools of MCP servers
+VS Code runs itself — as a tree grouped by where each came from, so a group can be
+checked instead of its members. A checked tool is handed to every agent as
+`editor__<name>` and run by the editor on the agent's behalf. A new workspace starts
+with the built-in `edit`, `execute`, `read` and `search` sets on and everything else
+off, because each tool definition travels with every request an agent makes. The
+grouping is `src/editorTools.ts`, the rest `src/mcpBridge.ts`.
+
 The extension also bundles `mfagent-mcp`, a stdio MCP server for Claude Code,
 Codex, Kilocode, and other MCP clients. Run **MF Agent: Register Task Queue
 MCP Server (Claude Code / Codex)** to wire it up automatically — it runs
@@ -324,10 +368,32 @@ others immediately.
 
 ---
 
+## Watching the queue run
+
+The queue database is the broker for everything the agents do, and the Task
+Queue view reads it two ways: a full redraw whenever the orchestrator says the
+state changed shape, and — while the view is showing — a 200 ms poll of the
+`agent_logs` table, which every agent writes to as it works: the text and
+reasoning it produces, each tool call and what came back, and the activity
+records it writes while it waits. Open a task and its **Live output** terminal
+shows all of that from every agent that touches it — executor, verifier,
+supervisor, and for a phase the planner. Planning from the Plan tab has a
+terminal of its own. Rows are pruned per task (`mfagent.queue.liveLogKeep`); the
+durable journal the supervisor reads, `task_events`, is separate and never pruned.
+
+The supervisor loop wakes every `mfagent.queue.cronIntervalSeconds` (10 s by
+default) and reads the `tasks` and `agent_logs` tables to decide, per task,
+whether work continues, stops, is broken down, or goes to verification. In the
+protocol the agents speak those are `CONTINUE_EXECUTION`, `STOP_AND_REWRITE_TASK`
+and `STOP_AND_REWRITE_VALIDATION`, `SPLIT`, and `START_VALIDATION` — see
+`src/queue/monitor.ts` and `src/queue/orchestrator.ts`. A tick that finds nothing
+new costs a few indexed reads; a full review of live work is a model turn and is
+rate-limited separately (`mfagent.queue.reviewIntervalSeconds`).
+
 ## Settings
 
-Providers, models, roles, languages and the browser toggle live on the **MF Agent
-Settings** page. What stays in `settings.json` is the handful of plain values the
+Providers, models, roles, languages, MCP servers and the browser toggle live on
+the **MF Agent Settings** page. What stays in `settings.json` is the handful of plain values the
 VS Code settings editor is genuinely good at:
 
 | Setting | Default | Notes |
@@ -335,7 +401,8 @@ VS Code settings editor is genuinely good at:
 | `mfagent.memory.enabled` | `true` | Graph memory for this workspace |
 | `mfagent.mcpServers` | `[]` | See above |
 | `mfagent.queue.mode` | `lockstep` | or `continuous` |
-| `mfagent.queue.cronIntervalSeconds` | `60` | Default supervisor wake-up interval. A task list that picks its own in the Task Queue view wins |
+| `mfagent.queue.cronIntervalSeconds` | `10` | How often the supervisor loop reads the queue. A task list that picks its own interval in the Task Queue view wins |
+| `mfagent.queue.liveLogKeep` | `2000` | Live-output rows kept per task in `agent_logs` |
 | `mfagent.queue.maxRounds` | `80` | Maximum tool-calling rounds per unattended turn; retries keep the same ceiling and repeated identical failures stop early |
 | `mfagent.queue.maxFilesPerRegion` | `150` | Largest file count one region of the workspace may hold before the deterministic scan splits it further — bounds how much a phase's expansion agent explores in one sitting, regardless of project size |
 | `mfagent.queue.workerSilentMinutes` | `10` | How long a worker may write nothing before it counts as dead |
@@ -430,13 +497,22 @@ node scripts/build-core.mjs --all   # cross-compile all six targets
 cd core && go test ./...
 ```
 
+On Windows, `build.ps1` is the one entry point: a plain run is a host build,
+`-Package` bumps the patch version, builds every target and packs the `.vsix`,
+and `-Install` does that and installs it. `-Bump minor|major|none` controls the
+version step; `-Watch` rebuilds the bundle on every save.
+
 Cross-compilation needs no per-platform toolchain — nothing in the core uses cgo.
 
 ### Layout
 
 ```
 src/            extension host shim (TypeScript)
-media/          webview chat UI (vanilla HTML/CSS/JS)
+  llm/          the LLM router, and the vscode.lm loopback proxy
+  mcpBridge.ts  the MCP bridge: servers ⇄ VS Code, vscode.lm.tools ⇒ core
+  queue/        db.ts (the task store), orchestrator.ts + monitor.ts (the
+                supervisor loop), panel.ts (the live webview), liveLog.ts
+media/          webview UIs (vanilla HTML/CSS/JS)
 core/
   cmd/mfcore/   entry point, JSON-RPC method registration
   internal/
@@ -470,6 +546,13 @@ the build.
   passes it through — but nothing calls it yet.
 - MCP support covers tools, not prompts or resources.
 - Prompt caching is Anthropic-only.
+- `better-sqlite3` drives the queue database when a native build for the running
+  VS Code's Electron is installed; none is published for Electron 42 as of this
+  writing, so the runtime's own `node:sqlite` — the same SQLite, also in WAL
+  mode — serves instead. Either way the schema and the file are identical.
+- `vscode.lm` has no system role, so on an editor model the system prompt is sent
+  as the opening user message; and it reports no token usage, so counts on those
+  turns come from the model's tokenizer.
 
 ## License
 

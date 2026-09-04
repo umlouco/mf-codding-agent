@@ -423,10 +423,73 @@ pre.out.err { color: var(--vscode-errorForeground); }
   line-height: 1.5;
 }
 
-/* ---- context tab: MCP servers + skill groups ---- */
+/* ---- live output ---- */
+
+/*
+ * The per-task terminal. Styled after the editor's terminal rather than the
+ * side bar so the eye reads it as a stream of output, not as another field:
+ * monospace, dark ground, and the same wrap-and-break as pre.out above so a
+ * long tool result never widens the panel.
+ */
+.termwrap {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  background: var(--vscode-terminal-background, var(--vscode-editor-background));
+}
+
+.termwrap > summary {
+  cursor: pointer;
+  padding: 4px 8px;
+  list-style: none;
+}
+
+.termwrap > summary::-webkit-details-marker { display: none; }
+
+.term {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  padding: 6px 8px;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--vscode-terminal-foreground, var(--vscode-foreground));
+}
+
+.term:empty::before {
+  content: 'nothing streamed yet';
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+
+/* One block per stretch of output from one agent, headed by who and what. */
+.tb { margin: 0 0 5px; }
+
+.tb-h {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.tb-reasoning .tb-t { color: var(--vscode-descriptionForeground); font-style: italic; }
+.tb-tool .tb-t { color: var(--vscode-charts-blue, #3794ff); }
+.tb-tool-error .tb-t,
+.tb-error .tb-t { color: var(--vscode-errorForeground); }
+.tb-activity .tb-t { color: var(--vscode-charts-yellow, #cca700); }
+.tb-attempt .tb-t,
+.tb-plan .tb-t { color: var(--vscode-charts-purple, #b180d7); }
+
+/* ---- context tab: the tool picker ---- */
 
 .section-title {
-  margin: 4px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 0;
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -434,39 +497,157 @@ pre.out.err { color: var(--vscode-errorForeground); }
   color: var(--vscode-descriptionForeground);
 }
 
-.checklist {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+/* A section's own action, pushed to the far end of its heading. */
+.hdr-action {
+  margin-left: auto;
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: 0;
 }
 
-.checklist-row {
+/*
+ * The filter and the running total, kept in view while the trees scroll under
+ * them: with three trees on one pane the count is the only thing that says
+ * how much is switched on without scrolling back up.
+ */
+.picker-bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 5px 6px;
+  gap: 6px;
+  margin: 0 calc(var(--gap) * -1);
+  padding: 6px var(--gap);
+  background: var(--vscode-sideBar-background);
+}
+
+.picker-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: inherit;
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
   border-radius: var(--radius);
+  padding: 5px 8px;
+}
+
+.picker-search:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.picker-count {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+
+.tree {
+  display: flex;
+  flex-direction: column;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding: 2px 6px 2px 0;
+  border-radius: var(--radius);
+  cursor: pointer;
+  user-select: none;
+}
+
+.tree-row:hover { background: var(--vscode-list-hoverBackground); }
+
+/* One indent per level, so a tool reads as belonging to its group. */
+.tree-row.depth-0 { padding-left: 0; }
+.tree-row.depth-1 { padding-left: 16px; }
+.tree-row.depth-2 { padding-left: 32px; }
+.tree-row.depth-3 { padding-left: 48px; }
+
+.tree-row input[type="checkbox"] {
+  flex: none;
+  margin: 0;
+  accent-color: var(--vscode-checkbox-selectBackground, var(--vscode-button-background));
+}
+
+/* The fold arrow. Leaves keep the space so every row's boxes line up. */
+.twisty {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--vscode-icon-foreground, var(--vscode-foreground));
   cursor: pointer;
 }
 
-.checklist-row:hover { background: var(--vscode-list-hoverBackground); }
+.twisty:hover:not(:disabled) { background: none; }
+.twisty.leaf { visibility: hidden; }
+.twisty .ico { transition: transform .1s ease; }
+.tree-row.open > .twisty .ico { transform: rotate(90deg); }
 
-.checklist-row input[type="checkbox"] { flex: none; }
+/* Where a checkbox would be on a detail row — a skill inside its group. */
+.tr-nobox { flex: none; width: 13px; }
 
-.cl-text {
+.tr-icon {
+  flex: none;
   display: flex;
-  flex-direction: column;
-  min-width: 0;
+  align-items: center;
+  color: var(--vscode-icon-foreground, var(--vscode-descriptionForeground));
 }
 
-.cl-name {
+.ico {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tr-name {
+  flex: none;
+  max-width: 60%;
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.cl-sub {
-  font-size: 10px;
+/* The dim half of the row: what a set is for, where a server came from. */
+.tr-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
   color: var(--vscode-descriptionForeground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+
+.tree-row.tr-failed .tr-hint { color: var(--vscode-errorForeground); }
+
+/* The row's one action, kept quiet until the row is hovered or it has focus. */
+.tr-action {
+  flex: none;
+  margin-left: auto;
+  font-size: 11px;
+  opacity: 0;
+}
+
+.tree-row:hover .tr-action,
+.tr-action:focus-visible { opacity: 1; }

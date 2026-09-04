@@ -254,7 +254,13 @@ func (t *httpTransport) do(ctx context.Context, req *rpcReq) (*rpcResp, error) {
 	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		msg := fmt.Sprintf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		// A 401 usually names the scheme it wanted, and that is the difference
+		// between a wrong key and a right key sent the wrong way; pass it on.
+		if wa := resp.Header.Get("WWW-Authenticate"); wa != "" {
+			msg += " (server asks for: " + wa + ")"
+		}
+		return nil, fmt.Errorf("%s", msg)
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))

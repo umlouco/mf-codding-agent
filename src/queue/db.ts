@@ -46,22 +46,37 @@ interface Driver {
 }
 
 /**
- * Loads better-sqlite3 when it is present, otherwise falls back to Node's
- * built-in `node:sqlite`.
+ * Opens the database on better-sqlite3, or on Node's built-in `node:sqlite`
+ * when no native build for this host exists.
  *
  * better-sqlite3 is a native addon and has to match the Electron ABI of the
- * running VS Code, which breaks on host upgrades; `node:sqlite` ships with the
- * runtime and needs no build step. Both expose the same prepare/run/get/all
- * shape, so the rest of this file does not care which one it got. Every query
- * below uses positional `?` parameters, which are the only binding style both
- * drivers agree on.
+ * running VS Code, which its published prebuilds do not always cover: a fresh
+ * Electron can ship before a prebuild for it does, and this extension is not
+ * going to compile C++ on a user's machine. `node:sqlite` is the same SQLite
+ * library, shipped inside the runtime, with no build step. Both expose the
+ * same prepare/run/get/all shape and both run WAL, so the rest of this file
+ * does not care which one it got. Every query below uses positional `?`
+ * parameters, the one binding style both drivers agree on.
+ *
+ * A build made for this platform can be shipped in the extension's `bin/`
+ * folder next to the Go binaries, as `bin/<platform>-<arch>/better_sqlite3.node`;
+ * it is preferred over whatever `node_modules` holds, which is what lets a
+ * packaged extension carry the native driver without carrying node_modules.
  */
 function openDriver(file: string): { db: Driver; impl: string } {
   // Both are marked external in esbuild.mjs, so these stay real runtime
   // requires in the bundle and either one is allowed to be absent.
   try {
     const BetterSqlite3 = require('better-sqlite3');
-    return { db: new BetterSqlite3(file) as Driver, impl: 'better-sqlite3' };
+    const shipped = path.join(
+      __dirname,
+      '..',
+      'bin',
+      `${process.platform}-${process.arch}`,
+      'better_sqlite3.node',
+    );
+    const options = fs.existsSync(shipped) ? { nativeBinding: shipped } : undefined;
+    return { db: new BetterSqlite3(file, options) as Driver, impl: 'better-sqlite3' };
   } catch {
     /* not installed, or built against a different ABI — fall through */
   }
@@ -209,6 +224,16 @@ export interface TaskEvent {
   at: number;
 }
 
+/** One piece of an agent's live output — see the agent_logs table. */
+export interface LogRow {
+  id: number;
+  taskId: number | null;
+  actor: string;
+  kind: string;
+  chunk: string;
+  at: number;
+}
+
 const COLUMNS = `
   id, title, description,
   impl_verify_prompt      AS implVerifyPrompt,
@@ -305,6 +330,22 @@ export class TaskQueue {
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+
+      -- The live stream. Every agent's text, reasoning and tool calls land
+      -- here in pieces small enough to show as they arrive, which is what the
+      -- Task Queue view polls every 200 ms (see queue/panel.ts). task_events
+      -- above is the durable journal the supervisor reads; this is the
+      -- terminal, and it is pruned per task as it grows — see appendLog.
+      CREATE TABLE IF NOT EXISTS agent_logs (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+        actor   TEXT NOT NULL,
+        kind    TEXT NOT NULL,
+        chunk   TEXT NOT NULL DEFAULT '',
+        at      INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_logs_task ON agent_logs(task_id, id);
     `);
 
     // Liveness lives on the task rather than in a separate table: it is read on
@@ -485,15 +526,17 @@ export class TaskQueue {
     return this.metaList('mcpDisabledServers');
   }
 
-  setMcpServerEnabled(name: string, enabled: boolean): void {
+  setMcpServerEnabled(names: string[], enabled: boolean): void {
     const set = new Set(this.disabledMcpServers);
-    if (enabled) {
-      set.delete(name);
-    } else {
-      set.add(name);
+    for (const name of names) {
+      if (enabled) {
+        set.delete(name);
+      } else {
+        set.add(name);
+      }
     }
     this.setMeta('mcpDisabledServers', JSON.stringify([...set]));
-    this.log(null, 'user', 'mcp-server', `${name} ${enabled ? 'enabled' : 'disabled'}`);
+    this.log(null, 'user', 'mcp-server', `${names.join(', ')} ${enabled ? 'enabled' : 'disabled'}`);
   }
 
   /**
@@ -510,15 +553,49 @@ export class TaskQueue {
     return this.metaList('enabledSkillGroups');
   }
 
-  setSkillGroupEnabled(id: string, enabled: boolean): void {
+  setSkillGroupEnabled(ids: string[], enabled: boolean): void {
     const set = new Set(this.enabledSkillGroups);
-    if (enabled) {
-      set.add(id);
-    } else {
-      set.delete(id);
+    for (const id of ids) {
+      if (enabled) {
+        set.add(id);
+      } else {
+        set.delete(id);
+      }
     }
     this.setMeta('enabledSkillGroups', JSON.stringify([...set]));
-    this.log(null, 'user', 'skill-group', `${id} ${enabled ? 'enabled' : 'disabled'}`);
+    this.log(null, 'user', 'skill-group', `${ids.join(', ')} ${enabled ? 'enabled' : 'disabled'}`);
+  }
+
+  /**
+   * `vscode.lm.tools` names switched on for this workspace's agent runs —
+   * see McpBridge.enabledToolNames in mcpBridge.ts, which is what actually
+   * reads this and is the only thing that should: an empty list here means
+   * "nothing switched on", while a *missing* one means "never asked", and
+   * only that method knows the difference (see `hasEditorToolChoice`).
+   */
+  get enabledEditorTools(): string[] {
+    return this.metaList('enabledEditorTools');
+  }
+
+  /**
+   * Whether this workspace has ever made a pick of its own.
+   *
+   * Until it has, the built-in read/search/edit/execute sets are in force —
+   * an agent that can do nothing until someone has ticked a hundred boxes is
+   * no use, and those four are what "can work on a codebase" means. The first
+   * toggle writes the whole resulting list, defaults included, so from then on
+   * the stored pick is the entire truth and switching the last tool off means
+   * off rather than back to the defaults.
+   */
+  get hasEditorToolChoice(): boolean {
+    return this.getMeta('enabledEditorTools', '') !== '';
+  }
+
+  /** Replaces the pick outright — group toggles and per-tool ones alike. */
+  setEditorTools(names: string[]): void {
+    const set = new Set(names);
+    this.setMeta('enabledEditorTools', JSON.stringify([...set]));
+    this.log(null, 'user', 'editor-tool', `${set.size} tool(s) enabled`);
   }
 
   // ---- reads -----------------------------------------------------------
@@ -621,6 +698,62 @@ export class TaskQueue {
       .run(taskId, actor, kind, message.slice(0, 8000), Date.now());
   }
 
+  // ---- live output -----------------------------------------------------
+
+  /**
+   * Appends one piece of an agent's live output and, every so often, trims
+   * that stream back to `keep` rows. A `taskId` of null is the queue's own
+   * stream — planning from the Plan tab, which has no task yet.
+   */
+  appendLog(taskId: number | null, actor: string, kind: string, chunk: string, keep: number): number {
+    const info = this.db
+      .prepare('INSERT INTO agent_logs (task_id, actor, kind, chunk, at) VALUES (?, ?, ?, ?, ?)')
+      .run(taskId, actor, kind, chunk.slice(0, 8000), Date.now());
+    const id = Number(info.lastInsertRowid);
+    // Pruning on every insert would cost a scan per chunk; every hundredth
+    // keeps the table within sight of `keep`, which is all it needs to be.
+    if (id % 100 === 0) {
+      this.pruneLogs(taskId, keep);
+    }
+    return id;
+  }
+
+  /** Drops everything but the newest `keep` rows of one stream. */
+  pruneLogs(taskId: number | null, keep: number): void {
+    this.db
+      .prepare(
+        `DELETE FROM agent_logs WHERE task_id IS ? AND id <= (
+           SELECT id FROM agent_logs WHERE task_id IS ? ORDER BY id DESC LIMIT 1 OFFSET ?)`,
+      )
+      .run(taskId, taskId, Math.max(1, Math.floor(keep)));
+  }
+
+  /** Rows written after `afterId`, oldest first — what the view polls for. */
+  logsSince(afterId: number, limit = 500): LogRow[] {
+    return this.db
+      .prepare(
+        `SELECT id, task_id AS taskId, actor, kind, chunk, at
+           FROM agent_logs WHERE id > ? ORDER BY id ASC LIMIT ?`,
+      )
+      .all(afterId, limit);
+  }
+
+  /** The newest `limit` rows of one stream, oldest first — for a terminal just opened. */
+  logsTail(taskId: number | null, limit = 300): LogRow[] {
+    const rows: LogRow[] = this.db
+      .prepare(
+        `SELECT id, task_id AS taskId, actor, kind, chunk, at
+           FROM agent_logs WHERE task_id IS ? ORDER BY id DESC LIMIT ?`,
+      )
+      .all(taskId, limit);
+    return rows.reverse();
+  }
+
+  latestLogId(): number {
+    const row = this.db.prepare('SELECT COALESCE(MAX(id), 0) AS m FROM agent_logs').get();
+    return Number(row?.m ?? 0);
+  }
+
   /**
    * Appends one timestamped line of worker activity and refreshes the task's
    * liveness in the same transaction.
@@ -692,6 +825,7 @@ export class TaskQueue {
     return this.tx(() => {
       this.db.exec('DELETE FROM tasks');
       this.db.exec('DELETE FROM task_events');
+      this.db.exec('DELETE FROM agent_logs');
       let n = 0;
       for (const t of tasks) {
         this.insert(t, ++n);
@@ -1171,6 +1305,7 @@ export class TaskQueue {
           tokens_cache_read = 0, tokens_cache_write = 0,
           updated_at = ${Date.now()}
       `);
+      this.db.exec('DELETE FROM agent_logs');
       this.setMeta('runState', 'IDLE');
       this.log(null, 'system', 'reset', 'all tasks returned to PENDING');
     });
