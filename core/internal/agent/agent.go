@@ -303,7 +303,9 @@ func (a *Agent) finalReport(
 		"Tool use has stopped because %s. No more tools are available in this turn. "+
 			"Do not claim that a command succeeded unless its successful output is already "+
 			"present in the conversation. Do not plan further work and do not ask to continue.\n\n"+
-			"Report now, plainly:\n"+
+			"Keep the final response format required by the task, including JSON when requested. "+
+			"For an execution completion report use NEEDS_MORE_WORK if work remains; for verification "+
+			"use INCOMPLETE if required checks could not finish. Include:\n"+
 			"- what you changed, naming every file you actually created or edited\n"+
 			"- what you verified, and how you verified it\n"+
 			"- what is still missing, precisely enough for the next agent to finish it "+

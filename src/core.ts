@@ -294,7 +294,10 @@ export class CoreClient implements vscode.Disposable {
   async initialize(overrides: Partial<CoreConfig> = {}): Promise<InitResult> {
     const payload = await buildCoreConfig(getStore());
     this.restarts = 0;
-    return this.request<InitResult>('initialize', { ...payload, ...overrides });
+    // A worker overrides Coding, but still needs the configured Vision provider.
+    const providers = new Map(payload.providers.map((provider) => [provider.id, provider]));
+    for (const provider of overrides.providers ?? []) providers.set(provider.id, provider);
+    return this.request<InitResult>('initialize', { ...payload, ...overrides, providers: [...providers.values()] });
   }
 
   async restart(overrides: Partial<CoreConfig> = {}): Promise<InitResult> {

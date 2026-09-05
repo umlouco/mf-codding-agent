@@ -1,13 +1,13 @@
 import * as vscode from 'vscode';
 import type { Task, TaskEvent, Usage } from './db';
-import { extractJson, runOnce, RunOptions } from './agents';
+import { attemptsExhausted, extractJson, runOnce, RunOptions } from './agents';
 import { completionForSupervisor, parseCompletionClaim } from './validation';
+import { recoveryRules } from './prompts';
 
 /**
  * Journal kind recording an independent validation run that did not finish.
  *
- * Counted rather than capped. There is no attempt ceiling anywhere in this
- * design, and adding one here would be the same mistake in a new place — but a
+ * Counted separately from the execution attempt budget. A
  * supervisor that cannot see it has already failed twice will keep sending the
  * same validator at the same wall. The count is evidence; what to do about it
  * stays a decision.
@@ -115,6 +115,7 @@ export async function reviewProgress(
   events: TaskEvent[],
   failedValidations: number,
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
+  goal = '',
 ): Promise<ProgressDecision> {
   const state = task.status === 'EXECUTING'
     ? 'The execution agent is still running.'
@@ -123,7 +124,7 @@ export async function reviewProgress(
     ? `Independent validation has already been started ${failedValidations} time(s) on this task ` +
       'and did not complete. Starting it again unchanged is very likely to fail the same way: ' +
       'either fix what it runs against with STOP_AND_REWRITE_VALIDATION, or send the work back ' +
-      'with CONTINUE_EXECUTION. Choose START_VALIDATION again only if the journal shows the cause ' +
+      'with STOP_AND_REWRITE_TASK. Choose START_VALIDATION again only if the journal shows the cause ' +
       'was transient.'
     : 'Independent validation has not failed on this task.';
   const prompt = `You supervise a coding agent by reading its durable database journal.
@@ -131,8 +132,18 @@ You have no tools. Judge direction and work quality, not elapsed time, token use
 or attempt count. A task may legitimately take hours. Intervene only when the evidence shows a
 rabbit hole, a wrong premise, invalid verification, or work ready for independent validation.
 
+${recoveryRules}
+
 TASK ${task.seq}: ${task.title}
 ${task.description}
+
+ATTEMPT ${task.attempts} OF ${task.maxAttempts}
+${attemptsExhausted(task) ? `The current attempt budget is spent. Let useful work finish or start
+validation when ready. If rewriting, supply a materially different recovery approach grounded in
+the failures below and the original goal. Preserve acceptance criteria, working code, and concrete
+evidence. Correct tool syntax or environment assumptions before asking for implementation changes.
+A changed task or validation contract starts a fresh attempt budget.
+ORIGINAL GOAL: ${clip(goal, 2000) || '(not recorded)'}` : ''}
 
 IMPLEMENTATION VERIFICATION: ${task.implVerifyPrompt || '(not specified)'}
 BEHAVIOR VERIFICATION: ${task.solutionVerifyPrompt || '(not specified)'}
@@ -153,8 +164,8 @@ RECENT DATABASE JOURNAL:
 ${journal(events)}
 
 Choose exactly one hard-coded action:
-- CONTINUE_EXECUTION: evidence shows useful forward progress. If the agent already stopped, resume
-  it from the work on disk because the task is not ready for validation.
+- CONTINUE_EXECUTION: the running agent shows useful forward progress. For a stopped agent this
+  starts validation; if more implementation is needed, choose STOP_AND_REWRITE_TASK instead.
 - STOP_AND_REWRITE_TASK: direction or premise is wrong. Supply a complete rewrittenDescription.
 - STOP_AND_REWRITE_VALIDATION: implementation may be sound but the checks are ambiguous, invalid,
   contradictory, or test the wrong thing. Supply corrected verification fields.
@@ -163,14 +174,15 @@ Choose exactly one hard-coded action:
 
 Reply with one JSON object. This protocol is fixed:
 {
-  "action": "CONTINUE_EXECUTION" | "STOP_AND_REWRITE_TASK" |
-            "STOP_AND_REWRITE_VALIDATION" | "START_VALIDATION",
+  "action": "CONTINUE_EXECUTION",
   "reason": "quality-based evidence for the decision",
   "rewrittenDescription": "required only for STOP_AND_REWRITE_TASK",
   "implVerifyPrompt": "replacement when rewriting validation",
   "solutionVerifyPrompt": "replacement when rewriting validation",
   "solutionVerifyCommand": "replacement when rewriting validation"
-}`;
+}
+Use one action from the list above and replace example values. Omit replacement fields unless
+that action needs them. The final response must be valid JSON, with no code fence or prose.`;
 
   const first = await runOnce(context, output, 'supervisor', prompt, {
     maxIterations: -1,

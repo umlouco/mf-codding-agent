@@ -55,3 +55,44 @@ func TestRepeatedToolFailureStopsEarly(t *testing.T) {
 		t.Errorf("Text=%q contains the unrelated round-budget label", res.Text)
 	}
 }
+
+func TestFailureLoopSurvivesInterleavedSuccessAndMixedBatches(t *testing.T) {
+	var guard toolFailureLoop
+	for i := 0; i < 3; i++ {
+		guard.observe([]llm.Block{{Name: "browser_open"}}, []llm.Block{{Text: "opened"}})
+		stopped, _ := guard.observe(
+			[]llm.Block{{Name: "browser_eval"}, {Name: "read_file"}},
+			[]llm.Block{{IsError: true, Text: "SyntaxError: missing )"}, {Text: "ok"}},
+		)
+		if stopped != (i == 2) {
+			t.Fatalf("failure %d: stopped=%v", i+1, stopped)
+		}
+	}
+}
+
+func TestFailureLoopNormalizesBrowserLocations(t *testing.T) {
+	var guard toolFailureLoop
+	for i, location := range []string{"(0:40)", "(0:62)", "(1:19)"} {
+		stopped, _ := guard.observe([]llm.Block{{Name: "browser_eval"}},
+			[]llm.Block{{IsError: true, Text: `exception "Uncaught" ` + location + ": SyntaxError: missing )"}})
+		if stopped != (i == 2) {
+			t.Fatalf("location %s: stopped=%v", location, stopped)
+		}
+	}
+}
+
+func TestFailureLoopAgesOutOldFailures(t *testing.T) {
+	var guard toolFailureLoop
+	call := []llm.Block{{Name: "browser_eval"}}
+	failure := []llm.Block{{IsError: true, Text: "SyntaxError: missing )"}}
+	guard.observe(call, failure)
+	guard.observe(call, failure)
+	for i := 0; i < toolFailureWindow; i++ {
+		if stopped, _ := guard.observe(call, []llm.Block{{Text: "true"}}); stopped {
+			t.Fatal("successful work stopped")
+		}
+	}
+	if stopped, _ := guard.observe(call, failure); stopped {
+		t.Fatal("old failures survived window")
+	}
+}

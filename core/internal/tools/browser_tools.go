@@ -185,7 +185,10 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 		Name: "browser_eval",
 		Description: "Evaluate a JavaScript expression in the page and return the JSON result. " +
 			"Use for assertions and for reading state the visible text does not expose, " +
-			`e.g. "document.querySelectorAll('.row').length".`,
+			`e.g. "document.querySelectorAll('.row').length". ` +
+			"For multiple statements use an IIFE with an explicit return: (() => { const el = document.querySelector('#id'); return { exists: !!el, disabled: el?.disabled }; })(). " +
+			"Return plain objects or primitives, not DOM nodes (nodes serialize as {}). A statement body without return has no result; that is not evidence an element is missing. " +
+			"When a task supplies a verification script, execute it intact. Fix evaluation syntax before changing application code.",
 		Mutating: true, // arbitrary code execution in the page, so sequence it
 		Schema: obj(map[string]any{
 			"expression": str("JavaScript expression evaluated in the page context."),

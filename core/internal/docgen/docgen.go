@@ -67,6 +67,11 @@ Directory structure:
 
 %s
 
+Only the directory listing is available. Describe visible structure as fact. Do not
+invent file contents, module behavior, dependencies, commands, or configuration.
+For details that require reading source files, state that they are not established
+by the supplied listing. Label any interpretation of a filename as an inference.
+
 Write a single markdown document that covers:
 1. A title (# Project Documentation) and brief overview.
 2. The project structure (directories and key files, explained).

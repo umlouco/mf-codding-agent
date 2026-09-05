@@ -9,6 +9,7 @@ import { getStore } from '../providers/instance';
 import { contextCeiling } from '../providers/payload';
 import { runClaudeCliTurn } from './claudeCli';
 import { NewTask, Task, TaskQueue, Usage } from './db';
+import { browserEvidence, codingWorkflow, executorExample, recoveryRules } from './prompts';
 import {
   CompletionClaim,
   extractExecutorNotes,
@@ -787,14 +788,15 @@ ${instruction}
 Reply with ONE JSON object and nothing else:
 {
   "summary": "one sentence describing what you changed",
-  "edits": [{ "seq": <number>, "title": "...", "description": "...", "implVerifyPrompt": "...",
+  "edits": [{ "seq": 1, "title": "...", "description": "...", "implVerifyPrompt": "...",
               "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
-  "deletes": [<seq>, ...],
+  "deletes": [],
   "adds": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
              "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
 Only include fields you are actually changing on an "edits" entry; omit a field to leave it as-is.
+Replace example sequence numbers with actual queue sequence numbers. deletes is an array of numbers.
 Do not edit or delete a VERIFIED task unless the instruction explicitly asks to redo finished work.
 Tasks in "adds" are appended after the current end of the queue, in the order given. Leave any of
 the three arrays empty when the instruction does not call for that kind of change.`;
@@ -931,6 +933,10 @@ Rules:
 - Order the array in the sequence the tasks must be executed.
 - Stay inside this phase's region. Do not propose work on files outside it.
 - Each task must be completable by one agent in a single sitting, touching a handful of files.
+- Give each task one concrete outcome, relevant file paths, prerequisites, and observable acceptance
+  criteria. Carry forward discovered commands and paths; later workers do not see this exploration.
+- Separate implementation from independent verification instructions. State expected outputs and
+  relevant failure or boundary cases. An unavailable runtime is a prerequisite to resolve, not a PASS.
 - Every task must be independently verifiable. Prefer real commands (test runners, builds,
   linters) that already work in this repo — do not invent scripts that do not exist.
 - Do not include a task for the phase itself.`;
@@ -1083,20 +1089,20 @@ function attemptHistory(task: Task): string {
  * has already been tried, not enough to drown the instruction.
  */
 function retryBriefing(task: Task): string {
-  if (task.attempts <= 1) {
+  if (task.attempts <= 1 && !task.errorLog.trim() && !task.supervisorFeedback.trim()) {
     return '';
   }
   return `
-THIS IS ATTEMPT ${task.attempts}. Earlier attempts did not pass verification.
+THIS IS ATTEMPT ${task.attempts} of the current attempt budget. Earlier work did not pass verification.
 
 How the earlier attempts ended, oldest first:
 ${attemptHistory(task)}
 
 Read the files before redoing any of that — an attempt that was cut off still
 left its edits on disk, and repeating them is how the next attempt runs out too.
-If an attempt ran out of rounds rather than getting something wrong, the task is
-too big to finish in one sitting: do the part that unblocks everything else
-first, and report precisely where you stopped.
+If an attempt was interrupted, inspect its completed changes before continuing.
+An interruption alone does not prove the task is too large or the code is wrong.
+Finish the missing work, or report the concrete blocker and next useful step.
 
 Supervisor feedback on the last attempt — treat this as binding:
 ${task.supervisorFeedback.trim() || '(none)'}
@@ -1139,7 +1145,10 @@ Verification requirements:
 ${task.solutionVerifyCommand ? `- This command must exit 0: \`${task.solutionVerifyCommand}\`` : ''}
 
 Rules:
-- Do the work. Read what you need, then edit the files for real — do not describe changes you have not made.
+${codingWorkflow}
+
+${browserEvidence}
+
 - Stay inside this task. Do not start the next one, and do not refactor unrelated code.
 - If the task turns out to be impossible or already done, say so plainly and explain why.
 - Inspect the final code and diff yourself. Run useful development checks. For UI/browser work,
@@ -1148,18 +1157,12 @@ Rules:
   to follow, how to build or test this project — put it in "notes" below. This is the only way
   that fact reaches later tasks: they run with no memory of this attempt. Leave "notes" empty if
   there is nothing new, and do not repeat what PROJECT NOTES above already says.
-- Finish with ONE JSON object and nothing else, in this exact shape:
-{
-  "report": "short summary of changes and files",
-  "completion": {
-    "status": "READY_FOR_VALIDATION" | "NEEDS_MORE_WORK",
-    "summary": "what is complete and why it is ready, or precisely what remains",
-    "filesChanged": ["relative/path"],
-    "developmentChecks": ["check and observed result"]
-  },
-  "notes": "a durable fact for later tasks, or \\"\\" if there is nothing new"
-}
-}`;
+- Your final response must be ONE valid JSON object, without a code fence or trailing prose.
+  Use status READY_FOR_VALIDATION only when implementation is complete and development checks
+  support handing it to the verifier. Otherwise use NEEDS_MORE_WORK. Neither status is a formal PASS.
+  Populate filesChanged and developmentChecks with strings describing actual files and results.
+  Use an empty notes string when there is no new durable fact. Replace this example's values:
+${executorExample}`;
 
   const { text, stopReason, usage } = await runOnce(context, output, 'executor', prompt, {
     // Negative means the core runs until the model finishes or the supervisor
@@ -1195,6 +1198,64 @@ export type Verdict = 'VERIFIED' | 'RETRY' | 'SPLIT' | 'RESET_FROM';
 /** Upper bound on the pieces one oversized task may be replaced with. */
 const MAX_SPLIT_PARTS = 6;
 
+/** How much of the original planning goal the supervisor is shown at the ceiling. */
+const MAX_GOAL_CHARS = 2000;
+
+/**
+ * Whether this task has spent the attempt budget its plan gave it.
+ *
+ * `maxAttempts` is not a countdown to giving up — nothing here can fail a task,
+ * and f9f496c's version, which did, is not what came back. It is a boundary on
+ * how long one *formulation* of a task may be retried. Without one the count
+ * only climbed, which is both a display defect (a row reading "attempt 7 of 3")
+ * and the thing that defect was reporting: a supervisor free to send a fourth,
+ * fifth and sixth phrasing of an instruction that has already failed three
+ * times. At the boundary the choice narrows to the two decisions that change
+ * something — split it, or rebuild it — and the budget then starts over on
+ * whatever comes out. See `escalate` and the RETRY case in the orchestrator.
+ */
+export function attemptsExhausted(task: Task): boolean {
+  return task.attempts >= Math.max(1, task.maxAttempts);
+}
+
+/**
+ * What the attempt budget means to this particular review.
+ *
+ * Below the ceiling the count is context and nothing else: a task on its second
+ * attempt is judged on its evidence exactly as the first was, because rejecting
+ * work for being late is how a correct implementation gets thrown away. At the
+ * ceiling it becomes an instruction, because by then the count *is* evidence —
+ * three failures against one description are not three accidents.
+ */
+function ceilingNotice(task: Task, goal: string): string {
+  if (!attemptsExhausted(task)) {
+    return `This is attempt ${task.attempts} of ${task.maxAttempts}. Judge the recorded work on its own
+merits — the count is context here, not a reason to accept or reject anything.`;
+  }
+  const objective = goal.trim().slice(0, MAX_GOAL_CHARS);
+  return `ATTEMPT BUDGET SPENT: this is attempt ${task.attempts} of ${task.maxAttempts}, the last one this
+task gets in its current form. Diagnose the recorded failure: it may be a tool invocation,
+environment problem, model mistake, or task ambiguity. Preserve the required acceptance criteria;
+do not weaken them to obtain a PASS. Repeating the same failed approach is not a recovery.
+If the evidence is not sufficient, choose exactly one:
+ - SPLIT, when scope is the obstacle: the report reads as several unfinished threads rather than
+   one unfinished thing, or no single agent can hold all of this at once. Return the ordered
+   smaller tasks that replace it.
+ - RETRY, for a code defect, broken tool invocation, environment problem, missing evidence, or
+   unclear requirement. Preserve the goal and required behavior. Write a self-contained task
+   using the observed failures, completed work, and a concrete different approach.
+Whichever you choose, the replacement starts again with a full attempt budget, so it is worth
+getting right.${
+    objective
+      ? `
+
+THE ORIGINAL OBJECTIVE THIS WHOLE PLAN WAS BUILT FROM — a rebuilt task must still serve it, and
+must not drift into work some other task in the plan already owns:
+${objective}`
+      : ''
+  }`;
+}
+
 /**
  * True for a value that is the supervisor's verdict rather than something it
  * quoted on the way to reaching one — a JSON snippet from a file it read, or an
@@ -1223,6 +1284,13 @@ export interface SupervisorDecision {
     solutionVerifyPrompt?: string;
     solutionVerifyCommand?: string;
   }[];
+  /**
+   * This decision was made at the attempt ceiling, so what it replaces the task
+   * with is a restructuring rather than another pass at the same one — which is
+   * what entitles it to a fresh attempt budget. Only meaningful for RETRY; a
+   * SPLIT replaces the row outright and its parts start at zero regardless.
+   */
+  escalated?: boolean;
   /** What the review itself cost — part of the task's bill like any other run. */
   usage: Usage;
 }
@@ -1233,26 +1301,28 @@ export async function superviseTask(
   task: Task,
   /** How many times this task has already been rewritten — see rewriteNotice. */
   rewrites: number,
+  /** The prompt the whole plan was generated from — see ceilingNotice. */
+  goal: string,
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
 ): Promise<SupervisorDecision> {
+  const exhausted = attemptsExhausted(task);
   const prompt = `You are the supervisor of an autonomous coding run. Make a lightweight
 accept/reject decision from the validation report stored in the queue database.
 
-That report was NOT written by the agent that did the work. You already decided this task looked
-ready and started a separate verification agent on it, in its own process with its own context,
-instructed to distrust the implementation agent's claims and to check the workspace itself. What
-you are reading is that independent agent's findings.
+The report below is from an independent verification agent, not the implementation agent.
 
 You have no tools and must not inspect files, execute commands, rerun tests, or drive a browser.
-Doing the checking yourself is what the verification agent was for. Check only whether its
-conclusion is consistent, whether every required check has concrete evidence, and whether failures
-or missing evidence require more work.
+Check whether its conclusion is consistent with concrete evidence for each requirement.
 
 A task is never terminally failed. When the evidence is not sufficient, make exactly one
 recovery decision: RETRY with a materially rewritten task description and verification, or
 SPLIT into several smaller ordered tasks. Use SPLIT only when scope is the obstacle; use RETRY
-when requirements or verification are contradictory, ambiguous, invalid, or poorly expressed.
-Base this decision on the quality and completeness of the recorded work, never on an attempt count.
+for a focused correction to code, tool use, setup, requirements, or missing verification.
+Whether the work passes is decided by the evidence alone and never by how many attempts it took.
+
+${ceilingNotice(task, goal)}
+
+${recoveryRules}
 
 Judge the structured current-attempt evidence, not its presentation. A successful command check
 with concrete output does not need the same command duplicated verbatim in another evidence field.
@@ -1260,7 +1330,6 @@ An allowed-value list does not mean every allowed value must occur unless the re
 says so. Do not reject current exact checks solely because an older attempt reported different data.
 
 TASK ${task.seq}: ${task.title}
-Attempt ${task.attempts}.
 ${rewriteNotice(rewrites)}
 Requirements:
 ${task.description}
@@ -1280,13 +1349,16 @@ ${attemptHistory(task)}
 
 Reply with ONE JSON object and nothing else:
 {
-  "verdict": "VERIFIED" | "RETRY" | "SPLIT",
+  "verdict": "RETRY",
   "feedback": "why the stored validation is or is not sufficient",
   "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
-  "taskEdits": [{ "seq": <number>, "description": "...", "implVerifyPrompt": "...",
+  "taskEdits": [{ "seq": ${task.seq}, "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
+
+Set verdict to VERIFIED, RETRY, or SPLIT. Use empty splitInto unless splitting; use empty taskEdits
+unless making edits. Replace example strings with concrete instructions, not placeholders.
 
 Choose VERIFIED only when the verification agent concluded PASS and its database report contains
 concrete implementation and behaviour evidence plus successful required commands/tests. Do not
@@ -1378,13 +1450,41 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
   // bare {"verdict":"RETRY"} — the single most common malformed reply there is
   // — re-runs the identical description, and the task fails identically, for as
   // long as anyone lets it.
+  //
+  // At the ceiling that is no longer enough on its own. The previous attempts
+  // each changed the description too, so `escalated` is the claim being made
+  // here: this rewrite was produced by a supervisor that was told the budget
+  // was spent and given the objective the plan came from. That is what buys
+  // the replacement a fresh budget in the orchestrator.
   const own = decision.taskEdits!.find((e) => e.seq === task.seq);
   if (rewritten(own?.description, task.description)) {
-    return decision;
+    return { ...decision, escalated: exhausted };
   }
 
-  const repair = await demandRewrite(context, output, task, feedback, parsed ? text : '', opts);
+  // Below the ceiling the model owes a rewrite and nothing more. At it, the
+  // demand is the harder one, and splitting is on the table — see `escalate`.
+  const repair = exhausted
+    ? await escalate(context, output, task, goal, feedback, opts)
+    : {
+        ...(await demandRewrite(context, output, task, feedback, parsed ? text : '', opts)),
+        splitInto: [] as NewTask[],
+      };
   addUsage(total, repair.usage);
+
+  if (repair.splitInto.length >= 2) {
+    return {
+      ...decision,
+      verdict: 'SPLIT',
+      splitInto: repair.splitInto,
+      feedback: repair.feedback || feedback,
+      // The row is about to be replaced by its parts, so an edit aimed at it
+      // has nowhere to land.
+      taskEdits: decision.taskEdits!.filter((e) => e.seq !== task.seq),
+      escalated: true,
+      usage: total,
+    };
+  }
+
   if (rewritten(repair.description, task.description)) {
     const rest = decision.taskEdits!.filter((e) => e.seq !== task.seq);
     return {
@@ -1400,6 +1500,7 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
           solutionVerifyCommand: repair.solutionVerifyCommand || own?.solutionVerifyCommand,
         },
       ],
+      escalated: exhausted,
       usage: total,
     };
   }
@@ -1408,6 +1509,13 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
   // the same page twice, so the correction goes in as its own section: less
   // considered than a real rewrite, but it is new information, prominently
   // placed, and it is what the supervisor actually said to do.
+  //
+  // This still counts as the escalation at the ceiling, and deliberately so.
+  // The alternative is a task whose budget is spent, whose supervisor twice
+  // refused to restructure it, and which therefore has no state left to be in
+  // — the counter climbs past its own limit again and we are back to "attempt
+  // 7 of 3". A weak restructuring that is honestly bounded beats an unbounded
+  // one, and the next review starts from a description it has not seen.
   return {
     ...decision,
     taskEdits: [
@@ -1418,8 +1526,129 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
         solutionVerifyCommand: own?.solutionVerifyCommand,
       },
     ],
+    escalated: exhausted,
     usage: total,
   };
+}
+
+/**
+ * The demand made of a supervisor whose task has spent its attempt budget.
+ *
+ * `demandRewrite` asks for the one thing a RETRY owes and did not deliver. This
+ * asks a harder question and offers a way out that one does not: three attempts
+ * against a single description have failed, so the description is the suspect,
+ * and the supervisor either breaks the task up or rebuilds it from the
+ * objective the plan was generated from. Re-wording is explicitly off the
+ * table, because re-wording is what the last three attempts were.
+ *
+ * A reply with fewer than two parts and no rewrite is a refusal, and the caller
+ * treats it as one; nothing here fabricates a split to force the shape.
+ */
+async function escalate(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+  task: Task,
+  goal: string,
+  feedback: string,
+  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'>,
+): Promise<{
+  splitInto: NewTask[];
+  description: string;
+  implVerifyPrompt: string;
+  solutionVerifyPrompt: string;
+  solutionVerifyCommand: string;
+  feedback: string;
+  usage: Usage;
+}> {
+  const empty = {
+    splitInto: [] as NewTask[],
+    description: '',
+    implVerifyPrompt: '',
+    solutionVerifyPrompt: '',
+    solutionVerifyCommand: '',
+    feedback: '',
+    usage: { ...NO_USAGE },
+  };
+
+  const objective = goal.trim().slice(0, MAX_GOAL_CHARS);
+  const prompt = `Task ${task.seq} has now used all ${task.maxAttempts} attempts its plan allowed, and you asked
+for another one without restructuring it. That is the one answer this task cannot take: the
+previous attempts each ran a description you had already corrected, and each failed anyway.
+
+TASK ${task.seq}: ${task.title}
+
+The description that has failed ${task.attempts} times:
+${task.description}
+
+What you said was wrong with the last attempt:
+${feedback || '(nothing recorded)'}
+
+How the attempts ended:
+${attemptHistory(task)}
+${
+  objective
+    ? `
+The objective this whole plan was generated from. A rebuilt task must still serve it, and must not
+absorb work that belongs to a different task in the plan:
+${objective}
+`
+    : ''
+}
+Decide which of the two failures this is, and answer with ONE JSON object and nothing else.
+
+If the task is TOO BIG — the work is several distinct pieces and no single agent turn can carry
+all of it — split it:
+{
+  "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
+                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
+  "feedback": "why the scope was the obstacle"
+}
+Give between 2 and ${MAX_SPLIT_PARTS} parts, in execution order, each independently doable and
+independently verifiable. Together they must cover everything the original asked for and nothing
+more.
+
+Otherwise rewrite the recovery instructions using the diagnosed failure:
+${recoveryRules}
+{
+  "description": "Full self-contained task: required behavior, confirmed files, completed work, and next concrete steps.",
+  "implVerifyPrompt": "a replacement implementation inspection that can actually be performed",
+  "solutionVerifyPrompt": "a replacement behavioural success condition that can actually be met",
+  "solutionVerifyCommand": "",
+  "feedback": "what was wrong with the premise, in one or two sentences"
+}
+
+Send one shape or the other, not both. Do not return a lightly edited version of the text above —
+change the failed approach while preserving the goal. An empty solutionVerifyCommand keeps the
+current command; otherwise provide the complete replacement command.`;
+
+  try {
+    const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
+      maxIterations: supervisorRounds(),
+      ...opts,
+    });
+    const d = extractJson<any>(text);
+    const splitInto = (Array.isArray(d?.splitInto) ? d.splitInto : [])
+      .filter((p: any) => p && typeof p === 'object' && String(p.title ?? '').trim())
+      .slice(0, MAX_SPLIT_PARTS)
+      .map((p: any) => ({
+        title: String(p.title).trim().slice(0, 200),
+        description: String(p.description ?? '').trim(),
+        implVerifyPrompt: String(p.implVerifyPrompt ?? '').trim(),
+        solutionVerifyPrompt: String(p.solutionVerifyPrompt ?? '').trim(),
+        solutionVerifyCommand: String(p.solutionVerifyCommand ?? '').trim(),
+      }));
+    return {
+      splitInto,
+      description: String(d?.description ?? '').trim(),
+      implVerifyPrompt: String(d?.implVerifyPrompt ?? '').trim(),
+      solutionVerifyPrompt: String(d?.solutionVerifyPrompt ?? '').trim(),
+      solutionVerifyCommand: String(d?.solutionVerifyCommand ?? '').trim(),
+      feedback: String(d?.feedback ?? '').trim(),
+      usage,
+    };
+  } catch {
+    return empty;
+  }
 }
 
 /** True when `next` is a real rewrite rather than a blank or a copy. */
@@ -1471,13 +1700,16 @@ ${rawReply.slice(0, 4000)}
 Restate the SAME judgement — do not reconsider it, do not change your mind, just put it in the
 required shape — as ONE JSON object and nothing else:
 {
-  "verdict": "VERIFIED" | "RETRY" | "SPLIT",
+  "verdict": "RETRY",
   "feedback": "what you found, and for a retry exactly what to do differently",
   "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
-  "taskEdits": [{ "seq": <number>, "description": "...", "implVerifyPrompt": "...",
+  "taskEdits": [{ "seq": ${task.seq}, "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
+
+Set verdict to VERIFIED, RETRY, or SPLIT to match the original conclusion. Use empty arrays for
+splitInto and taskEdits when they do not apply. Return valid JSON, without code fences.
 
 If your reply above reached a clear conclusion — the work is correct, it needs another attempt,
 it is too big to finish in one sitting — that conclusion,
@@ -1522,9 +1754,10 @@ async function demandRewrite(
   const prompt = `You judged task ${task.seq} and asked for another attempt, but you did not supply the
 rewritten description that a retry requires. Supply it now.
 
-The executor is a fresh agent. It will not see this conversation, your reasoning, or
-your feedback — it sees the description and little else. If the description does not
-change, nothing changes.
+The executor is a fresh agent. Provide self-contained recovery instructions; it does not see
+your full conversation. It receives the task, recent failure history, and supervisor feedback.
+
+${recoveryRules}
 
 TASK ${task.seq}: ${task.title}
 
@@ -1540,14 +1773,13 @@ ${attemptHistory(task)}
 
 Reply with ONE JSON object and nothing else:
 {
-  "description": "the full replacement description — self-contained, naming the files,
-                  functions and exact changes, and stating what the previous attempt got
-                  wrong so it is not repeated. Not a diff or a note: the whole thing.",
+  "description": "Full task with confirmed files, required behavior, completed work, and the next concrete correction.",
   "implVerifyPrompt": "a precise replacement implementation inspection",
   "solutionVerifyPrompt": "a precise replacement behavioral success condition",
-  "solutionVerifyCommand": "a corrected check command, or \\"\\" to keep the current one",
+  "solutionVerifyCommand": "",
   "feedback": "one or two sentences of standing instruction for the executor"
-}`;
+}
+Use an empty solutionVerifyCommand to keep the current command, or supply the complete replacement.`;
 
   try {
     const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
@@ -1595,7 +1827,7 @@ function appendCorrection(task: Task, feedback: string): string {
   const base = task.description.split(CORRECTION_MARK)[0].trimEnd();
   return `${base}
 
-${CORRECTION_MARK} ${task.attempts} (this is binding and overrides anything above) ---
+${CORRECTION_MARK} ${task.attempts} (apply while preserving required behavior and acceptance criteria) ---
 ${note}`;
 }
 
@@ -1612,8 +1844,8 @@ function rewriteNotice(rewrites: number): string {
   }
   return `
 The description below is not the original: you have already rewritten this task ${rewrites} time(s),
-and the attempt above used your latest version and still did not pass. Whatever you told the
-executor to do differently, it was not enough. Do not send a third phrasing of the same idea —
-change the plan, split the task, or correct the premise that is actually wrong.
+and the latest attempt still did not pass. Compare the current evidence with earlier failures.
+Preserve what works and change the failed approach. Do not assume the requirements are wrong
+merely because a worker failed to satisfy them.
 `;
 }

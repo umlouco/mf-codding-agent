@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import {
   encodeRegion,
+  attemptsExhausted,
   executeTask,
   expandPhase,
   parseRegion,
@@ -76,9 +77,10 @@ const WATCHDOG_MS = 60_000;
 /**
  * Attempts kept in a task's error log.
  *
- * With no attempt ceiling this is the only thing bounding the column. A task
- * that has been retried forty times has thirty-six entries nobody will read and
- * one the next executor needs, and the row is written back on every attempt.
+ * `maxAttempts` bounds how long one formulation of a task is retried, but a
+ * task escalated repeatedly still accumulates history without limit, and the
+ * row is written back on every attempt. Older than this and the entries are
+ * ones nobody will read, sitting in front of the one the next executor needs.
  */
 const KEEP_ATTEMPTS = 6;
 
@@ -646,6 +648,7 @@ export class Orchestrator implements vscode.Disposable {
             }
           },
         },
+        this.queue.getMeta('goal'),
       );
       if (gen !== this.reviewGen) {
         this.log(`task ${task.seq} — abandoned progress decision ignored`);
@@ -696,7 +699,7 @@ export class Orchestrator implements vscode.Disposable {
 
       case 'STOP_AND_REWRITE_TASK': {
         const description = decision.rewrittenDescription?.trim();
-        if (!description || description.length < 40) {
+        if (!description || description.length < 40 || description.trim() === task.description.trim()) {
           if (task.status === 'VERIFYING') {
             this.log(`task ${task.seq} — supervisor wanted a rewrite but provided none; running verification instead`);
             await this.verifyWithExecutor(task, review);
@@ -711,6 +714,7 @@ export class Orchestrator implements vscode.Disposable {
           validationReport: '',
           finishedAt: null,
           supervisorFeedback: decision.reason,
+          ...(attemptsExhausted(task) ? { attempts: 0 } : {}),
         })) {
           return;
         }
@@ -720,9 +724,8 @@ export class Orchestrator implements vscode.Disposable {
       }
 
       case 'STOP_AND_REWRITE_VALIDATION': {
-        const hasRewrite = !!(
-          decision.implVerifyPrompt || decision.solutionVerifyPrompt || decision.solutionVerifyCommand
-        );
+        const hasRewrite = (['implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const)
+          .some((field) => decision[field] !== undefined && decision[field]!.trim() !== task[field].trim());
         if (!hasRewrite) {
           if (task.status === 'VERIFYING') {
             this.log(`task ${task.seq} — supervisor wanted a validation rewrite but provided none; running verification instead`);
@@ -740,6 +743,7 @@ export class Orchestrator implements vscode.Disposable {
           validationReport: '',
           finishedAt: null,
           supervisorFeedback: decision.reason,
+          ...(attemptsExhausted(task) ? { attempts: 0 } : {}),
         })) {
           return;
         }
@@ -936,19 +940,29 @@ export class Orchestrator implements vscode.Disposable {
     const live = new LiveLog(this.queue, task.id, 'supervisor');
     let decision: SupervisorDecision;
     try {
-      decision = await superviseTask(this.context, this.output, task, this.rewrites(task), {
-        onAbort: (abort) => {
-          review.abort = abort;
+      // The goal is what the plan was generated from; at the attempt ceiling the
+      // supervisor rebuilds the task against it rather than against the text
+      // that has been failing. See ceilingNotice.
+      decision = await superviseTask(
+        this.context,
+        this.output,
+        task,
+        this.rewrites(task),
+        this.queue.getMeta('goal'),
+        {
+          onAbort: (abort) => {
+            review.abort = abort;
+          },
+          onEvent: live.onEvent,
+          onActivity: (a) => {
+            review.lastActivityAt = a.at;
+            live.activity(a);
+            if (this.queue.recordActivity(task.id, a.phase, a.detail, 'supervisor')) {
+              this.changed();
+            }
+          },
         },
-        onEvent: live.onEvent,
-        onActivity: (a) => {
-          review.lastActivityAt = a.at;
-          live.activity(a);
-          if (this.queue.recordActivity(task.id, a.phase, a.detail, 'supervisor')) {
-            this.changed();
-          }
-        },
-      });
+      );
     } catch (e: any) {
       const message = String(e?.message ?? e);
       this.log(`supervisor failed on task ${task.seq}: ${message}`);
@@ -1030,6 +1044,14 @@ export class Orchestrator implements vscode.Disposable {
 
       case 'RETRY':
       default: {
+        // `attempts` counts attempts against the task as currently written, not
+        // against the row. An escalated rewrite is a different task in all but
+        // its id — the supervisor produced it knowing the budget was spent, and
+        // working from the run's original goal rather than from the text that
+        // kept failing — so the budget starts again with it. Without this reset
+        // the counter runs past the ceiling it is displayed against and stops
+        // meaning anything, which is what "attempt 7 of 3" was.
+        const restart = decision.escalated === true;
         this.queue.update(task.id, {
           status: 'PENDING',
           supervisorFeedback: decision.feedback,
@@ -1038,10 +1060,14 @@ export class Orchestrator implements vscode.Disposable {
             `[attempt ${task.attempts}] ${decision.feedback}`,
           ),
           finishedAt: null,
+          ...(restart ? { attempts: 0 } : {}),
         });
         this.log(
-          `task ${task.seq} rewritten by the supervisor; ` +
-          `back to PENDING for attempt ${task.attempts + 1}`,
+          restart
+            ? `task ${task.seq} spent its ${task.maxAttempts} attempts and was rebuilt by the ` +
+              'supervisor; back to PENDING with a fresh budget'
+            : `task ${task.seq} rewritten by the supervisor; ` +
+              `back to PENDING for attempt ${task.attempts + 1}`,
         );
         break;
       }

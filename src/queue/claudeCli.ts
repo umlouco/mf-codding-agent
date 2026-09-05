@@ -39,9 +39,15 @@ function systemSuffixFor(role: Role): string {
       'only the text you are given in this prompt, exactly as it instructs.'
     );
   }
+  if (role === 'executor') {
+    return 'You are a task queue worker. Follow the current task role: implement coding tasks, ' +
+      'or independently check verification tasks without editing source or tests. ' +
+      'Use the final response format requested by the task.';
+  }
   return (
     'You are the Planner for an autonomous task queue running inside this workspace. Read the ' +
-    'workspace to inform your answer; do not edit or run anything.'
+    'workspace only when the task asks for exploration; do not edit files. Use read-only ' +
+    'inspection tools to ground the plan. Return the requested JSON format.'
   );
 }
 

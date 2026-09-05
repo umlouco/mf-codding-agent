@@ -62,7 +62,7 @@ type oaiToolCall struct {
 
 type oaiMessage struct {
 	Role       string        `json:"role"`
-	Content    string        `json:"content,omitempty"`
+	Content    any           `json:"content,omitempty"`
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
 	Name       string        `json:"name,omitempty"`
@@ -103,8 +103,11 @@ func (p *OpenAIProvider) convert(req Request) []oaiMessage {
 			// Tool results become their own `tool` messages; remaining text
 			// becomes one user message.
 			var text strings.Builder
+			var images []map[string]any
 			for _, b := range m.Blocks {
 				switch b.Type {
+				case BlockImage:
+					images = append(images, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:"+b.MediaType+";base64,"+b.Data}})
 				case BlockToolResult:
 					out = append(out, oaiMessage{
 						Role: "tool", ToolCallID: b.ToolUseID, Content: b.Text,
@@ -116,7 +119,11 @@ func (p *OpenAIProvider) convert(req Request) []oaiMessage {
 					text.WriteString(b.Text)
 				}
 			}
-			if text.Len() > 0 {
+			if len(images) > 0 {
+				parts := []map[string]any{{"type": "text", "text": text.String()}}
+				parts = append(parts, images...)
+				out = append(out, oaiMessage{Role: "user", Content: parts})
+			} else if text.Len() > 0 {
 				out = append(out, oaiMessage{Role: "user", Content: text.String()})
 			}
 		}

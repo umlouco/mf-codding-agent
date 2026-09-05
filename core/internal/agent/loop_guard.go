@@ -2,20 +2,23 @@ package agent
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/mflores/mfagent/core/internal/llm"
 )
 
 const repeatedToolFailureLimit = 3
+const toolFailureWindow = 8
+
+var browserErrorLocation = regexp.MustCompile(`\(\d+:\d+\)`)
 
 // toolFailureLoop stops a model from spending its whole round budget repeating
 // a tool call that fails in the same way. Inputs are deliberately not part of
 // the signature: broken quoting often grows on every retry while the useful
 // signal -- tool name plus terminal error -- stays identical.
 type toolFailureLoop struct {
-	signature string
-	count     int
+	rounds []map[string]bool
 }
 
 func (g *toolFailureLoop) observe(calls, results []llm.Block) (bool, string) {
@@ -24,28 +27,38 @@ func (g *toolFailureLoop) observe(calls, results []llm.Block) (bool, string) {
 		return false, ""
 	}
 
-	parts := make([]string, len(results))
+	failures := make(map[string]bool)
 	for i, result := range results {
 		if !result.IsError {
-			g.reset()
-			return false, ""
+			continue
 		}
-		parts[i] = calls[i].Name + ": " + terminalError(result.Text)
+		detail := terminalError(result.Text)
+		if calls[i].Name == "browser_eval" {
+			// Changing quote positions does not make the syntax failure new.
+			detail = browserErrorLocation.ReplaceAllString(detail, "(line:column)")
+		}
+		failures[calls[i].Name+": "+detail] = true
 	}
-
-	signature := strings.Join(parts, " | ")
-	if signature == g.signature {
-		g.count++
-	} else {
-		g.signature, g.count = signature, 1
+	g.rounds = append(g.rounds, failures)
+	if len(g.rounds) > toolFailureWindow {
+		g.rounds = g.rounds[1:]
 	}
-	return g.count >= repeatedToolFailureLimit,
-		fmt.Sprintf("the same tool failure occurred %d times: %s", g.count, signature)
+	for signature := range failures {
+		count := 0
+		for _, round := range g.rounds {
+			if round[signature] {
+				count++
+			}
+		}
+		if count >= repeatedToolFailureLimit {
+			return true, fmt.Sprintf("the same tool failure occurred in %d of the last %d rounds: %s", count, len(g.rounds), signature)
+		}
+	}
+	return false, ""
 }
 
 func (g *toolFailureLoop) reset() {
-	g.signature = ""
-	g.count = 0
+	g.rounds = nil
 }
 
 func terminalError(output string) string {

@@ -121,6 +121,8 @@ func (p *AnthropicProvider) toParams(req Request) anthropic.MessageNewParams {
 		var blocks []anthropic.ContentBlockParamUnion
 		for _, b := range m.Blocks {
 			switch b.Type {
+			case BlockImage:
+				blocks = append(blocks, anthropic.NewImageBlockBase64(b.MediaType, b.Data))
 			case BlockText:
 				if strings.TrimSpace(b.Text) == "" {
 					continue

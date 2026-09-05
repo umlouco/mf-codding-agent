@@ -34,6 +34,7 @@ export interface ProxyEndpoint {
 interface OaiContentPart {
   type?: string;
   text?: string;
+  image_url?: { url?: string };
 }
 
 interface OaiToolCall {
@@ -449,9 +450,15 @@ function toLmMessages(messages: OaiMessage[]): vscode.LanguageModelChatMessage[]
       default:
         // 'user', and 'system' / 'developer' as explained above.
         flush();
-        if (text.trim()) {
-          out.push(vscode.LanguageModelChatMessage.User(text));
+        const parts: (vscode.LanguageModelTextPart | vscode.LanguageModelDataPart)[] = [];
+        if (text.trim()) parts.push(new vscode.LanguageModelTextPart(text));
+        for (const part of Array.isArray(m.content) ? m.content : []) {
+          if (part.type !== 'image_url') continue;
+          const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/.exec(part.image_url?.url ?? '');
+          if (!match) throw new Error('Vision requires an inline PNG, JPEG, or WebP image.');
+          parts.push(vscode.LanguageModelDataPart.image(Buffer.from(match[2], 'base64'), match[1]));
         }
+        if (parts.length) out.push(vscode.LanguageModelChatMessage.User(parts));
         break;
     }
   }

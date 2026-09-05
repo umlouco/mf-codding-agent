@@ -928,6 +928,10 @@
 
     const meta = document.createElement('p');
     meta.className = 'hint';
+    // The denominator is real again: at `maxAttempts` the supervisor must split
+    // or rebuild the task, and the counter restarts on whatever replaces it. So
+    // this cannot read "7 of 3" — if it ever does, the escalation in
+    // superviseTask stopped firing rather than the label being wrong.
     meta.textContent = `attempt ${t.attempts} of ${t.maxAttempts}`;
     body.appendChild(meta);
 
