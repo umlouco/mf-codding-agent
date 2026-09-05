@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -35,13 +36,18 @@ type Browser struct {
 	logsMu  sync.Mutex
 	started bool
 
-	execPath string
-	headless bool
-	shotDir  string
+	execPath   string
+	headless   bool
+	shotDir    string
+	profileDir string
 }
 
-func New(execPath string, headless bool, shotDir string) *Browser {
-	return &Browser{execPath: execPath, headless: headless, shotDir: shotDir}
+// New builds a Browser. profileDir, when non-empty, is a persistent Chromium
+// user-data directory: cookies and session storage survive process exit, so a
+// login done in one core process is still valid in the next. Pass "" for an
+// ephemeral profile.
+func New(execPath string, headless bool, shotDir, profileDir string) *Browser {
+	return &Browser{execPath: execPath, headless: headless, shotDir: shotDir, profileDir: profileDir}
 }
 
 func (b *Browser) ensure(ctx context.Context) error {
@@ -50,6 +56,20 @@ func (b *Browser) ensure(ctx context.Context) error {
 	if b.started && b.ctx != nil && b.ctx.Err() == nil {
 		return nil
 	}
+
+	// A previous browser died (closed by hand, or crashed). Release its
+	// contexts before allocating a replacement so the process and its
+	// user-data dir do not leak.
+	if b.ctxCancel != nil {
+		b.ctxCancel()
+		b.ctxCancel = nil
+	}
+	if b.allocCancel != nil {
+		b.allocCancel()
+		b.allocCancel = nil
+	}
+	b.started = false
+	b.ctx = nil
 
 	opts := append([]chromedp.ExecAllocatorOption{},
 		chromedp.NoFirstRun,
@@ -62,6 +82,36 @@ func (b *Browser) ensure(ctx context.Context) error {
 	)
 	if b.execPath != "" {
 		opts = append(opts, chromedp.ExecPath(b.execPath))
+	}
+	if b.profileDir != "" {
+		// A stale SingletonLock from a hard-killed prior core makes Chromium
+		// refuse the profile. The queue tears cores down abruptly, so clear a
+		// dangling lock before reusing the directory. Chromium recreates it,
+		// and lockstep scheduling means no live peer owns it.
+		if err := os.MkdirAll(b.profileDir, 0o755); err == nil {
+			for _, name := range []string{"SingletonLock", "SingletonCookie", "SingletonSocket"} {
+				_ = os.Remove(filepath.Join(b.profileDir, name))
+			}
+			opts = append(opts, chromedp.UserDataDir(b.profileDir))
+		}
+	}
+
+	if goruntime.GOOS == "linux" {
+		// Servers reached over SSH are routinely containers with a small
+		// /dev/shm, where Chromium's shared-memory allocation fails and the
+		// tab crashes mid-render. Writing to /tmp instead is slower and
+		// always works.
+		opts = append(opts, chromedp.Flag("disable-dev-shm-usage", true))
+
+		// Chromium refuses to start as root unless sandboxing is off, and
+		// root is the norm in the containers this runs in. Scope it to that
+		// case rather than dropping the sandbox everywhere.
+		if os.Geteuid() == 0 {
+			opts = append(opts,
+				chromedp.NoSandbox,
+				chromedp.Flag("disable-setuid-sandbox", true),
+			)
+		}
 	}
 
 	// Detach from the request context: the browser outlives a single turn.
@@ -85,12 +135,27 @@ func (b *Browser) ensure(ctx context.Context) error {
 		}
 	})
 
-	startCtx, cancel := context.WithTimeout(bctx, 45*time.Second)
-	defer cancel()
-	if err := chromedp.Run(startCtx); err != nil {
+	// The first Run is what actually launches Chromium, and chromedp ties the
+	// browser process to the context it is handed there —
+	// exec.CommandContext(ctx, ...) inside ExecAllocator.Allocate. A
+	// context.WithTimeout here would therefore kill the browser as soon as that
+	// context was cancelled, leaving every later call to fail with "context
+	// canceled". So the first Run gets bctx, which lives as long as the
+	// browser should, and the startup deadline is enforced from outside.
+	startErr := make(chan error, 1)
+	go func() { startErr <- chromedp.Run(bctx) }()
+
+	select {
+	case err := <-startErr:
+		if err != nil {
+			bcancel()
+			allocCancel()
+			return fmt.Errorf("could not start Chromium at %q (set MFAGENT_CHROME_PATH to a Chrome or Edge executable): %w", b.execPath, err)
+		}
+	case <-time.After(45 * time.Second):
 		bcancel()
 		allocCancel()
-		return fmt.Errorf("could not start Chromium (set mfagent.browser.executable to a Chrome or Edge path): %w", err)
+		return fmt.Errorf("timed out after 45s starting Chromium at %q (set MFAGENT_CHROME_PATH to a Chrome or Edge executable)", b.execPath)
 	}
 
 	b.allocCancel = allocCancel
@@ -357,6 +422,25 @@ func (b *Browser) Screenshot(ctx context.Context, selector string, fullPage bool
 func (b *Browser) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Cancelling the context alone SIGKILLs Chromium, which loses any cookies
+	// it has not yet flushed to the profile's SQLite store — so a persistent
+	// profile would forget a login the moment the core exits. chromedp.Cancel
+	// sends Browser.close and waits for a clean shutdown, which flushes. Only
+	// worth it when there is a profile to preserve; give it a short deadline
+	// so a wedged browser cannot hang teardown.
+	if b.profileDir != "" && b.ctx != nil && b.ctx.Err() == nil {
+		done := make(chan struct{})
+		go func() {
+			_ = chromedp.Cancel(b.ctx)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}
+
 	if b.ctxCancel != nil {
 		b.ctxCancel()
 		b.ctxCancel = nil

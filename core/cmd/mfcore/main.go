@@ -182,6 +182,10 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	tools.RegisterPosix(s.registry)
 	tools.RegisterShell(s.registry)
 	tools.RegisterShellBg(s.registry)
+	// Unconditional: whether the project can actually run Playwright is
+	// decided per call against the workspace, and playwright_status exists
+	// precisely to explain when it cannot.
+	tools.RegisterPlaywright(s.registry)
 
 	// Graph memory.
 	embModel, embKey, embBaseURL := cfg.ResolveEmbedding()
@@ -219,9 +223,13 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		}
 	}
 
-	// Browser control.
+	// Browser control. The profile dir is persistent and workspace-scoped so a
+	// login survives across the throwaway cores the queue spawns per task —
+	// authenticate once, and every later task opens already signed in. The
+	// queue runs lockstep, so only one core drives this profile at a time.
 	shotDir := filepath.Join(cfg.WorkspaceRoot, ".mfagent", "screenshots")
-	s.brw = browser.New(cfg.BrowserExecutable, cfg.BrowserHeadless, shotDir)
+	profileDir := filepath.Join(cfg.WorkspaceRoot, ".mfagent", "browser-profile")
+	s.brw = browser.New(cfg.BrowserExecutable, cfg.BrowserHeadless, shotDir, profileDir)
 	tools.RegisterBrowser(s.registry, s.brw)
 
 	// MCP servers, connected in parallel so one slow server does not stall
@@ -331,7 +339,7 @@ func (s *server) registerMCPTools(server string, client *mcp.Client) {
 			Name:        name,
 			Description: desc + fmt.Sprintf(" (via MCP server %q)", server),
 			Schema:      schema,
-			Mutating: true, // an external server's side effects are unknown
+			Mutating:    true, // an external server's side effects are unknown
 			Summarize: func(json.RawMessage) string {
 				return fmt.Sprintf("Call %s on MCP server %s", toolName, server)
 			},

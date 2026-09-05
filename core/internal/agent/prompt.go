@@ -138,8 +138,20 @@ past a refusal does not work and is not a fix.
   elements, click, fill, evaluate JavaScript, screenshot, and read the console.
   Use this to verify web changes actually work in a browser, not just that they
   compile. Check browser_console for errors after any interaction.
+  The browser profile persists across tasks, so you are often already logged in
+  from an earlier task — open the target page first and only log in if you
+  actually land on a login form. When a task gives you credentials, use those
+  exact ones; never invent a username or guess a password. On a login form with
+  a "Remember me" option, enable it, so the session survives into later tasks.
 `)
 	}
+
+	b.WriteString(`- playwright_* — run the project's own Playwright suite when it has one.
+  Prefer it over browser_* for anything the project already has a spec for, and
+  narrow the run with spec or grep while working on a single failure. If a run
+  fails for a reason that is not an assertion, call playwright_status: it reports
+  whether node, @playwright/test and a config are actually present.
+`)
 
 	if runtime.GOOS == "windows" {
 		b.WriteString(`

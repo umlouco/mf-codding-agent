@@ -2,8 +2,16 @@
 // the extension ships (Windows, macOS Intel + Apple Silicon, Linux) — Go does
 // this without a toolchain per platform because nothing here uses cgo.
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, existsSync, copyFileSync, readFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  existsSync,
+  copyFileSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+} from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -103,20 +111,75 @@ const hostPlatformCopy = path.join(binDir, hostDir, hostExe);
 const hostRootCopy = path.join(binDir, hostExe);
 const [from, to] = all ? [hostPlatformCopy, hostRootCopy] : [hostRootCopy, hostPlatformCopy];
 
-if (existsSync(from)) {
+/*
+ * Windows refuses to overwrite a running executable, and both of these are
+ * long-lived: the core is spawned by the extension, and the MCP server is
+ * registered with VS Code and Claude Code, so it is running essentially
+ * always. That made `build:core --all` fail with EBUSY every time.
+ *
+ * Windows does allow *renaming* a running image, though — the lock is on the
+ * path, not the bytes. So move the live one aside and copy into the freed
+ * name.
+ *
+ * The displaced file goes to the temp dir, never beside its replacement:
+ * `.vscodeignore` force-includes `bin/**` with a negation that later patterns
+ * cannot undo, so anything left in bin/ ships inside the VSIX as a second,
+ * stale copy of a 7-20MB binary.
+ */
+function parkPath(to) {
+  return path.join(tmpdir(), `mfagent-parked-${Date.now()}-${path.basename(to)}`);
+}
+
+function syncBinary(from, to) {
+  if (!existsSync(from)) return;
   mkdirSync(path.dirname(to), { recursive: true });
-  copyFileSync(from, to);
+
+  // Sweep up anything an older build left in bin/ before this moved to tmp.
+  const legacyPark = `${to}.old`;
+  if (existsSync(legacyPark)) {
+    try {
+      rmSync(legacyPark, { force: true });
+    } catch {
+      // Still held by a running process; try again next build.
+    }
+  }
+
+  try {
+    copyFileSync(from, to);
+  } catch (e) {
+    if (e.code !== 'EBUSY' && e.code !== 'EPERM' && e.code !== 'EACCES') throw e;
+
+    let parked = parkPath(to);
+    try {
+      renameSync(to, parked); // Permitted on Windows even while running.
+    } catch (e2) {
+      if (e2.code !== 'EXDEV') throw e2;
+      // Temp is on another volume; fall back to a sibling and delete it now
+      // that we know it is only the *destination* name that is locked.
+      parked = legacyPark;
+      renameSync(to, parked);
+    }
+    copyFileSync(from, to);
+    console.log(
+      `  (${path.basename(to)} was in use — parked the running copy; ` +
+        `restart the extension to pick up the new build)`,
+    );
+    try {
+      rmSync(parked, { force: true });
+    } catch {
+      // Expected while the old process lives; it is outside bin/, so it
+      // cannot end up in the VSIX either way.
+    }
+  }
   console.log(`synced ${path.relative(root, to)} from ${path.relative(root, from)}`);
 }
+
+syncBinary(from, to);
 
 const hostMcpPlatformCopy = path.join(binDir, hostDir, hostMcpExe);
 const hostMcpRootCopy = path.join(binDir, hostMcpExe);
 const [mcpFrom, mcpTo] = all ? [hostMcpPlatformCopy, hostMcpRootCopy] : [hostMcpRootCopy, hostMcpPlatformCopy];
 
-if (existsSync(mcpFrom)) {
-  mkdirSync(path.dirname(mcpTo), { recursive: true });
-  copyFileSync(mcpFrom, mcpTo);
-  console.log(`synced ${path.relative(root, mcpTo)} from ${path.relative(root, mcpFrom)}`);
-}
+syncBinary(mcpFrom, mcpTo);
 
 console.log(`core version ${pkgVersion}+${stamp}`);

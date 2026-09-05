@@ -191,6 +191,20 @@ with ready-made CSS selectors, so the agent isn't guessing them; `browser_consol
 returns errors and uncaught exceptions, so "it compiles" and "it works" stay
 different claims. Screenshots appear inline in chat.
 
+The browser profile is persistent, at `.mfagent/browser-profile/`, so a login done in
+one task is still valid in the next — the task queue spawns a fresh core per task, and
+without this every auth-gated task would have to log in again. For the session to
+actually survive, the login must set a *persistent* cookie: on a WordPress login, tick
+"Remember Me", or the cookie is a session cookie that is never written to disk. Delete
+the profile directory to sign out.
+
+**Playwright** — `playwright_status`, `playwright_test`, `playwright_install`. Runs the
+project's *own* suite, rather than a second automation stack: `playwright_test` returns
+which specs passed and failed with the assertion, the `file:line`, and any screenshot or
+trace left behind, so a failure arrives ready to act on instead of as a wall of output.
+Narrow a run with `spec` or `grep` while iterating. The browser tools above stay on CDP
+and need no Node, so a server without Playwright still has working browser tools.
+
 **Memory** — `memory_recall`, `memory_trace`, `memory_remember`.
 
 **MCP** — every tool from every connected server, namespaced `mcp__<server>__<tool>`.
@@ -459,7 +473,8 @@ tab on the settings page shows what was found.
 | Task queue DB | `.mfagent/queue.db` |
 | Screenshots | `.mfagent/screenshots/` |
 | Agent core binary | Bundled in `bin/`; `MFAGENT_CORE_PATH` overrides |
-| Chrome / Chromium | System install, then apt, then a cached download; `MFAGENT_CHROME_PATH` overrides |
+| Chrome / Chromium | System install, then a Playwright download if one is already cached, then apt, then a cached download; `MFAGENT_CHROME_PATH` overrides |
+| Playwright | The project's own `playwright.config.*` and `node_modules/@playwright/test`; nothing is bundled |
 
 Upgrading from an earlier version imports your old `mfagent.providers` setup into the
 new store on first launch and offers to delete the obsolete keys.
@@ -539,7 +554,11 @@ the build.
 - No inline ghost-text completion. This is an agent, not a completion engine.
 - `sed` supports substitution only (`s/a/b/[gi]`), not the full script language.
 - The browser driver needs Chrome or Edge installed; set `MFAGENT_CHROME_PATH` if
-  auto-detection picks the wrong one.
+  auto-detection picks the wrong one. There are no Chromium snapshots published for
+  linux-arm64, so on those servers a browser has to be installed by hand.
+- The `playwright_*` tools run the project's own suite and need Node and
+  `@playwright/test` in that project. They are always registered; `playwright_status`
+  reports which piece is missing rather than failing opaquely.
 - **The Vision role is configured but not yet consumed.** `browser_screenshot` shows
   the image in the chat panel and hands the agent a file path; no image is sent to a
   model. Binding the role is wired end to end — the core reports it and the extension

@@ -2,7 +2,7 @@
   "name": "mf-agent",
   "displayName": "MF Agent",
   "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
-  "version": "0.1.7",
+  "version": "0.1.12",
   "publisher": "mflores",
   "license": "MIT",
   "pricing": "Free",

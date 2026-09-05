@@ -19,6 +19,9 @@ esbuild.mjs
 !out/extension.js
 !media/**
 !bin/**
+# Note: the negation above is global in vsce — a later `bin/**/*.old` does NOT
+# re-exclude. Anything dropped into bin/ ships, so build-core.mjs parks
+# displaced binaries in the temp dir rather than beside their replacement.
 
 # Kilocode's agent-manager folder, with its own node_modules — never part of the extension.
 .kilo/**
