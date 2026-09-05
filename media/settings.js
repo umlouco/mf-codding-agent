@@ -36,6 +36,17 @@
     if (sel.value) send({ type: 'addProfile', providerId: sel.value });
   });
   $('addSkillBtn').addEventListener('click', () => send({ type: 'addSkill' }));
+  $('installSkillBtn').addEventListener('click', () => {
+    const repo = $('skillSource').value.trim();
+    if (!repo || repo.startsWith('-')) {
+      toast('error', 'Enter a repository or URL, such as WordPress/agent-skills.');
+      $('skillSource').focus();
+      return;
+    }
+    send({ type: 'installSkillPack', repo, skill: $('skillName').value.trim(), agent: $('skillAgent').value });
+  });
+  $('installedSkillFilter').addEventListener('input', () => renderInstalledSkills());
+  $('refreshSkillsBtn').addEventListener('click', () => send({ type: 'refreshSkills' }));
   $('addMcpBtn').addEventListener('click', () => send({ type: 'addMcpServer' }));
 
   // ---- messages ---------------------------------------------------------
@@ -719,7 +730,44 @@
 
   // ---- skills -------------------------------------------------------------
 
+  function renderInstalledSkills() {
+    const installed = $('installedSkills');
+    installed.replaceChildren();
+    const queue = S.skillQueue;
+    $('skillQueueScope').textContent = queue ? `Queue: ${queue.path}` : 'Open a workspace with an available task queue to enable skills.';
+    const filter = $('installedSkillFilter').value.trim().toLowerCase();
+    const packs = S.installedSkills || [];
+    const groups = S.settings.skillGroups || [];
+    const rows = [
+      ...packs.map(pack => ({ id: pack.group.id, name: pack.skill.name, description: pack.skill.description,
+        scope: pack.scope === 'workspace' ? 'Project skill' : 'User skill ? shared across projects', pack })),
+      ...groups.map(group => ({ id: group.id, name: group.name, description: 'Custom skill group', scope: 'Custom group' })),
+    ].filter(row => `${row.name} ${row.description || ''} ${row.scope}`.toLowerCase().includes(filter));
+    installed.appendChild(el('p', { class: 'hint', text: `${packs.length} installed skill(s) ? ${groups.length} custom group(s)` }));
+    if (!rows.length) installed.appendChild(el('p', { class: 'hint', text: filter ? 'No matching skills.' : 'No skills found in this workspace or your user folders. Install a skill, then refresh.' }));
+    for (const row of rows) {
+      const checkbox = el('input', { type: 'checkbox', checked: !!queue?.enabled.includes(row.id), disabled: !queue,
+        onchange: e => send({ type: 'setSkillGroupEnabled', id: row.id, enabled: e.target.checked }) });
+      const children = [
+        el('label', { class: 'check' }, [checkbox, el('strong', { text: row.name })]),
+        el('p', { class: 'hint mt-sm', text: row.scope }),
+        el('p', { class: 'hint', text: row.description || '' }),
+      ];
+      if (row.pack) {
+        children.push(el('div', { class: 'hint skill-path', text: row.pack.dir }));
+        children.push(el('div', { class: 'add-row' }, [
+          el('button', { class: 'ghost', text: 'Edit SKILL.md', onclick: () => send({ type: 'editInstalledSkill', id: row.pack.skill.id }) }),
+          el('button', { class: 'ghost', text: 'Show files', onclick: () => send({ type: 'revealInstalledSkill', id: row.pack.skill.id }) }),
+          el('button', { class: 'ghost', text: 'Update…', onclick: () => send({ type: 'updateInstalledSkill', id: row.pack.skill.id }) }),
+          el('button', { class: 'danger', text: 'Uninstall…', onclick: () => send({ type: 'removeInstalledSkill', id: row.pack.skill.id }) }),
+        ]));
+      }
+      installed.appendChild(el('div', { class: 'card mt-sm' }, children));
+    }
+  }
+
   function renderSkillList() {
+    renderInstalledSkills();
     const host = $('skillList');
     host.textContent = '';
 

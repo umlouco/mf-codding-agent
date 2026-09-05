@@ -709,54 +709,48 @@ ${json}
     }
   });
 
-  reg('mfagent.installSkillPack', async () => {
-    const repo = await vscode.window.showInputBox({
-      prompt: 'Skill pack to install (GitHub shorthand or URL)',
-      placeHolder: 'e.g. WordPress/agent-skills',
-      validateInput: (v) => (v.trim() ? undefined : 'Required'),
+  reg('mfagent.installSkillPack', async (options?: { repo: string; skill: string; agent: string }) => {
+    const repo = options?.repo ?? await vscode.window.showInputBox({
+      prompt: 'Skill pack to install for your user (GitHub shorthand or URL)',
+      placeHolder: 'vercel-labs/agent-skills',
+      validateInput: (v) => (v.trim() && !v.trim().startsWith('-') ? undefined : 'Enter a repository or URL'),
     });
-    if (!repo) {
-      return;
+    if (!repo?.trim()) return;
+    if (repo.trim().startsWith('-') || /[\r\n\0]/.test(repo)) {
+      throw new Error('Enter a repository or URL, not a command or CLI option.');
     }
-    const skill = await vscode.window.showInputBox({
-      prompt: 'Specific skill to install (optional — leave blank to pick interactively in the terminal)',
-      placeHolder: 'e.g. wp-plugin-development',
+    const skill = options?.skill ?? await vscode.window.showInputBox({
+      prompt: 'Specific skill (leave blank to choose in the terminal)',
+      placeHolder: 'web-design-guidelines',
     });
+    if (skill === undefined) return;
+    const agent = options
+      ? SKILL_INSTALL_AGENTS.find((a) => a.id === options.agent)
+      : await vscode.window.showQuickPick(
+        SKILL_INSTALL_AGENTS.map((a) => ({ label: a.label, id: a.id })),
+        { title: 'Global install target (all are available to MF Agent)' },
+      );
+    if (!agent) return;
 
-    // The CLI has no generic or MF-Agent-specific install target — it only
-    // writes to one of its own known agents' folders (see SKILL_INSTALL_AGENTS
-    // and the matching read side, globalSkillsDirs, in skills.ts) — so this
-    // extension has to name one. Asking rather than hardcoding claude-code
-    // means installing a skill pack never implies Claude Code has to be on
-    // this machine.
-    const agent = await vscode.window.showQuickPick(
-      SKILL_INSTALL_AGENTS.map((a) => ({ label: a.label, id: a.id })),
-      { title: 'Install for which agent? (any is discovered the same way afterward)' },
-    );
-    if (!agent) {
-      return;
-    }
-
-    // -g is what puts it in that agent's *global* skills folder rather than
-    // this workspace's own — the one discoverInstalledSkills() (src/skills.ts)
-    // reads, which is what makes it show up, with its own checkbox, in every
-    // workspace's Task Queue. -y is only added once a specific skill is
-    // named: with a bare repo, the CLI's own interactive picker is how you
-    // choose among a multi-skill pack.
-    let cmd = `npx skills add "${repo.trim()}" -g -a ${agent.id}`;
-    if (skill?.trim()) {
-      cmd += ` --skill "${skill.trim()}" -y`;
-    }
-
+    // Pass input as environment values, never executable shell text. Pin the
+    // shell so quoting is independent of the user's terminal profile.
+    const windows = process.platform === 'win32';
+    const command = windows
+      ? '& npx.cmd --yes skills add "$env:MF_SKILL_SOURCE" --global --agent "$env:MF_SKILL_AGENT"'
+      : 'npx --yes skills add "$MF_SKILL_SOURCE" --global --agent "$MF_SKILL_AGENT"';
+    const selection = skill.trim()
+      ? (windows ? ' --skill "$env:MF_SKILL_NAME" --yes' : ' --skill "$MF_SKILL_NAME" --yes')
+      : '';
     const term = vscode.window.createTerminal({
       name: 'MF Agent: Install Skill',
       iconPath: new vscode.ThemeIcon('gift'),
+      shellPath: windows ? 'powershell.exe' : '/bin/sh',
+      env: { MF_SKILL_SOURCE: repo.trim(), MF_SKILL_AGENT: agent.id, MF_SKILL_NAME: skill.trim() },
     });
     term.show();
-    term.sendText(cmd);
-
+    term.sendText(command + selection);
     void vscode.window.showInformationMessage(
-      "Once it finishes, open the Task Queue's Context tab — installed skill packs appear there automatically with their own checkbox, no reload needed.",
+      'Complete the installation in the terminal, then click Refresh installed skills in Settings. Skills are available across workspaces on this host; enable them in Context.',
     );
   });
 

@@ -1,9 +1,14 @@
 import * as vscode from 'vscode';
+import * as os from 'os';
+import * as path from 'path';
 import { Detected, clearLanguageCache, detect, detectLanguages } from '../detect';
 import { PROVIDERS, providerOrFallback } from '../providers/catalog';
 import { ModelList, ModelRegistry } from '../providers/models';
 import { ROLES, ROLE_LABELS, Role, ProfileStore } from '../providers/store';
 import { testClaudeCliBinary } from '../queue/claudeCli';
+import { discoverInstalledSkills, SKILL_INSTALL_AGENTS } from '../skills';
+import { getActiveQueue, notifySkillsChanged, onDidChangeSkills } from '../queue/registry';
+import { scheduleRestart } from '../coreRestart';
 
 /**
  * The MF Agent settings page.
@@ -42,6 +47,14 @@ export class SettingsPanel {
       // Anything that changes the config elsewhere (a migration, another
       // window) should be reflected here rather than silently diverge.
       store.onDidChange(() => void this.pushState()),
+      onDidChangeSkills(() => void this.pushState()),
+      panel.onDidChangeViewState(e => { if (e.webviewPanel.visible) void this.pushState(); }),
+      vscode.workspace.onDidSaveTextDocument(doc => {
+        if (doc.uri.path.endsWith('/SKILL.md')) {
+          notifySkillsChanged();
+          scheduleRestart('skill edited', this.output);
+        }
+      }),
       panel.onDidDispose(() => this.dispose()),
     );
   }
@@ -174,6 +187,55 @@ export class SettingsPanel {
           });
           break;
 
+        case 'installSkillPack':
+          await vscode.commands.executeCommand('mfagent.installSkillPack', {
+            repo: String(msg.repo ?? ''), skill: String(msg.skill ?? ''), agent: String(msg.agent ?? ''),
+          });
+          break;
+        case 'refreshSkills':
+          notifySkillsChanged();
+          break;
+        case 'setSkillGroupEnabled': {
+          const queue = getActiveQueue();
+          if (!queue) throw new Error('Open a workspace with an available task queue first.');
+          const groups = [...this.store.settings.skillGroups, ...discoverInstalledSkills(vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? []).map(d => d.group)];
+          if (!groups.some(g => g.id === msg.id)) throw new Error('Skill no longer exists. Refresh the list.');
+          queue.setSkillGroupEnabled([String(msg.id)], !!msg.enabled);
+          notifySkillsChanged();
+          scheduleRestart('skill toggled in Settings', this.output);
+          break;
+        }
+        case 'updateInstalledSkill':
+        case 'removeInstalledSkill': {
+          const installed = discoverInstalledSkills(vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? []).find(d => d.skill.id === msg.id);
+          if (!installed) throw new Error('Skill no longer exists. Refresh the list.');
+          const name = path.basename(installed.dir);
+          if (name.startsWith('-') || name === '*' || /[\r\n\0]/.test(name)) throw new Error('Unsupported skill name for CLI management.');
+          const action = msg.type === 'removeInstalledSkill' ? 'remove' : 'update';
+          const scope = installed.scope === 'user' ? ' --global' : action === 'update' ? ' --project' : '';
+          const windows = process.platform === 'win32';
+          const command = windows ? '& npx.cmd --yes skills' : 'npx --yes skills';
+          const argument = windows ? ' "$env:MF_SKILL_NAME"' : ' "$MF_SKILL_NAME"';
+          const terminal = vscode.window.createTerminal({
+            name: `MF Agent: ${action} skill`,
+            shellPath: windows ? 'powershell.exe' : '/bin/sh',
+            cwd: installed.workspaceRoot ?? os.homedir(),
+            env: { MF_SKILL_NAME: name },
+          });
+          terminal.show();
+          terminal.sendText(`${command} ${action}${argument}${scope}`);
+          this.toast('info', 'Complete the skill command in the terminal, then refresh skills.');
+          break;
+        }
+        case 'editInstalledSkill':
+        case 'revealInstalledSkill': {
+          const installed = discoverInstalledSkills(vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? []).find(d => d.skill.id === msg.id);
+          if (!installed) throw new Error('Skill no longer exists. Refresh the list.');
+          const uri = vscode.Uri.joinPath(vscode.Uri.file(installed.dir), 'SKILL.md');
+          if (msg.type === 'editInstalledSkill') await vscode.window.showTextDocument(uri);
+          else await vscode.commands.executeCommand('revealInExplorer', uri);
+          break;
+        }
         case 'addSkill': {
           const skill = await this.store.addSkill(String(msg.name ?? ''));
           await this.pushState(undefined, skill.id);
@@ -291,6 +353,8 @@ export class SettingsPanel {
     this.post({
       type: 'state',
       settings,
+      installedSkills: discoverInstalledSkills(vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? []),
+      skillQueue: getActiveQueue() ? { path: getActiveQueue()!.path, enabled: getActiveQueue()!.enabledSkillGroups } : null,
       selectProfileId,
       selectSkillId,
       selectMcpId,
@@ -487,6 +551,30 @@ export class SettingsPanel {
   </section>
 
   <section class="panel" data-panel="skills" hidden>
+    <div class="card">
+      <h3>Task Queue skills</h3>
+      <p class="hint">Enable skills for this project's task queue. Selections are saved per project, independently of other open projects. Windows opening the same project share its queue.</p>
+      <div id="skillQueueScope" class="hint skill-path"></div>
+      <div class="field"><input type="text" id="installedSkillFilter" placeholder="Filter installed skills and groups" aria-label="Filter skills" /></div>
+      <div class="add-row"><button id="refreshSkillsBtn" class="ghost">Refresh skills</button></div>
+      <div id="installedSkills" class="mt-md"></div>
+    </div>
+    <details class="card mt-md">
+      <summary>Install skills for your user</summary>
+      <p class="hint mt-md">Use <code>npx skills</code> to install skills for all workspaces on this host. In SSH, WSL or containers, this installs for the remote user. Requires Node.js and npx.</p>
+      <label class="field" for="skillSource"><span class="lbl">Repository or URL</span>
+        <input type="text" id="skillSource" placeholder="WordPress/agent-skills" />
+      </label>
+      <label class="field" for="skillName"><span class="lbl">Skill name (optional)</span>
+        <input type="text" id="skillName" placeholder="wp-plugin-development" />
+      </label>
+      <label class="field" for="skillAgent"><span class="lbl">Global install target</span>
+        <select id="skillAgent">${SKILL_INSTALL_AGENTS.map((a) => `<option value="${a.id}">${a.label}</option>`).join('')}</select>
+      </label>
+      <p class="hint">MF Agent reads skills from every listed target; that agent does not need to be installed. Installation here always uses <code>--global</code>. Skills installed from a terminal at project level are also discovered.</p>
+      <div class="add-row"><button id="installSkillBtn">Install globally with npx</button></div>
+      <p class="hint mt-md">Finish the prompts in the terminal, then refresh the skills list above.</p>
+    </details>
     <p class="hint">
       A skill is a block of instruction text the agent can be given — conventions, a
       checklist, domain knowledge for one kind of project. Group skills and pick which

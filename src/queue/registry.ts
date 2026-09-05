@@ -1,4 +1,9 @@
 import { TaskQueue } from './db';
+import * as vscode from 'vscode';
+
+const skillChanges = new vscode.EventEmitter<void>();
+export const onDidChangeSkills = skillChanges.event;
+export function notifySkillsChanged(): void { skillChanges.fire(); }
 
 /**
  * The task queue open in this window, if any.

@@ -196,7 +196,7 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
       enabled: s.enabled !== false && !disabledMcp.has(s.name),
     }));
 
-  const installed = discoverInstalledSkills();
+  const installed = discoverInstalledSkills(vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? []);
   const skills = [...store.settings.skills, ...installed.map((d) => d.skill)];
   const skillGroups = [...store.settings.skillGroups, ...installed.map((d) => d.group)];
   const enabledSkillGroups = new Set(activeQueue?.enabledSkillGroups ?? []);

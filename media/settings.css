@@ -199,6 +199,9 @@ label.check input { width: auto; }
 }
 
 .add-row { display: flex; gap: 6px; }
+.add-row { flex-wrap: wrap; }
+.skill-path { overflow-wrap: anywhere; }
+summary { cursor: pointer; font-weight: 600; }
 .add-row select { flex: 1; min-width: 0; }
 
 .editor-col { min-width: 0; }

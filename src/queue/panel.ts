@@ -10,6 +10,7 @@ import { editTasks, planGoal } from './agents';
 import { Task, TaskQueue } from './db';
 import { LiveLog } from './liveLog';
 import { Orchestrator } from './orchestrator';
+import { notifySkillsChanged, onDidChangeSkills } from './registry';
 
 /**
  * The Task Queue sidebar.
@@ -57,7 +58,9 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     private readonly output: vscode.OutputChannel,
     /** Re-runs the open attempt; resolves once `attach` or `fail` has been called. */
     private readonly reopen: () => Promise<void>,
-  ) {}
+  ) {
+    context.subscriptions.push(onDidChangeSkills(() => this.render()));
+  }
 
   /** The queue opened: wire it up and drop any previous failure. */
   attach(queue: TaskQueue, orch: Orchestrator): void {
@@ -223,6 +226,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'setSkillGroupEnabled':
           queue.setSkillGroupEnabled(names(msg.ids), !!msg.enabled);
+          notifySkillsChanged();
           this.render();
           scheduleRestart('skill group toggled from the Task Queue', this.output);
           break;
@@ -699,7 +703,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
             .filter((s): s is Skill => !!s)
             .map((s) => ({ name: s.name, description: s.description ?? '' })),
         })),
-        ...discoverInstalledSkills().map((d) => ({
+        ...discoverInstalledSkills(vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? []).map((d) => ({
           id: d.group.id,
           name: d.group.name,
           enabled: enabledSkillGroups.has(d.group.id),

@@ -105,6 +105,14 @@ export const DEFAULT_SETS: ReadonlySet<string> = new Set(['edit', 'execute', 're
 /** Name prefixes the editor and its chat use for tools of its own. */
 const BUILTIN_NAMESPACES = new Set(['copilot', 'vscode', 'github', 'core', 'editor', 'chat']);
 
+// VS Code exposes these without a namespace. Their first word is an action,
+// not an extension ID (https://github.com/microsoft/vscode).
+const BROWSER_TOOLS = new Set([
+  'open_browser_page', 'click_element', 'screenshot_page', 'navigate_page',
+  'read_page', 'hover_element', 'drag_element', 'type_in_page',
+  'handle_dialog', 'run_playwright_code',
+]);
+
 /** Mirrors `sanitize` in core/cmd/mfcore/main.go and mcpBridge.ts. */
 function sanitize(s: string): string {
   return s.replace(/[^A-Za-z0-9_]/g, '_');
@@ -120,6 +128,7 @@ function haystacks(t: ToolInfo): { id: string; text: string } {
 
 /** Which capability set a built-in tool belongs to. */
 export function setOf(t: ToolInfo): string {
+  if (BROWSER_TOOLS.has(t.name)) return 'browser';
   const { id, text } = haystacks(t);
   // The name and tags are the tool's own vocabulary; the description is prose
   // that mentions half the verbs in the list. Only fall back to it.
@@ -159,6 +168,7 @@ export function serverOf(t: ToolInfo, servers: readonly string[]): string {
 
 /** The extension namespace of a non-MCP tool (`myext_doThing` → `myext`), or ''. */
 function namespaceOf(t: ToolInfo): string {
+  if (BROWSER_TOOLS.has(t.name)) return '';
   const m = /^([A-Za-z0-9]+)_/.exec(t.name);
   if (!m || BUILTIN_NAMESPACES.has(m[1].toLowerCase())) {
     return '';
