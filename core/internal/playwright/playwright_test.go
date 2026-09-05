@@ -1,7 +1,13 @@
 package playwright
 
 import (
+	"context"
+	"encoding/json"
+	"github.com/mflores/mfagent/core/internal/layout"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +23,68 @@ const escToken = "<ESC>"
 func fixture(s string) []byte {
 	jsonEscapedESC := `\` + "u001b"
 	return []byte(strings.ReplaceAll(s, escToken, jsonEscapedESC))
+}
+
+func TestRunUsesInstalledNodeCLIWithLiteralArguments(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node unavailable")
+	}
+	root := filepath.Join(t.TempDir(), "project with spaces")
+	if err = os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cli := filepath.Join(root, "cli.cjs")
+	script := `const fs=require('fs');fs.writeFileSync('args.json',JSON.stringify(process.argv.slice(2)));fs.writeFileSync(process.env.PLAYWRIGHT_JSON_OUTPUT_NAME,JSON.stringify({suites:[],errors:[],stats:{expected:1,unexpected:0}}));`
+	if err = os.WriteFile(cli, []byte(script), 0600); err != nil {
+		t.Fatal(err)
+	}
+	setup := &Setup{Root: root, NodePath: node, CLIPath: cli, Installed: true, ConfigPath: filepath.Join(root, "playwright.config.js")}
+	spec := `layout spec; echo SHOULD_NOT_RUN`
+	report, err := Run(context.Background(), setup, RunOptions{Spec: spec})
+	if err != nil || !report.OK() {
+		t.Fatalf("report=%+v err=%v", report, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "args.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var args []string
+	if err = json.Unmarshal(raw, &args); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, arg := range args {
+		if arg == spec {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("spec argument changed: %v", args)
+	}
+}
+
+func TestLayoutCaptureWithInstalledPlaywright(t *testing.T) {
+	root := os.Getenv("MFAGENT_TEST_PLAYWRIGHT_ROOT")
+	chrome := os.Getenv("MFAGENT_TEST_CHROME")
+	if root == "" || chrome == "" {
+		t.Skip("set MFAGENT_TEST_PLAYWRIGHT_ROOT and MFAGENT_TEST_CHROME for live replay")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<button id="show" onclick="document.querySelector('#panel').hidden=false">Show</button><div id="panel" hidden>Ready</div>`))
+	}))
+	defer server.Close()
+	capture, err := CaptureLayout(context.Background(), Detect(root), layout.Spec{Width: 800, Height: 600, Criteria: []layout.Criterion{{ID: "panel", Requirement: "Panel is visible below button", Selectors: []string{"#panel"}}}}, server.URL, chrome, "", []LayoutStep{{Kind: "click", Selector: "#show"}, {Kind: "visible", Selector: "#panel"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !capture.Stable || len(capture.PNG) == 0 || !strings.Contains(string(capture.DOM), `"visible":true`) {
+		t.Fatalf("bad capture: %+v", capture)
+	}
+	if !strings.Contains(string(capture.Behavior), `"completed":true`) {
+		t.Fatal("missing replay evidence")
+	}
 }
 
 // A report with one passing and one failing spec, nested one suite deep, which

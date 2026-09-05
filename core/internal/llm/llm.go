@@ -30,9 +30,9 @@ const (
 type Block struct {
 	Type string `json:"type"`
 
-	Text string `json:"text,omitempty"`
+	Text      string `json:"text,omitempty"`
 	MediaType string `json:"mediaType,omitempty"`
-	Data string `json:"data,omitempty"` // base64 image, sent only to the vision provider
+	Data      string `json:"data,omitempty"` // base64 image, sent only to the vision provider
 	// Signature must be round-tripped verbatim on thinking blocks; the API
 	// rejects tampering.
 	Signature string `json:"signature,omitempty"`

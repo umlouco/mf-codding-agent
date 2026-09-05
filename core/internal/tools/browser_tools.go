@@ -126,9 +126,7 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 	r.Add(&Tool{
 		Name:        "browser_click",
 		Description: "Click an element by CSS selector, then report the resulting page state.",
-		// Not mutating: a click changes the page, not the workspace, so it does
-		// not need to be sequenced against the file writes in the same batch.
-		Mutating: false,
+		Mutating:    true,
 		Schema: obj(map[string]any{
 			"selector": str("CSS selector, ideally taken from browser_elements."),
 		}, "selector"),
@@ -156,7 +154,7 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 	r.Add(&Tool{
 		Name:        "browser_fill",
 		Description: "Type a value into an input, textarea or contenteditable element.",
-		Mutating:    false, // same reasoning as browser_click
+		Mutating:    true,
 		Schema: obj(map[string]any{
 			"selector": str("CSS selector for the field."),
 			"value":    str("Text to enter. Replaces any existing value."),
@@ -311,4 +309,11 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 			return Ok("Browser closed.")
 		},
 	})
+	// Page reads must also preserve ordering against navigation and interaction.
+	// Otherwise a batched capture can run before the click it was meant to check.
+	for _, tool := range r.List() {
+		if strings.HasPrefix(tool.Name, "browser_") {
+			tool.Mutating = true
+		}
+	}
 }

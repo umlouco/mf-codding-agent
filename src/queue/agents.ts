@@ -9,12 +9,13 @@ import { getStore } from '../providers/instance';
 import { contextCeiling } from '../providers/payload';
 import { runClaudeCliTurn } from './claudeCli';
 import { NewTask, Task, TaskQueue, Usage } from './db';
-import { browserEvidence, codingWorkflow, executorExample, recoveryRules } from './prompts';
+import { browserEvidence, codingWorkflow, executorExample, recoveryRules, reportContract, originalGoalContext } from './prompts';
 import {
   CompletionClaim,
   extractExecutorNotes,
   parseCompletionClaim,
   validationForSupervisor,
+  storedValidationProblem,
 } from './validation';
 
 /**
@@ -88,13 +89,22 @@ async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<Core
     // one scrollback. They spawn their own shell instead.
     editorTerminal: false,
     maxIterations,
-    // An executor turn runs with no round ceiling (see executeTask), so this is
-    // the only limit the core itself still applies. It is not a work budget:
-    // past this point the next request is about to be refused for its size, and
-    // stopping just short of that is the difference between a handoff report
-    // the supervisor can act on and an API error that loses the whole turn.
-    maxContextTokens: contextCeiling(),
+    // Keep local worker context bounded while respecting a lower global ceiling.
+    maxContextTokens: queueContextCeiling(),
   };
+}
+
+function queueContextCeiling(): number {
+  const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.maxContextTokens', 32768);
+  const local = Number.isFinite(configured) && configured >= 4096 ? configured : 32768;
+  const global = contextCeiling();
+  return global > 0 ? Math.min(local, global) : local;
+}
+
+/** Short turns preserve changes and hand control back to autonomous recovery. */
+export function workerRounds(): number {
+  const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.workerMaxRounds', 24);
+  return Number.isFinite(configured) ? Math.max(4, Math.min(200, Math.floor(configured))) : 24;
 }
 
 /** Base tool-calling rounds for one unattended executor turn. */
@@ -930,6 +940,10 @@ Each element must be an object with exactly these keys:
                             how much smaller that piece needs to be, not you.
 
 Rules:
+- Order tasks by dependencies: inspect validation, persistence and existing tests before UI changes.
+- Do not turn each file read, naming check, or temporary artifact into a separate task. Group these
+  into the smallest behavioral outcome that can be implemented and tested together.
+- Task output is a deliverable; never require a final reply format that replaces the queue report.
 - Order the array in the sequence the tasks must be executed.
 - Stay inside this phase's region. Do not propose work on files outside it.
 - Each task must be completable by one agent in a single sitting, touching a handful of files.
@@ -1034,7 +1048,7 @@ export interface ExecutionOutcome {
  * or is ready to validate.
  */
 export function coreHalted(stopReason: string): boolean {
-  return stopReason === 'repeated_tool_error' || stopReason === 'context_limit';
+  return stopReason === 'repeated_tool_error' || stopReason === 'context_limit' || stopReason === 'max_iterations';
 }
 
 const MAX_LOG_ENTRIES = 4;
@@ -1158,6 +1172,7 @@ ${browserEvidence}
   that fact reaches later tasks: they run with no memory of this attempt. Leave "notes" empty if
   there is nothing new, and do not repeat what PROJECT NOTES above already says.
 - Your final response must be ONE valid JSON object, without a code fence or trailing prose.
+${reportContract}
   Use status READY_FOR_VALIDATION only when implementation is complete and development checks
   support handing it to the verifier. Otherwise use NEEDS_MORE_WORK. Neither status is a formal PASS.
   Populate filesChanged and developmentChecks with strings describing actual files and results.
@@ -1165,9 +1180,7 @@ ${browserEvidence}
 ${executorExample}`;
 
   const { text, stopReason, usage } = await runOnce(context, output, 'executor', prompt, {
-    // Negative means the core runs until the model finishes or the supervisor
-    // stops it based on work quality. Time and round counts are not verdicts.
-    maxIterations: -1,
+    maxIterations: workerRounds(),
     onActivity,
     onEvent,
     onAbort,
@@ -1198,9 +1211,6 @@ export type Verdict = 'VERIFIED' | 'RETRY' | 'SPLIT' | 'RESET_FROM';
 /** Upper bound on the pieces one oversized task may be replaced with. */
 const MAX_SPLIT_PARTS = 6;
 
-/** How much of the original planning goal the supervisor is shown at the ceiling. */
-const MAX_GOAL_CHARS = 2000;
-
 /**
  * Whether this task has spent the attempt budget its plan gave it.
  *
@@ -1227,12 +1237,11 @@ export function attemptsExhausted(task: Task): boolean {
  * ceiling it becomes an instruction, because by then the count *is* evidence —
  * three failures against one description are not three accidents.
  */
-function ceilingNotice(task: Task, goal: string): string {
+function ceilingNotice(task: Task): string {
   if (!attemptsExhausted(task)) {
     return `This is attempt ${task.attempts} of ${task.maxAttempts}. Judge the recorded work on its own
 merits — the count is context here, not a reason to accept or reject anything.`;
   }
-  const objective = goal.trim().slice(0, MAX_GOAL_CHARS);
   return `ATTEMPT BUDGET SPENT: this is attempt ${task.attempts} of ${task.maxAttempts}, the last one this
 task gets in its current form. Diagnose the recorded failure: it may be a tool invocation,
 environment problem, model mistake, or task ambiguity. Preserve the required acceptance criteria;
@@ -1245,15 +1254,7 @@ If the evidence is not sufficient, choose exactly one:
    unclear requirement. Preserve the goal and required behavior. Write a self-contained task
    using the observed failures, completed work, and a concrete different approach.
 Whichever you choose, the replacement starts again with a full attempt budget, so it is worth
-getting right.${
-    objective
-      ? `
-
-THE ORIGINAL OBJECTIVE THIS WHOLE PLAN WAS BUILT FROM — a rebuilt task must still serve it, and
-must not drift into work some other task in the plan already owns:
-${objective}`
-      : ''
-  }`;
+getting right.`;
 }
 
 /**
@@ -1320,7 +1321,9 @@ SPLIT into several smaller ordered tasks. Use SPLIT only when scope is the obsta
 for a focused correction to code, tool use, setup, requirements, or missing verification.
 Whether the work passes is decided by the evidence alone and never by how many attempts it took.
 
-${ceilingNotice(task, goal)}
+${originalGoalContext(goal)}
+
+${ceilingNotice(task)}
 
 ${recoveryRules}
 
@@ -1384,7 +1387,7 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
     // restate that same judgement in the required shape before this code
     // assumes anything on its behalf; see reformatVerdict for why that is not
     // the same repair demandRewrite does.
-    const reformatted = await reformatVerdict(context, output, task, text, opts);
+    const reformatted = await reformatVerdict(context, output, task, text, goal, opts);
     addUsage(total, reformatted.usage);
     if (reformatted.decision) {
       d = reformatted.decision;
@@ -1407,9 +1410,12 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
   // FAIL is no longer in the protocol. A model that has seen it elsewhere still
   // emits it, and it means "I have run out of ideas" — which is a reason to
   // rewrite the task, never a reason to end the run.
-  const verdict: Verdict = (['VERIFIED', 'RETRY', 'SPLIT'] as string[]).includes(named)
+  let verdict: Verdict = (['VERIFIED', 'RETRY', 'SPLIT'] as string[]).includes(named)
     ? (named as Verdict)
     : 'RETRY';
+
+  const evidenceProblem = verdict === 'VERIFIED' ? storedValidationProblem(task.validationReport) : '';
+  if (evidenceProblem) verdict = 'RETRY';
 
   const splitInto = (Array.isArray(d.splitInto) ? d.splitInto : [])
     .filter((p: any) => p && typeof p === 'object' && String(p.title ?? '').trim())
@@ -1425,7 +1431,7 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
   // A split into fewer than two usable parts is not a split. Fall back to the
   // retry it amounts to rather than replacing the task with a copy of itself.
   const settled: Verdict = verdict === 'SPLIT' && splitInto.length < 2 ? 'RETRY' : verdict;
-  const feedback = String(d.feedback ?? '').trim();
+  const feedback = evidenceProblem || String(d.feedback ?? '').trim();
   const taskEdits = (Array.isArray(d.taskEdits) ? d.taskEdits : []).filter(
     (e: any) => e && typeof e === 'object' && typeof e.seq === 'number',
   );
@@ -1466,7 +1472,7 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
   const repair = exhausted
     ? await escalate(context, output, task, goal, feedback, opts)
     : {
-        ...(await demandRewrite(context, output, task, feedback, parsed ? text : '', opts)),
+        ...(await demandRewrite(context, output, task, feedback, parsed ? text : '', goal, opts)),
         splitInto: [] as NewTask[],
       };
   addUsage(total, repair.usage);
@@ -1570,7 +1576,6 @@ async function escalate(
     usage: { ...NO_USAGE },
   };
 
-  const objective = goal.trim().slice(0, MAX_GOAL_CHARS);
   const prompt = `Task ${task.seq} has now used all ${task.maxAttempts} attempts its plan allowed, and you asked
 for another one without restructuring it. That is the one answer this task cannot take: the
 previous attempts each ran a description you had already corrected, and each failed anyway.
@@ -1585,15 +1590,8 @@ ${feedback || '(nothing recorded)'}
 
 How the attempts ended:
 ${attemptHistory(task)}
-${
-  objective
-    ? `
-The objective this whole plan was generated from. A rebuilt task must still serve it, and must not
-absorb work that belongs to a different task in the plan:
-${objective}
-`
-    : ''
-}
+${originalGoalContext(goal)}
+
 Decide which of the two failures this is, and answer with ONE JSON object and nothing else.
 
 If the task is TOO BIG — the work is several distinct pieces and no single agent turn can carry
@@ -1690,12 +1688,15 @@ async function reformatVerdict(
   output: vscode.OutputChannel,
   task: Task,
   rawReply: string,
+  goal: string,
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'>,
 ): Promise<{ decision?: Partial<SupervisorDecision>; usage: Usage }> {
   const prompt = `Your last reply about task ${task.seq} was not returned as the required JSON object, so it
 could not be read as a verdict. Here is exactly what you wrote:
 
 ${rawReply.slice(0, 4000)}
+
+${originalGoalContext(goal)}
 
 Restate the SAME judgement — do not reconsider it, do not change your mind, just put it in the
 required shape — as ONE JSON object and nothing else:
@@ -1742,6 +1743,7 @@ async function demandRewrite(
   task: Task,
   feedback: string,
   rawReply: string,
+  goal: string,
   opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'>,
 ): Promise<{
   description: string;
@@ -1753,6 +1755,8 @@ async function demandRewrite(
 }> {
   const prompt = `You judged task ${task.seq} and asked for another attempt, but you did not supply the
 rewritten description that a retry requires. Supply it now.
+
+${originalGoalContext(goal)}
 
 The executor is a fresh agent. Provide self-contained recovery instructions; it does not see
 your full conversation. It receives the task, recent failure history, and supervisor feedback.

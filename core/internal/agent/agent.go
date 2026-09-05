@@ -449,6 +449,14 @@ func (a *Agent) invoke(ctx context.Context, sessionID string, call llm.Block, t 
 	}()
 
 	status := "ok"
+	a.mu.Lock()
+	if sess, ok := a.sessions[sessionID]; ok {
+		sess.Usage.Input += res.Usage.Input
+		sess.Usage.Output += res.Usage.Output
+		sess.Usage.CacheRead += res.Usage.CacheRead
+		sess.Usage.CacheWrite += res.Usage.CacheWrite
+	}
+	a.mu.Unlock()
 	if res.IsError {
 		status = "error"
 	}

@@ -80,7 +80,7 @@ export function parseExecutorValidation(text: string, cutOff: boolean): Executor
     const checks = Array.isArray(value.checks)
       ? value.checks.slice(0, 40).map(normalizeCheck).filter((c): c is ValidationCheck => !!c)
       : [];
-    return {
+    const report: ExecutorValidation = {
       conclusion,
       summary: clean(value.summary),
       implementationEvidence: clean(value.implementationEvidence),
@@ -88,13 +88,23 @@ export function parseExecutorValidation(text: string, cutOff: boolean): Executor
       checks,
       remaining: clean(value.remaining),
     };
+    if (conclusion === 'PASS' && (!Array.isArray(value.checks) || value.checks.length > 40 ||
+      value.checks.some(check => !normalizeCheck(check)))) {
+      return incomplete('Verification checks are malformed or exceed the 40-check report limit.', text);
+    }
+    const problem = validationProblem(report);
+    if (report.conclusion === 'PASS' && problem) {
+      report.conclusion = 'INCOMPLETE';
+      report.remaining = problem;
+    }
+    return report;
   } catch {
     return incomplete('The verification reply could not be parsed as structured validation.', text);
   }
 }
 
 /**
- * The closing JSON object carrying `key`, searched from the end of the reply.
+ * The last complete outer JSON object carrying `key`, scanned in linear time.
  *
  * `key` is what makes this reliable: an agent's report quotes diffs, tool output
  * and sometimes whole JSON files, so "the last object that parses" is regularly
@@ -102,27 +112,63 @@ export function parseExecutorValidation(text: string, cutOff: boolean): Executor
  * the object the schema actually asked for.
  */
 function extractEnvelope<T>(text: string, key: 'validation' | 'completion' | 'notes'): T {
-  const candidates = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((m) => m[1]);
-  candidates.push(text);
-  for (const candidate of candidates.reverse()) {
-    // Walk the opening braces from the end. The step has to stop explicitly
-    // at index 0: `lastIndexOf('{', -1)` clamps its start to 0 and finds the
-    // brace at 0 again, so a reply that *begins* with `{` — the normal shape
-    // of a JSON report — and does not parse, or lacks the key, looped here
-    // forever and froze the extension host.
-    for (let start = candidate.lastIndexOf('{'); start >= 0; start = start === 0 ? -1 : candidate.lastIndexOf('{', start - 1)) {
+  // One linear scan accepts fences/prose without repairing or inventing data.
+  // Consider only complete outer objects: nested quoted artifacts are not reports.
+  let start = -1, depth = 0;
+  let quoted = false, escaped = false;
+  let found: T | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (start < 0) {
+      if (ch !== '{') continue;
+      start = i;
+      depth = 1;
+      continue;
+    }
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') quoted = false;
+      continue;
+    }
+    if (ch === '"') quoted = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) {
       try {
-        const value = JSON.parse(candidate.slice(start).trim());
+        const value = JSON.parse(text.slice(start, i + 1));
         if (!!value && typeof value === 'object' && !Array.isArray(value) &&
           key in (value as Record<string, unknown>)) {
-          return value as T;
+          found = value as T;
         }
       } catch {
-        // Try an earlier opening brace; executor prose and evidence can contain JSON.
+        // Malformed JSON remains untrusted.
       }
+      start = -1;
     }
   }
+  if (found !== undefined && start < 0) return found;
   throw new Error(`no executor ${key} envelope`);
+}
+
+/** Necessary evidence floor, not a replacement for independent behavioral review. */
+export function validationProblem(report: ExecutorValidation): string {
+  if (report.conclusion !== 'PASS') return 'Independent verification did not conclude PASS.';
+  if (!report.summary.trim() || !report.implementationEvidence.trim() || !report.behaviorEvidence.trim()) {
+    return 'PASS requires a summary, implementation evidence, and behavior evidence.';
+  }
+  if (report.remaining.trim()) return 'Required verification remains unfinished: ' + report.remaining;
+  if (!report.checks.length || report.checks.some(c => c.passed !== true || !c.evidence.trim())) {
+    return 'PASS requires passing checks with observed evidence for every reported check.';
+  }
+  return '';
+}
+
+export function storedValidationProblem(serialized: string): string {
+  try {
+    return validationProblem(parseExecutorValidation(JSON.stringify({ validation: JSON.parse(serialized) }), false));
+  } catch {
+    return 'Independent verification report is missing or invalid.';
+  }
 }
 
 function normalizeCheck(raw: unknown): ValidationCheck | undefined {

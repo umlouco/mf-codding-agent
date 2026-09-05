@@ -14,14 +14,15 @@ func RegisterPlaywright(r *Registry) {
 	r.Add(&Tool{
 		Name: "playwright_status",
 		Description: "Report whether this project can run Playwright: config file, " +
-			"@playwright/test version, and whether node and npx are available. " +
+			"@playwright/test version, installed CLI, and Node availability on the workspace host. " +
 			"Call this first when a Playwright run fails for an unclear reason.",
 		Schema: obj(map[string]any{}),
 		Run: func(ctx context.Context, env *Env, in json.RawMessage) Result {
 			s := playwright.Detect(env.Root)
 			var sb strings.Builder
 			fmt.Fprintf(&sb, "node:    %s\n", orNone(s.NodePath))
-			fmt.Fprintf(&sb, "npx:     %s\n", orNone(s.NpxPath))
+			fmt.Fprintf(&sb, "CLI:     %s\n", orNone(s.CLIPath))
+			sb.WriteString("Execution host: workspace host (remote server when using SSH). Tests launch via node, without a shell or implicit package downloads.\n")
 			if s.ConfigPath != "" {
 				fmt.Fprintf(&sb, "config:  %s\n", env.Rel(s.ConfigPath))
 			} else {
@@ -40,6 +41,9 @@ func RegisterPlaywright(r *Registry) {
 				fmt.Fprintf(&sb, "\nNot ready: %v", err)
 			} else {
 				sb.WriteString("\nReady to run tests.")
+			}
+			if s.NodePath != "" && s.Installed {
+				sb.WriteString("\nDeclarative layout replay is available without a test config; browser installation is checked at launch.")
 			}
 			return Ok(sb.String())
 		},

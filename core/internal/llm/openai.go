@@ -107,7 +107,7 @@ func (p *OpenAIProvider) convert(req Request) []oaiMessage {
 			for _, b := range m.Blocks {
 				switch b.Type {
 				case BlockImage:
-					images = append(images, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:"+b.MediaType+";base64,"+b.Data}})
+					images = append(images, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + b.MediaType + ";base64," + b.Data}})
 				case BlockToolResult:
 					out = append(out, oaiMessage{
 						Role: "tool", ToolCallID: b.ToolUseID, Content: b.Text,

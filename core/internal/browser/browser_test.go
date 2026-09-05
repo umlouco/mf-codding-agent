@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"github.com/mflores/mfagent/core/internal/layout"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -97,6 +98,13 @@ func TestBrowserSurvivesAcrossCalls(t *testing.T) {
 	}
 	if !b.Running() {
 		t.Fatal("browser reports not running after a full sequence")
+	}
+	capture, err := b.CaptureLayout(ctx, layout.Spec{Width: 800, Height: 600, Criteria: []layout.Criterion{{ID: "heading", Requirement: "Heading is visible", Selectors: []string{"#hd"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !capture.Stable || len(capture.PNG) == 0 || !strings.Contains(string(capture.DOM), `"width":800`) {
+		t.Fatalf("bad layout capture: stable=%v DOM=%s", capture.Stable, capture.DOM)
 	}
 }
 

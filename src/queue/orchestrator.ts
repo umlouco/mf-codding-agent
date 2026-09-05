@@ -940,7 +940,7 @@ export class Orchestrator implements vscode.Disposable {
     const live = new LiveLog(this.queue, task.id, 'supervisor');
     let decision: SupervisorDecision;
     try {
-      // The goal is what the plan was generated from; at the attempt ceiling the
+      // The goal is what the plan was generated from; on every review the
       // supervisor rebuilds the task against it rather than against the text
       // that has been failing. See ceilingNotice.
       decision = await superviseTask(

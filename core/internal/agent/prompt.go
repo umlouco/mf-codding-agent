@@ -158,11 +158,24 @@ past a refusal does not work and is not a fix.
   Run supplied verification scripts intact. Return plain objects or primitives
   from browser_eval, not DOM nodes. Multiple statements need an explicit return
   inside an IIFE. A result with no returned value does not prove a missing element.
-  The browser profile persists across tasks, so you are often already logged in
-  from an earlier task — open the target page first and only log in if you
-  actually land on a login form. When a task gives you credentials, use those
-  exact ones; never invent a username or guess a password. On a login form with
-  a "Remember me" option, enable it, so the session survives into later tasks.
+  Each worker has an isolated browser session. Open the target page first and
+  authenticate when required using only provided credentials or test fixtures.
+  Do not assume a previous task's login exists in this session.
+- browser_layout_check — ask the configured Vision model about the current page
+  after browser interactions. Supply a viewport and 1..8 concrete visual criteria
+  with IDs and CSS selectors. It saves the screenshot and DOM evidence together
+  and returns text findings; you do not need image capability yourself.
+- playwright_layout_check — reach a state with a short declarative Playwright
+  replay and get the same visual report. Requires installed @playwright/test,
+  but no project test config. This is a separate browser session; an existing
+  Playwright storageState file can supply authentication.
+  A visual PASS covers only the stated criteria in that captured viewport.
+  Run behavioral checks separately. On INCOMPLETE, resolve the reported capture
+  or model problem; never replace missing visual evidence with a claim.
+  After changing code or page state, capture again. Do not reuse an old PASS.
+  Use separate desktop/mobile captures when responsive layout is required.
+  Browser URLs, binaries and files are on the workspace host: localhost over SSH
+  means the remote server, not the laptop. No desktop display is needed remotely.
 `)
 	}
 

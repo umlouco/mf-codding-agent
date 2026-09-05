@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
 import type { Task, Usage } from './db';
-import { ActivityRecord, coreHalted, runOnce, RunOptions } from './agents';
+import { ActivityRecord, coreHalted, runOnce, RunOptions, workerRounds } from './agents';
 import { parseExecutorValidation, serializeValidation } from './validation';
-import { browserEvidence, verificationExample } from './prompts';
+import { browserEvidence, verificationExample, reportContract } from './prompts';
 
 export interface VerificationOutcome {
   text: string;
@@ -50,6 +50,7 @@ criterion has passing evidence. List unverified checks in remaining, even if ano
 ${browserEvidence}
 
 Your final response must be ONE valid JSON object, without a code fence or trailing prose.
+${reportContract}
 Set conclusion to PASS, FAIL, or INCOMPLETE. Fill checks with one object per check, using keys kind,
 name, passed, and evidence. kind is inspection, command, test, browser, or other; passed is a JSON
 boolean. For an unperformed required check use passed false and explain the blocker in evidence.
@@ -57,7 +58,7 @@ Replace this example's values with observations; leave remaining empty only when
 ${verificationExample}`;
 
   const result = await runOnce(context, output, 'executor', prompt, {
-    maxIterations: -1,
+    maxIterations: workerRounds(),
     onActivity,
     onEvent,
     onAbort,

@@ -223,13 +223,10 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		}
 	}
 
-	// Browser control. The profile dir is persistent and workspace-scoped so a
-	// login survives across the throwaway cores the queue spawns per task —
-	// authenticate once, and every later task opens already signed in. The
-	// queue runs lockstep, so only one core drives this profile at a time.
+	// Each core owns an isolated browser. Executors and validators can overlap;
+	// they must never remove one another's profile locks or change each other's page.
 	shotDir := filepath.Join(cfg.WorkspaceRoot, ".mfagent", "screenshots")
-	profileDir := filepath.Join(cfg.WorkspaceRoot, ".mfagent", "browser-profile")
-	s.brw = browser.New(cfg.BrowserExecutable, cfg.BrowserHeadless, shotDir, profileDir)
+	s.brw = browser.New(cfg.BrowserExecutable, cfg.BrowserHeadless, shotDir, "")
 	tools.RegisterBrowser(s.registry, s.brw)
 
 	// MCP servers, connected in parallel so one slow server does not stall
@@ -286,7 +283,12 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	// Docgen tool — markdown + screenshot documentation.
 	tools.RegisterDocgen(s.registry, s.brw, s.env, provider)
 
-	_, visModel, _, _, _ := cfg.ResolveRole(cfg.Vision)
+	visType, visModel, visKey, visBase, visEffort := cfg.ResolveRole(cfg.Vision)
+	var vision llm.Provider
+	if visModel != "" && visBase != "" || visModel != "" && visType == "anthropic" {
+		vision = llm.NewProvider(visType, visBase, visKey, visModel, 4096, visEffort, "")
+	}
+	tools.RegisterLayout(s.registry, s.brw, vision)
 
 	system := agent.BuildSystemPrompt(agent.PromptInput{
 		WorkspaceRoot: cfg.WorkspaceRoot,

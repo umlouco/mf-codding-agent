@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/mflores/mfagent/core/internal/llm"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,11 +18,12 @@ type Result struct {
 	Output  string
 	Display string
 	IsError bool
+	Usage   llm.Usage // nested model work, e.g. a tool-free vision inspection
 	// Meta rides along to the UI (e.g. a screenshot path, a diff).
 	Meta map[string]any
 }
 
-func Ok(s string) Result          { return Result{Output: s} }
+func Ok(s string) Result { return Result{Output: s} }
 func Errf(f string, a ...any) Result {
 	return Result{Output: fmt.Sprintf(f, a...), IsError: true}
 }
@@ -272,6 +274,6 @@ func obj(props map[string]any, required ...string) map[string]any {
 	}
 }
 
-func str(desc string) map[string]any  { return map[string]any{"type": "string", "description": desc} }
-func num(desc string) map[string]any  { return map[string]any{"type": "integer", "description": desc} }
+func str(desc string) map[string]any   { return map[string]any{"type": "string", "description": desc} }
+func num(desc string) map[string]any   { return map[string]any{"type": "integer", "description": desc} }
 func boolp(desc string) map[string]any { return map[string]any{"type": "boolean", "description": desc} }

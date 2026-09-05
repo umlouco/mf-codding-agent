@@ -214,6 +214,21 @@ func TestSendAsksForAReportWhenRoundsRunOut(t *testing.T) {
 	}
 }
 
+func TestNestedVisionUsageIsIncluded(t *testing.T) {
+	fake := &fakeProvider{answerAfter: 1, finalText: "done"}
+	a := newTestAgent(t, fake, 5)
+	a.registry.Add(&tools.Tool{Name: "noop", Schema: map[string]any{"type": "object"}, Run: func(context.Context, *tools.Env, json.RawMessage) tools.Result {
+		return tools.Result{Output: "visual evidence", Usage: llm.Usage{Input: 10, Output: 5}}
+	}})
+	result, err := a.Send(context.Background(), SendRequest{SessionID: "vision-cost", Text: "inspect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Usage.Input != 12 || result.Usage.Output != 7 {
+		t.Fatalf("nested usage missing: %+v", result.Usage)
+	}
+}
+
 func TestDisableToolsMakesSupervisorConclusionOnly(t *testing.T) {
 	fake := &fakeProvider{finalText: `{"verdict":"VERIFIED"}`}
 	a := newTestAgent(t, fake, 10)

@@ -84,14 +84,8 @@ func (b *Browser) ensure(ctx context.Context) error {
 		opts = append(opts, chromedp.ExecPath(b.execPath))
 	}
 	if b.profileDir != "" {
-		// A stale SingletonLock from a hard-killed prior core makes Chromium
-		// refuse the profile. The queue tears cores down abruptly, so clear a
-		// dangling lock before reusing the directory. Chromium recreates it,
-		// and lockstep scheduling means no live peer owns it.
+		// Never remove Chromium's lock: another process may own this profile.
 		if err := os.MkdirAll(b.profileDir, 0o755); err == nil {
-			for _, name := range []string{"SingletonLock", "SingletonCookie", "SingletonSocket"} {
-				_ = os.Remove(filepath.Join(b.profileDir, name))
-			}
 			opts = append(opts, chromedp.UserDataDir(b.profileDir))
 		}
 	}
@@ -146,6 +140,10 @@ func (b *Browser) ensure(ctx context.Context) error {
 	go func() { startErr <- chromedp.Run(bctx) }()
 
 	select {
+	case <-ctx.Done():
+		bcancel()
+		allocCancel()
+		return ctx.Err()
 	case err := <-startErr:
 		if err != nil {
 			bcancel()
@@ -218,6 +216,8 @@ func (b *Browser) run(ctx context.Context, timeout time.Duration, actions ...chr
 
 	tctx, cancel := context.WithTimeout(base, timeout)
 	defer cancel()
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
 	return chromedp.Run(tctx, actions...)
 }
 

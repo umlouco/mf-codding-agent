@@ -2,7 +2,7 @@
   "name": "mf-agent",
   "displayName": "MF Agent",
   "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
-  "version": "0.1.13",
+  "version": "0.1.15",
   "publisher": "mflores",
   "license": "MIT",
   "pricing": "Free",
@@ -30,7 +30,9 @@
     "delphi"
   ],
   "main": "./out/extension.js",
-  "extensionKind": ["workspace"],
+  "extensionKind": [
+    "workspace"
+  ],
   "activationEvents": [],
   "contributes": {
     "viewsContainers": {
@@ -302,11 +304,24 @@
           "minimum": 30,
           "markdownDescription": "How often the supervisor may look in on a task that is still executing. Each look is a full model turn over the task's journal, so on a task that legitimately runs for hours a review on every `#mfagent.queue.cronIntervalSeconds#` tick is mostly re-reading evidence it has already judged. A review is skipped entirely when the journal has not grown since the last one, and this interval is never applied to a task that has stopped and is waiting on a decision."
         },
+        "mfagent.queue.workerMaxRounds": {
+          "type": "number",
+          "default": 24,
+          "minimum": 4,
+          "maximum": 200,
+          "description": "Tool rounds per executor or verifier turn. At the limit, preserve progress and hand off to automatic supervisor recovery; this never counts as a passing check."
+        },
+        "mfagent.queue.maxContextTokens": {
+          "type": "number",
+          "default": 32768,
+          "minimum": 4096,
+          "description": "Context ceiling for queue workers, additionally capped by llm.maxContextTokens. A conservative default for local models; set at or below your inference server context size."
+        },
         "mfagent.queue.maxRounds": {
           "type": "number",
           "default": 80,
           "minimum": 10,
-          "markdownDescription": "Tool-calling round budget for planning agents. Task execution and formal validation run until completion or a quality-based supervisor action; repeated identical tool failures still stop after three occurrences."
+          "markdownDescription": "Tool-calling round budget for planning agents. Task execution and formal validation use queue.workerMaxRounds; repeated identical tool failures still stop after three occurrences."
         },
         "mfagent.queue.maxFilesPerRegion": {
           "type": "number",

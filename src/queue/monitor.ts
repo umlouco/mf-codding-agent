@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import type { Task, TaskEvent, Usage } from './db';
 import { attemptsExhausted, extractJson, runOnce, RunOptions } from './agents';
 import { completionForSupervisor, parseCompletionClaim } from './validation';
-import { recoveryRules } from './prompts';
+import { recoveryRules, originalGoalContext } from './prompts';
 
 /**
  * Journal kind recording an independent validation run that did not finish.
@@ -134,6 +134,8 @@ rabbit hole, a wrong premise, invalid verification, or work ready for independen
 
 ${recoveryRules}
 
+${originalGoalContext(goal)}
+
 TASK ${task.seq}: ${task.title}
 ${task.description}
 
@@ -142,8 +144,7 @@ ${attemptsExhausted(task) ? `The current attempt budget is spent. Let useful wor
 validation when ready. If rewriting, supply a materially different recovery approach grounded in
 the failures below and the original goal. Preserve acceptance criteria, working code, and concrete
 evidence. Correct tool syntax or environment assumptions before asking for implementation changes.
-A changed task or validation contract starts a fresh attempt budget.
-ORIGINAL GOAL: ${clip(goal, 2000) || '(not recorded)'}` : ''}
+A changed task or validation contract starts a fresh attempt budget.` : ''}
 
 IMPLEMENTATION VERIFICATION: ${task.implVerifyPrompt || '(not specified)'}
 BEHAVIOR VERIFICATION: ${task.solutionVerifyPrompt || '(not specified)'}

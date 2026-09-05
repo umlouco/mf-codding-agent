@@ -40,12 +40,12 @@ function findPlaywrightChromium(output: vscode.OutputChannel): string | undefine
         : process.env.HOME && path.join(process.env.HOME, '.cache', 'ms-playwright'),
   ].filter((r): r is string => !!r);
 
-  const exe =
+  const executables =
     process.platform === 'win32'
-      ? path.join('chrome-win', 'chrome.exe')
+      ? [path.join('chrome-win64', 'chrome.exe'), path.join('chrome-win', 'chrome.exe')]
       : process.platform === 'darwin'
-        ? path.join('chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium')
-        : path.join('chrome-linux', 'chrome');
+        ? [path.join('chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium')]
+        : [path.join('chrome-linux64', 'chrome'), path.join('chrome-linux', 'chrome')];
 
   for (const root of roots) {
     let entries: string[];
@@ -59,10 +59,12 @@ function findPlaywrightChromium(output: vscode.OutputChannel): string | undefine
       .filter((e) => e.startsWith('chromium-'))
       .sort((a, b) => (parseInt(b.slice(9), 10) || 0) - (parseInt(a.slice(9), 10) || 0));
     for (const b of builds) {
+      for (const exe of executables) {
       const p = path.join(root, b, exe);
       if (fs.existsSync(p)) {
         output.appendLine(`[chromium] reusing Playwright's Chromium: ${p}`);
         return p;
+      }
       }
     }
   }

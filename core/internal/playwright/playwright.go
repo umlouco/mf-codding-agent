@@ -39,6 +39,7 @@ type Setup struct {
 	ConfigPath string // absolute path, "" when not found
 	NodePath   string
 	NpxPath    string
+	CLIPath    string // installed JS entry point, invoked with node (never npx.cmd)
 	Installed  bool   // @playwright/test resolvable from Root
 	Version    string // best-effort, "" when unknown
 }
@@ -47,11 +48,11 @@ func (s *Setup) Ready() error {
 	if s.NodePath == "" {
 		return errors.New("node is not on PATH — Playwright needs Node.js installed on this machine")
 	}
-	if s.NpxPath == "" {
-		return errors.New("npx is not on PATH — install Node.js, which provides it")
-	}
 	if !s.Installed {
 		return errors.New("@playwright/test is not installed in this project — run `npm install -D @playwright/test`")
+	}
+	if s.CLIPath == "" {
+		return errors.New("installed Playwright CLI is missing; restore the project's dependencies")
 	}
 	if s.ConfigPath == "" {
 		return errors.New("no playwright.config.* found — Playwright needs a config to know where the specs live")
@@ -78,6 +79,9 @@ func Detect(root string) *Setup {
 	pkgDir := filepath.Join(root, "node_modules", "@playwright", "test")
 	if fi, err := os.Stat(pkgDir); err == nil && fi.IsDir() {
 		s.Installed = true
+		if info, err := os.Stat(filepath.Join(pkgDir, "cli.js")); err == nil && !info.IsDir() {
+			s.CLIPath = filepath.Join(pkgDir, "cli.js")
+		}
 		if b, err := os.ReadFile(filepath.Join(pkgDir, "package.json")); err == nil {
 			var pj struct {
 				Version string `json:"version"`
@@ -192,7 +196,7 @@ func Run(ctx context.Context, s *Setup, opt RunOptions) (*Report, error) {
 	defer os.RemoveAll(tmp)
 	reportPath := filepath.Join(tmp, "report.json")
 
-	args := []string{"playwright", "test", "--reporter=json"}
+	args := []string{s.CLIPath, "test", "--reporter=json", "--config", s.ConfigPath}
 	if opt.Spec != "" {
 		args = append(args, opt.Spec)
 	}
@@ -219,7 +223,8 @@ func Run(ctx context.Context, s *Setup, opt RunOptions) (*Report, error) {
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, s.NpxPath, args...)
+	cmd := exec.CommandContext(runCtx, s.NodePath, args...)
+	configureCommand(cmd)
 	cmd.Dir = s.Root
 	cmd.Env = append(os.Environ(),
 		"PLAYWRIGHT_JSON_OUTPUT_NAME="+reportPath,
@@ -350,17 +355,18 @@ func collect(s jsonSuite, file string, rep *Report) {
 // InstallBrowsers runs `playwright install`, which is the step people forget
 // on a fresh server and which produces a famously opaque failure when missed.
 func InstallBrowsers(ctx context.Context, s *Setup, withDeps bool) (string, error) {
-	if s.NpxPath == "" {
-		return "", errors.New("npx is not on PATH")
+	if s.NodePath == "" || s.CLIPath == "" {
+		return "", errors.New("node and the project's installed @playwright/test CLI are required; no implicit package download is performed")
 	}
-	args := []string{"playwright", "install", "chromium"}
+	args := []string{s.CLIPath, "install", "chromium"}
 	if withDeps && runtime.GOOS == "linux" {
 		args = append(args, "--with-deps")
 	}
 	runCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, s.NpxPath, args...)
+	cmd := exec.CommandContext(runCtx, s.NodePath, args...)
+	configureCommand(cmd)
 	cmd.Dir = s.Root
 	cmd.Env = append(os.Environ(), "NO_COLOR=1", "CI=1")
 	out, err := cmd.CombinedOutput()
