@@ -567,6 +567,7 @@ export class SettingsPanel {
       </label>
       <label class="field" for="skillName"><span class="lbl">Skill name (optional)</span>
         <input type="text" id="skillName" placeholder="wp-plugin-development" />
+        <span class="note">Exact skill name from the repository, not a display name. Leave blank to choose from the available skills in the terminal.</span>
       </label>
       <label class="field" for="skillAgent"><span class="lbl">Global install target</span>
         <select id="skillAgent">${SKILL_INSTALL_AGENTS.map((a) => `<option value="${a.id}">${a.label}</option>`).join('')}</select>

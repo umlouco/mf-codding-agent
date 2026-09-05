@@ -14,7 +14,9 @@ import { TaskQueue } from './queue/db';
 import { Orchestrator } from './queue/orchestrator';
 import { QueueViewProvider } from './queue/panel';
 import { setActiveQueue } from './queue/registry';
-import { SKILL_INSTALL_AGENTS } from './skills';
+import { discoverInstalledSkills, SKILL_INSTALL_AGENTS } from './skills';
+import { runSkillInstall } from './skillInstall';
+import { notifySkillsChanged } from './queue/registry';
 import { resolveChromium } from './chromium';
 import { getContext, getModelRegistry, getStore, initProviders } from './providers/instance';
 import { ProfileStore } from './providers/store';
@@ -741,17 +743,16 @@ ${json}
     const selection = skill.trim()
       ? (windows ? ' --skill "$env:MF_SKILL_NAME" --yes' : ' --skill "$MF_SKILL_NAME" --yes')
       : '';
-    const term = vscode.window.createTerminal({
-      name: 'MF Agent: Install Skill',
-      iconPath: new vscode.ThemeIcon('gift'),
-      shellPath: windows ? 'powershell.exe' : '/bin/sh',
-      env: { MF_SKILL_SOURCE: repo.trim(), MF_SKILL_AGENT: agent.id, MF_SKILL_NAME: skill.trim() },
+    const code = await runSkillInstall(command + selection, {
+      MF_SKILL_SOURCE: repo.trim(), MF_SKILL_AGENT: agent.id, MF_SKILL_NAME: skill.trim(),
     });
-    term.show();
-    term.sendText(command + selection);
-    void vscode.window.showInformationMessage(
-      'Complete the installation in the terminal, then click Refresh installed skills in Settings. Skills are available across workspaces on this host; enable them in Context.',
-    );
+    notifySkillsChanged();
+    if (code !== 0) {
+      throw new Error(`Skill installation ${code === undefined ? 'was cancelled' : `failed (exit ${code})`}. Check the terminal output. Skill name must be an exact repository name, such as wp-plugin-development; leave it blank to choose interactively.`);
+    }
+    const installed = discoverInstalledSkills().filter(d => !skill.trim() || skill.trim() === '*' || d.skill.name === skill.trim());
+    if (!installed.length) throw new Error('The installer exited successfully, but no matching user-level skill was found. Check the install location in the terminal output.');
+    void vscode.window.showInformationMessage('Skill installation complete. The skills list has been refreshed; enable the skill for this project.');
   });
 
   reg('mfagent.generateDocumentation', async () => {

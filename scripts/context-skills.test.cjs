@@ -15,6 +15,32 @@ function load(file, dependencies = {}) {
   return exports;
 }
 
+test('installer observes its own exit status and keeps user input out of shell code', async () => {
+  for (const code of [0, 1, undefined]) {
+    let listener, task, disposed = false;
+    const vscode = {
+      workspace: { workspaceFolders: [] }, TaskScope: { Global: 1 },
+      TaskRevealKind: { Always: 1 }, TaskPanelKind: { New: 1 },
+      Task: class { constructor(definition, scope, name, source, execution) { Object.assign(this, { definition, execution }); } },
+      ShellExecution: class { constructor(command, options) { Object.assign(this, { command, options }); } },
+      tasks: {
+        onDidEndTaskProcess: callback => { listener = callback; return { dispose: () => { disposed = true; } }; },
+        executeTask: async value => { task = value; },
+      },
+    };
+    const { runSkillInstall } = load('src/skillInstall.ts', { vscode });
+    const source = 'owner/repo; echo unexpected';
+    const promise = runSkillInstall('npx skills add "$MF_SKILL_SOURCE"', { MF_SKILL_SOURCE: source });
+    listener({ execution: { task: { definition: { id: 'different-window' } } }, exitCode: 0 });
+    assert.equal(disposed, false);
+    assert.equal(task.execution.command.includes(source), false);
+    assert.equal(task.execution.options.env.MF_SKILL_SOURCE, source);
+    listener({ execution: { task }, exitCode: code });
+    assert.equal(await promise, code);
+    assert.equal(disposed, true);
+  }
+});
+
 test('integrated browser actions share one optional group; MCP and extension ownership stays intact', () => {
   const { buildToolTree, defaultEnabledTools } = load('src/editorTools.ts');
   const names = ['open_browser_page', 'click_element', 'screenshot_page', 'navigate_page',
