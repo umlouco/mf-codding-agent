@@ -60,14 +60,20 @@ var powerShellEscapedRune = regexp.MustCompile(`(?i)_x([0-9a-f]{4})_`)
 // repeated failures much more likely.
 func cleanPowerShellOutput(output string) string {
 	trimmed := strings.TrimSpace(output)
-	if strings.HasPrefix(trimmed, "#< CLIXML") {
-		if start := strings.Index(trimmed, "<Objs "); start >= 0 {
-			trimmed = trimmed[start:]
-		}
-	}
-	if !strings.HasPrefix(trimmed, "<Objs ") {
+	if !strings.Contains(trimmed, "#< CLIXML") && !strings.HasPrefix(trimmed, "<Objs ") {
 		return output
 	}
+	start := strings.Index(trimmed, "<Objs ")
+	end := strings.Index(trimmed, "</Objs>")
+	if start < 0 || end < start {
+		return output
+	}
+	end += len("</Objs>")
+	// Combined stdout/stderr can put ordinary command output between the
+	// CLIXML marker and the XML document. Never discard that actual evidence.
+	prefix := strings.TrimSpace(strings.ReplaceAll(trimmed[:start], "#< CLIXML", ""))
+	suffix := strings.TrimSpace(trimmed[end:])
+	trimmed = trimmed[start:end]
 	var values []string
 	decoder := xml.NewDecoder(strings.NewReader(trimmed))
 	for {
@@ -88,10 +94,10 @@ func cleanPowerShellOutput(output string) string {
 		}
 		values = append(values, value)
 	}
-	if len(values) == 0 {
-		return output
-	}
 	lines := make([]string, 0, len(values))
+	if prefix != "" {
+		lines = append(lines, prefix)
+	}
 	for _, value := range values {
 		value = powerShellEscapedRune.ReplaceAllStringFunc(value, func(token string) string {
 			var n rune
@@ -114,6 +120,9 @@ func cleanPowerShellOutput(output string) string {
 		if value = strings.TrimSpace(value); value != "" {
 			lines = append(lines, value)
 		}
+	}
+	if suffix != "" {
+		lines = append(lines, cleanPowerShellOutput(suffix))
 	}
 	return strings.Join(lines, "\n")
 }

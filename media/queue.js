@@ -297,6 +297,7 @@
     // Not just on first render: an executor can append to this at any time
     // while the run is going, so it has to stay live — but never while the
     // user is mid-edit in the same box.
+    $('agentObservations').textContent = state.agentObservations || 'No generated findings yet.';
     const notesEl = /** @type {HTMLTextAreaElement} */ ($('instructions'));
     if (document.activeElement !== notesEl) {
       notesEl.value = state.instructions || '';

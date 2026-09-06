@@ -45,6 +45,20 @@ func TestCleanPowerShellOutputLeavesPlainTextAlone(t *testing.T) {
 	}
 }
 
+func TestCleanPowerShellOutputPreservesStdoutBesideProgressAndErrors(t *testing.T) {
+	progress := `<Objs Version="1.1.0.1"><Obj S="progress"><PR><AV>Loading modules</AV></PR></Obj></Objs>`
+	if got := cleanPowerShellOutput("#< CLIXML\r\ncount=1\r\n" + progress); got != "count=1" {
+		t.Fatalf("lost command output beside progress XML: %q", got)
+	}
+	errorXML := `<Objs Version="1.1.0.1"><S S="Error">check failed_x000A_</S></Objs>`
+	if got := cleanPowerShellOutput("#< CLIXML\ncount=1\n" + errorXML + "\nafter"); got != "count=1\ncheck failed\nafter" {
+		t.Fatalf("lost stdout or error evidence: %q", got)
+	}
+	if got := cleanPowerShellOutput("#< CLIXML\n" + progress); got != "" {
+		t.Fatalf("progress serialization leaked: %q", got)
+	}
+}
+
 func TestRunShellAcceptsAndChainOnWindowsPowerShell(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows PowerShell compatibility")

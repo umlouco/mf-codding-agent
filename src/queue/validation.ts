@@ -7,6 +7,14 @@ export interface ValidationCheck {
   evidence: string;
 }
 
+/** Captured by the host, never accepted from a model-authored report. */
+export interface ToolObservation {
+  name: string;
+  status: string;
+  input: string;
+  output: string;
+}
+
 /**
  * Evidence produced by the independent verification agent and persisted before
  * the supervisor rules on it.
@@ -22,6 +30,7 @@ export interface ExecutorValidation {
   behaviorEvidence: string;
   checks: ValidationCheck[];
   remaining: string;
+  observedTools?: ToolObservation[];
 }
 
 interface ExecutorEnvelope {
@@ -88,6 +97,16 @@ export function parseExecutorValidation(text: string, cutOff: boolean): Executor
       checks,
       remaining: clean(value.remaining),
     };
+    // Evidence may already be present in typed checks. Requiring the same
+    // observation twice turns valid reports into implementation retry loops.
+    if (!report.implementationEvidence) {
+      report.implementationEvidence = checks.filter(c => c.passed && c.kind === 'inspection')
+        .map(c => `${c.name}: ${c.evidence}`).join('\n');
+    }
+    if (!report.behaviorEvidence) {
+      report.behaviorEvidence = checks.filter(c => c.passed && ['command', 'test', 'browser'].includes(c.kind))
+        .map(c => `${c.name}: ${c.evidence}`).join('\n');
+    }
     if (conclusion === 'PASS' && (!Array.isArray(value.checks) || value.checks.length > 40 ||
       value.checks.some(check => !normalizeCheck(check)))) {
       return incomplete('Verification checks are malformed or exceed the 40-check report limit.', text);
@@ -139,6 +158,11 @@ function extractEnvelope<T>(text: string, key: 'validation' | 'completion' | 'no
         if (!!value && typeof value === 'object' && !Array.isArray(value) &&
           key in (value as Record<string, unknown>)) {
           found = value as T;
+        } else if (key === 'validation' && value && typeof value === 'object' &&
+          !Array.isArray(value) && 'conclusion' in value && Array.isArray(value.checks)) {
+          // Accept the complete, top-level report used by older task templates.
+          // No JSON repair, nested artifact extraction, or invented verdict.
+          found = { validation: value } as T;
         }
       } catch {
         // Malformed JSON remains untrusted.

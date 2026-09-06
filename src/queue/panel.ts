@@ -643,6 +643,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       dbPath: queue.path,
       driver: queue.impl,
       instructions: queue.instructions,
+      agentObservations: queue.agentObservations,
       models: { planner: '', supervisor: '', executor: '' },
       mcpServers: discoverMcpServers(this.context, getStore()).map((s) => ({
         name: s.name,
@@ -788,7 +789,11 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
 
     <label class="lbl" for="instructions">Project notes (sent to every task)</label>
     <textarea id="instructions" rows="6" placeholder="e.g. Use Go with Wails; test with Playwright.&#10;The class list lives in classes.md.&#10;Build with build.ps1."></textarea>
-    <p class="hint">Every task otherwise runs in its own process with no memory of any other — this is the one thing every execution agent sees regardless. Start it with standing conventions for the project; it also grows on its own as agents report durable facts worth keeping, so a fact task 1 establishes can reach task 3 without task 3 rediscovering it.</p>
+    <p class="hint">Your standing instructions reach execution, verification and supervisor reviews. Agents record their findings separately below; those findings cannot change your requirements or test environment.</p>
+    <details class="termwrap">
+      <summary class="lbl">Agent findings (confirm before relying on them)</summary>
+      <pre id="agentObservations" class="term"></pre>
+    </details>
   </section>
 
   <section id="pane-run" class="pane">

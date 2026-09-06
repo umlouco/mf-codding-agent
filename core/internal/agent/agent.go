@@ -218,15 +218,22 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		sess.Messages = append(sess.Messages, llm.Message{Role: llm.RoleUser, Blocks: results})
 		a.mu.Unlock()
 
-		// Persistent operational memory diagnoses repeated observations without
-		// withdrawing the model's ability to recover. Retain the legacy stop
-		// only for hosts that have not attached an operational journal.
-		if _, observing := ctx.Value(cognitionContextKey{}).(*cognitionRun); !observing {
-			if repeated, detail := failures.observe(calls, results); repeated {
-				a.activity(req.SessionID, PhaseError, detail+"; stopping the tool loop")
+		// VS Code's completion tool expresses an intent to hand work back. It
+		// does not verify the work, but ignoring it can leave the model calling
+		// task_complete and rereading the same files until the round ceiling.
+		for i, call := range calls {
+			if call.Name == "editor__task_complete" && i < len(results) && !results[i].IsError {
 				return a.finalReport(ctx, req, sess, system, iter, accumulated.String(),
-					halt{reason: "repeated_tool_error", detail: detail})
+					halt{reason: "completion_signal", detail: "you signalled task completion; return the required handoff report for independent review"})
 			}
+		}
+
+		// Operational memory records the failure; it must not disable the
+		// handoff that lets a fresh worker/supervisor choose another approach.
+		if repeated, detail := failures.observe(calls, results); repeated {
+			a.activity(req.SessionID, PhaseError, detail+"; stopping the tool loop")
+			return a.finalReport(ctx, req, sess, system, iter, accumulated.String(),
+				halt{reason: "repeated_tool_error", detail: detail})
 		}
 
 		// Cache reads and writes are context too — a provider that caches the
@@ -375,6 +382,11 @@ func (a *Agent) finalReport(
 	result.Text = fmt.Sprintf(
 		"%s[%s; this is a partial-progress report, not a finished task]\n\n%s",
 		prefix, stopLabel, turn.Text())
+	if stopReason == "completion_signal" {
+		// A completion claim is a normal handoff, not a forced partial report.
+		// The queue still independently verifies every claim of completion.
+		result.Text = prefix + turn.Text()
+	}
 	a.emit("stream/done", map[string]any{
 		"sessionId": req.SessionID, "stopReason": result.StopReason,
 		"usage": result.Usage, "iterations": rounds,

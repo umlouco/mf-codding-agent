@@ -155,6 +155,7 @@ export class Orchestrator implements vscode.Disposable {
    * finishExecution in db.ts), not by anything kept here.
    */
   private executionAbort: (() => void) | null = null;
+  private executionGen = 0;
   /** Which supervision cycle owns `supervising`; see tick and sweepSilentReview. */
   private cycle = 0;
   private nextTickAt: number | null = null;
@@ -401,7 +402,11 @@ export class Orchestrator implements vscode.Disposable {
           continue;
         }
         if (!current.validationReport.trim()) {
-          await this.reviewWork(current);
+          if (current.activityPhase === 'ready_for_validation') {
+            await this.startIndependentVerification(current);
+          } else {
+            await this.reviewWork(current);
+          }
           current = this.queue.get(task.id);
         }
         if (current?.status === 'VERIFYING' && current.validationReport.trim()) {
@@ -533,6 +538,7 @@ export class Orchestrator implements vscode.Disposable {
    * silently drops it — see pump().
    */
   private abandonExecution(): void {
+    this.executionGen = (this.executionGen ?? 0) + 1;
     const abort = this.executionAbort;
     this.executionAbort = null;
     try {
@@ -621,8 +627,8 @@ export class Orchestrator implements vscode.Disposable {
 
   /** Lets the supervisor judge live work and choose one fixed control action. */
   private async reviewWork(task: Task): Promise<void> {
-    const events = this.queue.events(task.id, JOURNAL_EVENTS);
-    const latestEventId = events[0]?.id ?? 0;
+    const events = this.queue.events(task.id, JOURNAL_EVENTS, true);
+    const latestEventId = events.find(event => event.actor !== 'supervisor')?.id ?? 0;
     if (!this.shouldReview(task, latestEventId)) {
       return;
     }
@@ -646,11 +652,14 @@ export class Orchestrator implements vscode.Disposable {
         events,
         this.queue.countEvents(task.id, VALIDATION_FAILED),
         {
+          projectNotes: this.queue.contextInstructions,
           onAbort: (abort) => {
+            if (gen !== this.reviewGen) { abort(); return; }
             review.abort = abort;
           },
-          onEvent: this.observerEvents(task.id, 'supervisor', live),
+          onEvent: this.observerEvents(task.id, 'supervisor', live, () => gen === this.reviewGen),
           onActivity: (activity) => {
+            if (gen !== this.reviewGen) return;
             review.lastActivityAt = activity.at;
             live.activity(activity);
             // On the row as well, as supervise() does — but only for a task
@@ -699,7 +708,11 @@ export class Orchestrator implements vscode.Disposable {
     review: Review,
   ): Promise<void> {
     const task = this.queue.get(snapshot.id);
-    if (!task || !['EXECUTING', 'VERIFYING'].includes(task.status)) {
+    if (!task || !['EXECUTING', 'VERIFYING'].includes(task.status) ||
+        task.status !== snapshot.status || task.startedAt !== snapshot.startedAt || task.attempts !== snapshot.attempts ||
+        task.description !== snapshot.description || task.implVerifyPrompt !== snapshot.implVerifyPrompt ||
+        task.solutionVerifyPrompt !== snapshot.solutionVerifyPrompt ||
+        task.solutionVerifyCommand !== snapshot.solutionVerifyCommand) {
       this.log(`task ${snapshot.seq} moved while its progress was reviewed; action ignored`);
       return;
     }
@@ -707,8 +720,12 @@ export class Orchestrator implements vscode.Disposable {
     switch (decision.action) {
       case 'CONTINUE_EXECUTION':
         if (task.status === 'VERIFYING' && !task.validationReport.trim()) {
-          this.log(`task ${task.seq} in VERIFYING with no report — cannot continue executing; running verification instead`);
-          await this.verifyWithExecutor(task, review);
+          this.queue.update(task.id, {
+            status: 'PENDING', finishedAt: null, supervisorFeedback: decision.reason,
+            ...(attemptsExhausted(task) ? { attempts: 0 } : {}),
+          });
+          this.queue.log(task.id, 'supervisor', 'continued', decision.reason);
+          this.log(`task ${task.seq} will resume from its handoff with the same requirements`);
         } else {
           this.log(`task ${task.seq} is progressing in the right direction; continuing`);
         }
@@ -789,6 +806,7 @@ export class Orchestrator implements vscode.Disposable {
       if (!this.queue.finishExecution(task.id, task.attempts, patch)) {
         return false;
       }
+      this.executionGen = (this.executionGen ?? 0) + 1;
       const abort = this.executionAbort;
       this.executionAbort = null;
       try {
@@ -803,9 +821,10 @@ export class Orchestrator implements vscode.Disposable {
   }
 
   /** Runtime observations are durable evidence of execution, never liveness heartbeats. */
-  private observerEvents(taskId: number, actor: string, live: LiveLog) {
+  private observerEvents(taskId: number, actor: string, live: LiveLog, accepts = () => true) {
     let lastCognition = '';
     return (method: string, params: any): void => {
+      if (!accepts()) return;
       live.onEvent(method, params);
       if (method === 'agent/cognition') {
         const record = cognitionRecord(params);
@@ -832,7 +851,7 @@ export class Orchestrator implements vscode.Disposable {
    * when it starts a tool call, and by the caller when the turn ends — that last
    * one is not optional, or the tail of every reply is lost.
    */
-  private streamJournal(taskId: number, actor: 'executor' | 'validator') {
+  private streamJournal(taskId: number, actor: 'executor' | 'validator', accepts = () => true) {
     const pendingTools = new Map<string, { name: string; input: unknown }>();
     let kind = '';
     let buffer = '';
@@ -841,6 +860,7 @@ export class Orchestrator implements vscode.Disposable {
     const live = new LiveLog(this.queue, taskId, actor);
 
     const flush = (): void => {
+      if (!accepts()) { buffer = ''; return; }
       live.flush();
       if (!buffer.trim()) {
         buffer = '';
@@ -851,6 +871,7 @@ export class Orchestrator implements vscode.Disposable {
     };
 
     const onEvent = (method: string, params: any): void => {
+      if (!accepts()) return;
       live.onEvent(method, params);
       if (method === 'agent/cognition') {
         flush();
@@ -904,7 +925,7 @@ export class Orchestrator implements vscode.Disposable {
   private async verifyWithExecutor(task: Task, review: Review): Promise<void> {
     this.log(`task ${task.seq} — supervisor started independent verification`);
     this.queue.log(task.id, 'supervisor', 'validation-started', 'delegated to execution LLM');
-    const journal = this.streamJournal(task.id, 'validator');
+    const journal = this.streamJournal(task.id, 'validator', () => review.gen === this.reviewGen);
     try {
       const result = await runVerification(
         this.context,
@@ -927,6 +948,7 @@ export class Orchestrator implements vscode.Disposable {
           if (review.gen !== this.reviewGen) { abort(); return; }
           review.abort = abort;
         },
+        this.queue.contextInstructions,
       );
       journal.flush();
       if (review.gen !== this.reviewGen || this.queue.get(task.id)?.status !== 'VERIFYING') {
@@ -935,7 +957,6 @@ export class Orchestrator implements vscode.Disposable {
       }
       this.queue.addUsage(task.id, result.usage);
       this.queue.update(task.id, {
-        output: result.text,
         validationReport: result.validationReport,
         finishedAt: Date.now(),
       });
@@ -975,6 +996,24 @@ export class Orchestrator implements vscode.Disposable {
   }
 
   /** Runs the full verification pass for one task and applies the verdict. */
+  private async startIndependentVerification(task: Task): Promise<void> {
+    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now() };
+    this.review = review;
+    try {
+      await this.verifyWithExecutor(task, review);
+    } finally {
+      if (this.review === review) this.review = null;
+    }
+  }
+
+  /** Completed stages should not wait for the periodic liveness scan. */
+  private wakeAfterHandoff(): void {
+    setTimeout(() => {
+      if (!this.disposed && this.queue.runState === 'RUNNING') void this.tick();
+    }, 0);
+  }
+
+  /** Runs the full verification pass for one task and applies the verdict. */
   private async supervise(task: Task): Promise<void> {
     this.log(`supervising task ${task.seq} — ${task.title}`);
 
@@ -998,11 +1037,14 @@ export class Orchestrator implements vscode.Disposable {
         this.rewrites(task),
         this.queue.getMeta('goal'),
         {
+          projectNotes: this.queue.contextInstructions,
           onAbort: (abort) => {
+            if (gen !== this.reviewGen) { abort(); return; }
             review.abort = abort;
           },
-          onEvent: this.observerEvents(task.id, 'supervisor', live),
+          onEvent: this.observerEvents(task.id, 'supervisor', live, () => gen === this.reviewGen),
           onActivity: (a) => {
+            if (gen !== this.reviewGen) return;
             review.lastActivityAt = a.at;
             live.activity(a);
             if (this.queue.recordActivity(task.id, a.phase, a.detail, 'supervisor')) {
@@ -1040,6 +1082,22 @@ export class Orchestrator implements vscode.Disposable {
     this.applyTaskEdits(decision, task.seq);
 
     switch (decision.verdict) {
+      case 'REVERIFY': {
+        this.queue.update(task.id, {
+          validationReport: '', finishedAt: null, supervisorFeedback: decision.feedback,
+        });
+        const verification: Review = {
+          taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now(),
+        };
+        this.review = verification;
+        try {
+          await this.verifyWithExecutor(this.queue.get(task.id) ?? task, verification);
+        } finally {
+          if (this.review === verification) this.review = null;
+        }
+        if (this.queue.get(task.id)?.validationReport.trim()) this.wakeAfterHandoff();
+        break;
+      }
       case 'VERIFIED':
         this.queue.update(task.id, {
           status: 'VERIFIED',
@@ -1201,13 +1259,13 @@ export class Orchestrator implements vscode.Disposable {
       return;
     }
 
-    // The fencing token: claimNext bumped this when it claimed the row, and
-    // finishExecution below will only write back while both this number and
-    // 'EXECUTING' still match what is actually in the database. A turn
-    // abandonExecution has since given up on — the queue was stopped, this
-    // very task was reclaimed by a fresh attempt — fails that match and its
-    // write is silently dropped, no in-memory bookkeeping required.
+    // Attempts may reset after a rewrite. Process generation and the committed
+    // claim identity fence callbacks as well as final results; old workers cannot
+    // release the replacement's abort handle or contaminate its journal.
     const attempt = task.attempts;
+    const gen = this.executionGen = (this.executionGen ?? 0) + 1;
+    const current = () => this.executionGen === gen && this.queue.get(task.id)?.status === 'EXECUTING' &&
+      this.queue.get(task.id)?.startedAt === task.startedAt;
     this.changed();
 
     // A phase is a coarse slice of the plan awaiting expansion into real
@@ -1215,7 +1273,7 @@ export class Orchestrator implements vscode.Disposable {
     // that everything below (the cron ordering, requeueStale, silentWorkers,
     // the watchdog) covers phase-expansion crashes for free.
     if (task.kind === 'phase') {
-      await this.runExpansion(task, attempt);
+      await this.runExpansion(task, attempt, gen, current);
       if (this.mode === 'continuous') {
         void this.pump();
       }
@@ -1224,7 +1282,7 @@ export class Orchestrator implements vscode.Disposable {
 
     this.log(`executing task ${task.seq} — ${task.title} (attempt ${task.attempts})`);
 
-    const journal = this.streamJournal(task.id, 'executor');
+    const journal = this.streamJournal(task.id, 'executor', current);
     journal.live.note('attempt', `attempt ${task.attempts} started`);
 
     try {
@@ -1236,9 +1294,10 @@ export class Orchestrator implements vscode.Disposable {
         this.context,
         this.output,
         task,
-        this.queue.instructions,
+        this.queue.contextInstructions,
         this.queue.getMeta('goal'),
         (a) => {
+          if (!current()) return;
           journal.live.activity(a);
           if (this.queue.recordActivity(task.id, a.phase, a.detail)) {
             this.changed();
@@ -1246,10 +1305,12 @@ export class Orchestrator implements vscode.Disposable {
         },
         journal.onEvent,
         (abort) => {
+          if (!current()) { abort(); return; }
           this.executionAbort = abort;
         },
       );
       journal.flush();
+      if (!current()) return;
 
       // The core stopped this turn itself rather than the model finishing it —
       // see coreHalted. The report is partial progress, so say which limit it
@@ -1270,6 +1331,8 @@ export class Orchestrator implements vscode.Disposable {
         output: res.text,
         // Empty means the supervisor has not delegated formal verification yet.
         validationReport: '',
+        activityPhase: !res.cutOff && res.completion.status === 'READY_FOR_VALIDATION'
+          ? 'ready_for_validation' : 'needs_review',
         ...(cutOffNote ? { errorLog: cutOffNote } : {}),
       });
       if (!applied) {
@@ -1292,7 +1355,7 @@ export class Orchestrator implements vscode.Disposable {
         );
         // The hand-off to every later task — see TaskQueue.instructions.
         if (res.notes) {
-          this.queue.appendInstruction(res.notes);
+          this.queue.appendInstruction(res.notes, `task ${task.seq}, attempt ${task.attempts}`);
           this.queue.log(task.id, 'executor', 'notes-added', res.notes);
         }
         this.log(
@@ -1304,6 +1367,7 @@ export class Orchestrator implements vscode.Disposable {
       }
     } catch (e: any) {
       journal.flush();
+      if (!current()) return;
       const msg = String(e?.message ?? e);
       journal.live.note('error', `stopped: ${msg}`);
       // A worker that died mid-turn — a dropped connection, a crashed core, or
@@ -1329,10 +1393,12 @@ export class Orchestrator implements vscode.Disposable {
         this.log(`task ${task.seq} — its worker stopped after the run moved past this attempt; ignoring it`);
       }
     } finally {
-      this.executionAbort = null;
+      journal.live.close();
+      if (this.executionGen === gen) this.executionAbort = null;
       this.changed();
     }
 
+    if (this.executionGen === gen) this.wakeAfterHandoff();
     // Continuous mode keeps going without waiting for the cron. pump() will
     // no-op on its own if the database says there is nothing left to claim.
     if (this.mode === 'continuous') {
@@ -1349,10 +1415,11 @@ export class Orchestrator implements vscode.Disposable {
    * `expandTask`, and failure puts it straight back to PENDING, the same as a
    * worker that stopped mid-turn in `pump()` above.
    */
-  private async runExpansion(task: Task, attempt: number): Promise<void> {
+  private async runExpansion(task: Task, attempt: number, gen: number, current: () => boolean): Promise<void> {
     this.log(`expanding phase ${task.seq} — ${task.title} (attempt ${task.attempts})`);
     const goal = this.queue.getMeta('goal');
     const live = new LiveLog(this.queue, task.id, 'planner');
+    const observe = this.observerEvents(task.id, 'planner', live);
 
     let result: PhaseExpansion;
     try {
@@ -1362,18 +1429,22 @@ export class Orchestrator implements vscode.Disposable {
         task,
         goal,
         (a) => {
+          if (!current()) return;
           live.activity(a);
           if (this.queue.recordActivity(task.id, a.phase, a.detail)) {
             this.changed();
           }
         },
-        this.observerEvents(task.id, 'planner', live),
+        (method, params) => { if (current()) observe(method, params); },
         (abort) => {
+          if (!current()) { abort(); return; }
           this.executionAbort = abort;
         },
+        this.queue.contextInstructions,
       );
     } catch (e: any) {
       live.close();
+      if (!current()) return;
       const msg = String(e?.message ?? e);
       const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'PENDING',
@@ -1390,13 +1461,14 @@ export class Orchestrator implements vscode.Disposable {
       } else {
         this.log(`phase ${task.seq} — its worker stopped after the run moved past this attempt; ignoring it`);
       }
-      this.executionAbort = null;
+      if (this.executionGen === gen) this.executionAbort = null;
       this.changed();
       return;
     }
 
     live.close();
-    this.executionAbort = null;
+    if (!current()) return;
+    if (this.executionGen === gen) this.executionAbort = null;
     this.queue.addUsage(task.id, result.usage);
 
     // The expander itself may flag a slice of its own region as still too
@@ -1423,6 +1495,7 @@ export class Orchestrator implements vscode.Disposable {
       parts = await this.resplitPhaseRegion(task, undefined, task.title, task.description);
     }
 
+    if (!current()) return;
     if (parts.length > 0) {
       const applied = this.queue.expandTask(task.id, attempt, parts);
       if (applied > 0) {
@@ -1625,7 +1698,9 @@ export class Orchestrator implements vscode.Disposable {
     if (open === 0) {
       return;
     }
-    this.log(`nothing in flight with ${open} task(s) still open; restarting the pump`);
+    if (s.byStatus.EXECUTING === 0 && s.byStatus.VERIFYING === 0) {
+      this.log(`${open} pending task(s); checking the execution pump`);
+    }
     void this.pump();
   }
 

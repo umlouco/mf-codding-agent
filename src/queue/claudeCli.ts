@@ -150,6 +150,7 @@ export async function runClaudeCliTurn(
   });
 
   const toolNames = new Map<string, string>();
+  const toolBlocks = new Map<number, { id: string; name: string; json: string }>();
   let finalResult: any;
   let lastActivityAt = 0;
 
@@ -190,12 +191,16 @@ export async function runClaudeCliTurn(
           } else if (e.delta?.type === 'thinking_delta') {
             opts.onEvent?.('stream/thinking', { delta: e.delta.thinking });
             activity('thinking');
+          } else if (e.delta?.type === 'input_json_delta') {
+            const block = toolBlocks.get(e.index);
+            if (block) block.json += String(e.delta.partial_json ?? '');
           }
         } else if (e?.type === 'content_block_start' && e.content_block?.type === 'tool_use') {
           const id = String(e.content_block.id ?? '');
           const name = String(e.content_block.name ?? '');
           if (id) {
             toolNames.set(id, name);
+            toolBlocks.set(e.index, { id, name, json: '' });
           }
           opts.onEvent?.('stream/tool', {
             id,
@@ -204,6 +209,24 @@ export async function runClaudeCliTurn(
             input: e.content_block.input ?? {},
           });
           activity(name || 'using a tool');
+        } else if (e?.type === 'content_block_stop') {
+          const block = toolBlocks.get(e.index);
+          toolBlocks.delete(e.index);
+          if (block?.json) {
+            try {
+              opts.onEvent?.('stream/tool', { id: block.id, name: block.name,
+                status: 'running', input: JSON.parse(block.json) });
+            } catch { /* A complete assistant message may supply the input. */ }
+          }
+        }
+        return;
+      }
+      case 'assistant': {
+        for (const block of evt.message?.content ?? []) {
+          if (block?.type !== 'tool_use' || !block.id) continue;
+          toolNames.set(String(block.id), String(block.name ?? ''));
+          opts.onEvent?.('stream/tool', { id: String(block.id), name: String(block.name ?? ''),
+            status: 'running', input: block.input ?? {} });
         }
         return;
       }
@@ -222,7 +245,7 @@ export async function runClaudeCliTurn(
           opts.onEvent?.('stream/tool', {
             id,
             name: toolNames.get(id) ?? '',
-            status: 'done',
+            status: block.is_error ? 'error' : 'done',
             output: typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? ''),
           });
         }

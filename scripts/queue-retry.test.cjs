@@ -198,7 +198,7 @@ test('malformed, truncated and nested artifact reports never become PASS', () =>
 test('PASS requires consistent independent evidence', () => {
   for (const patch of [
     { checks: [] }, { checks: [passingValidation().checks[0], null] },
-    { checks: Array(41).fill(passingValidation().checks[0]) }, { remaining: 'Browser not run' }, { behaviorEvidence: '' },
+    { checks: Array(41).fill(passingValidation().checks[0]) }, { remaining: 'Browser not run' }, { behaviorEvidence: '', checks: [{ kind: 'inspection', passed: true, evidence: 'Read source' }] },
     { checks: [{ kind: 'test', passed: false, evidence: 'exit 1' }] },
     { checks: [{ kind: 'test', passed: true, evidence: '' }] },
     { checks: [{ kind: 'test', passed: 'true', evidence: 'exit 0' }] },

@@ -10,7 +10,7 @@ import { contextCeiling } from '../providers/payload';
 import { runClaudeCliTurn } from './claudeCli';
 import { CognitiveBinding, taskCognition } from './cognition';
 import { NewTask, Task, TaskQueue, Usage } from './db';
-import { browserEvidence, codingWorkflow, executorExample, recoveryRules, reportContract, originalGoalContext } from './prompts';
+import { browserEvidence, codingWorkflow, executorExample, recoveryRules, reportContract, originalGoalContext, projectNotesContext } from './prompts';
 import {
   CompletionClaim,
   extractExecutorNotes,
@@ -151,6 +151,8 @@ export interface TurnResult {
 
 const NO_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
+export type ReviewOptions = Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> & { projectNotes?: string };
+
 export interface RunOptions {
   /** Durable work identity; independent from this disposable process and conversation. */
   cognition?: CognitiveBinding;
@@ -236,13 +238,19 @@ export async function runOnce(
   });
 
   const started = Date.now();
+  let aborted = false;
+  const checkAborted = () => { if (aborted) throw new AgentRunError('Queue turn aborted'); };
   try {
     await client.start();
     // Available from the moment there is a process to kill — a core that wedges
     // during `initialize` needs aborting exactly as much as one that wedges
     // mid-turn.
-    onAbort?.(() => client.stop());
-    const init = await client.initialize(await overridesFor(role, maxIterations));
+    onAbort?.(() => { aborted = true; client.stop(); });
+    checkAborted();
+    const overrides = await overridesFor(role, maxIterations);
+    checkAborted();
+    const init = await client.initialize(overrides);
+    checkAborted();
     output.appendLine(
       `[queue:${role}] core ready on ${init.model} (${init.provider})` +
         (maxIterations > 0 ? `, ${maxIterations} rounds` : ''),
@@ -270,6 +278,7 @@ export async function runOnce(
       onActivity?.({ phase: 'memory', detail: 'graph retrieval complete; findings included in worker context', at: Date.now() });
     }
 
+    checkAborted();
     const res = await client.request<{ text: string; stopReason: string; usage?: Usage }>(
       'chat/send',
       { sessionId, text: prompt, ...(opts.cognition ? { cognition: opts.cognition } : {}) },
@@ -975,6 +984,7 @@ export async function expandPhase(
   onActivity?: (a: ActivityRecord) => void,
   onEvent?: (method: string, params: any) => void,
   onAbort?: (abort: () => void) => void,
+  projectNotes = '',
 ): Promise<PhaseExpansion> {
   const region = parseRegion(phase.region);
   const scopeNote = region.paths.length
@@ -998,6 +1008,8 @@ rest of the project, only this phase.
 OVERALL GOAL
 ${goal}
 
+${projectNotesContext(projectNotes)}
+
 THIS PHASE (${phase.seq}): ${phase.title}
 ${phase.description}
 
@@ -1012,7 +1024,7 @@ Each element must be an object with exactly these keys:
                             name the files, functions and behaviour
   "implVerifyPrompt"       how a reviewer confirms the code and files exist as described
   "solutionVerifyPrompt"   how a reviewer confirms the behaviour is correct
-  "solutionVerifyCommand"  a single shell command that exits 0 on success and non-zero on
+  "solutionVerifyCommand"  a portable POSIX shell command (the unix tool on every host) that exits 0 on success and non-zero on
                             failure, or "" if none applies
   "kind"                   "task" (the default). Use "phase" instead, ONLY after exploring,
                             if part of this region turns out to be a distinct piece of work
@@ -1228,13 +1240,7 @@ export async function executeTask(
   onAbort?: (abort: () => void) => void,
 ): Promise<ExecutionOutcome> {
   const retry = retryBriefing(task);
-  const notes = instructions.trim()
-    ? `PROJECT NOTES — standing conventions and facts for this whole project, written by the
-project owner and by earlier tasks. Apply these to your work:
-${instructions.trim()}
-
-`
-    : '';
+  const notes = projectNotesContext(instructions);
 
   const prompt = `You are an execution agent. Complete exactly one task, then stop.
 
@@ -1311,7 +1317,7 @@ ${executorExample}`;
  * one outcome an unattended overnight run must not have. Every path out of a
  * failed attempt goes back through the supervisor rewriting the task.
  */
-export type Verdict = 'VERIFIED' | 'RETRY' | 'SPLIT' | 'RESET_FROM';
+export type Verdict = 'VERIFIED' | 'REVERIFY' | 'RETRY' | 'SPLIT' | 'RESET_FROM';
 
 /** Upper bound on the pieces one oversized task may be replaced with. */
 const MAX_SPLIT_PARTS = 6;
@@ -1348,18 +1354,21 @@ function ceilingNotice(task: Task): string {
 merits — the count is context here, not a reason to accept or reject anything.`;
   }
   return `ATTEMPT BUDGET SPENT: this is attempt ${task.attempts} of ${task.maxAttempts}, the last one this
-task gets in its current form. Diagnose the recorded failure: it may be a tool invocation,
+implementation retry budget allows before reassessment. Diagnose the recorded failure: it may be a tool invocation,
 environment problem, model mistake, or task ambiguity. Preserve the required acceptance criteria;
 do not weaken them to obtain a PASS. Repeating the same failed approach is not a recovery.
 If the evidence is not sufficient, choose exactly one:
+ - REVERIFY, when implementation has no observed defect and the independent verifier must finish
+   a check, correct a tool invocation, or complete its report. Preserve the task and acceptance
+   criteria. An execution attempt ceiling does not require rewriting working implementation.
  - SPLIT, when scope is the obstacle: the report reads as several unfinished threads rather than
    one unfinished thing, or no single agent can hold all of this at once. Return the ordered
    smaller tasks that replace it.
- - RETRY, for a code defect, broken tool invocation, environment problem, missing evidence, or
-   unclear requirement. Preserve the goal and required behavior. Write a self-contained task
+ - RETRY, for a code or test setup defect requiring executor changes, or a task that has drifted
+   from the owner's requirements. Preserve the goal and required behavior. Write a self-contained task
    using the observed failures, completed work, and a concrete different approach.
-Whichever you choose, the replacement starts again with a full attempt budget, so it is worth
-getting right.`;
+REVERIFY retains the implementation and its attempt count. A rewritten or split implementation
+starts with a fresh attempt budget; preserve completed work and every acceptance criterion.`;
 }
 
 /**
@@ -1409,27 +1418,31 @@ export async function superviseTask(
   rewrites: number,
   /** The prompt the whole plan was generated from — see ceilingNotice. */
   goal: string,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> = {},
+  opts: ReviewOptions = {},
 ): Promise<SupervisorDecision> {
   opts = { ...opts, cognition: taskCognition(task, goal, 'supervisor') };
   const exhausted = attemptsExhausted(task);
-  const prompt = `You are the supervisor of an autonomous coding run. Make a lightweight
-accept/reject decision from the validation report stored in the queue database.
+  const prompt = `You are the supervisor of an autonomous coding run. First establish this task's
+share of the original user goal and owner project notes. Then judge its implementation and
+verification evidence. A rewritten task and a passing report can both be wrong about the goal.
 
 The report below is from an independent verification agent, not the implementation agent.
 
-Start with the supplied report. Tool definitions are omitted to keep the context compact;
+Check the requirements before the supplied report. Tool definitions are omitted to keep the context compact;
 registered tools remain callable when you need additional observations to make the decision.
 Check whether the conclusion is consistent with concrete evidence for each requirement.
 Your own tool use does not replace the independent verification report required for completion.
 
 A task is never terminally failed. When the evidence is not sufficient, make exactly one
-recovery decision: RETRY with a materially rewritten task description and verification, or
+recovery decision: REVERIFY for a missing/invalid check or report without an observed code defect,
+RETRY for an observed implementation or test setup defect that needs editing, or
 SPLIT into several smaller ordered tasks. Use SPLIT only when scope is the obstacle; use RETRY
-for a focused correction to code, tool use, setup, requirements, or missing verification.
+for a focused correction that requires changes to code or test setup.
 Whether the work passes is decided by the evidence alone and never by how many attempts it took.
 
 ${originalGoalContext(goal)}
+
+${projectNotesContext(opts.projectNotes)}
 
 ${ceilingNotice(task)}
 
@@ -1455,6 +1468,13 @@ ${task.solutionVerifyCommand ? `Required command: ${task.solutionVerifyCommand}`
 INDEPENDENT VERIFICATION AGENT'S REPORT, READ FROM THE DATABASE:
 ${validationForSupervisor(task.validationReport)}
 
+The observedTools field, when present, is captured by the host from the current verifier's tool
+calls. Compare its inputs, outputs, and statuses with the verifier's claims. Creating a report,
+reading source, or running an unrelated command cannot prove a required test executed. An observed
+tool result outranks a conflicting narrative. Reject claimed runtime results absent from those
+observations. Compare the task with the original request and owner notes before accepting a narrowed
+check; earlier task rewrites and earlier PASS labels are not authority to discard requirements.
+
 Earlier attempt outcomes:
 ${attemptHistory(task)}
 
@@ -1468,16 +1488,24 @@ Reply with ONE JSON object and nothing else:
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
-Set verdict to VERIFIED, RETRY, or SPLIT. Use empty splitInto unless splitting; use empty taskEdits
+Set verdict to VERIFIED, REVERIFY, RETRY, or SPLIT. Use empty splitInto unless splitting; use empty taskEdits
 unless making edits. Replace example strings with concrete instructions, not placeholders.
+In feedback, state the original requirement this task covers and why the actual evidence satisfies
+it or what remains missing. Never accept report formatting or a demonstration as a replacement for
+the requested application behavior. If the task itself drifted, correct it through RETRY or SPLIT;
+REVERIFY alone cannot fix a task that now requires testing the wrong thing.
 
 Choose VERIFIED only when the verification agent concluded PASS and its database report contains
 concrete implementation and behaviour evidence plus successful required commands/tests. Do not
-independently repeat the checks. Choose RETRY for FAIL, INCOMPLETE, contradictory conclusions, or
-missing evidence; include a materially rewritten description for task ${task.seq}. Choose SPLIT when
+independently repeat the checks. Choose REVERIFY when the verifier must finish checks, correct its invocation, authenticate at the
+supplied URL, or complete its report. Put the exact missing checks in feedback and leave taskEdits
+and splitInto empty. Preserve implementation and acceptance criteria. A report format problem
+must not be converted into new product requirements, a tool-call quota, or a requirement to
+produce a particular table. Choose RETRY when evidence identifies changes the executor must make;
+include a materially rewritten description for task ${task.seq}. Choose SPLIT when
 the remaining work is more than one agent can hold at once — a report that reads as several
-unfinished threads rather than one unfinished thing. For an unsuccessful task these are the only two
-decisions: rewrite it or split it. There is no fail or give-up verdict.`;
+unfinished threads rather than one unfinished thing. For an unsuccessful task these are the available
+decisions: reverify it, correct it, or split it. There is no fail or give-up verdict.`;
 
   const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
     maxIterations: supervisorRounds(),
@@ -1486,7 +1514,6 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
   const total = { ...usage };
 
   let d: Partial<SupervisorDecision> = {};
-  let parsed = true;
   try {
     d = extractJson<SupervisorDecision>(text, isReview);
   } catch {
@@ -1500,17 +1527,7 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
     if (reformatted.decision) {
       d = reformatted.decision;
     } else {
-      // Still nothing usable. A supervisor that cannot be understood must not
-      // silently pass the task — but it must not silently retry it either,
-      // because a retry with no rewrite is the same attempt again. Fall
-      // through to the demandRewrite repair pass below.
-      parsed = false;
-      d = {
-        verdict: 'RETRY',
-        feedback:
-          "The supervisor's reply could not be understood as a verdict, even after being asked " +
-          'to restate it. Raw reply:\n' + text.slice(0, 2000),
-      };
+      throw new AgentRunError('The supervisor supplied no readable verdict after reformatting. Preserve the task and reassess; a formatting failure is not an implementation defect.');
     }
   }
 
@@ -1518,12 +1535,12 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
   // FAIL is no longer in the protocol. A model that has seen it elsewhere still
   // emits it, and it means "I have run out of ideas" — which is a reason to
   // rewrite the task, never a reason to end the run.
-  let verdict: Verdict = (['VERIFIED', 'RETRY', 'SPLIT'] as string[]).includes(named)
+  let verdict: Verdict = (['VERIFIED', 'REVERIFY', 'RETRY', 'SPLIT'] as string[]).includes(named)
     ? (named as Verdict)
     : 'RETRY';
 
   const evidenceProblem = verdict === 'VERIFIED' ? storedValidationProblem(task.validationReport) : '';
-  if (evidenceProblem) verdict = 'RETRY';
+  if (evidenceProblem) verdict = 'REVERIFY';
 
   const splitInto = (Array.isArray(d.splitInto) ? d.splitInto : [])
     .filter((p: any) => p && typeof p === 'object' && String(p.title ?? '').trim())
@@ -1554,6 +1571,10 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
   };
 
   if (settled !== 'RETRY') {
+    if (settled === 'REVERIFY' || settled === 'VERIFIED') {
+      decision.taskEdits = [];
+      decision.splitInto = undefined;
+    }
     return decision;
   }
 
@@ -1580,7 +1601,7 @@ decisions: rewrite it or split it. There is no fail or give-up verdict.`;
   const repair = exhausted
     ? await escalate(context, output, task, goal, feedback, opts)
     : {
-        ...(await demandRewrite(context, output, task, feedback, parsed ? text : '', goal, opts)),
+        ...(await demandRewrite(context, output, task, feedback, text, goal, opts)),
         splitInto: [] as NewTask[],
       };
   addUsage(total, repair.usage);
@@ -1664,7 +1685,7 @@ async function escalate(
   task: Task,
   goal: string,
   feedback: string,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'>,
+  opts: ReviewOptions,
 ): Promise<{
   splitInto: NewTask[];
   description: string;
@@ -1699,6 +1720,8 @@ ${feedback || '(nothing recorded)'}
 How the attempts ended:
 ${attemptHistory(task)}
 ${originalGoalContext(goal)}
+
+${projectNotesContext(opts.projectNotes)}
 
 Decide which of the two failures this is, and answer with ONE JSON object and nothing else.
 
@@ -1797,7 +1820,7 @@ async function reformatVerdict(
   task: Task,
   rawReply: string,
   goal: string,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'>,
+  opts: ReviewOptions,
 ): Promise<{ decision?: Partial<SupervisorDecision>; usage: Usage }> {
   const prompt = `Your last reply about task ${task.seq} was not returned as the required JSON object, so it
 could not be read as a verdict. Here is exactly what you wrote:
@@ -1805,6 +1828,8 @@ could not be read as a verdict. Here is exactly what you wrote:
 ${rawReply.slice(0, 4000)}
 
 ${originalGoalContext(goal)}
+
+${projectNotesContext(opts.projectNotes)}
 
 Restate the SAME judgement — do not reconsider it, do not change your mind, just put it in the
 required shape — as ONE JSON object and nothing else:
@@ -1817,7 +1842,7 @@ required shape — as ONE JSON object and nothing else:
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
-Set verdict to VERIFIED, RETRY, or SPLIT to match the original conclusion. Use empty arrays for
+Set verdict to VERIFIED, REVERIFY, RETRY, or SPLIT to match the original conclusion. Use empty arrays for
 splitInto and taskEdits when they do not apply. Return valid JSON, without code fences.
 
 If your reply above reached a clear conclusion — the work is correct, it needs another attempt,
@@ -1852,7 +1877,7 @@ async function demandRewrite(
   feedback: string,
   rawReply: string,
   goal: string,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'>,
+  opts: ReviewOptions,
 ): Promise<{
   description: string;
   implVerifyPrompt: string;
@@ -1865,6 +1890,8 @@ async function demandRewrite(
 rewritten description that a retry requires. Supply it now.
 
 ${originalGoalContext(goal)}
+
+${projectNotesContext(opts.projectNotes)}
 
 The executor is a fresh agent. Provide self-contained recovery instructions; it does not see
 your full conversation. It receives the task, recent failure history, and supervisor feedback.

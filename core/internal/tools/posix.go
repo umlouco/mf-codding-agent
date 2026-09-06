@@ -70,7 +70,7 @@ func init() {
 		"head":     {fn: cmdHead, usage: "head [-n N | -N] [file...]"},
 		"tail":     {fn: cmdTail, usage: "tail [-n N | -N] [file...]"},
 		"wc":       {fn: cmdWc, usage: "wc [-l] [-w] [-c] [file...]"},
-		"grep":     {fn: cmdGrep, usage: "grep [-i] [-v] [-n] [-r] [-q] PATTERN [file...]"},
+		"grep":     {fn: cmdGrep, usage: "grep [-i] [-v] [-n] [-r] [-q] [-c] [-E | -F] PATTERN [file...]"},
 		"sed":      {fn: cmdSed, usage: "sed s/re/replacement/[g] [file...]"},
 		"awk":      {fn: cmdAwk, usage: "awk [-F sep] [-v var=val] PROGRAM [file...]"},
 		"sort":     {fn: cmdSort, usage: "sort [-r] [-u] [-n] [file...]"},
@@ -344,7 +344,27 @@ func cmdTail(c *cmdCtx) error {
 	if err != nil {
 		return err
 	}
+	fromStart := false
+	for i, arg := range c.args {
+		if arg == "-n" && i+1 < len(c.args) {
+			fromStart = strings.HasPrefix(c.args[i+1], "+")
+		} else if strings.HasPrefix(arg, "-n") && len(arg) > 2 {
+			fromStart = strings.HasPrefix(arg[2:], "+")
+		} else if len(arg) > 1 && arg[0] == '-' && isAllDigits(arg[1:]) {
+			fromStart = false
+		}
+	}
 	return eachInput(c, rest, func(_ string, r io.Reader) error {
+		if fromStart {
+			lineNumber := 0
+			return scanLines(r, func(line string) error {
+				lineNumber++
+				if lineNumber >= limit {
+					fmt.Fprintln(c.out, line)
+				}
+				return nil
+			})
+		}
 		ring := make([]string, 0, limit)
 		if err := scanLines(r, func(line string) error {
 			if limit <= 0 {
@@ -404,10 +424,20 @@ func cmdGrep(c *cmdCtx) error {
 	if err != nil {
 		return err
 	}
+	for flag := range f.set {
+		if !strings.ContainsRune("ivnrqcEF", rune(flag)) {
+			return usagef("unsupported grep option -%c", flag)
+		}
+	}
 	if len(f.rest) == 0 {
 		return fmt.Errorf("missing PATTERN")
 	}
 	expr := f.rest[0]
+	if f.set['F'] {
+		expr = regexp.QuoteMeta(expr)
+	} else if !f.set['E'] {
+		expr = basicGrepPattern(expr)
+	}
 	if f.set['i'] {
 		expr = "(?i)" + expr
 	}
@@ -422,8 +452,12 @@ func cmdGrep(c *cmdCtx) error {
 	matched := false
 
 	emit := func(name string, r io.Reader) error {
-		n := 0
-		return scanLines(r, func(line string) error {
+		n, count := 0, 0
+		prefix := ""
+		if name != "" && (len(targets) > 1 || f.set['r']) {
+			prefix = name + ":"
+		}
+		err := scanLines(r, func(line string) error {
 			n++
 			hit := re.MatchString(line)
 			if f.set['v'] {
@@ -433,19 +467,21 @@ func cmdGrep(c *cmdCtx) error {
 				return nil
 			}
 			matched = true
-			if f.set['q'] {
+			count++
+			if f.set['q'] || f.set['c'] {
 				return nil
 			}
-			prefix := ""
-			if name != "" && (len(targets) > 1 || f.set['r']) {
-				prefix = name + ":"
-			}
+			linePrefix := prefix
 			if f.set['n'] {
-				prefix += strconv.Itoa(n) + ":"
+				linePrefix += strconv.Itoa(n) + ":"
 			}
-			fmt.Fprintln(c.out, prefix+line)
+			fmt.Fprintln(c.out, linePrefix+line)
 			return nil
 		})
+		if err == nil && f.set['c'] && !f.set['q'] {
+			fmt.Fprintf(c.out, "%s%d\n", prefix, count)
+		}
+		return err
 	}
 
 	if f.set['r'] {
@@ -481,6 +517,38 @@ func cmdGrep(c *cmdCtx) error {
 		return exitCodeError(1)
 	}
 	return nil
+}
+
+// POSIX grep defaults to basic expressions: an unescaped | or parenthesis is
+// literal. Go's engine uses extended expressions, so translate the operators
+// whose escaping has the opposite meaning. Backreferences remain unsupported
+// by RE2 and fail explicitly instead of silently returning a wrong match set.
+func basicGrepPattern(pattern string) string {
+	var result strings.Builder
+	insideClass := false
+	classStart := -1
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if ch == '\\' && i+1 < len(pattern) {
+			i++
+			if !insideClass && strings.ContainsRune("+?|(){}", rune(pattern[i])) {
+				result.WriteByte(pattern[i])
+			} else {
+				result.WriteByte('\\')
+				result.WriteByte(pattern[i])
+			}
+			continue
+		}
+		if ch == '[' && !insideClass {
+			insideClass, classStart = true, i
+		} else if ch == ']' && insideClass && i > classStart+1 && !(i == classStart+2 && pattern[classStart+1] == '^') {
+			insideClass = false
+		} else if !insideClass && strings.ContainsRune("+?|(){}", rune(ch)) {
+			result.WriteByte('\\')
+		}
+		result.WriteByte(ch)
+	}
+	return result.String()
 }
 
 // splitSed parses `s<delim>pattern<delim>replacement<delim>flags`. Go's RE2
@@ -586,8 +654,8 @@ func cmdSort(c *cmdCtx) error {
 	}
 	if f.set['n'] {
 		sort.SliceStable(lines, func(i, j int) bool {
-			a, _ := strconv.ParseFloat(strings.TrimSpace(strings.Fields(lines[i]+" ")[0]), 64)
-			b, _ := strconv.ParseFloat(strings.TrimSpace(strings.Fields(lines[j]+" ")[0]), 64)
+			a, _ := strconv.ParseFloat(strings.TrimSpace(strings.Fields(lines[i] + " ")[0]), 64)
+			b, _ := strconv.ParseFloat(strings.TrimSpace(strings.Fields(lines[j] + " ")[0]), 64)
 			return a < b
 		})
 	} else {

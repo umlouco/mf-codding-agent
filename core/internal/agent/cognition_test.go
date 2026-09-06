@@ -394,9 +394,9 @@ func TestCognitionRunIdentityChangesAcrossSends(t *testing.T) {
 	}
 }
 
-func TestCognitionRepeatedErrorsLeaveRecoveryToolsCallable(t *testing.T) {
+func TestCognitionAllowsRecoveryBeforeRepeatedFailureHandoff(t *testing.T) {
 	provider := &cognitionProvider{}
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 3; i++ {
 		provider.rounds = append(provider.rounds, []llm.Block{cognitionCall(fmt.Sprint(i), "recoverable")})
 	}
 	a, _ := newLoggedAgent(t, provider, 7)
@@ -406,16 +406,16 @@ func TestCognitionRepeatedErrorsLeaveRecoveryToolsCallable(t *testing.T) {
 	var attempts int
 	a.registry.Add(&tools.Tool{Name: "recoverable", Run: func(context.Context, *tools.Env, json.RawMessage) tools.Result {
 		attempts++
-		if attempts <= 4 {
+		if attempts <= 2 {
 			return tools.Errf("dependency not ready")
 		}
 		return tools.Ok("dependency available")
 	}})
 	result, err := a.Send(context.Background(), SendRequest{SessionID: "recover", Text: "inspect readiness"})
-	if err != nil || result.StopReason != "end_turn" || attempts != 5 {
+	if err != nil || result.StopReason != "end_turn" || attempts != 3 {
 		t.Fatalf("result=%+v err=%v attempts=%d; runtime attention must preserve recovery", result, err, attempts)
 	}
-	if len(journal.outcomes) != 5 || journal.outcomes[4].IsError {
+	if len(journal.outcomes) != 3 || journal.outcomes[2].IsError {
 		t.Fatalf("recovery observation missing: %+v", journal.outcomes)
 	}
 	for _, request := range provider.requests {

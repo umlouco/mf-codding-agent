@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
 import type { Task, TaskEvent, Usage } from './db';
-import { attemptsExhausted, extractJson, runOnce, RunOptions } from './agents';
+import { attemptsExhausted, extractJson, runOnce, ReviewOptions } from './agents';
 import { completionForSupervisor, parseCompletionClaim } from './validation';
-import { recoveryRules, originalGoalContext } from './prompts';
+import { recoveryRules, originalGoalContext, projectNotesContext } from './prompts';
 import { taskCognition } from './cognition';
 
 /**
@@ -127,7 +127,7 @@ export async function reviewProgress(
   task: Task,
   events: TaskEvent[],
   failedValidations: number,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> = {},
+  opts: ReviewOptions = {},
   goal = '',
 ): Promise<ProgressDecision> {
   opts = { ...opts, cognition: taskCognition(task, goal, 'supervisor') };
@@ -159,6 +159,8 @@ ${recoveryRules}
 
 ${originalGoalContext(goal)}
 
+${projectNotesContext(opts.projectNotes)}
+
 TASK ${task.seq}: ${task.title}
 ${task.description}
 
@@ -188,8 +190,10 @@ RECENT DATABASE JOURNAL:
 ${journal(events)}
 
 Choose exactly one hard-coded action:
-- CONTINUE_EXECUTION: the running agent shows useful forward progress. For a stopped agent this
-  starts validation; if more implementation is needed, choose STOP_AND_REWRITE_TASK instead.
+- CONTINUE_EXECUTION: the approach is sound and more implementation or development checks remain.
+  Let a running agent continue; resume a stopped agent from its handoff with unchanged requirements.
+  Use this for a productive turn that reached its round/context limit. Do not rewrite requirements
+  merely because a turn ended. Choose START_VALIDATION when implementation is ready to be checked.
 - STOP_AND_REWRITE_TASK: direction or premise is wrong. Supply a complete rewrittenDescription.
 - STOP_AND_REWRITE_VALIDATION: implementation may be sound but the checks are ambiguous, invalid,
   contradictory, or test the wrong thing. Supply corrected verification fields.
@@ -219,6 +223,10 @@ that action needs them. The final response must be valid JSON, with no code fenc
     const formatPrompt = `Restate the decision below as the required JSON object. Do not reconsider it.
 
 ${first.text.slice(0, 6000)}
+
+${originalGoalContext(goal)}
+
+${projectNotesContext(opts.projectNotes)}
 
 Allowed action values: ${SUPERVISOR_ACTIONS.join(', ')}.`;
     try {

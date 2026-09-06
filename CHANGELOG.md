@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Live replay follow-up: compare required verification commands with actual tool inputs, attach observed tool results to supervisor evidence, and separate bounded agent findings from owner project notes. Fix portable `grep -c` returning matching lines instead of counts, support fixed-string matching, and reject unsupported grep options. Preserve Claude CLI streamed tool arguments and failed result status. Correct misleading watchdog output while work is active.
+
+- Recover queue progress after the Plugins/ECM overnight stalls: fence superseded worker callbacks and abort handles, preserve executor handoffs, and keep heartbeat traffic from displacing review evidence. Productive interrupted turns can continue without rewriting requirements. A new REVERIFY decision repeats missing verification without rerunning implementation. Project notes now reach verifiers, supervisors, recovery turns, and phase expansion. Accept complete top-level validation reports and evidence in typed checks; reject claimed command/browser success without corresponding observed tool execution. See `docs/queue-incident-2026-09-06.md` for findings and validation limits.
+
 - Fix **Edit Tasks** silently applying only the first 40 requested edits, deletions, or additions. Complete revisions now commit in one database transaction, use the task identities shown to the planner, and report the actual saved counts. Invalid, interrupted, or conflicting proposals leave the queue unchanged.
 
 - Add Visual Witness layout checks: text-only executors can call `browser_layout_check` or `playwright_layout_check` to obtain criterion-based findings from the Vision role, backed by a saved screenshot and DOM measurements. Unstable captures, missing anchors, malformed model replies, and unavailable vision return incomplete evidence. Image transport now works through OpenAI-compatible, Anthropic, and VS Code model adapters; queue workers retain Vision provider bindings and account for its tokens.

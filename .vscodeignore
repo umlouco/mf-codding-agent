@@ -15,13 +15,26 @@ esbuild.mjs
 .mcp.json
 .mfagent/**
 
-# Keep only the binary for the target platform when packaging per-platform.
+# Ship runtime binaries, never arbitrary test executables left in bin/.
+bin/**
 !out/extension.js
 !media/**
-!bin/**
-# Note: the negation above is global in vsce — a later `bin/**/*.old` does NOT
-# re-exclude. Anything dropped into bin/ ships, so build-core.mjs parks
-# displaced binaries in the temp dir rather than beside their replacement.
+!bin/mfcore
+!bin/mfcore.exe
+!bin/mfagent-mcp
+!bin/mfagent-mcp.exe
+!bin/win32-x64/mfcore.exe
+!bin/win32-x64/mfagent-mcp.exe
+!bin/win32-arm64/mfcore.exe
+!bin/win32-arm64/mfagent-mcp.exe
+!bin/linux-x64/mfcore
+!bin/linux-x64/mfagent-mcp
+!bin/linux-arm64/mfcore
+!bin/linux-arm64/mfagent-mcp
+!bin/darwin-x64/mfcore
+!bin/darwin-x64/mfagent-mcp
+!bin/darwin-arm64/mfcore
+!bin/darwin-arm64/mfagent-mcp
 
 # Kilocode's agent-manager folder, with its own node_modules — never part of the extension.
 .kilo/**

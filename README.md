@@ -416,6 +416,15 @@ and `STOP_AND_REWRITE_VALIDATION`, `SPLIT`, and `START_VALIDATION` — see
 new costs a few indexed reads; a full review of live work is a model turn and is
 rate-limited separately (`mfagent.queue.reviewIntervalSeconds`).
 
+Project notes reach execution, verification, supervision, recovery, and phase
+expansion. Supplied application URLs and login instructions remain part of the
+test requirements. New agent findings are stored separately from your editable
+notes, labelled with their task/attempt, and bounded in the context passed forward.
+Verification reports include tool observations captured by the extension; a supplied
+command must actually complete successfully with that command text before PASS.
+Heartbeats keep the activity display current but do not count
+as new evidence for another supervisor review.
+
 ## Settings
 
 Providers, models, roles, languages, MCP servers and the browser toggle live on
@@ -470,7 +479,10 @@ PASS, FAIL, or INCOMPLETE report containing the observed evidence for every chec
 That report is written to `validation_report` in `.mfagent/queue.db` before the
 supervisor's completion decision. The supervisor starts with this report, checks
 that the conclusion is consistent and adequately supported, and either validates
-the task or sends it back with revised instructions. Its Go model requests omit
+the task, requests another verification pass (`REVERIFY`), or sends implementation
+back with revised instructions. A missing check or report-format error can be
+recovered without rewriting the task or rerunning working implementation. A
+productive executor handoff can also resume with unchanged requirements. Its Go model requests omit
 tool definitions to save context; configured tools remain callable if it needs
 additional observations. CLI supervisors also retain their available tools.
 Supervisor tool use does not replace the independent verification report.

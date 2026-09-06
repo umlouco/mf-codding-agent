@@ -97,3 +97,35 @@ for (const role of ['supervisor', 'executor', 'planner']) {
     assert.equal(result.usage.output, 2);
   });
 }
+
+test('CLI tool evidence retains streamed arguments and distinguishes failed results', async () => {
+  const events = [];
+  const cli = loadCli(() => {
+    const proc = new EventEmitter();
+    proc.stdin = new PassThrough(); proc.stdout = new PassThrough(); proc.stderr = new PassThrough();
+    setImmediate(() => {
+      const lines = [
+        { type: 'stream_event', event: { type: 'content_block_start', index: 0,
+          content_block: { type: 'tool_use', id: 'shell-1', name: 'Bash', input: {} } } },
+        ...['{"command":', '"go test ./..."}'].map(partial_json => ({ type: 'stream_event',
+          event: { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json } } })),
+        { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } },
+        { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'shell-1',
+          is_error: true, content: 'Tests failed' }] } },
+        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'shell-2', name: 'Bash',
+          input: { command: 'go test ./...' } }] } },
+        { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'shell-2', content: 'ok' }] } },
+        { type: 'result', result: 'Finished', stop_reason: 'end_turn' },
+      ];
+      proc.stdout.end(lines.map(JSON.stringify).join('\n') + '\n');
+      proc.stderr.end(); proc.emit('close', 0);
+    });
+    return proc;
+  });
+  await cli.runClaudeCliTurn({ appendLine() {} }, 'executor', { model: 'configured', profile: { extra: {} } },
+    'Run verification.', { onEvent: (method, params) => events.push({ method, ...params }) });
+  assert.equal(events.find(e => e.id === 'shell-1' && e.input?.command).input.command, 'go test ./...');
+  assert.equal(events.find(e => e.id === 'shell-1' && e.output).status, 'error');
+  assert.equal(events.find(e => e.id === 'shell-2' && e.input).input.command, 'go test ./...');
+  assert.equal(events.find(e => e.id === 'shell-2' && e.output).status, 'done');
+});
