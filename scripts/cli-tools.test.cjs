@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const ts = require('typescript');
 
-function loadCli(spawn) {
+function loadCli(spawn, overrides = {}) {
   const file = 'src/queue/claudeCli.ts';
   const source = readFileSync(path.join(__dirname, '..', file), 'utf8');
   const { outputText } = ts.transpileModule(source, {
@@ -21,6 +21,10 @@ function loadCli(spawn) {
     vscode: { workspace: { getConfiguration: () => ({ get: (_, fallback) => fallback }) } },
     '../detect': { workspaceRoot: () => 'test-workspace' },
     './agents': { killTree: () => {} },
+    './registry': { getActiveQueue: () => undefined },
+    './testingEnvironment': { redactTestingSecrets: text => text },
+    '../providers/instance': {},
+    ...overrides,
   };
   const exports = {};
   vm.runInNewContext(outputText, {
@@ -128,4 +132,26 @@ test('CLI tool evidence retains streamed arguments and distinguishes failed resu
   assert.equal(events.find(e => e.id === 'shell-1' && e.output).status, 'error');
   assert.equal(events.find(e => e.id === 'shell-2' && e.input).input.command, 'go test ./...');
   assert.equal(events.find(e => e.id === 'shell-2' && e.output).status, 'done');
+});
+
+
+test('CLI turns receive fixed fields, private credentials, built-in testing tools and an execution hook', async () => {
+ let invocation;
+ const testing={url:'https://app.example.test/project/',credentials:{password:'private-cli-secret'}};
+ const cli=loadCli((bin,args,options)=>{
+  invocation={args,options};const proc=new EventEmitter();proc.stdin=new PassThrough();proc.stdout=new PassThrough();proc.stderr=new PassThrough();
+  setImmediate(()=>{proc.stdout.end(JSON.stringify({type:'result',result:'Finished',stop_reason:'end_turn'})+'\n');proc.stderr.end();proc.emit('close',0)});return proc;
+ },{
+  './registry':{getActiveQueue:()=>({testingContext:'FIXED OWNER ENVIRONMENT'})},
+  '../providers/instance':{getContext:()=>({})},
+  '../detect':{workspaceRoot:()=> 'workspace',resolveMcpBinary:()=> 'C:/tool folder/mfagent-mcp.exe',resolveCoreBinary:()=>({path:"C:/tool's folder/mfcore.exe"})},
+  './testingEnvironment':{loadTestingEnvironment:async()=>testing,testingProcessEnvironment:()=>({MFAGENT_TEST_URL:testing.url,MFAGENT_CREDENTIAL_PASSWORD:testing.credentials.password}),testingPrompt:text=>text,redactTestingSecrets:text=>text},
+ });
+ await cli.runClaudeCliTurn({appendLine(){}},'executor',{model:'configured',profile:{extra:{}}},'Test the app.',{});
+ const args=invocation.args;
+ const mcp=JSON.parse(args[args.indexOf('--mcp-config')+1]);assert.equal(mcp.mcpServers.mfagent.command,'C:/tool folder/mfagent-mcp.exe');
+ const settings=JSON.parse(args[args.indexOf('--settings')+1]);const hook=settings.hooks.PreToolUse[0].hooks[0];
+ assert.match(hook.command,/testing-hook/);if(process.platform==='win32'){assert.equal(hook.shell,'powershell');assert.match(hook.command,/tool''s folder/)}
+ assert.equal(invocation.options.env.MFAGENT_CREDENTIAL_PASSWORD,'private-cli-secret');
+ assert.ok(!JSON.stringify(args).includes('private-cli-secret'));
 });

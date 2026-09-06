@@ -200,7 +200,7 @@ func Project(s State, scope Scope) Snapshot {
 	}
 	for _, p := range s.Pending {
 		if p.Observer == scope.Observer || p.Mutating {
-			add("unfinished_operation", 100, p.Action, p.Summary+": invocation started; no result is recorded. Inspect its state before repeating an action with effects.", p.StartSeq)
+			add("unfinished_operation", 100, p.Action, p.Summary+": invocation started; no result is recorded. Its effects are unknown, and this record does not authorize repeating it.", p.StartSeq)
 		}
 	}
 	for _, p := range s.Interrupted {
@@ -214,13 +214,17 @@ func Project(s State, scope Scope) Snapshot {
 		}
 		switch {
 		case v.Unknown:
-			add("unknown_outcome", 90, v.Action, v.Summary+": the tool did not provide a known exit status. Obtain an observable outcome before relying on this command.", v.LastSeq)
+			add("unknown_outcome", 90, v.Action, v.Summary+": the tool did not provide a known exit status. Success is not established by this record.", v.LastSeq)
 		case unresolved(v):
-			add("diagnose_failure", 85, v.Action, v.Summary+": unresolved tool failure. Use a discriminating check to separate invocation, environment and implementation causes. Observed output: "+clip(v.Excerpt, 180), v.FailureSeq, v.LastSeq)
+			detail := ": this recorded invocation returned a tool error; no successful repeat of this exact invocation is recorded. It does not establish a broken tool, environment, or application. Newer successful calls remain valid evidence. Observed output: "
+			if v.RunID != scope.RunID {
+				detail = ": a previous attempt recorded this invocation error. Its present outcome is untested, not known to be failing. Newer successful calls remain valid evidence. Historical output: "
+			}
+			add("diagnose_failure", 85, v.Action, v.Summary+detail+clip(v.Excerpt, 180), v.FailureSeq, v.LastSeq)
 		case v.Repeats >= 2 && !v.Mutating && !v.Overlapped && v.Epoch == s.Epoch && v.RunID == scope.RunID && v.RunID == s.Runs[v.Observer]:
-			add("seek_new_information", 75, v.Action, fmt.Sprintf("%s: %d identical observations in the same recorded workspace epoch. What different observation would change the next decision?", v.Summary, v.Repeats+1), v.FirstSeq, v.LastSeq)
+			add("seek_new_information", 75, v.Action, fmt.Sprintf("%s: %d identical observations in the same recorded workspace epoch. These repeats added no new observed information.", v.Summary, v.Repeats+1), v.FirstSeq, v.LastSeq)
 		case v.Overlapped || v.Epoch < s.Epoch || v.RunID != scope.RunID || v.RunID != s.Runs[v.Observer]:
-			add("refresh_observation", 65, v.Action, v.Summary+": this observation predates a possible change or overlaps another operation. Refresh the relevant check before relying on it.", v.LastSeq)
+			add("refresh_observation", 65, v.Action, v.Summary+": this observation predates a possible change or overlaps another operation and may be stale. This status alone does not require repeating the operation or changing working code.", v.LastSeq)
 		case v.RecoverySeq > v.FailureSeq && v.FailureSeq > 0:
 			add("observed_recovery", 55, v.Action, v.Summary+": this exact operation returned without a tool error after a prior failure. The cause and task correctness remain to be established.", v.FailureSeq, v.RecoverySeq)
 		default:

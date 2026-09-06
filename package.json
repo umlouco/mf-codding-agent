@@ -306,7 +306,7 @@
         },
         "mfagent.queue.workerMaxRounds": {
           "type": "number",
-          "default": 24,
+          "default": 80,
           "minimum": 4,
           "maximum": 200,
           "description": "Tool rounds per executor or verifier turn. At the limit, preserve progress and hand off to automatic supervisor recovery; this never counts as a passing check."
@@ -333,7 +333,7 @@
           "type": "number",
           "default": 40,
           "minimum": 10,
-          "description": "Compatibility ceiling for supervisor replies. Supervisors receive no tools and normally finish in one conclusion-only response."
+          "description": "Tool-round ceiling for supervisor reviews. Reviews start from recorded evidence and can inspect the workspace to resolve uncertainty before returning a decision."
         },
         "mfagent.queue.notifyCommand": {
           "type": "string",

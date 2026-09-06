@@ -73,6 +73,11 @@ func looksBinary(b []byte) bool {
 	n := len(b)
 	if n > 8000 {
 		n = 8000
+		// The sampling boundary may fall inside a valid multibyte character.
+		// Do not classify ordinary UTF-8 source as binary because we cut it.
+		for n > 0 && !utf8.RuneStart(b[n]) {
+			n--
+		}
 	}
 	head := b[:n]
 	if !utf8.Valid(head) {
@@ -461,7 +466,7 @@ func replaceIn(text, oldStr, newStr string, all bool) (string, int, error) {
 		if strings.Contains(text, "\r\n") && strings.Count(strings.ReplaceAll(text, "\r\n", "\n"), oldStr) > 0 {
 			return "", 0, fmt.Errorf("old_string not found (file uses CRLF line endings; match them or re-read the file)")
 		}
-		return "", 0, fmt.Errorf("old_string not found")
+		return "", 0, fmt.Errorf("old_string not found; read_file the current file, then copy a smaller unique exact block without line numbers. For a deliberate full-file replacement, use write_file after reading it. No change was applied")
 	}
 	if count > 1 && !all {
 		return "", 0, fmt.Errorf("old_string appears %d times; add surrounding context or set replace_all", count)

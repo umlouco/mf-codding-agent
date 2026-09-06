@@ -18,6 +18,31 @@ import (
 	"github.com/mflores/mfagent/core/internal/tools"
 )
 
+func TestRuntimeHistoryPrecedesCurrentRequestAndPreservesToolPair(t *testing.T) {
+	request := []llm.Message{llm.UserText("current owner request")}
+	projected := cognitionAppendContext(request, "historical runtime evidence")
+	if len(projected) != 1 || projected[0].Blocks[len(projected[0].Blocks)-1].Text != "current owner request" {
+		t.Fatal("runtime history displaced current request")
+	}
+	messages := append(request, llm.Message{Role: llm.RoleAssistant, Blocks: []llm.Block{{Type: llm.BlockToolUse, ID: "read-1", Name: "read_file"}}}, llm.Message{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockToolResult, ToolUseID: "read-1", Text: "actual successful result"}}})
+	projected = cognitionAppendContext(messages, "old invocation failed")
+	if projected[len(projected)-2].Blocks[0].Type != llm.BlockToolUse || projected[len(projected)-1].Blocks[0].Type != llm.BlockToolResult {
+		t.Fatal("runtime history split the tool protocol pair")
+	}
+	if len(projected) != len(messages) || !strings.HasSuffix(projected[len(projected)-1].Blocks[0].Text, "actual successful result") {
+		t.Fatal("runtime projection added a conversational turn or displaced actual evidence")
+	}
+	// A second tool round must also retain the exact conversation roles.
+	messages = append(messages, llm.Message{Role: llm.RoleAssistant, Blocks: []llm.Block{{Type: llm.BlockToolUse, ID: "read-2", Name: "read_file"}}}, llm.Message{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockToolResult, ToolUseID: "read-2", Text: "second result"}}})
+	projected = cognitionAppendContext(messages, "fresh runtime evidence")
+	if len(projected) != len(messages) || projected[4].Blocks[0].ToolUseID != "read-2" || projected[2].Blocks[0].Text != "actual successful result" {
+		t.Fatal("second projection changed earlier history or tool result identity")
+	}
+	if strings.Contains(messageText(messages), "old invocation failed") {
+		t.Fatal("projection mutated durable message history")
+	}
+}
+
 // The fake implements only the persistence boundary; calls still travel through
 // the real agent scheduler, panic containment, result pairing, and model loop.
 type cognitionJournal struct {

@@ -33,6 +33,15 @@ export { retryBriefing, demandRewrite, escalate, reformatVerdict, queueContextCe
 export function setTestRunner(runner: typeof runOnce) { runOnce = runner; }
 `);
 const { Orchestrator } = load('src/queue/orchestrator.ts', { './agents': agents });
+test('worker budget permits sustained work and honors explicit bounded limits', () => {
+  assert.equal(agents.workerRounds(), 80);
+  for (const [configured, expected] of [[24, 24], [0, 4], [240, 200], [12.8, 12], [NaN, 80]]) {
+    const configuredAgents = load('src/queue/agents.ts', {
+      vscode: { workspace: { getConfiguration: () => ({ get: () => configured }) } },
+    });
+    assert.equal(configuredAgents.workerRounds(), expected);
+  }
+});
 const task = (attempts = 3) => ({
   id: 1, seq: 1, status: 'EXECUTING', attempts, maxAttempts: 3,
   description: 'Implement conditional visibility and independently verify all four required states.',
@@ -110,12 +119,12 @@ test('live validation rewrite resets an exhausted budget', async () => {
 });
 
 test('unchanged task or verification cannot buy a fresh budget', async () => {
-  assert.equal((await apply(task(), {
+  await assert.rejects(apply(task(), {
     action: 'STOP_AND_REWRITE_TASK', rewrittenDescription: task().description,
-  })).length, 0);
-  assert.equal((await apply(task(), {
+  }), /without.*changed/);
+  await assert.rejects(apply(task(), {
     action: 'STOP_AND_REWRITE_VALIDATION', solutionVerifyPrompt: task().solutionVerifyPrompt,
-  })).length, 0);
+  }), /without.*changed/);
 });
 
 test('rendered worker and recovery prompts contain valid JSON examples', async () => {
@@ -237,7 +246,7 @@ test('worker budgets apply to execution and verification, with halted turns unve
   });
   const checked = await verifier.runVerification({}, {}, task(), 'Correct behavior');
   assert.equal(JSON.parse(checked.validationReport).conclusion, 'INCOMPLETE');
-  assert.ok(options.every(o => o.maxIterations === 24));
+  assert.ok(options.every(o => o.maxIterations === 80));
 });
 
 test('queue context respects the smaller local or global ceiling', () => {

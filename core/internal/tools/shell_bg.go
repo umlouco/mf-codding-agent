@@ -14,9 +14,9 @@ import (
 
 // bgProc holds a running background command so it can be killed later.
 type bgProc struct {
-	cmd    *exec.Cmd
-	label  string
-	pid    int
+	cmd     *exec.Cmd
+	label   string
+	pid     int
 	started time.Time
 }
 
@@ -46,6 +46,9 @@ func RegisterShellBg(r *Registry) {
 			return "Start background: " + a.Command
 		},
 		Run: func(ctx context.Context, env *Env, in json.RawMessage) Result {
+			if err := env.CheckTestingTool("shell_run_background", in); err != nil {
+				return Errf("%v", err)
+			}
 			var a struct {
 				Command string `json:"command"`
 				Cwd     string `json:"cwd"`
@@ -269,5 +272,3 @@ func bgProcsList() string {
 	}
 	return b.String()
 }
-
-

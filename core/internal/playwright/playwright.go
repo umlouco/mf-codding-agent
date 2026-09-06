@@ -54,9 +54,6 @@ func (s *Setup) Ready() error {
 	if s.CLIPath == "" {
 		return errors.New("installed Playwright CLI is missing; restore the project's dependencies")
 	}
-	if s.ConfigPath == "" {
-		return errors.New("no playwright.config.* found — Playwright needs a config to know where the specs live")
-	}
 	return nil
 }
 
@@ -131,7 +128,7 @@ type Report struct {
 }
 
 func (r *Report) OK() bool {
-	return r.Failed == 0 && len(r.TopLevelErrors) == 0 && r.ExitCode == 0
+	return r.Passed+r.Flaky > 0 && r.Failed == 0 && len(r.TopLevelErrors) == 0 && r.ExitCode == 0
 }
 
 // jsonReport mirrors the subset of Playwright's JSON reporter we rely on.
@@ -196,7 +193,12 @@ func Run(ctx context.Context, s *Setup, opt RunOptions) (*Report, error) {
 	defer os.RemoveAll(tmp)
 	reportPath := filepath.Join(tmp, "report.json")
 
-	args := []string{s.CLIPath, "test", "--reporter=json", "--config", s.ConfigPath}
+	args := []string{s.CLIPath, "test", "--reporter=json"}
+	// Playwright supports its defaults without a configuration file. Passing
+	// an empty --config instead would turn a runnable project into an error.
+	if s.ConfigPath != "" {
+		args = append(args, "--config", s.ConfigPath)
+	}
 	if opt.Spec != "" {
 		args = append(args, opt.Spec)
 	}

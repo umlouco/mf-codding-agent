@@ -26,7 +26,7 @@ func RegisterPlaywright(r *Registry) {
 			if s.ConfigPath != "" {
 				fmt.Fprintf(&sb, "config:  %s\n", env.Rel(s.ConfigPath))
 			} else {
-				sb.WriteString("config:  (none found)\n")
+				sb.WriteString("config:  (none found; Playwright defaults apply, or select an explicit spec)\n")
 			}
 			if s.Installed {
 				v := s.Version
@@ -208,7 +208,9 @@ func formatReport(rep *playwright.Report, env *Env) string {
 	}
 
 	if rep.OK() {
-		sb.WriteString("\nAll tests passed.")
+		sb.WriteString("\nExecuted tests passed.")
+	} else if rep.Passed+rep.Flaky+rep.Failed == 0 && len(rep.TopLevelErrors) == 0 {
+		sb.WriteString("\nNo tests executed. An empty or entirely skipped run does not verify the requested behavior.")
 	}
 	return sb.String()
 }

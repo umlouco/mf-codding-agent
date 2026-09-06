@@ -7,11 +7,20 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mflores/mfagent/core/internal/config"
 	"github.com/mflores/mfagent/core/internal/llm"
 	"github.com/mflores/mfagent/core/internal/tools"
 )
+
+func TestToolPreviewRetainsInitialDiagnosticsAndFinalTestResult(t *testing.T) {
+	output := "Running required checks\n" + strings.Repeat("診断", 3000) + "\nFAIL: conditional check was not satisfied; exit=1"
+	preview := truncateForUI(output)
+	if !utf8.ValidString(preview) || len(preview) > 4200 || !strings.HasPrefix(preview, "Running required checks") || !strings.HasSuffix(preview, "exit=1") || !strings.Contains(preview, "preview omitted") {
+		t.Fatalf("preview lost evidence, bounds, or encoding: %q", preview)
+	}
+}
 
 /*
 The round ceiling is the one place the loop can end without the model having
@@ -27,12 +36,14 @@ type fakeProvider struct {
 	toolless     int
 	finalText    string
 	lastToolsLen int
+	toolName     string
 	// delay makes a round take measurable time.
 	delay time.Duration
 	// wireEvery, when set, reports bytes at that interval for the whole delay.
 	// A reply that keeps delivering is slow; one that delivers nothing is dead,
 	// and this field is the difference between the two.
-	wireEvery time.Duration
+	wireEvery     time.Duration
+	argumentBytes int // generated argument content on each progress tick
 	// answerAfter returns finalText normally after this many tool rounds.
 	answerAfter int
 	// contextPerRound, when set, grows the reported context by this much every
@@ -62,6 +73,9 @@ func (f *fakeProvider) wait(ctx context.Context, sink func(llm.Event)) error {
 			return nil
 		case <-tick.C:
 			sink(llm.Event{Kind: llm.EventWire, Bytes: 64})
+			if f.argumentBytes > 0 {
+				sink(llm.Event{Kind: llm.EventToolInput, Bytes: f.argumentBytes})
+			}
 		}
 	}
 }
@@ -110,11 +124,15 @@ func (f *fakeProvider) Stream(
 		}
 	}
 
+	toolName := f.toolName
+	if toolName == "" {
+		toolName = "noop"
+	}
 	return &llm.Turn{
 		Blocks: []llm.Block{{
 			Type:  llm.BlockToolUse,
 			ID:    "call-1",
-			Name:  "noop",
+			Name:  toolName,
 			Input: json.RawMessage(`{}`),
 		}},
 		StopReason: "tool_use",
@@ -287,6 +305,45 @@ func TestASlowReplyIsNeverCutOff(t *testing.T) {
 	if !log.hasPhase(PhaseStreaming) {
 		t.Errorf("phases = %v, want the wait to have been journalled", log.phases())
 	}
+}
+
+func TestWireKeepalivesAreNotReportedAsModelProgress(t *testing.T) {
+	fake := &fakeProvider{finalText: "finished", delay: 1200 * time.Millisecond, wireEvery: 100 * time.Millisecond}
+	a, log := newLoggedAgent(t, fake, 1)
+	a.cfg.ActivitySeconds = 1
+	_, err := a.stream(context.Background(), "wire", llm.Request{}, func(llm.Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range log.rows {
+		detail, _ := row["detail"].(string)
+		if strings.Contains(detail, "no model output yet") {
+			found = true
+			if row["phase"] != PhaseModel {
+				t.Fatalf("keepalive presented as generation: %+v", row)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("missing distinction between a connected transport and generated model output")
+	}
+}
+
+func TestStreamingToolArgumentsAreReportedAsModelProgress(t *testing.T) {
+	fake := &fakeProvider{finalText: "finished", delay: 1200 * time.Millisecond, wireEvery: 100 * time.Millisecond, argumentBytes: 16}
+	a, log := newLoggedAgent(t, fake, 1)
+	a.cfg.ActivitySeconds = 1
+	if _, err := a.stream(context.Background(), "arguments", llm.Request{}, func(llm.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range log.rows {
+		detail, _ := row["detail"].(string)
+		if row["phase"] == PhaseStreaming && strings.Contains(detail, "tool argument bytes") && !strings.Contains(detail, "no model output") {
+			return
+		}
+	}
+	t.Fatal("generated tool arguments were hidden as a transport-only wait")
 }
 
 // A connection that delivers nothing for the whole idle window is dropped, and
@@ -494,5 +551,19 @@ func TestNegativeContextCeilingDisablesTheBackstop(t *testing.T) {
 	}
 	if res.StopReason != "end_turn" || !strings.Contains(res.Text, fake.finalText) {
 		t.Fatalf("result=%+v, want the model's own end_turn", res)
+	}
+}
+
+func TestResponseOnlyReviewHasNoCodingToolsOrContext(t *testing.T) {
+	fake := &fakeProvider{finalText: `{"compatible":false}`}
+	a := newTestAgent(t, fake, 10)
+	a.cfg.ResponseOnly = true
+	a.cfg.DisableTools = false
+	result, err := a.Send(context.Background(), SendRequest{SessionID: "contract-review", Text: "Compare only these owner requirements and proposed task."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.calls != 1 || fake.toolless != 1 || result.Text != fake.finalText {
+		t.Fatalf("response review entered tool loop: calls=%d noTools=%d result=%+v", fake.calls, fake.toolless, result)
 	}
 }

@@ -11,9 +11,47 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/bmatcuk/doublestar/v4"
 )
+
+// A match-count limit alone does not bound minified or generated source: one
+// matching line can consume an entire model context. Preserve the location and
+// a preview around the first match, with an explicit notice to inspect the file.
+func searchLinePreview(text string, re *regexp.Regexp) string {
+	const limit = 2000
+	if len(text) <= limit {
+		return text
+	}
+	start := 0
+	if match := re.FindStringIndex(text); match != nil && match[0] > 200 {
+		start = match[0] - 200
+	}
+	for start > 0 && !utf8.RuneStart(text[start]) {
+		start--
+	}
+	end := start + limit
+	if end > len(text) {
+		end = len(text)
+	}
+	for end < len(text) && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return fmt.Sprintf("[line preview bytes %d-%d of %d] %s [line shortened; inspect this file for complete source]", start+1, end, len(text), text[start:end])
+}
+
+func searchOutputPreview(text string) string {
+	const limit = 24000
+	if len(text) <= limit {
+		return text
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end] + "\n[Search output truncated at 24000 bytes. Narrow path/glob/pattern or use output_mode files to locate the relevant source. Use output_mode count for exact totals.]"
+}
 
 // skipDirs are never walked. Keeping this list tight is what makes search fast
 // enough to not need a native ripgrep dependency.
@@ -146,7 +184,8 @@ func RegisterSearch(r *Registry) {
 			"Between them these answer \"what matches\", \"where\" and \"how many\" in one " +
 			"call, so there is no reason to pipe this into sort, uniq or wc in a shell, " +
 			"and no chance of two hand-built pipelines disagreeing about the count. " +
-			"Filter with the glob or lang parameter to keep results tight.",
+			"Filter with the glob or lang parameter to keep results tight. Content output is a bounded preview; " +
+			"long lines and large results are explicitly shortened. Count mode always counts complete matches.",
 		Schema: obj(map[string]any{
 			"pattern":          str("Go regular expression (RE2 syntax)."),
 			"path":             str("Directory or single file to search. Defaults to workspace root."),
@@ -265,7 +304,7 @@ func RegisterSearch(r *Registry) {
 				if counting {
 					return
 				}
-				fmt.Fprintf(&out, "%s:%d:%s\n", rel, lineNo, text)
+				fmt.Fprintf(&out, "%s:%d:%s\n", rel, lineNo, searchLinePreview(text, re))
 			}
 
 			search := func(abs string) error {
@@ -319,7 +358,7 @@ func RegisterSearch(r *Registry) {
 						if a.Context > 0 {
 							start := lineNo - len(window)
 							for i, w := range window {
-								fmt.Fprintf(&out, "%s:%d-%s\n", rel, start+i, w)
+								fmt.Fprintf(&out, "%s:%d-%s\n", rel, start+i, searchLinePreview(w, re))
 							}
 						}
 						if extracting {
@@ -346,7 +385,7 @@ func RegisterSearch(r *Registry) {
 						continue
 					}
 					if pendingAfter > 0 {
-						fmt.Fprintf(&out, "%s:%d-%s\n", rel, lineNo, line)
+						fmt.Fprintf(&out, "%s:%d-%s\n", rel, lineNo, searchLinePreview(line, re))
 						pendingAfter--
 					}
 					if a.Context > 0 {
@@ -412,7 +451,7 @@ func RegisterSearch(r *Registry) {
 					note = fmt.Sprintf("\n\n(showing %d of %d distinct, from %d %s; raise limit for the rest)",
 						len(values), len(distinct), total, unit)
 				}
-				return Ok(body + note)
+				return Ok(searchOutputPreview(body) + note)
 			}
 			if out.Len() == 0 {
 				return Ok("No matches.")
@@ -421,7 +460,7 @@ func RegisterSearch(r *Registry) {
 				fmt.Fprintf(&out, "(truncated at %d %s — use output_mode \"count\" for the real total)\n",
 					a.Limit, unit)
 			}
-			return Ok(out.String())
+			return Ok(searchOutputPreview(out.String()))
 		},
 	})
 }

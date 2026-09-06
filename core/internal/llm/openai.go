@@ -61,11 +61,13 @@ type oaiToolCall struct {
 }
 
 type oaiMessage struct {
-	Role       string        `json:"role"`
-	Content    any           `json:"content,omitempty"`
-	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
-	Name       string        `json:"name,omitempty"`
+	Role             string        `json:"role"`
+	Content          any           `json:"content,omitempty"`
+	ToolCalls        []oaiToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	Name             string        `json:"name,omitempty"`
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
+	Reasoning        string        `json:"reasoning,omitempty"`
 }
 
 func (p *OpenAIProvider) convert(req Request) []oaiMessage {
@@ -73,7 +75,22 @@ func (p *OpenAIProvider) convert(req Request) []oaiMessage {
 	if req.System != "" {
 		out = append(out, oaiMessage{Role: "system", Content: req.System})
 	}
-	for _, m := range req.Messages {
+	currentRequest := -1
+	for i, message := range req.Messages {
+		if message.Role != RoleUser {
+			continue
+		}
+		toolResult := false
+		for _, block := range message.Blocks {
+			if block.Type == BlockToolResult {
+				toolResult = true
+			}
+		}
+		if !toolResult {
+			currentRequest = i
+		}
+	}
+	for index, m := range req.Messages {
 		switch m.Role {
 		case RoleAssistant:
 			msg := oaiMessage{Role: "assistant"}
@@ -82,6 +99,15 @@ func (p *OpenAIProvider) convert(req Request) []oaiMessage {
 				switch b.Type {
 				case BlockText:
 					text.WriteString(b.Text)
+				case BlockThinking:
+					if index > currentRequest {
+						switch b.ReasoningField {
+						case "reasoning_content":
+							msg.ReasoningContent += b.Text
+						case "reasoning":
+							msg.Reasoning += b.Text
+						}
+					}
 				case BlockToolUse:
 					tc := oaiToolCall{ID: b.ID, Type: "function"}
 					tc.Function.Name = b.Name
@@ -90,11 +116,13 @@ func (p *OpenAIProvider) convert(req Request) []oaiMessage {
 						tc.Function.Arguments = "{}"
 					}
 					msg.ToolCalls = append(msg.ToolCalls, tc)
-					// Thinking blocks have no portable representation here and
-					// are dropped rather than leaked into the visible content.
 				}
 			}
 			msg.Content = text.String()
+			if len(msg.ToolCalls) == 0 {
+				msg.ReasoningContent = ""
+				msg.Reasoning = ""
+			}
 			if msg.Content == "" && len(msg.ToolCalls) == 0 {
 				continue
 			}
@@ -128,7 +156,31 @@ func (p *OpenAIProvider) convert(req Request) []oaiMessage {
 			}
 		}
 	}
-	return out
+	// Context and recovery notices can introduce adjacent user messages. Strict
+	// local chat templates require alternating conversational roles. Join only
+	// adjacent user content; never move a notice across a tool call or result.
+	merged := make([]oaiMessage, 0, len(out))
+	for _, message := range out {
+		if len(merged) > 0 && message.Role == "user" && merged[len(merged)-1].Role == "user" {
+			previous := &merged[len(merged)-1]
+			left, leftText := previous.Content.(string)
+			right, rightText := message.Content.(string)
+			if leftText && rightText {
+				previous.Content = left + "\n\n" + right
+			} else {
+				parts := func(content any) []map[string]any {
+					if text, ok := content.(string); ok {
+						return []map[string]any{{"type": "text", "text": text}}
+					}
+					return content.([]map[string]any)
+				}
+				previous.Content = append(parts(previous.Content), parts(message.Content)...)
+			}
+			continue
+		}
+		merged = append(merged, message)
+	}
+	return merged
 }
 
 // sanitizeSchema removes null-valued keys and guarantees a well-formed object
@@ -307,9 +359,11 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 
 	turn := &Turn{Model: p.model}
 	var text strings.Builder
+	var reasoningContent, reasoningText strings.Builder
 	// Tool calls arrive fragmented across chunks, keyed by index.
 	calls := map[int]*oaiToolCall{}
 	announced := map[int]bool{}
+	finished := false
 
 	// Read through a WireReader so every chunk — including the SSE comments a
 	// server sends to hold the connection open — counts as proof of life.
@@ -321,7 +375,11 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
+		if payload == "[DONE]" {
+			finished = true
+			continue
+		}
+		if payload == "" {
 			continue
 		}
 		var chunk struct {
@@ -371,6 +429,9 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 			reasoning := ch.Delta.ReasoningContent
 			if reasoning == "" {
 				reasoning = ch.Delta.Reasoning
+				reasoningText.WriteString(reasoning)
+			} else {
+				reasoningContent.WriteString(reasoning)
 			}
 			if reasoning != "" && sink != nil {
 				sink(Event{Kind: EventThinking, Text: reasoning})
@@ -394,6 +455,9 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 					cur.Function.Name = tc.Function.Name
 				}
 				cur.Function.Arguments += tc.Function.Arguments
+				if tc.Function.Arguments != "" && sink != nil {
+					sink(Event{Kind: EventToolInput, Bytes: len(tc.Function.Arguments)})
+				}
 				if cur.Function.Name != "" && !announced[tc.Index] && sink != nil {
 					announced[tc.Index] = true
 					sink(Event{Kind: EventToolStart, ToolName: cur.Function.Name, ToolID: cur.ID})
@@ -401,13 +465,22 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 			}
 			if ch.FinishReason != "" {
 				turn.StopReason = ch.FinishReason
+				finished = true
 			}
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
+	if !finished {
+		return nil, fmt.Errorf("model stream ended without a completion marker: %w", io.ErrUnexpectedEOF)
+	}
 
+	for _, item := range []struct{ field, value string }{{"reasoning_content", reasoningContent.String()}, {"reasoning", reasoningText.String()}} {
+		if item.value != "" {
+			turn.Blocks = append(turn.Blocks, Block{Type: BlockThinking, Text: item.value, ReasoningField: item.field})
+		}
+	}
 	if text.Len() > 0 {
 		turn.Blocks = append(turn.Blocks, Block{Type: BlockText, Text: text.String()})
 	}

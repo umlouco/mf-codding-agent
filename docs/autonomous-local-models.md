@@ -1,10 +1,13 @@
 # Autonomous runs with local models
 
-Queue workers now default to 24 tool rounds per turn and a 32,768-token context
-ceiling. These are conservative application defaults, not benchmark results for
-a specific model or quantization. Configure `mfagent.queue.maxContextTokens` at or
-below the context configured on your inference server. The smaller positive value
-of this setting and `mfagent.llm.maxContextTokens` wins.
+Queue workers default to 80 tool rounds per turn. The former 24-round default
+repeatedly interrupted useful investigation in the live replay, adding handoff and
+rediscovery work. Existing explicit limits remain in effect; repeated failures,
+context limits, cancellation, and supervisor decisions still stop a turn.
+The queue context override defaults to zero, inheriting `mfagent.llm.maxContextTokens`.
+Configure the global limit at or below the context configured on your inference
+server. A positive queue override of at least 4096 imposes an additional cap;
+the smaller positive limit wins. These defaults are not model benchmark results.
 
 `mfagent.queue.workerMaxRounds` controls executor and independent verifier turns.
 At a limit, the core requests a handoff report and the supervisor automatically

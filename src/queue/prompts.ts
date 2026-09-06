@@ -14,6 +14,8 @@ export const codingWorkflow = `Work in this order:
    interfaces and unrelated user edits. Do not add a dependency unless the task needs it.
 3. Implement the change, including relevant error paths and boundary cases. For a bug, add or
    update a focused regression test when the repository supports it.
+   Use file-writing/editing tools for source and configuration text. They preserve text without
+   shell quoting or redirection encoding. Use the shell for builds, tests, and commands.
 4. Run the relevant checks and read their actual output. Inspect the final diff for unintended
    changes, missing imports, debug code, and tests weakened to make the change pass.
 5. Report changed files, observed check results, and anything still unverified.
@@ -29,6 +31,9 @@ return, for example: (() => { const el = document.querySelector('#id'); return {
 disabled: el ? el.disabled : null }; })(). Return primitives or plain objects, not DOM nodes.
 An empty serialized object or a statement with no return does not prove an element is missing.
 A selector syntax error is a broken check, not evidence of an application defect.
+Register console/page-error listeners before navigation and interactions. An empty or entirely
+skipped test run is not verification. Confirm required controls and assertions actually ran;
+silently skipping missing elements does not establish the requested behavior.
 For layout requirements use browser_layout_check after reaching the required state. Give it
 1..8 concrete visual criteria with IDs, selectors and an explicit viewport. The Vision role
 returns text evidence even when your model cannot see images. Use playwright_layout_check for
@@ -44,6 +49,9 @@ export const recoveryRules = `Diagnose the failure before rewriting:
   just because workspace paths contain spaces. Quote paths or use workspace-relative paths.
 - Code defect: preserve the requirements; name the observed mismatch and the focused fix.
 - Tool syntax or test setup error: correct the invocation or prerequisite; preserve working code.
+- Quoting or encoding errors while creating source files: use the available file-writing/editing
+  tool. Do not prescribe another shell string workaround when direct file tools are available.
+  Changing how a file is written does not change its implementation or acceptance criteria.
 - Missing evidence: request the exact missing check, without redoing completed implementation.
 - A malformed verifier report is a verification failure, not an implementation defect. Reverify
   with the missing evidence named; do not invent exact table layouts or tool-call quotas.

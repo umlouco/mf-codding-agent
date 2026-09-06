@@ -89,6 +89,12 @@ func TestBrowserSurvivesAcrossCalls(t *testing.T) {
 	if len(els) == 0 {
 		t.Fatal("Interactive returned no elements, want the button")
 	}
+	if err := b.Click(ctx, `button:has-text("go")`); err == nil || !strings.Contains(err.Error(), "standard CSS selectors") {
+		t.Fatalf("invalid selector needs actionable recovery: %v", err)
+	}
+	if err := b.Click(ctx, "#btn"); err != nil {
+		t.Fatalf("valid selector after failed query: %v", err)
+	}
 
 	if _, err := b.Navigate(ctx, srv.URL, "#hd"); err != nil {
 		t.Fatalf("second navigate: %v", err)
@@ -105,6 +111,48 @@ func TestBrowserSurvivesAcrossCalls(t *testing.T) {
 	}
 	if !capture.Stable || len(capture.PNG) == 0 || !strings.Contains(string(capture.DOM), `"width":800`) {
 		t.Fatalf("bad layout capture: stable=%v DOM=%s", capture.Stable, capture.DOM)
+	}
+}
+
+func TestFillSubmitsTypedCredentials(t *testing.T) {
+	exe := findChrome()
+	if exe == "" {
+		t.Skip("no Chromium browser installed")
+	}
+	received := make(chan bool, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_ = r.ParseForm()
+			received <- r.FormValue("username") == "sample-user" && r.FormValue("password") == "sample-pass!42"
+			_, _ = w.Write([]byte("Signed in"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<form method="post"><input id="username" name="username" required><input id="password" name="password" type="password" required><input id="submit" type="submit" value="Sign in"></form>`))
+	}))
+	defer srv.Close()
+	b := New(exe, true, t.TempDir(), "")
+	defer b.Close()
+	ctx := context.Background()
+	if _, err := b.Navigate(ctx, srv.URL, "#username"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Fill(ctx, "#username", "sample-user", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Fill(ctx, "#password", "sample-pass!42", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Click(ctx, "#submit"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case valid := <-received:
+		if !valid {
+			t.Fatal("submitted credentials did not match typed values")
+		}
+	default:
+		t.Fatal("form was not submitted after successful fill and click")
 	}
 }
 

@@ -68,6 +68,8 @@ interface Review {
   gen: number;
   /** Last time this review's core said anything — its liveness, as above. */
   lastActivityAt: number;
+  /** Worker evidence available when this review's prompt was assembled. */
+  evidenceEventId?: number;
   /** Set only by a validator when its shell tool exceeds the tool's own bound. */
   validationToolViolation?: string;
   /** Kills the core process, which rejects the request wedged on it. */
@@ -155,6 +157,7 @@ export class Orchestrator implements vscode.Disposable {
    * finishExecution in db.ts), not by anything kept here.
    */
   private executionAbort: (() => void) | null = null;
+  private executionSteer: ((text: string) => Promise<boolean>) | null = null;
   private executionGen = 0;
   /** Which supervision cycle owns `supervising`; see tick and sweepSilentReview. */
   private cycle = 0;
@@ -627,6 +630,7 @@ export class Orchestrator implements vscode.Disposable {
 
   /** Lets the supervisor judge live work and choose one fixed control action. */
   private async reviewWork(task: Task): Promise<void> {
+    const evidenceEventId = this.queue.latestWorkerToolEventId(task.id);
     const events = this.queue.events(task.id, JOURNAL_EVENTS, true);
     const latestEventId = events.find(event => event.actor !== 'supervisor')?.id ?? 0;
     if (!this.shouldReview(task, latestEventId)) {
@@ -638,7 +642,7 @@ export class Orchestrator implements vscode.Disposable {
 
     this.log(`reviewing live work on task ${task.seq} — ${task.title}`);
     const gen = ++this.reviewGen;
-    const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now() };
+    const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now(), evidenceEventId };
     this.review = review;
     // The supervisor's reasoning streams to the view like everyone else's —
     // into the live table only, never into the journal it will read next time.
@@ -653,6 +657,22 @@ export class Orchestrator implements vscode.Disposable {
         this.queue.countEvents(task.id, VALIDATION_FAILED),
         {
           projectNotes: this.queue.contextInstructions,
+          testingUrl: this.queue.testingUrl,
+          ownerInstructions: this.queue.testingContext + this.queue.instructions,
+          refreshProgress: () => {
+            if (gen !== this.reviewGen) throw new Error('Progress review was superseded.');
+            const current = this.queue.get(task.id);
+            if (!current || !['EXECUTING', 'VERIFYING'].includes(current.status) ||
+                current.attempts !== task.attempts || current.startedAt !== task.startedAt ||
+                current.description !== task.description || current.implVerifyPrompt !== task.implVerifyPrompt ||
+                current.solutionVerifyPrompt !== task.solutionVerifyPrompt || current.solutionVerifyCommand !== task.solutionVerifyCommand) {
+              throw new Error('Task contract changed during requirements comparison; obtain a fresh review.');
+            }
+            task = current;
+            review.evidenceEventId = this.queue.latestWorkerToolEventId(task.id);
+            return { task, events: this.queue.events(task.id, JOURNAL_EVENTS, true),
+              failedValidations: this.queue.countEvents(task.id, VALIDATION_FAILED) };
+          },
           onAbort: (abort) => {
             if (gen !== this.reviewGen) { abort(); return; }
             review.abort = abort;
@@ -681,9 +701,12 @@ export class Orchestrator implements vscode.Disposable {
         return;
       }
       this.queue.addUsage(task.id, decision.usage);
-      this.queue.log(task.id, 'supervisor', `action:${decision.action}`, decision.reason);
       await this.applyProgressDecision(task, decision, review);
     } catch (error: any) {
+      if (gen !== this.reviewGen) {
+        this.log(`task ${task.seq} — abandoned progress review error ignored`);
+        return;
+      }
       const message = String(error?.message ?? error);
       this.queue.log(task.id, 'supervisor', 'monitor-error', message);
       // In the row and the terminal too: a supervisor that fails on every
@@ -717,34 +740,56 @@ export class Orchestrator implements vscode.Disposable {
       return;
     }
 
+    // A queued local review can take minutes while its worker edits or tests.
+    // Unchanged task instructions do not make that older evidence current.
+    // Preserve the worker and ask again with its new results; heartbeat-only
+    // activity must not invalidate a useful review of slow, ongoing inference.
+    if (review.evidenceEventId !== undefined &&
+        this.queue.latestWorkerToolEventId(task.id) > review.evidenceEventId) {
+      this.queue.log(task.id, 'supervisor', 'review-outdated',
+        'New worker tool activity arrived while this review was queued or running. Decision discarded; execution preserved.');
+      this.reviewed.delete(task.id);
+      this.log(`task ${task.seq} has newer tool evidence; obtain a fresh progress review`);
+      return;
+    }
+
+    this.queue.log(task.id, 'supervisor', `action:${decision.action}`, decision.reason);
     switch (decision.action) {
       case 'CONTINUE_EXECUTION':
         if (task.status === 'VERIFYING' && !task.validationReport.trim()) {
           this.queue.update(task.id, {
-            status: 'PENDING', finishedAt: null, supervisorFeedback: decision.reason,
+            status: 'PENDING', finishedAt: null, supervisorFeedback: decision.guidance || decision.reason,
             ...(attemptsExhausted(task) ? { attempts: 0 } : {}),
           });
           this.queue.log(task.id, 'supervisor', 'continued', decision.reason);
           this.log(`task ${task.seq} will resume from its handoff with the same requirements`);
         } else {
+          if (decision.guidance && decision.guidance !== task.supervisorFeedback) {
+            this.queue.update(task.id, { supervisorFeedback: decision.guidance });
+            const gen = this.executionGen;
+            let accepted = false;
+            try { accepted = await this.executionSteer?.(decision.guidance) ?? false; } catch { /* Retained for the next handoff. */ }
+            if (gen === this.executionGen && this.queue.get(task.id)?.startedAt === task.startedAt) {
+              this.queue.log(task.id, 'supervisor', accepted ? 'guidance-queued' : 'guidance-saved',
+                `${accepted ? 'Queued for the next model round' : 'Saved for the next worker handoff'}: ${decision.guidance}`);
+            }
+          }
           this.log(`task ${task.seq} is progressing in the right direction; continuing`);
         }
         return;
 
       case 'STOP_AND_REWRITE_TASK': {
         const description = decision.rewrittenDescription?.trim();
-        if (!description || description.length < 40 || description.trim() === task.description.trim()) {
-          if (task.status === 'VERIFYING') {
-            this.log(`task ${task.seq} — supervisor wanted a rewrite but provided none; running verification instead`);
-            await this.verifyWithExecutor(task, review);
-            return;
-          }
-          this.log(`task ${task.seq} — supervisor omitted the required task rewrite; continuing safely`);
-          return;
+        if (!description || description.trim() === task.description.trim()) {
+          throw new Error('The supervisor requested a task rewrite without supplying changed requirements. Preserve the task and request a complete decision; do not verify the rejected approach.');
         }
+
         if (!this.stopForDecision(task, {
           status: 'PENDING',
           description,
+          implVerifyPrompt: decision.implVerifyPrompt ?? task.implVerifyPrompt,
+          solutionVerifyPrompt: decision.solutionVerifyPrompt ?? task.solutionVerifyPrompt,
+          solutionVerifyCommand: decision.solutionVerifyCommand ?? task.solutionVerifyCommand,
           validationReport: '',
           finishedAt: null,
           supervisorFeedback: decision.reason,
@@ -761,14 +806,9 @@ export class Orchestrator implements vscode.Disposable {
         const hasRewrite = (['implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const)
           .some((field) => decision[field] !== undefined && decision[field]!.trim() !== task[field].trim());
         if (!hasRewrite) {
-          if (task.status === 'VERIFYING') {
-            this.log(`task ${task.seq} — supervisor wanted a validation rewrite but provided none; running verification instead`);
-            await this.verifyWithExecutor(task, review);
-            return;
-          }
-          this.log(`task ${task.seq} — supervisor omitted replacement validation; continuing safely`);
-          return;
+          throw new Error('The supervisor requested a validation rewrite without changed checks. Preserve the task and request a complete decision; do not run the rejected checks.');
         }
+
         if (!this.stopForDecision(task, {
           status: 'PENDING',
           implVerifyPrompt: decision.implVerifyPrompt ?? task.implVerifyPrompt,
@@ -823,9 +863,22 @@ export class Orchestrator implements vscode.Disposable {
   /** Runtime observations are durable evidence of execution, never liveness heartbeats. */
   private observerEvents(taskId: number, actor: string, live: LiveLog, accepts = () => true) {
     let lastCognition = '';
+    const pendingTools = new Map<string, { name: string; input: unknown }>();
     return (method: string, params: any): void => {
       if (!accepts()) return;
       live.onEvent(method, params);
+      if (method === 'stream/tool' && params?.id && params.status !== 'start') {
+        if (params.status === 'running') {
+          pendingTools.set(params.id, { name: String(params.name ?? 'tool'), input: params.input });
+          this.queue.log(taskId, actor, 'tool', `${String(params.name ?? 'tool')}() → start`);
+        } else {
+          const started = pendingTools.get(params.id);
+          pendingTools.delete(params.id);
+          this.queue.log(taskId, actor, 'tool', formatToolEvent(
+            started?.name ?? String(params.name ?? 'tool'), started?.input,
+            String(params.status ?? ''), params.output, params.elapsedMs));
+        }
+      }
       if (method === 'agent/cognition') {
         const record = cognitionRecord(params);
         if (record && record !== lastCognition) {
@@ -902,9 +955,11 @@ export class Orchestrator implements vscode.Disposable {
       if (method !== 'stream/tool' || !params?.id) {
         return;
       }
+      if (params.status === 'start') return;
       if (params.status === 'running') {
         flush();
         pendingTools.set(params.id, { name: String(params.name ?? 'tool'), input: params.input });
+        this.queue.log(taskId, actor, 'tool', `${String(params.name ?? 'tool')}() → start`);
         return;
       }
       const started = pendingTools.get(params.id);
@@ -1264,6 +1319,7 @@ export class Orchestrator implements vscode.Disposable {
     // release the replacement's abort handle or contaminate its journal.
     const attempt = task.attempts;
     const gen = this.executionGen = (this.executionGen ?? 0) + 1;
+    this.executionSteer = null;
     const current = () => this.executionGen === gen && this.queue.get(task.id)?.status === 'EXECUTING' &&
       this.queue.get(task.id)?.startedAt === task.startedAt;
     this.changed();
@@ -1308,6 +1364,7 @@ export class Orchestrator implements vscode.Disposable {
           if (!current()) { abort(); return; }
           this.executionAbort = abort;
         },
+        steer => { if (current()) this.executionSteer = text => current() ? steer(text) : Promise.resolve(false); },
       );
       journal.flush();
       if (!current()) return;

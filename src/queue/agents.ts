@@ -81,9 +81,10 @@ async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<Core
       enabled: true,
     }],
     coding: { providerId: `queue-${role}`, model: rc.model, effort: rc.effort },
-    // Keep routine reviews compact by omitting tool definitions. Every configured
-    // tool remains registered and callable if the supervisor needs it.
-    disableTools: role === 'supervisor',
+    // A registered tool is not discoverable by the model without its definition.
+    // Supervisors need inspection tools to resolve conflicting handoffs and notes.
+    disableTools: false,
+    inspectOnly: role === 'supervisor',
     // Queue workers spawn their own core processes and run unattended, often
     // several at once. The editor terminal is a single visible tab shared by
     // everything in the window: handing it to background work would steal focus
@@ -104,10 +105,10 @@ function queueContextCeiling(): number {
   return global > 0 ? Math.min(local, global) : local;
 }
 
-/** Short turns preserve changes and hand control back to autonomous recovery. */
+/** Allow sustained work; progress reviews and tool/context guards recover actual failures. */
 export function workerRounds(): number {
-  const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.workerMaxRounds', 24);
-  return Number.isFinite(configured) ? Math.max(4, Math.min(200, Math.floor(configured))) : 24;
+  const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.workerMaxRounds', 80);
+  return Number.isFinite(configured) ? Math.max(4, Math.min(200, Math.floor(configured))) : 80;
 }
 
 /** Base tool-calling rounds for one unattended executor turn. */
@@ -154,6 +155,8 @@ const NO_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 export type ReviewOptions = Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> & { projectNotes?: string };
 
 export interface RunOptions {
+  /** Repair a response using supplied evidence without starting another tool investigation. */
+  formatOnly?: boolean;
   /** Durable work identity; independent from this disposable process and conversation. */
   cognition?: CognitiveBinding;
   /** Retrieve relevant workspace graph knowledge before a fresh worker starts. */
@@ -161,6 +164,8 @@ export interface RunOptions {
   maxIterations?: number;
   onEvent?: (method: string, params: any) => void;
   onCancellable?: (cancel: () => void) => void;
+  /** Native workers accept advice at the next tool-safe model boundary. */
+  onSteerable?: (steer: (text: string) => Promise<boolean>) => void;
   /**
    * Hands back a hard stop: kills the core process rather than asking it to
    * stop. `onCancellable` goes through the core, so it is worth nothing against
@@ -212,11 +217,14 @@ export async function runOnce(
   // Claude CLI is a complete agent on its own — its own tool loop, its own
   // permission handling — so it is never routed through mfcore's agent loop
   // the way an HTTP provider is; see providers/store.ts's rolesAllowed guard
-  // for why this can only be planner/supervisor. Branching here, before the
+  // for which queue roles it supports. Branching here, before the
   // core is even spawned, means every caller downstream (orchestrator.ts,
   // monitor.ts, every prompt builder in this file) needs no changes: they
   // only ever see RunOptions in, TurnResult out.
   const resolved = await getStore().resolve(role);
+  if (resolved.kind === 'openai-compatible' && resolved.baseURL === '' && !resolved.profile) {
+    throw new AgentRunError(`No supported provider is configured for the ${role} role. Select a provider for this role in MF Agent settings.`);
+  }
   if (resolved.kind === 'claude-cli') {
     return runClaudeCliTurn(output, role, resolved, prompt, opts);
   }
@@ -224,7 +232,9 @@ export async function runOnce(
   const client = new CoreClient(context, output);
   registerEditorFsHandlers(client);
   getBridge().attach(client);
-  const { maxIterations = 0, onEvent, onCancellable, onAbort, onActivity } = opts;
+  const { onEvent, onCancellable, onAbort, onActivity } = opts;
+  const maxIterations = role === 'supervisor' && !(opts.maxIterations! > 0)
+    ? supervisorRounds() : opts.maxIterations ?? 0;
 
   client.onNotification((method, params) => {
     if (method === 'agent/activity' && onActivity) {
@@ -248,6 +258,7 @@ export async function runOnce(
     onAbort?.(() => { aborted = true; client.stop(); });
     checkAborted();
     const overrides = await overridesFor(role, maxIterations);
+    if (opts.formatOnly) { overrides.disableTools = true; overrides.responseOnly = true; }
     checkAborted();
     const init = await client.initialize(overrides);
     checkAborted();
@@ -279,6 +290,11 @@ export async function runOnce(
     }
 
     checkAborted();
+    opts.onSteerable?.(async text => {
+      if (aborted) return false;
+      const result = await client.request<{ accepted: boolean }>('chat/steer', { sessionId, text });
+      return result.accepted;
+    });
     const res = await client.request<{ text: string; stopReason: string; usage?: Usage }>(
       'chat/send',
       { sessionId, text: prompt, ...(opts.cognition ? { cognition: opts.cognition } : {}) },
@@ -1144,7 +1160,7 @@ export interface ExecutionOutcome {
  * or is ready to validate.
  */
 export function coreHalted(stopReason: string): boolean {
-  return stopReason === 'repeated_tool_error' || stopReason === 'context_limit' || stopReason === 'max_iterations';
+  return stopReason === 'repeated_tool_error' || stopReason === 'unchanged_tool_loop' || stopReason === 'context_limit' || stopReason === 'max_iterations';
 }
 
 const MAX_LOG_ENTRIES = 4;
@@ -1238,6 +1254,7 @@ export async function executeTask(
   onActivity?: (a: ActivityRecord) => void,
   onEvent?: (method: string, params: any) => void,
   onAbort?: (abort: () => void) => void,
+  onSteerable?: RunOptions['onSteerable'],
 ): Promise<ExecutionOutcome> {
   const retry = retryBriefing(task);
   const notes = projectNotesContext(instructions);
@@ -1295,6 +1312,7 @@ ${executorExample}`;
     onActivity,
     onEvent,
     onAbort,
+    onSteerable,
   });
   return {
     text,
@@ -1498,8 +1516,12 @@ REVERIFY alone cannot fix a task that now requires testing the wrong thing.
 Choose VERIFIED only when the verification agent concluded PASS and its database report contains
 concrete implementation and behaviour evidence plus successful required commands/tests. Do not
 independently repeat the checks. Choose REVERIFY when the verifier must finish checks, correct its invocation, authenticate at the
-supplied URL, or complete its report. Put the exact missing checks in feedback and leave taskEdits
-and splitInto empty. Preserve implementation and acceptance criteria. A report format problem
+supplied URL, or complete its report. Put the exact missing checks in feedback and leave splitInto
+empty. If the saved command itself has invalid syntax or quoting, REVERIFY may include one taskEdits
+entry for this task containing ONLY a complete nonempty solutionVerifyCommand replacement. Preserve
+every assertion and the same success conditions. Saved commands run in the portable POSIX shell on
+all hosts. Never waive a required command by saying to ignore it, or replace assertions with echo PASS.
+For other REVERIFY decisions leave taskEdits empty. Preserve implementation and acceptance criteria. A report format problem
 must not be converted into new product requirements, a tool-call quota, or a requirement to
 produce a particular table. Choose RETRY when evidence identifies changes the executor must make;
 include a materially rewritten description for task ${task.seq}. Choose SPLIT when
@@ -1572,7 +1594,11 @@ decisions: reverify it, correct it, or split it. There is no fail or give-up ver
 
   if (settled !== 'RETRY') {
     if (settled === 'REVERIFY' || settled === 'VERIFIED') {
-      decision.taskEdits = [];
+      decision.taskEdits = settled === 'REVERIFY' && named === 'REVERIFY'
+        ? taskEdits.filter(e => e.seq === task.seq && typeof e.solutionVerifyCommand === 'string' &&
+          e.solutionVerifyCommand.trim() && e.solutionVerifyCommand.trim() !== task.solutionVerifyCommand.trim())
+          .slice(0, 1).map(e => ({ seq: task.seq, solutionVerifyCommand: e.solutionVerifyCommand!.trim() }))
+        : [];
       decision.splitInto = undefined;
     }
     return decision;

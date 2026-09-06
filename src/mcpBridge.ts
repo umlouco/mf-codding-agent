@@ -1,3 +1,4 @@
+import { loadTestingEnvironment, testingProcessEnvironment } from './queue/testingEnvironment';
 import * as vscode from 'vscode';
 import type { CoreClient } from './core';
 import { resolveMcpBinary } from './detect';
@@ -136,6 +137,10 @@ export class McpBridge implements vscode.Disposable {
    * starts that server. Every other definition is returned as it was.
    */
   private async resolve(server: vscode.McpServerDefinition): Promise<vscode.McpServerDefinition> {
+    if (server.label === MCP_SERVER_LABEL && server instanceof vscode.McpStdioServerDefinition) {
+      server.env = { ...server.env, ...testingProcessEnvironment(await loadTestingEnvironment(this.context, getActiveQueue())) };
+      return server;
+    }
     const src = this.published.get(server.label);
     const def = src?.source === 'store' && src.id ? this.store.mcpServer(src.id) : undefined;
     const keyName = def?.keyName?.trim();

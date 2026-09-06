@@ -126,19 +126,33 @@ func (a *Agent) stream(
 	defer cancel()
 
 	var (
-		lastByte  atomic.Int64 // unix nanos of the most recent read
-		total     atomic.Int64 // bytes read on this call
-		streaming atomic.Bool  // the reply has started arriving
-		stalled   atomic.Bool
+		lastByte    atomic.Int64 // unix nanos of the most recent read
+		total       atomic.Int64 // bytes read on this call
+		decoded     atomic.Int64 // actual model content, excluding SSE keepalives
+		arguments   atomic.Int64 // generated tool arguments, never their contents
+		lastContent atomic.Int64
+		streaming   atomic.Bool // decoded model output has started arriving
+		stalled     atomic.Bool
 	)
 	lastByte.Store(time.Now().UnixNano())
+	lastContent.Store(time.Now().UnixNano())
 
 	watched := func(ev llm.Event) {
 		lastByte.Store(time.Now().UnixNano())
 		if ev.Kind == llm.EventWire {
 			total.Add(int64(ev.Bytes))
-			streaming.Store(true)
 			return // liveness only — never content
+		}
+		if ev.Kind == llm.EventToolInput && ev.Bytes > 0 {
+			streaming.Store(true)
+			arguments.Add(int64(ev.Bytes))
+			decoded.Add(int64(ev.Bytes))
+			lastContent.Store(time.Now().UnixNano())
+		}
+		if ((ev.Kind == llm.EventText || ev.Kind == llm.EventThinking) && ev.Text != "") || ev.Kind == llm.EventToolStart {
+			streaming.Store(true)
+			decoded.Add(int64(len(ev.Text)))
+			lastContent.Store(time.Now().UnixNano())
 		}
 		sink(ev)
 	}
@@ -169,7 +183,13 @@ func (a *Agent) stream(
 				phase, what := PhaseModel, fmt.Sprintf("waiting for the first token from %s", a.provider.Model())
 				if streaming.Load() {
 					phase = PhaseStreaming
-					what = fmt.Sprintf("receiving the reply — %d bytes so far", total.Load())
+					what = fmt.Sprintf("receiving model output — %d decoded bytes, last model output %s ago",
+						decoded.Load(), brief(now.Sub(time.Unix(0, lastContent.Load()))))
+					if n := arguments.Load(); n > 0 {
+						what += fmt.Sprintf(" (%d tool argument bytes)", n)
+					}
+				} else if total.Load() > 0 {
+					what += fmt.Sprintf("; connection alive (%d transport bytes), no model output yet", total.Load())
 				}
 				a.activity(sessionID, phase, fmt.Sprintf(
 					"%s, %s in, last data %s ago", what, brief(time.Since(started)), brief(idle)))

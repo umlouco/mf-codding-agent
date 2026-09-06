@@ -416,12 +416,53 @@ and `STOP_AND_REWRITE_VALIDATION`, `SPLIT`, and `START_VALIDATION` — see
 new costs a few indexed reads; a full review of live work is a model turn and is
 rate-limited separately (`mfagent.queue.reviewIntervalSeconds`).
 
+The Task Queue has a **Testing environment** section with an optional HTTP(S)
+**Testing URL** and named **Credentials**. Save these once for the workspace.
+The URL and credential names belong to the queue; values live in VS Code SecretStorage,
+not the queue database or generated notes. Blank saved values retain the existing
+secret; Remove deletes it. Saving stops active workers and restarts a running queue
+with fresh configuration. Credentials also work without a URL for terminal, Go,
+Delphi, database, and other non-browser work.
+
+Agents can call `testing_environment` to discover references. Native `browser_fill`
+accepts `credential: "password"` instead of a literal value. Child commands and
+Playwright tests inherit `MFAGENT_TEST_URL` and `MFAGENT_CREDENTIAL_<NAME>`; use
+`process.env` in Node, `$env:NAME` in PowerShell, or `$NAME` in the portable shell.
+Passwords and tokens are redacted from native tool results and recorded tool inputs;
+usernames remain usable identifiers. Do not print credentials or embed them in source.
+Copying a queue database does not copy its secrets: configure credentials on the new
+host/profile through the Testing environment section.
+
+With a URL configured, native browser navigation checks its origin and requires the
+exact initial URL. Common replacement server commands and conflicting loopback URLs
+are rejected by native shells, saved verification commands, and the Claude CLI's
+PreToolUse hook. The CLI also receives the bundled testing tools through MCP. These
+checks prevent ordinary target drift; they are not a sandbox for arbitrary programs,
+and cannot prove that a same-origin demonstration page is the requested application.
+Supervisor reviews require an explicit comparison of the required and observed work;
+a reported scope mismatch cannot authorize continuation or validation.
+
+For Apache 2.4, `apache_rewrite_check` checks the actual configured host using a
+random temporary rewrite probe. Supply the public directory's `base_path` explicitly.
+Repair additionally requires an existing `front_controller`, a real relative
+`probe_path`, and `expected_text`. It backs up `.htaccess`, preserves unrelated
+access/header directives, and keeps a routing repair only when both the rewrite
+probe and the specified application route pass. Failed checks restore the original;
+a durable journal permits recovery after a killed tool process. Concurrent edits are
+preserved and reported with the backup location. The tool cannot enable server-level
+modules or override permissions: see [Apache's rewrite documentation](https://httpd.apache.org/docs/2.4/mod/mod_rewrite.html).
+The CLI hook uses the documented [PreToolUse blocking protocol](https://code.claude.com/docs/en/hooks#exit-code-2).
+
 Project notes reach execution, verification, supervision, recovery, and phase
 expansion. Supplied application URLs and login instructions remain part of the
 test requirements. New agent findings are stored separately from your editable
 notes, labelled with their task/attempt, and bounded in the context passed forward.
-Verification reports include tool observations captured by the extension; a supplied
-command must actually complete successfully with that command text before PASS.
+The extension executes a saved verification command unchanged through its portable
+shell before the independent verifier reviews it. Reports include captured tool
+observations; a required command must actually complete successfully before PASS.
+Reverification can correct command quoting while preserving task requirements.
+Ready handoffs go directly to independent verification, followed by a supervisor
+verdict. Completed stages wake the queue without waiting for the next cron tick.
 Heartbeats keep the activity display current but do not count
 as new evidence for another supervisor review.
 
@@ -482,9 +523,11 @@ that the conclusion is consistent and adequately supported, and either validates
 the task, requests another verification pass (`REVERIFY`), or sends implementation
 back with revised instructions. A missing check or report-format error can be
 recovered without rewriting the task or rerunning working implementation. A
-productive executor handoff can also resume with unchanged requirements. Its Go model requests omit
-tool definitions to save context; configured tools remain callable if it needs
-additional observations. CLI supervisors also retain their available tools.
+productive executor handoff can also resume with unchanged requirements. Task rewrites
+retain accompanying corrections to their verification prompts and command, so the
+old check cannot silently survive a corrected task. Supervisor model requests include
+the configured tool definitions for inspection when evidence conflicts or is missing.
+CLI supervisors also retain their available tools.
 Supervisor tool use does not replace the independent verification report.
 
 ### What is worked out for you

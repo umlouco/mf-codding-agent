@@ -76,14 +76,18 @@ func runSh(argv []string) int {
 	// run from the command line.
 	env := &tools.Env{
 		Root:        root,
+		Testing:     tools.TestingFromEnvironment(),
 		Emit:        func(string, any) {},
 		FileChanged: func(string) {},
 	}
 
 	start := time.Now()
+	if err := env.CheckTestingCommand(string(script)); err != nil {
+		return emitSh(*asJSON, shResult{Invalid: true, Code: -1, Error: err.Error()})
+	}
 	out, status, runErr := tools.RunScript(ctx, env, root, string(script))
 	res := shResult{
-		Output:   strings.TrimRight(out, "\r\n"),
+		Output:   env.RedactTestingSecrets(strings.TrimRight(out, "\r\n")),
 		Code:     int(status),
 		Elapsed:  int(time.Since(start).Milliseconds()),
 		TimedOut: ctx.Err() == context.DeadlineExceeded,

@@ -61,7 +61,11 @@ type EditorToolDef struct {
 }
 
 type Config struct {
-	WorkspaceRoot string `json:"workspaceRoot"`
+	ResponseOnly bool `json:"responseOnly"`
+	// InspectOnly keeps supervisor reviews from becoming a second writer.
+	InspectOnly        bool               `json:"inspectOnly"`
+	TestingEnvironment TestingEnvironment `json:"testingEnvironment"`
+	WorkspaceRoot      string             `json:"workspaceRoot"`
 
 	Providers []ProviderConfig `json:"providers"`
 

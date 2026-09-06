@@ -63,6 +63,9 @@ requirement was satisfied; an absence requirement passes when the value is confi
 Check each acceptance criterion against current observations. Record command, working directory,
 exit code, and relevant output for command checks. For behavioral checks record expected and actual
 values. A successful inspection does not substitute for a required runtime check.
+Tool previews and partial file reads may omit content. A truncated preview does not establish that
+the source file or test is incomplete. Inspect the remaining lines or saved report before claiming
+required code or check results are missing; keep an uninspected check INCOMPLETE.
 Execute a supplied Required command intact as the command argument of unix, run_shell, or the
 CLI's Bash tool. For browser tests launched through a shell use kind test. Merely
 reading or creating its input file does not execute it. Tool observations are independently recorded
@@ -115,8 +118,10 @@ ${verificationExample}`;
   let stopCurrent: (() => void) | undefined;
   onAbort?.(() => { aborted = true; stopCurrent?.(); });
   const registerAbort = (abort: () => void) => { stopCurrent = abort; if (aborted) abort(); };
+  let requiredCommandObservation: ToolObservation | undefined;
   if (task.solutionVerifyCommand?.trim()) {
     const evidence = await runVerificationCommand(context, task.solutionVerifyCommand, observe, registerAbort, onActivity);
+    requiredCommandObservation = observations.at(-1);
     stopCurrent = undefined;
     prompt += `\n\nHOST-EXECUTED REQUIRED COMMAND (current verification attempt):\n${evidence}\n` +
       `The host already ran the required command intact. Use this observed result; do not translate\n` +
@@ -138,6 +143,9 @@ ${verificationExample}`;
   // This field comes only from this process's tool events, never model JSON.
   // Keep it bounded, with recent outcomes favored, for the independent reviewer.
   report.observedTools = observations.slice(-20);
+  if (requiredCommandObservation && !report.observedTools.includes(requiredCommandObservation)) {
+    report.observedTools = [requiredCommandObservation, ...observations.slice(-19)];
+  }
   // A model's prose can claim a script passed after only reading a file. Require
   // actual tool execution in this verifier turn before accepting that account.
   if (report.conclusion === 'PASS') {

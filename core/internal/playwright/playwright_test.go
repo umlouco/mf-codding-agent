@@ -87,6 +87,28 @@ func TestLayoutCaptureWithInstalledPlaywright(t *testing.T) {
 	}
 }
 
+// Exercise the installed runner rather than assuming a config is required.
+// The test uses no browser and writes only in its temporary project.
+func TestRunWithoutConfigurationWithInstalledPlaywright(t *testing.T) {
+	installedRoot := os.Getenv("MFAGENT_TEST_PLAYWRIGHT_ROOT")
+	if installedRoot == "" {
+		t.Skip("set MFAGENT_TEST_PLAYWRIGHT_ROOT to exercise the installed runner")
+	}
+	setup := Detect(installedRoot)
+	root := t.TempDir()
+	packagePath := filepath.Join(installedRoot, "node_modules", "@playwright", "test")
+	quoted, _ := json.Marshal(packagePath)
+	spec := "const {test,expect}=require(" + string(quoted) + ");test('configless assertion',()=>expect(2+2).toBe(4));"
+	if err := os.WriteFile(filepath.Join(root, "configless.spec.js"), []byte(spec), 0600); err != nil {
+		t.Fatal(err)
+	}
+	setup.Root, setup.ConfigPath = root, ""
+	report, err := Run(context.Background(), setup, RunOptions{Spec: "configless.spec.js", Workers: 1})
+	if err != nil || !report.OK() || report.Passed != 1 {
+		t.Fatalf("report=%+v err=%v", report, err)
+	}
+}
+
 // A report with one passing and one failing spec, nested one suite deep, which
 // is the shape Playwright actually emits (file suite -> describe suite).
 const mixedReport = `{
@@ -237,6 +259,15 @@ func TestParseAllPassing(t *testing.T) {
 	}
 	if rep.Passed != 12 || rep.Skipped != 2 {
 		t.Errorf("passed=%d skipped=%d", rep.Passed, rep.Skipped)
+	}
+}
+
+func TestEmptyAndEntirelySkippedRunsDoNotVerifyBehavior(t *testing.T) {
+	for _, skipped := range []int{0, 7} {
+		report := Report{Skipped: skipped, ExitCode: 0}
+		if report.OK() {
+			t.Fatalf("zero executed tests reported success with %d skipped", skipped)
+		}
 	}
 }
 

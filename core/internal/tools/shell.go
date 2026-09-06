@@ -128,6 +128,9 @@ func runInTerminal(ctx context.Context, env *Env, dir, command string, timeout t
 		}
 	}
 	meta["exitCode"] = *run.ExitCode
+	if runtime.GOOS == "windows" && *run.ExitCode != 0 {
+		body += powerShellRecoveryHint(command, body)
+	}
 	return Result{
 		Output:  fmt.Sprintf("exit=%d cwd=%s\n%s", *run.ExitCode, env.Rel(dir), body),
 		IsError: *run.ExitCode != 0,
@@ -142,6 +145,7 @@ func RegisterShell(r *Registry) {
 			"Use for builds, test suites, package managers, git and compilers — " +
 			"composer, npm/pnpm, go build/test, dcc32/msbuild, php. " +
 			"Simple && command chains are accepted on Windows and retain stop-on-error semantics. " +
+			"On Windows, use curl.exe for curl CLI flags: PowerShell's curl alias invokes Invoke-WebRequest with different arguments. " +
 			"When the editor offers a terminal this runs there, in the user's own " +
 			"configured shell and visible in a tab they can scroll back through, so " +
 			"a long build can be watched rather than waited on. " +
@@ -179,6 +183,9 @@ func RegisterShell(r *Registry) {
 			if strings.TrimSpace(a.Command) == "" {
 				return Errf("command is empty")
 			}
+			if err := env.CheckTestingCommand(a.Command); err != nil {
+				return Errf("%v", err)
+			}
 			low := strings.ToLower(a.Command)
 			for _, d := range deniedPatterns {
 				if strings.Contains(low, strings.ToLower(d)) {
@@ -208,7 +215,7 @@ func RegisterShell(r *Registry) {
 			// the command in the shell the user actually configured and leaves
 			// it on screen. Spawning below is the fallback for when there is no
 			// editor listening at all.
-			if env.EditorTerminal != nil {
+			if env.EditorTerminal != nil && !strings.Contains(a.Command, "MFAGENT_") {
 				return runInTerminal(cctx, env, dir, a.Command, timeout)
 			}
 
@@ -267,6 +274,9 @@ func RegisterShell(r *Registry) {
 			body := clamp(out, 60000)
 			if strings.TrimSpace(body) == "" {
 				body = "(no output)"
+			}
+			if runtime.GOOS == "windows" && exitCode != 0 {
+				body += powerShellRecoveryHint(a.Command, body)
 			}
 			return Result{
 				Output:  header + "\n" + body,

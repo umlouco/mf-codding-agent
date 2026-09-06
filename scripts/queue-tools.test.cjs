@@ -22,7 +22,7 @@ function load(file, dependencies = {}, extra = '') {
 }
 
 for (const [role, omitDefinitions] of [
-  ['supervisor', true], ['executor', false], ['planner', false],
+  ['supervisor', false], ['executor', false], ['planner', false],
 ]) {
   for (const memoryEnabled of [true, false]) {
     test(`${role} preserves configured MCP tools and memoryEnabled=${memoryEnabled}`, async () => {
@@ -63,6 +63,7 @@ for (const [role, omitDefinitions] of [
       assert.equal(config.memoryEnabled, memoryEnabled, 'role preserves the configured memory setting');
       assert.equal(config.mcpServers, mcpServers, 'role preserves the configured MCP servers');
       assert.equal(config.disableTools, omitDefinitions, 'definition omission survives initialization');
+      assert.equal(config.inspectOnly, role === 'supervisor', 'supervisor inspection is enforced separately from executor capabilities');
       assert.equal(config.coding.model, 'configured-model');
       assert.equal(config.coding.providerId, `queue-${role}`);
       assert.equal(config.maxIterations, 12);

@@ -12,6 +12,41 @@
   /** Ids of tasks the user has expanded, kept across re-renders. */
   const open = new Set();
   let state = null;
+  let testingDirty = false;
+  let testingInitialized = false;
+  let testingNames = "";
+  const removedCredentials = new Set();
+
+  function credentialRow(name = '', saved = false) {
+    const row = document.createElement('div');
+    row.className = 'testing-credential';
+    const key = document.createElement('input');
+    key.value = name; key.placeholder = 'Name'; key.setAttribute('aria-label', 'Credential name');
+    if (saved) key.readOnly = true;
+    const value = document.createElement('input');
+    value.type = 'password'; value.autocomplete = 'new-password';
+    value.placeholder = saved ? 'Saved — leave blank to keep' : 'Value';
+    value.setAttribute('aria-label', name ? `${name} value` : 'Credential value');
+    const remove = document.createElement('button');
+    remove.type = 'button'; remove.textContent = 'Remove';
+    remove.addEventListener('click', () => {
+      if (saved) removedCredentials.add(name);
+      row.remove(); testingDirty = true;
+    });
+    row.addEventListener('input', () => { testingDirty = true; });
+    row.append(key, value, remove);
+    $('testingCredentials').appendChild(row);
+  }
+
+  $('testingUrl').addEventListener('input', () => { testingDirty = true; });
+  $('addTestingCredential').addEventListener('click', () => { credentialRow(); testingDirty = true; });
+  $('saveTestingEnvironment').addEventListener('click', () => {
+    const credentials = Array.from($('testingCredentials').children).map(row => {
+      const inputs = row.querySelectorAll('input');
+      return { name: inputs[0].value, value: inputs[1].value };
+    });
+    send({ type: 'setTestingEnvironment', url: $('testingUrl').value, credentials, remove: [...removedCredentials] });
+  });
 
   // ---- live output ----
   //
@@ -227,6 +262,10 @@
   }
 
   window.addEventListener('message', (e) => {
+    if (e.data?.type === 'testingEnvironmentSaved') {
+      testingDirty = false; testingInitialized = false; removedCredentials.clear();
+      $('testingSaved').textContent = 'Testing environment saved.';
+    }
     if (e.data?.type === 'unavailable') {
       state = null;
       showUnavailable(e.data);
@@ -272,6 +311,15 @@
 
   function render() {
     if (!state) return;
+    if (!testingDirty && (!testingInitialized || testingNames !== JSON.stringify(state.testingCredentialNames || []) || $('testingUrl').value !== (state.testingUrl || ''))) {
+      $('testingUrl').value = state.testingUrl || '';
+      $('testingCredentials').replaceChildren();
+      const names = state.testingCredentialNames || [];
+      for (const name of names) credentialRow(name, true);
+      if (!names.length) { credentialRow('username'); credentialRow('password'); }
+      testingInitialized = true;
+      testingNames = JSON.stringify(names);
+    }
 
     /** @type {HTMLButtonElement} */ ($('generate')).disabled = state.generating;
     /** @type {HTMLButtonElement} */ ($('generate')).textContent = state.generating

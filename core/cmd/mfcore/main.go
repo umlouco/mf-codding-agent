@@ -47,6 +47,9 @@ type server struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "testing-hook" {
+		os.Exit(runTestingHook(os.Stdin, os.Stderr))
+	}
 	// Subcommands are checked before flag parsing so `mfcore sh` can own its own
 	// flags. With no subcommand this is the JSON-RPC server it has always been.
 	if len(os.Args) > 1 && os.Args[1] == "sh" {
@@ -117,6 +120,7 @@ func (s *server) register() {
 	// permission round-trip, so it is the one async handler.
 	s.conn.RegisterAsync("chat/send", s.onSend)
 	s.conn.Register("chat/cancel", s.onCancel)
+	s.conn.Register("chat/steer", s.onSteer)
 	s.conn.Register("chat/reset", s.onReset)
 	s.conn.Register("tools/list", s.onToolsList)
 	s.conn.Register("tools/invoke", s.onToolsInvoke)
@@ -160,6 +164,9 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		return nil, fmt.Errorf("bad configuration: %w", err)
 	}
 	cfg.ApplyDefaults()
+	if err := tools.ApplyTestingProcessEnvironment(cfg.TestingEnvironment); err != nil {
+		return nil, err
+	}
 	if cfg.WorkspaceRoot == "" {
 		wd, _ := os.Getwd()
 		cfg.WorkspaceRoot = wd
@@ -181,7 +188,8 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	}
 
 	s.env = &tools.Env{
-		Root: cfg.WorkspaceRoot,
+		Root:    cfg.WorkspaceRoot,
+		Testing: cfg.TestingEnvironment,
 		Emit: func(kind string, payload any) {
 			_ = s.conn.Notify("stream/event", map[string]any{"kind": kind, "payload": payload})
 		},
@@ -200,6 +208,8 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	tools.RegisterPosix(s.registry)
 	tools.RegisterShell(s.registry)
 	tools.RegisterShellBg(s.registry)
+	tools.RegisterTestingEnvironment(s.registry)
+	tools.RegisterApacheRewrite(s.registry)
 	// Unconditional: whether the project can actually run Playwright is
 	// decided per call against the workspace, and playwright_status exists
 	// precisely to explain when it cannot.
@@ -309,14 +319,16 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	tools.RegisterLayout(s.registry, s.brw, vision)
 
 	system := agent.BuildSystemPrompt(agent.PromptInput{
-		WorkspaceRoot: cfg.WorkspaceRoot,
-		Languages:     cfg.Languages,
-		MemoryEnabled: s.mem != nil,
-		BrowserReady:  true,
-		MCPServers:    mcpNames,
-		EditorTools:   editorTools,
-		ProjectFacts:  agent.LoadProjectInstructions(cfg.WorkspaceRoot),
-		Skills:        cfg.SkillsText,
+		WorkspaceRoot:         cfg.WorkspaceRoot,
+		Languages:             cfg.Languages,
+		MemoryEnabled:         s.mem != nil,
+		BrowserReady:          true,
+		MCPServers:            mcpNames,
+		EditorTools:           editorTools,
+		ProjectFacts:          agent.LoadProjectInstructions(cfg.WorkspaceRoot),
+		Skills:                cfg.SkillsText,
+		TestingURL:            cfg.TestingEnvironment.URL,
+		HasTestingCredentials: len(cfg.TestingEnvironment.Credentials) > 0,
 	})
 
 	s.ag = agent.New(&cfg, provider, s.registry, s.env,
@@ -567,6 +579,18 @@ func (s *server) onSend(ctx context.Context, params json.RawMessage) (any, error
 		return nil, err
 	}
 	return res, nil
+}
+
+func (s *server) onSteer(ctx context.Context, params json.RawMessage) (any, error) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+		Text      string `json:"text"`
+	}
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, err
+	}
+	accepted := s.ag != nil && s.ag.Steer(req.SessionID, req.Text)
+	return map[string]any{"accepted": accepted}, nil
 }
 
 func (s *server) onCancel(ctx context.Context, params json.RawMessage) (any, error) {

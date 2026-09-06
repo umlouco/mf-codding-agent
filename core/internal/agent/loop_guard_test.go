@@ -11,6 +11,31 @@ import (
 	"github.com/mflores/mfagent/core/internal/tools"
 )
 
+func TestUnchangedObservationWarnsBeforeRecoveryAndResetsOnProgress(t *testing.T) {
+	var guard unchangedToolLoop
+	call := []llm.Block{{Name: "browser_open", Input: json.RawMessage(`{"url":"https://example.test/"}`)}}
+	result := []llm.Block{{Text: "Sign in"}}
+	for i := 1; i <= 5; i++ {
+		warn, stop, _ := guard.observe(call, result)
+		if warn != (i == 3) || stop != (i == 5) {
+			t.Fatalf("round %d: warn=%v stop=%v", i, warn, stop)
+		}
+	}
+	if warn, stop, _ := guard.observe(call, []llm.Block{{Text: "Dashboard"}}); warn || stop {
+		t.Fatal("changed page treated as a loop")
+	}
+	for _, name := range []string{"browser_fill", "browser_click", "shell_wait_for_http", "browser_wait", "run_shell"} {
+		for i := 0; i < 8; i++ {
+			if warn, stop, _ := guard.observe([]llm.Block{{Name: name, Input: json.RawMessage(`{}`)}}, result); warn || stop {
+				t.Fatalf("action/wait %s treated as observation loop", name)
+			}
+		}
+	}
+	if warn, stop, _ := guard.observe(call, result); warn || stop {
+		t.Fatal("intervening action did not reset observation loop")
+	}
+}
+
 func TestFailureLoopIgnoresChangingBrokenInput(t *testing.T) {
 	var guard toolFailureLoop
 	result := []llm.Block{{IsError: true, Text: "line changed\nSyntaxError: invalid syntax"}}
@@ -20,6 +45,20 @@ func TestFailureLoopIgnoresChangingBrokenInput(t *testing.T) {
 		if stopped != (i == repeatedToolFailureLimit) {
 			t.Fatalf("attempt %d stopped=%v", i, stopped)
 		}
+	}
+}
+
+func TestUnchangedSuccessHandsOffWithoutClaimingCompletion(t *testing.T) {
+	fake := &fakeProvider{toolName: "read_file", finalText: `{"status":"NEEDS_MORE_WORK","summary":"Repeated observation; inspect the missing action."}`}
+	a := newTestAgent(t, fake, 80)
+	a.registry = tools.NewRegistry()
+	a.registry.Add(&tools.Tool{Name: "read_file", Schema: map[string]any{"type": "object"}, Run: func(context.Context, *tools.Env, json.RawMessage) tools.Result { return tools.Ok("unchanged source") }})
+	result, err := a.Send(context.Background(), SendRequest{SessionID: "repeat-success", Text: "Read the source and implement the requested change"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StopReason != "unchanged_tool_loop" || result.Iterations != 5 || !strings.Contains(result.Text, "NEEDS_MORE_WORK") {
+		t.Fatalf("invalid recovery: %+v", result)
 	}
 }
 
@@ -102,5 +141,24 @@ func TestFailureLoopAgesOutOldFailures(t *testing.T) {
 	}
 	if stopped, _ := guard.observe(call, failure); stopped {
 		t.Fatal("old failures survived window")
+	}
+}
+
+func TestFailureLoopDistinguishesErrorsUnderTheSameTestFooter(t *testing.T) {
+	var guard toolFailureLoop
+	call := []llm.Block{{Name: "run_shell", Input: json.RawMessage(`{}`)}}
+	footer := "\n1 failed\nworkflow.spec.js:3:1 > full application flow"
+	for _, diagnostic := range []string{"TypeError: url.includes is not a function", "TimeoutError: page.waitForSelector: Timeout 5000ms exceeded.\nCall log:\n - waiting for locator('.form') to be visible", "TimeoutError: page.waitForSelector: Timeout 5000ms exceeded.\nCall log:\n - waiting for locator('.different-control') to be visible"} {
+		if stop, detail := guard.observe(call, []llm.Block{{IsError: true, Text: diagnostic + footer}}); stop {
+			t.Fatalf("different failures collapsed into one: %s", detail)
+		}
+	}
+	var repeat toolFailureLoop
+	for i := 0; i < 3; i++ {
+		output := fmt.Sprintf("exit=1 elapsed=%ds\nTimeoutError: page.waitForSelector: Timeout 5000ms exceeded.\nCall log:\n - waiting for locator('.form') to be visible\n at spec.js:%d:3%s", i+1, i+10, footer)
+		stop, _ := repeat.observe(call, []llm.Block{{IsError: true, Text: output}})
+		if stop != (i == 2) {
+			t.Fatalf("same failure at changing presentation locations: stop=%v iteration=%d", stop, i)
+		}
 	}
 }

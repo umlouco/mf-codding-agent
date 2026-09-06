@@ -194,6 +194,10 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req Request, sink func(E
 				if d.Thinking != "" && sink != nil {
 					sink(Event{Kind: EventThinking, Text: d.Thinking})
 				}
+			case anthropic.InputJSONDelta:
+				if d.PartialJSON != "" && sink != nil {
+					sink(Event{Kind: EventToolInput, Bytes: len(d.PartialJSON)})
+				}
 			}
 		case anthropic.ContentBlockStartEvent:
 			// Announce a tool call as soon as its name is known so the UI can

@@ -1,0 +1,27 @@
+package main
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+func TestCLITestingHook(t *testing.T) {
+	t.Setenv("MFAGENT_TEST_URL", "https://app.example.test/")
+	for _, tc := range []struct {
+		input string
+		code  int
+	}{
+		{`{"tool_name":"Bash","tool_input":{"command":"python -m http.server 8080"}}`, 2},
+		{`{"tool_name":"PowerShell","tool_input":{"command":"php -S 127.0.0.1:8080"}}`, 2},
+		{`{"tool_name":"Bash","tool_input":{"command":"go test ./..."}}`, 0},
+		{`{"tool_name":"mcp__browser__navigate_page","tool_input":{"url":"http://localhost:8080/"}}`, 2},
+		{`{"tool_name":"mcp__browser__navigate_page","tool_input":{"url":"https://app.example.test/login"}}`, 0},
+		{`invalid`, 2},
+	} {
+		var output bytes.Buffer
+		if got := runTestingHook(strings.NewReader(tc.input), &output); got != tc.code {
+			t.Fatalf("got %d want %d: %s", got, tc.code, output.String())
+		}
+	}
+}

@@ -11,6 +11,29 @@ import (
 const powerShellAndGuard = "; if (-not $?) { " +
 	"if ($LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; exit 1 }; "
 
+func powerShellRecoveryHint(command, output string) string {
+	if strings.Contains(output, "InvalidEndOfLine") && strings.Contains(command, "||") {
+		return "\nRecovery: this PowerShell version does not support ||. Send the complete POSIX command to the unix tool, which supports &&, ||, pipelines and native build tools on Windows. This parser error occurred before commands ran; it is not an application failure."
+	}
+	if strings.Contains(output, "DirectoryExist,Microsoft.PowerShell.Commands.NewItemCommand") && strings.Contains(command, "mkdir") {
+		return "\nRecovery: PowerShell mkdir reported an existing directory. POSIX mkdir -p is idempotent; send that command to the unix tool, or use New-Item -ItemType Directory -Force in PowerShell. Preserve the existing directory and its contents."
+	}
+	if strings.Contains(output, "here-string header") {
+		return "\nRecovery: a PowerShell here-string header must be followed by an actual newline, not literal backtick-n or backslash-n text. Use write_file with path and content to create source files without shell quoting or encoding changes. A generated recovery task's suggested shell command is not a requirement to keep repeating broken syntax."
+	}
+	if strings.Contains(strings.ToLower(command), "curl") && strings.Contains(output, "Invoke-WebRequest") {
+		return "\nRecovery: PowerShell resolved curl to Invoke-WebRequest. Use curl.exe for curl CLI flags, or use the unix tool for a POSIX pipeline. Repeating the same curl flags in PowerShell will repeat this error."
+	}
+	if strings.Contains(output, "CommandNotFoundException") {
+		for _, name := range []string{"head", "tail", "grep", "sed", "awk"} {
+			if strings.Contains(output, name+" :") {
+				return "\nRecovery: this command uses POSIX text tools in PowerShell. Send the pipeline to the unix tool, which implements these tools on Windows, or translate it into PowerShell cmdlets."
+			}
+		}
+	}
+	return ""
+}
+
 // powerShellCompatible accepts the most common cross-platform command chain.
 // Models, package documentation and task verification commands frequently use
 // `&&`; Windows PowerShell 5 rejects it before running either command. Rewriting
@@ -20,8 +43,18 @@ func powerShellCompatible(command string) string {
 	var out strings.Builder
 	out.Grow(len(command) + 64)
 	var single, double, escaped bool
+	var hereQuote byte
 	for i := 0; i < len(command); i++ {
 		ch := command[i]
+		if hereQuote != 0 {
+			out.WriteByte(ch)
+			if ch == hereQuote && i+1 < len(command) && command[i+1] == '@' && (i == 0 || command[i-1] == '\n') {
+				out.WriteByte('@')
+				i++
+				hereQuote = 0
+			}
+			continue
+		}
 		if escaped {
 			out.WriteByte(ch)
 			escaped = false
@@ -31,6 +64,19 @@ func powerShellCompatible(command string) string {
 			out.WriteByte(ch)
 			escaped = true
 			continue
+		}
+		if ch == '@' && !single && !double && i+1 < len(command) && (command[i+1] == '\'' || command[i+1] == '"') {
+			next := i + 2
+			for next < len(command) && (command[next] == ' ' || command[next] == '\t') {
+				next++
+			}
+			if next < len(command) && (command[next] == '\r' || command[next] == '\n') {
+				hereQuote = command[i+1]
+				out.WriteByte(ch)
+				out.WriteByte(hereQuote)
+				i++
+				continue
+			}
 		}
 		if ch == '\'' && !double {
 			single = !single

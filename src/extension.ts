@@ -335,6 +335,11 @@ function registerTaskQueue(context: vscode.ExtensionContext): void {
   // `mfagent.queue.focus` is not registered here: VS Code creates a
   // `<viewId>.focus` command for every contributed view, and declaring our own
   // would collide with it.
+  reg('mfagent.queue.configureTestingEnvironment', async (value?: { url?: unknown; credentials?: unknown; remove?: unknown }) => {
+    if (!value) return vscode.commands.executeCommand('mfagent.queue.focus');
+    if (!queueView) throw new Error('Task queue view is unavailable.');
+    return queueView.configureTestingEnvironment(value);
+  });
   reg('mfagent.queue.start', withQueue((o) => o.start()));
   reg('mfagent.queue.pause', withQueue((o) => o.pause()));
   reg('mfagent.queue.stop', withQueue((o) => o.stop()));

@@ -2,6 +2,8 @@ import * as cp from 'child_process';
 import type * as vscode from 'vscode';
 import { resolveCoreBinary, workspaceRoot } from '../detect';
 import { killTree, type ActivityRecord } from './agents';
+import { getActiveQueue } from './registry';
+import { loadTestingEnvironment, testingProcessEnvironment } from './testingEnvironment';
 
 /** Execute the recorded check through the same portable shell used by workers.
  * The script goes through stdin unchanged, never through a second shell's quoting.
@@ -16,6 +18,8 @@ export async function runVerificationCommand(
   const binary = resolveCoreBinary(context).path;
   const root = workspaceRoot();
   if (!binary || !root) throw new Error('Verification requires the core binary and an open workspace.');
+  const queue = getActiveQueue?.();
+  const environment = queue ? testingProcessEnvironment(await loadTestingEnvironment(context, queue)) : {};
   const id = `required-command-${Date.now()}`;
   onEvent('stream/tool', { id, name: 'unix', status: 'running', input: { command } });
   const started = Date.now();
@@ -26,7 +30,7 @@ export async function runVerificationCommand(
   try {
     const result = await new Promise<{ output: string; isError: boolean }>(resolve => {
       const child = cp.spawn(binary, ['sh', '--json', '--dir', root, '--timeout', '10m'],
-        { cwd: root, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
+        { cwd: root, env: { ...process.env, ...environment }, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
       let stdout = '', stderr = '', cancelled = false, overflow = false, timedOut = false;
       // Also bound the process tree: a child inheriting stdout can outlive the
       // shell's own timeout and otherwise keep this verification promise open.

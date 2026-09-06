@@ -29,6 +29,7 @@ import (
 	"syscall"
 
 	"github.com/mflores/mfagent/core/internal/queue"
+	"github.com/mflores/mfagent/core/internal/tools"
 
 	_ "modernc.org/sqlite"
 )
@@ -118,6 +119,7 @@ func main() {
 	s.in.Buffer(make([]byte, 0, 1<<20), 64<<20)
 
 	s.registerTools()
+	s.registerTestingTools(*workspace)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -286,5 +288,21 @@ func (s *server) write(resp *rpcResponse) {
 	_, _ = s.out.Write(append(b, '\n'))
 	if f, ok := s.out.(interface{ Flush() error }); ok {
 		_ = f.Flush()
+	}
+}
+
+// The same built-in implementation is available to CLI and external MCP agents.
+func (s *server) registerTestingTools(workspace string) {
+	registry := tools.NewRegistry()
+	tools.RegisterTestingEnvironment(registry)
+	tools.RegisterApacheRewrite(registry)
+	env := &tools.Env{Root: workspace, Testing: tools.TestingFromEnvironment()}
+	for _, tool := range registry.List() {
+		s.tools = append(s.tools, registeredTool{Name: tool.Name, Description: tool.Description, InputSchema: tool.Schema,
+			Annotations: map[string]any{"readOnlyHint": !tool.Mutating, "openWorldHint": true},
+			Handler: func(ctx context.Context, input json.RawMessage) (string, bool, error) {
+				result := tool.Run(ctx, env, input)
+				return env.RedactTestingSecrets(result.Output), result.IsError, nil
+			}})
 	}
 }

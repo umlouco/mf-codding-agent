@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/mflores/mfagent/core/internal/config"
 	"github.com/mflores/mfagent/core/internal/llm"
 	"os"
 	"path/filepath"
@@ -75,7 +76,10 @@ func (t *Tool) Describe(input json.RawMessage) string {
 
 // Env is the ambient context every tool receives.
 type Env struct {
-	Root string
+	Root          string
+	Testing       config.TestingEnvironment
+	testingMu     sync.Mutex
+	testingOpened bool
 
 	// Emit pushes a progress line to the UI.
 	Emit func(kind string, payload any)

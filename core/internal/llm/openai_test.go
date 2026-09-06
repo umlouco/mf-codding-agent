@@ -34,6 +34,101 @@ func newTestProvider(url string) *OpenAIProvider {
 	}
 }
 
+func TestLocalTemplateJoinsContextWithoutBreakingToolProtocol(t *testing.T) {
+	request := Request{System: "system", Messages: []Message{
+		UserText("owner request"), UserText("runtime observations"),
+		{Role: RoleAssistant, Blocks: []Block{{Type: BlockToolUse, ID: "call1", Name: "read_file", Input: json.RawMessage(`{"path":"main.go"}`)}}},
+		{Role: RoleUser, Blocks: []Block{{Type: BlockToolResult, ToolUseID: "call1", Text: "source"}}},
+		UserText("next request"),
+		{Role: RoleUser, Blocks: []Block{{Type: BlockImage, MediaType: "image/png", Data: "aW1hZ2U="}}},
+	}}
+	messages := newTestProvider("").convert(request)
+	if len(messages) != 5 || messages[1].Content != "owner request\n\nruntime observations" {
+		t.Fatalf("context was not merged: %#v", messages)
+	}
+	if messages[2].Role != "assistant" || messages[3].Role != "tool" || messages[3].ToolCallID != "call1" {
+		t.Fatalf("tool protocol changed: %#v", messages)
+	}
+	parts := messages[4].Content.([]map[string]any)
+	if len(parts) != 3 || parts[0]["text"] != "next request" || parts[2]["type"] != "image_url" {
+		t.Fatalf("multimodal content lost: %#v", parts)
+	}
+}
+
+func TestToolArgumentProgressCountsBytesWithoutExposingContents(t *testing.T) {
+	input := `{"content":"private argument value"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		var chunks []string
+		for _, fragment := range []string{input[:10], input[10:]} {
+			encoded, _ := json.Marshal(fragment)
+			chunks = append(chunks, fmt.Sprintf(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"write_file","arguments":%s}}]}}]}`, encoded))
+		}
+		_, _ = w.Write([]byte(sse(chunks...)))
+	}))
+	defer srv.Close()
+	var bytes, fragments int
+	turn, err := newTestProvider(srv.URL).Stream(context.Background(), Request{}, func(ev Event) {
+		if ev.Kind == EventToolInput {
+			if ev.Text != "" {
+				t.Error("raw arguments exposed in progress")
+			}
+			bytes += ev.Bytes
+			fragments++
+		}
+	})
+	if err != nil || bytes != len(input) || fragments != 2 {
+		t.Fatalf("bytes=%d fragments=%d err=%v", bytes, fragments, err)
+	}
+	if len(turn.Blocks) != 1 || string(turn.Blocks[0].Input) != input {
+		t.Fatal("argument assembly changed")
+	}
+}
+
+func TestThinkingSurvivesToolContinuationOnlyInObservedField(t *testing.T) {
+	for _, field := range []string{"reasoning_content", "reasoning"} {
+		t.Run(field, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, sse(fmt.Sprintf(`{"choices":[{"delta":{%q:"retained reasoning"}}]}`, field),
+					`{"choices":[{"delta":{"content":"Checking now","tool_calls":[{"index":0,"id":"call1","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`))
+			}))
+			defer srv.Close()
+			provider := newTestProvider(srv.URL)
+			turn, err := provider.Stream(context.Background(), Request{}, nil)
+			if err != nil || turn.Text() != "Checking now" {
+				t.Fatalf("turn=%+v err=%v", turn, err)
+			}
+			messages := []Message{UserText("owner request"), {Role: RoleAssistant, Blocks: turn.Blocks},
+				{Role: RoleUser, Blocks: []Block{{Type: BlockToolResult, ToolUseID: "call1", Text: "source"}}}}
+			converted := provider.convert(Request{Messages: messages})
+			raw, _ := json.Marshal(converted[1])
+			var assistant map[string]any
+			json.Unmarshal(raw, &assistant)
+			if assistant[field] != "retained reasoning" || assistant["content"] != "Checking now" {
+				t.Fatalf("continuation lost reasoning or leaked it: %s", raw)
+			}
+			messages = append(messages, UserText("new owner request"))
+			converted = provider.convert(Request{Messages: messages})
+			if converted[1].ReasoningContent != "" || converted[1].Reasoning != "" {
+				t.Fatal("old-turn reasoning carried into new user turn")
+			}
+		})
+	}
+}
+
+func TestTruncatedStreamCannotBecomeCompletedTurn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n")
+	}))
+	defer srv.Close()
+	turn, err := newTestProvider(srv.URL).Stream(context.Background(), Request{}, nil)
+	if err == nil || turn != nil || !strings.Contains(err.Error(), "without a completion marker") {
+		t.Fatalf("turn=%+v err=%v", turn, err)
+	}
+}
+
 func TestStreamAsksForUsageAndRecordsIt(t *testing.T) {
 	var body map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

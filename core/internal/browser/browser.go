@@ -341,11 +341,20 @@ func (b *Browser) Interactive(ctx context.Context) ([]Element, error) {
 }
 
 func (b *Browser) Click(ctx context.Context, selector string) error {
-	return b.run(ctx, 20*time.Second,
+	return selectorError(b.run(ctx, 20*time.Second,
 		chromedp.WaitVisible(selector, chromedp.ByQuery),
 		chromedp.Click(selector, chromedp.ByQuery),
 		chromedp.Sleep(300*time.Millisecond),
-	)
+	))
+}
+
+// CDP's query error otherwise gives the caller no way to recover from using
+// a Playwright locator in the native CSS-only browser tools.
+func selectorError(err error) error {
+	if err != nil && strings.Contains(err.Error(), "DOM Error while querying") {
+		return fmt.Errorf("%w; native browser tools require standard CSS selectors, not Playwright :has-text(), text=, or role= locators. Use a selector returned by browser_elements", err)
+	}
+	return err
 }
 
 func (b *Browser) Fill(ctx context.Context, selector, value string, submit bool) error {
@@ -354,11 +363,27 @@ func (b *Browser) Fill(ctx context.Context, selector, value string, submit bool)
 		chromedp.Clear(selector, chromedp.ByQuery),
 		chromedp.SendKeys(selector, value, chromedp.ByQuery),
 	}
+	// A successful key dispatch does not establish that the field accepted
+	// the text (validation scripts, readonly inputs and re-renders can reject
+	// it). Compare privately so credential values never enter error output.
+	selJSON, _ := json.Marshal(selector)
+	valueJSON, _ := json.Marshal(value)
+	actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
+		var matches bool
+		expression := `(()=>{const el=document.querySelector(` + string(selJSON) + `);return !!el && (el.isContentEditable ? el.textContent : el.value) === ` + string(valueJSON) + `;})()`
+		if err := chromedp.Evaluate(expression, &matches).Do(ctx); err != nil {
+			return err
+		}
+		if !matches {
+			return fmt.Errorf("field did not retain the requested value; inspect whether the application normalized, rejected, or replaced the input before retrying")
+		}
+		return nil
+	}))
 	if submit {
 		actions = append(actions, chromedp.SendKeys(selector, "\r", chromedp.ByQuery))
 	}
 	actions = append(actions, chromedp.Sleep(300*time.Millisecond))
-	return b.run(ctx, 20*time.Second, actions...)
+	return selectorError(b.run(ctx, 20*time.Second, actions...))
 }
 
 func (b *Browser) Eval(ctx context.Context, expr string) (string, error) {
@@ -388,8 +413,8 @@ func (b *Browser) WaitFor(ctx context.Context, selector string, timeoutMS int) e
 	if timeoutMS <= 0 {
 		timeoutMS = 10000
 	}
-	return b.run(ctx, time.Duration(timeoutMS)*time.Millisecond+2*time.Second,
-		chromedp.WaitVisible(selector, chromedp.ByQuery))
+	return selectorError(b.run(ctx, time.Duration(timeoutMS)*time.Millisecond+2*time.Second,
+		chromedp.WaitVisible(selector, chromedp.ByQuery)))
 }
 
 // Screenshot writes a PNG and returns its absolute path so the extension can

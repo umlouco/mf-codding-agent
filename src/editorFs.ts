@@ -150,7 +150,7 @@ function checkMatch(text: string, oldStr: string, newStr: string, positions: num
     if (text.includes('\r\n') && findAll(normalized, oldStr).length > 0) {
       throw new Error('old_string not found (file uses CRLF line endings; match them or re-read the file)');
     }
-    throw new Error('old_string not found');
+    throw new Error('old_string not found; read_file the current file, then copy a smaller unique exact block without line numbers. For a deliberate full-file replacement, use write_file after reading it. No change was applied');
   }
   if (positions.length > 1 && !all) {
     throw new Error(`old_string appears ${positions.length} times; add surrounding context or set replace_all`);

@@ -11,6 +11,7 @@ import { Task, TaskQueue, taskEditSummary } from './db';
 import { LiveLog } from './liveLog';
 import { Orchestrator } from './orchestrator';
 import { notifySkillsChanged, onDidChangeSkills } from './registry';
+import { saveTestingEnvironment } from './testingEnvironment';
 
 /**
  * The Task Queue sidebar.
@@ -197,6 +198,10 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       }
 
       switch (msg.type) {
+        case 'setTestingEnvironment': {
+          await this.configureTestingEnvironment(msg);
+          break;
+        }
         case 'generate':
           await this.generate(msg.goal, !!msg.append);
           break;
@@ -616,6 +621,26 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     void this.view?.webview.postMessage(msg);
   }
 
+  async configureTestingEnvironment(msg: { url?: unknown; credentials?: unknown; remove?: unknown }): Promise<void> {
+    const queue = this.queue, orch = this.orch;
+    if (!queue || !orch) throw new Error("Open a task queue workspace first.");
+    await saveTestingEnvironment(this.context, queue, msg);
+    const prior = queue.runState;
+    orch.stop();
+    for (const task of queue.list()) {
+      if (task.status === 'VERIFYING') queue.update(task.id, {
+        validationReport: '', activityPhase: 'requirements_changed',
+        supervisorFeedback: 'The owner changed the fixed testing environment. Reconcile the task and its checks with the configured target and credentials before proceeding.',
+      });
+    }
+    queue.log(null, 'user', 'testing-environment-set', `Testing URL ${queue.testingUrl ? 'configured' : 'not set'}; ${queue.testingCredentialNames.length} named credential(s). Active workers will use the new environment.`);
+    scheduleRestart('Testing environment changed', this.output);
+    if (prior === 'RUNNING') orch.start();
+    else if (prior === 'PAUSED') queue.setRunState('PAUSED');
+    this.post({ type: 'testingEnvironmentSaved' });
+    this.render();
+  }
+
   render(): void {
     if (!this.view) {
       return;
@@ -643,6 +668,8 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       dbPath: queue.path,
       driver: queue.impl,
       instructions: queue.instructions,
+      testingUrl: queue.testingUrl,
+      testingCredentialNames: queue.testingCredentialNames,
       agentObservations: queue.agentObservations,
       models: { planner: '', supervisor: '', executor: '' },
       mcpServers: discoverMcpServers(this.context, getStore()).map((s) => ({
@@ -787,6 +814,18 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     <button id="applyEdit">Apply edit</button>
     <p class="hint">The planner reads the current task list and your instruction, then edits, adds or removes tasks in place — nothing already VERIFIED is touched.</p>
 
+    <fieldset id="testingEnvironment">
+      <legend>Testing environment — applies to every task</legend>
+      <label class="lbl" for="testingUrl">Testing URL</label>
+      <input id="testingUrl" type="url" placeholder="https://your-application.example/path/" />
+      <p class="hint">Agents must use this application instead of creating another test server. Leave blank for projects that only need terminal access.</p>
+      <label class="lbl">Credentials</label>
+      <div id="testingCredentials"></div>
+      <button id="addTestingCredential" type="button">Add credential</button>
+      <button id="saveTestingEnvironment" type="button">Save testing environment</button>
+      <p class="hint">Use names such as username, password, token, or database_password. Values stay in secure storage and are available to browser and terminal tools. Leave a saved value blank to keep it. Saving restarts active workers with these settings.</p>
+      <p id="testingSaved" class="hint" role="status"></p>
+    </fieldset>
     <label class="lbl" for="instructions">Project notes (sent to every task)</label>
     <textarea id="instructions" rows="6" placeholder="e.g. Use Go with Wails; test with Playwright.&#10;The class list lives in classes.md.&#10;Build with build.ps1."></textarea>
     <p class="hint">Your standing instructions reach execution, verification and supervisor reviews. Agents record their findings separately below; those findings cannot change your requirements or test environment.</p>

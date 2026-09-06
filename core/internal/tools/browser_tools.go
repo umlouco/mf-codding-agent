@@ -41,7 +41,7 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 			"render and behave correctly, not just that the code compiles.",
 		Mutating: true,
 		Schema: obj(map[string]any{
-			"url":      str("Absolute URL, e.g. http://localhost:5173/."),
+			"url":      str("Absolute URL. When a testing URL is configured, open that exact URL first."),
 			"wait_for": str("CSS selector to wait for before reading the page. Optional."),
 		}, "url"),
 		Summarize: func(in json.RawMessage) string {
@@ -62,6 +62,9 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 			if !strings.Contains(a.URL, "://") {
 				a.URL = "http://" + a.URL
 			}
+			if err := env.CheckTestingURL(a.URL, true); err != nil {
+				return Errf("%v", err)
+			}
 			st, err := b.Navigate(ctx, a.URL, a.WaitFor)
 			if err != nil {
 				return Errf("navigation failed: %v", err)
@@ -69,6 +72,7 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 			if env.Emit != nil {
 				env.Emit("browser", map[string]any{"url": st.URL, "title": st.Title})
 			}
+			env.MarkTestingOpened()
 			return Ok(formatState(st))
 		},
 	})
@@ -156,21 +160,43 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 		Description: "Type a value into an input, textarea or contenteditable element.",
 		Mutating:    true,
 		Schema: obj(map[string]any{
-			"selector": str("CSS selector for the field."),
-			"value":    str("Text to enter. Replaces any existing value."),
-			"submit":   boolp("Press Enter afterwards. Default false."),
-		}, "selector", "value"),
+			"selector":   str("CSS selector for the field."),
+			"value":      str("Text to enter. Replaces any existing value."),
+			"credential": str("Saved credential name from testing_environment, such as username or password. Use instead of value; the value stays out of model context and logs."),
+			"submit":     boolp("Press Enter afterwards. Default false."),
+		}, "selector"),
 		Run: func(ctx context.Context, env *Env, in json.RawMessage) Result {
 			var a struct {
-				Selector string `json:"selector"`
-				Value    string `json:"value"`
-				Submit   bool   `json:"submit"`
+				Selector   string `json:"selector"`
+				Value      string `json:"value"`
+				Credential string `json:"credential"`
+				Submit     bool   `json:"submit"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
 				return Errf("bad input: %v", err)
 			}
 			if !b.Running() {
 				return Errf("no browser session is open; call browser_open first")
+			}
+			if a.Credential != "" {
+				if a.Value != "" {
+					return Errf("use credential or value, not both")
+				}
+				secret, ok := env.Testing.Credentials[strings.ToLower(a.Credential)]
+				if !ok {
+					return Errf("credential %q is not configured; call testing_environment", a.Credential)
+				}
+				state, err := b.State(ctx)
+				if err != nil {
+					return Errf("cannot confirm login origin: %v", err)
+				}
+				if env.Testing.URL == "" {
+					return Errf("configure a testing URL before entering saved credentials into a browser; terminal use does not need a URL")
+				}
+				if err := env.CheckTestingURL(state.URL, false); err != nil {
+					return Errf("credential destination: %v", err)
+				}
+				a.Value = secret
 			}
 			if err := b.Fill(ctx, a.Selector, a.Value, a.Submit); err != nil {
 				return Errf("fill %s: %v", a.Selector, err)

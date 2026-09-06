@@ -3,9 +3,35 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
+
+func TestGrepBoundsGeneratedLinesWithoutChangingCounts(t *testing.T) {
+	root := t.TempDir()
+	content := strings.Repeat("界", 30000) + "NEEDLE" + strings.Repeat("尾", 3000) + "\nNEEDLE in readable source\n"
+	if err := os.WriteFile(filepath.Join(root, "generated.js"), []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out := grepIn(t, root, map[string]any{"pattern": "NEEDLE"})
+	if len(out) > 3000 || !utf8.ValidString(out) || !strings.Contains(out, "line shortened") || !strings.Contains(out, "NEEDLE in readable source") || strings.Count(out, "NEEDLE") != 2 {
+		t.Fatalf("unusable bounded preview: bytes=%d", len(out))
+	}
+	count := grepIn(t, root, map[string]any{"pattern": "NEEDLE", "output_mode": "count"})
+	if !strings.Contains(count, "total: 2 matching lines") {
+		t.Fatalf("count changed: %s", count)
+	}
+	if err := os.WriteFile(filepath.Join(root, "many.txt"), []byte(strings.Repeat("NEEDLE"+strings.Repeat("x", 900)+"\n", 100)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out = grepIn(t, root, map[string]any{"pattern": "NEEDLE"})
+	if len(out) > 24300 || !strings.Contains(out, "Search output truncated") {
+		t.Fatalf("unbounded output: %d", len(out))
+	}
+}
 
 // grepCall runs the grep tool against root. Arguments go through json.Marshal
 // rather than a hand-written string: the patterns here are full of backslashes,

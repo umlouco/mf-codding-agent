@@ -68,13 +68,16 @@ for (const t of targets) {
 
   // ---- mfcore ----
   const coreOut = path.join(outDir, t.exe);
+  const coreBuild = parkPath(coreOut) + '.build';
   process.stdout.write(`building core for ${label}… `);
   try {
     execFileSync(
       'go',
-      ['build', '-trimpath', '-ldflags', ldflags, '-o', coreOut, './cmd/mfcore'],
+      ['build', '-trimpath', '-ldflags', ldflags, '-o', coreBuild, './cmd/mfcore'],
       { cwd: coreDir, env, stdio: ['ignore', 'ignore', 'pipe'] },
     );
+    syncBinary(coreBuild, coreOut);
+    rmSync(coreBuild, { force: true });
     console.log('ok');
   } catch (e) {
     console.log('FAILED');
@@ -84,13 +87,16 @@ for (const t of targets) {
 
   // ---- mfagent-mcp ----
   const mcpOut = path.join(outDir, t.mcpExe);
+  const mcpBuild = parkPath(mcpOut) + '.build';
   process.stdout.write(`building mcp   for ${label}… `);
   try {
     execFileSync(
       'go',
-      ['build', '-trimpath', '-ldflags', ldflags, '-o', mcpOut, './cmd/mfagent-mcp'],
+      ['build', '-trimpath', '-ldflags', ldflags, '-o', mcpBuild, './cmd/mfagent-mcp'],
       { cwd: coreDir, env, stdio: ['ignore', 'ignore', 'pipe'] },
     );
+    syncBinary(mcpBuild, mcpOut);
+    rmSync(mcpBuild, { force: true });
     console.log('ok');
   } catch (e) {
     console.log('FAILED');
@@ -127,7 +133,7 @@ const [from, to] = all ? [hostPlatformCopy, hostRootCopy] : [hostRootCopy, hostP
  * stale copy of a 7-20MB binary.
  */
 function parkPath(to) {
-  return path.join(tmpdir(), `mfagent-parked-${Date.now()}-${path.basename(to)}`);
+  return path.join(tmpdir(), `mfagent-parked-${process.pid}-${Date.now()}-${path.basename(to)}`);
 }
 
 function syncBinary(from, to) {

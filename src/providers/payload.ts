@@ -7,6 +7,7 @@ import { getActiveQueue } from '../queue/registry';
 import { discoverInstalledSkills } from '../skills';
 import { ProfileStore, ResolvedRole, Skill, SkillGroup } from './store';
 import { getContext } from './instance';
+import { loadTestingEnvironment, TestingEnvironment } from '../queue/testingEnvironment';
 
 /**
  * Translation from the profile store to the payload the Go core expects.
@@ -40,6 +41,9 @@ export interface CoreRole {
 
 /** The initialize payload the Go core expects. */
 export interface CoreConfig {
+  responseOnly?: boolean;
+  inspectOnly?: boolean;
+  testingEnvironment: TestingEnvironment;
   workspaceRoot: string;
   providers: CoreProvider[];
   coding: CoreRole;
@@ -203,6 +207,7 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
   const skillsText = buildSkillsText(skills, skillGroups, enabledSkillGroups);
 
   return {
+    testingEnvironment: await loadTestingEnvironment(getContext(), activeQueue),
     workspaceRoot: root,
     providers: [...providers.values()],
     coding,

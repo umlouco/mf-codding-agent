@@ -68,6 +68,9 @@ func scriptEnv() []string {
 // satisfy it. A check that disagrees with the build about what `&&` means is
 // worse than no check at all.
 func RunScript(ctx context.Context, env *Env, dir, script string) (string, uint8, error) {
+	if err := env.CheckTestingCommand(script); err != nil {
+		return "", 1, err
+	}
 	return runScript(ctx, env, dir, script)
 }
 
@@ -320,34 +323,12 @@ func resolveProgram(dir, name string) (string, bool) {
 // human — or a supervisor agent reading a failed check — was supposed to see.
 // Anything that is not a CLIXML document is passed through untouched.
 func decodeCLIXML(s string) string {
-	if !strings.HasPrefix(strings.TrimSpace(s), "#< CLIXML") {
-		return s
-	}
-	var b strings.Builder
-	rest := s
-	for {
-		i := strings.Index(rest, `<S S="Error">`)
-		if i < 0 {
-			break
-		}
-		rest = rest[i+len(`<S S="Error">`):]
-		j := strings.Index(rest, "</S>")
-		if j < 0 {
-			break
-		}
-		b.WriteString(rest[:j])
-		rest = rest[j+len("</S>"):]
-	}
-	if b.Len() == 0 {
-		return s
-	}
-	// The serialiser escapes the line breaks and the XML entities it needs to.
-	out := b.String()
-	for _, r := range []struct{ from, to string }{
-		{"_x000D__x000A_", "\n"}, {"_x000A_", "\n"}, {"_x000D_", "\n"},
-		{"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", `"`}, {"&apos;", "'"},
-	} {
-		out = strings.ReplaceAll(out, r.from, r.to)
+	// Package-manager shims can mix a native compiler's plain stderr with
+	// PowerShell progress records. The shared decoder preserves both plain
+	// text and serialized errors, including XML after ordinary output.
+	out := cleanPowerShellOutput(s)
+	if out != "" && out != s {
+		return out + "\n"
 	}
 	return out
 }
@@ -534,7 +515,7 @@ func RegisterPosix(r *Registry) {
 			defer cancel()
 
 			start := time.Now()
-			out, code, err := runScript(cctx, env, dir, a.Command)
+			out, code, err := RunScript(cctx, env, dir, a.Command)
 			elapsed := time.Since(start).Round(time.Millisecond)
 
 			if cctx.Err() == context.DeadlineExceeded {

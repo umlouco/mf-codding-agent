@@ -36,6 +36,9 @@ type Block struct {
 	// Signature must be round-tripped verbatim on thinking blocks; the API
 	// rejects tampering.
 	Signature string `json:"signature,omitempty"`
+	// OpenAI-compatible providers use different reasoning field names. Retain
+	// the observed spelling for tool continuations, never as visible content.
+	ReasoningField string `json:"reasoningField,omitempty"`
 
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
@@ -65,6 +68,8 @@ const (
 	EventText      = "text"
 	EventThinking  = "thinking"
 	EventToolStart = "tool_start"
+	// Argument fragments count as model progress without exposing their contents.
+	EventToolInput = "tool_input"
 	// EventWire reports bytes arriving off the socket, including the framing
 	// and keep-alives that never become text. It is a liveness signal rather
 	// than content: see wire.go.
@@ -76,7 +81,7 @@ type Event struct {
 	Text     string
 	ToolName string
 	ToolID   string
-	// Bytes carries the size of the read that produced an EventWire.
+	// Bytes carries transport size for EventWire or argument size for EventToolInput.
 	Bytes int
 }
 

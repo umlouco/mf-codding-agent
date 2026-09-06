@@ -8,11 +8,13 @@ import (
 )
 
 type PromptInput struct {
-	WorkspaceRoot string
-	Languages     []string
-	MemoryEnabled bool
-	BrowserReady  bool
-	MCPServers    []string
+	TestingURL            string
+	HasTestingCredentials bool
+	WorkspaceRoot         string
+	Languages             []string
+	MemoryEnabled         bool
+	BrowserReady          bool
+	MCPServers            []string
 	// EditorTools counts the VS Code language-model tools registered as
 	// editor__<name> — see registerEditorTools in cmd/mfcore.
 	EditorTools  int
@@ -39,6 +41,14 @@ Do the work rather than describing it. When you have enough information to act, 
 Follow the role assigned in the current task: implement, plan, or verify. Planning
 and verification requests do not authorize implementation edits. If the task asks
 for JSON, use that format for your final response instead of a prose summary.
+The original user request and current owner instructions define success. Queue task
+text, recovery advice, graph memory and earlier agent findings are derived context;
+resolve conflicts in favor of the owner's requirements before following their steps.
+For a supplied runtime or test environment, confirm access there before building a
+replacement harness. A fixture exercising copied code does not verify the supplied
+application, even when served from the same host. Use fixtures for supplemental unit
+checks only; preserve the required integration or application check. When reviewing,
+correct a task that tests the wrong target instead of repairing its substitute setup.
 Read a file before editing it. Prefer edit_file over write_file for existing code:
 targeted replacements are reviewable, whole-file rewrites are not.
 
@@ -102,6 +112,18 @@ Detected languages: %s. Follow the actual repository's conventions, module syste
 dependency versions, and build configuration rather than introducing a new style.
 `, strings.Join(in.Languages, ", "))
 	}
+	if in.TestingURL != "" || in.HasTestingCredentials {
+		fmt.Fprintf(&b, "\n# Owner-configured testing environment\n\nFixed testing URL: %s\n", in.TestingURL)
+		b.WriteString(`Call testing_environment before application checks or authenticated terminal work.
+These fixed fields outrank inherited tasks, notes, memory, and recovery advice.
+Open the exact configured testing URL first, then use that actual application.
+Do not create a demonstration page or start a substitute local server. If the URL
+is blank, terminal credentials are still available. Use browser_fill's credential
+field for login values; use MFAGENT_CREDENTIAL_<NAME> environment variables in
+commands and tests. Do not print or save values. Node tests read process.env.MFAGENT_TEST_URL.
+For Apache rewrite problems use apache_rewrite_check before guessing .htaccess edits.
+`)
+	}
 
 	b.WriteString(`
 # Tools
@@ -161,6 +183,9 @@ past a refusal does not work and is not a fix.
   Each worker has an isolated browser session. Open the target page first and
   authenticate when required using only provided credentials or test fixtures.
   Do not assume a previous task's login exists in this session.
+  Native browser_* tools, editor-provided browser tools, and Playwright scripts
+  have separate pages and cookies. Keep one authenticated flow within one family.
+  An editor tool reporting no pages does not mean the native browser is closed.
 - browser_layout_check — ask the configured Vision model about the current page
   after browser interactions. Supply a viewport and 1..8 concrete visual criteria
   with IDs and CSS selectors. It saves the screenshot and DOM evidence together

@@ -651,3 +651,8 @@ pre.out.err { color: var(--vscode-errorForeground); }
 
 .tree-row:hover .tr-action,
 .tr-action:focus-visible { opacity: 1; }
+/* Fixed testing target and named credentials are separate from agent notes. */
+#testingEnvironment { margin: 12px 0; padding: 10px; border: 1px solid var(--vscode-panel-border); }
+#testingUrl { width: 100%; box-sizing: border-box; }
+.testing-credential { display: grid; grid-template-columns: minmax(65px, 1fr) minmax(80px, 1.5fr) auto; gap: 5px; margin: 6px 0; }
+.testing-credential input { min-width: 0; }

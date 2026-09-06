@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -61,6 +60,8 @@ type Session struct {
 	Messages []llm.Message
 	Usage    llm.Usage
 	Started  time.Time
+	running  bool
+	guidance string
 }
 
 func New(cfg *config.Config, p llm.Provider, r *tools.Registry, env *tools.Env, emit Emitter, system string) *Agent {
@@ -111,8 +112,17 @@ type SendResult struct {
 }
 
 func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) {
+	req.Text = a.env.TestingPrompt(req.Text)
 	ctx = a.startCognition(ctx, req)
 	sess := a.Session(req.SessionID)
+	a.mu.Lock()
+	if sess.running {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("session already has an active turn")
+	}
+	sess.running = true
+	a.mu.Unlock()
+	defer func() { a.mu.Lock(); sess.running = false; sess.guidance = ""; a.mu.Unlock() }()
 
 	user := req.Text
 	if pre := turnPreamble(req.OpenFiles, req.Selection, req.SelectionPath); pre != "" {
@@ -122,6 +132,12 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	a.mu.Lock()
 	sess.Messages = append(sess.Messages, llm.UserText(user))
 	system := a.system
+	if a.cfg.InspectOnly {
+		system = "This turn is an inspection-only supervisor review. Read available evidence and return the requested decision or guidance. The executor owns file changes, command execution, and application testing. Mutating tools and arbitrary commands are unavailable in this role.\n\n" + system
+	}
+	if a.cfg.ResponseOnly {
+		system = "You review supplied text and evidence. Follow the current request and its response schema exactly. You cannot inspect files or execute tools in this turn. Do not propose tool calls, XML checks, or an investigation. Owner requirements outrank derived task instructions and prior agent conclusions. Preserve required behavior and assertions. Return the requested decision using only the supplied information; distinguish missing evidence from a proven defect."
+	}
 	a.mu.Unlock()
 
 	defs := a.toolDefs()
@@ -135,6 +151,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	// in the same turn would produce a final result with no JSON at all.
 	var accumulated strings.Builder
 	var failures toolFailureLoop
+	var unchanged unchangedToolLoop
 
 	for iter := 1; maxIterations == 0 || iter <= maxIterations; iter++ {
 		select {
@@ -154,10 +171,16 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		}
 
 		a.mu.Lock()
+		if sess.guidance != "" {
+			sess.Messages = append(sess.Messages, llm.UserText("SUPERVISOR GUIDANCE FOR THE CURRENT TASK:\n"+sess.guidance+"\nTreat this as derived advice, not new owner requirements or proof. Confirm hypotheses against current evidence. Preserve the task's acceptance criteria."))
+			sess.guidance = ""
+		}
 		msgs := make([]llm.Message, len(sess.Messages))
 		copy(msgs, sess.Messages)
 		a.mu.Unlock()
-		msgs = a.cognitionMessages(ctx, req.SessionID, msgs)
+		if !a.cfg.ResponseOnly {
+			msgs = a.cognitionMessages(ctx, req.SessionID, msgs)
+		}
 
 		turn, err := a.stream(ctx, req.SessionID, llm.Request{
 			System: system, Messages: msgs, Tools: defs,
@@ -196,6 +219,9 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		a.mu.Unlock()
 
 		calls := turn.ToolCalls()
+		if a.cfg.ResponseOnly && len(calls) > 0 {
+			return nil, fmt.Errorf("the response-only reviewer requested tools instead of returning the requested decision")
+		}
 		if len(calls) == 0 {
 			result.Text = accumulated.String()
 			result.StopReason = turn.StopReason
@@ -234,6 +260,16 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 			a.activity(req.SessionID, PhaseError, detail+"; stopping the tool loop")
 			return a.finalReport(ctx, req, sess, system, iter, accumulated.String(),
 				halt{reason: "repeated_tool_error", detail: detail})
+		}
+		if warn, stop, detail := unchanged.observe(calls, results); stop {
+			a.activity(req.SessionID, PhaseError, detail+"; handing off for recovery")
+			return a.finalReport(ctx, req, sess, system, iter, accumulated.String(),
+				halt{reason: "unchanged_tool_loop", detail: detail})
+		} else if warn {
+			a.activity(req.SessionID, PhaseError, detail)
+			a.mu.Lock()
+			sess.Messages = append(sess.Messages, llm.UserText("Runtime observation: "+detail+". This does not establish a task defect or completion."))
+			a.mu.Unlock()
 		}
 
 		// Cache reads and writes are context too — a provider that caches the
@@ -397,12 +433,15 @@ func (a *Agent) finalReport(
 func (a *Agent) toolDefs() []llm.ToolDef {
 	// Visibility controls context size. runTools still resolves every call
 	// against the complete registry, whether its definition was sent or not.
-	if a.cfg.DisableTools {
+	if a.cfg.DisableTools || a.cfg.ResponseOnly {
 		return nil
 	}
 	list := a.registry.List()
 	defs := make([]llm.ToolDef, 0, len(list))
 	for _, t := range list {
+		if !a.toolAllowed(t) {
+			continue
+		}
 		defs = append(defs, llm.ToolDef{Name: t.Name, Description: t.Description, Schema: t.Schema})
 	}
 	return defs
@@ -446,10 +485,10 @@ func (a *Agent) runTools(ctx context.Context, sessionID string, calls []llm.Bloc
 }
 
 func (a *Agent) invoke(ctx context.Context, sessionID string, call llm.Block, t *tools.Tool, mutating bool) llm.Block {
-	summary := t.Describe(call.Input)
+	summary := a.env.RedactTestingSecrets(t.Describe(call.Input))
 	a.emit("stream/tool", map[string]any{
 		"sessionId": sessionID, "id": call.ID, "name": call.Name,
-		"status": "running", "input": json.RawMessage(call.Input),
+		"status": "running", "input": a.env.RedactTestingInput(call.Input),
 		// Nothing pauses for approval, so this line is the only warning the
 		// user gets that a write or a command is happening. It goes out before
 		// Run, not after, so it is on screen while the work is in flight.
@@ -499,14 +538,31 @@ func truncateForUI(s string) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + fmt.Sprintf("\n… (%d more bytes)", len(s)-n)
+	head, tail := n/2, len(s)-n/2
+	for head > 0 && s[head]&0xc0 == 0x80 {
+		head--
+	}
+	for tail < len(s) && s[tail]&0xc0 == 0x80 {
+		tail++
+	}
+	return s[:head] + fmt.Sprintf("\n… [preview omitted %d middle bytes; full output remains in the worker context] …\n", tail-head) + s[tail:]
 }
 
 func (a *Agent) toolNames() string {
 	list := a.registry.List()
 	names := make([]string, 0, len(list))
 	for _, t := range list {
+		if !a.toolAllowed(t) {
+			continue
+		}
 		names = append(names, t.Name)
 	}
 	return strings.Join(names, ", ")
+}
+
+func (a *Agent) toolAllowed(t *tools.Tool) bool {
+	// Shell command classification is for scheduling, not an inspection
+	// guarantee. A reviewer uses dedicated read tools instead of arbitrary
+	// commands, browser scripts or third-party tools that can change state.
+	return !a.cfg.InspectOnly || (!t.Mutating && t.MutatesOn == nil)
 }

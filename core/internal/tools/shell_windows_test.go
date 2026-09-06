@@ -28,6 +28,17 @@ func TestPowerShellCompatibleHonoursBacktickEscape(t *testing.T) {
 	}
 }
 
+func TestPowerShellCompatiblePreservesHereStringSource(t *testing.T) {
+	for _, quote := range []string{"'", "\""} {
+		body := "if (first && second) { console.log('yes'); }"
+		input := "$code = @" + quote + "\n" + body + "\n" + quote + "@\nWrite-Output $code && Write-Output done"
+		got := powerShellCompatible(input)
+		if !strings.Contains(got, body) || strings.Count(got, powerShellAndGuard) != 1 {
+			t.Fatalf("here-string source corrupted: %q", got)
+		}
+	}
+}
+
 func TestCleanPowerShellOutputDecodesCliXml(t *testing.T) {
 	input := `<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">` +
 		`<S S="Error">At line:1 char:26_x000D__x000A_</S>` +
@@ -72,6 +83,67 @@ func TestRunShellAcceptsAndChainOnWindowsPowerShell(t *testing.T) {
 	result := tool.Run(context.Background(), &Env{Root: t.TempDir()}, input)
 	if result.IsError || !strings.Contains(result.Output, "first") || !strings.Contains(result.Output, "second") {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestPowerShellErrorsExplainPortableRecovery(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows PowerShell compatibility")
+	}
+	r := NewRegistry()
+	RegisterShell(r)
+	tool, _ := r.Get("run_shell")
+	input, _ := json.Marshal(map[string]any{"command": "powershell.exe -NoProfile -NonInteractive -Command \"curl -I http://example.invalid\""})
+	result := tool.Run(context.Background(), &Env{Root: t.TempDir()}, input)
+	if !result.IsError || !strings.Contains(result.Output, "Use curl.exe") {
+		t.Fatalf("missing actionable recovery: %+v", result)
+	}
+}
+
+func TestRunShellWritesHereStringWithoutRewritingEmbeddedCode(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows PowerShell compatibility")
+	}
+	r := NewRegistry()
+	RegisterShell(r)
+	tool, _ := r.Get("run_shell")
+	root := t.TempDir()
+	source := "console.log('value && preserved');"
+	input, _ := json.Marshal(map[string]any{"command": "$source = @'\n" + source + "\n'@\n[IO.File]::WriteAllText((Join-Path (Get-Location) 'probe.js'), $source) && Write-Output saved"})
+	result := tool.Run(context.Background(), &Env{Root: root}, input)
+	actual, err := os.ReadFile(filepath.Join(root, "probe.js"))
+	if result.IsError || err != nil || strings.TrimSpace(string(actual)) != source {
+		t.Fatalf("embedded source changed: result=%+v err=%v", result, err)
+	}
+}
+
+func TestPortableRecoveryPreservesExistingDirectory(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows PowerShell compatibility")
+	}
+	r := NewRegistry()
+	RegisterShell(r)
+	RegisterPosix(r)
+	native, _ := r.Get("run_shell")
+	portable, _ := r.Get("unix")
+	root := t.TempDir()
+	env := &Env{Root: root}
+	if err := os.Mkdir(filepath.Join(root, "existing"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, "existing", "keep.txt")
+	if err := os.WriteFile(marker, []byte("existing work"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	input := json.RawMessage(`{"command":"mkdir -p existing"}`)
+	failed := native.Run(context.Background(), env, input)
+	if !failed.IsError || !strings.Contains(failed.Output, "unix tool") {
+		t.Fatalf("missing recovery: %+v", failed)
+	}
+	recovered := portable.Run(context.Background(), env, input)
+	data, err := os.ReadFile(marker)
+	if recovered.IsError || err != nil || string(data) != "existing work" {
+		t.Fatalf("unsafe recovery: %+v %v", recovered, err)
 	}
 }
 
