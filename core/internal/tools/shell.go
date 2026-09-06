@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -145,6 +146,7 @@ func RegisterShell(r *Registry) {
 			"configured shell and visible in a tab they can scroll back through, so " +
 			"a long build can be watched rather than waited on. " +
 			"Prefer the unix tool for plain file inspection and text processing. " +
+			"Use shell_run_background for HTTP/dev servers, then shell_wait_for_http; do not start servers with '&' here. " +
 			"Returns combined stdout and stderr plus the exit code.",
 		Mutating: true,
 		Schema: obj(map[string]any{
@@ -217,6 +219,10 @@ func RegisterShell(r *Registry) {
 			name, args, cleanup := shellFor(command)
 			defer cleanup()
 			cmd := exec.CommandContext(cctx, name, args...)
+			// A background child can inherit our output pipes after the shell
+			// exits. Bound the pipe drain as well as the process lifetime, or
+			// Run can wait forever even after its context has been cancelled.
+			cmd.WaitDelay = time.Second
 			cmd.Dir = dir
 			cmd.Env = append(os.Environ(), "MFAGENT=1", "NO_COLOR=1", "CI=1")
 
@@ -234,14 +240,24 @@ func RegisterShell(r *Registry) {
 				out = cleanPowerShellOutput(out)
 			}
 			exitCode := 0
+			if cctx.Err() != nil {
+				status := "Command cancelled."
+				if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+					status = fmt.Sprintf("Command timed out after %s.", timeout)
+				}
+				return Result{Output: status + " Child processes may still be running; check before retrying.\n\n" + clamp(out, 30000), IsError: true}
+			}
+			if errors.Is(err, exec.ErrWaitDelay) {
+				return Result{
+					Output: "Shell exited, but a child process kept stdout/stderr open. Output capture was stopped. " +
+						"The child may still be running; check before restarting it. Use shell_run_background " +
+						"and shell_wait_for_http for servers.\n\n" + clamp(out, 30000),
+					IsError: true,
+				}
+			}
 			if err != nil {
 				if ee, ok := err.(*exec.ExitError); ok {
 					exitCode = ee.ExitCode()
-				} else if cctx.Err() == context.DeadlineExceeded {
-					return Result{
-						Output:  fmt.Sprintf("Command timed out after %s.\n\n%s", timeout, clamp(out, 30000)),
-						IsError: true,
-					}
 				} else {
 					return Errf("failed to start %q: %v", a.Command, err)
 				}

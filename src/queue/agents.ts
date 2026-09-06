@@ -8,12 +8,15 @@ import { getBridge } from '../mcpBridge';
 import { getStore } from '../providers/instance';
 import { contextCeiling } from '../providers/payload';
 import { runClaudeCliTurn } from './claudeCli';
+import { CognitiveBinding, taskCognition } from './cognition';
 import { NewTask, Task, TaskQueue, Usage } from './db';
 import { browserEvidence, codingWorkflow, executorExample, recoveryRules, reportContract, originalGoalContext } from './prompts';
 import {
   CompletionClaim,
   extractExecutorNotes,
   parseCompletionClaim,
+  completionForSupervisor,
+  parseExecutorValidation,
   validationForSupervisor,
   storedValidationProblem,
 } from './validation';
@@ -78,10 +81,9 @@ async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<Core
       enabled: true,
     }],
     coding: { providerId: `queue-${role}`, model: rc.model, effort: rc.effort },
-    // Supervisors only validate the executor's persisted conclusion. They are
-    // intentionally unable to inspect files, execute commands, or drive a browser.
+    // Keep routine reviews compact by omitting tool definitions. Every configured
+    // tool remains registered and callable if the supervisor needs it.
     disableTools: role === 'supervisor',
-    ...(role === 'supervisor' ? { memoryEnabled: false, mcpServers: [] } : {}),
     // Queue workers spawn their own core processes and run unattended, often
     // several at once. The editor terminal is a single visible tab shared by
     // everything in the window: handing it to background work would steal focus
@@ -89,15 +91,16 @@ async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<Core
     // one scrollback. They spawn their own shell instead.
     editorTerminal: false,
     maxIterations,
-    // Keep local worker context bounded while respecting a lower global ceiling.
+    // Use the configured model budget unless the user explicitly caps the queue.
     maxContextTokens: queueContextCeiling(),
   };
 }
 
 function queueContextCeiling(): number {
-  const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.maxContextTokens', 32768);
-  const local = Number.isFinite(configured) && configured >= 4096 ? configured : 32768;
+  const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.maxContextTokens', 0);
   const global = contextCeiling();
+  if (!Number.isFinite(configured) || configured < 4096) return global;
+  const local = Math.floor(configured);
   return global > 0 ? Math.min(local, global) : local;
 }
 
@@ -149,6 +152,10 @@ export interface TurnResult {
 const NO_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 export interface RunOptions {
+  /** Durable work identity; independent from this disposable process and conversation. */
+  cognition?: CognitiveBinding;
+  /** Retrieve relevant workspace graph knowledge before a fresh worker starts. */
+  memoryQuery?: string;
   maxIterations?: number;
   onEvent?: (method: string, params: any) => void;
   onCancellable?: (cancel: () => void) => void;
@@ -240,6 +247,14 @@ export async function runOnce(
       `[queue:${role}] core ready on ${init.model} (${init.provider})` +
         (maxIterations > 0 ? `, ${maxIterations} rounds` : ''),
     );
+    for (const warning of new Set(init.warnings ?? [])) {
+      output.appendLine(`[queue:${role}] ${warning}`);
+      // An unavailable store cannot emit later cognition diagnostics. Preserve
+      // its initialization failure in this worker's journal while tools remain usable.
+      if (warning.toLowerCase().includes('runtime memory unavailable')) {
+        onActivity?.({ phase: 'error', detail: warning, at: Date.now() });
+      }
+    }
 
     const sessionId = `queue-${role}-${Date.now()}`;
     // The caller can only stop the turn once the core is up and the session is
@@ -248,9 +263,16 @@ export async function runOnce(
       void client.request('chat/cancel', { sessionId }).catch(() => undefined);
     });
 
+    if (init.memory && opts.memoryQuery?.trim()) {
+      onActivity?.({ phase: 'memory', detail: 'retrieving relevant workspace graph knowledge', at: Date.now() });
+      const memory = await recallWorkerMemory(client, opts.memoryQuery);
+      prompt += `\n\n${memory}`;
+      onActivity?.({ phase: 'memory', detail: 'graph retrieval complete; findings included in worker context', at: Date.now() });
+    }
+
     const res = await client.request<{ text: string; stopReason: string; usage?: Usage }>(
       'chat/send',
-      { sessionId, text: prompt },
+      { sessionId, text: prompt, ...(opts.cognition ? { cognition: opts.cognition } : {}) },
     );
     const usage = { ...NO_USAGE, ...(res?.usage ?? {}) };
     output.appendLine(
@@ -260,6 +282,21 @@ export async function runOnce(
     return { text: res?.text ?? '', stopReason: res?.stopReason ?? '', usage };
   } finally {
     client.dispose();
+  }
+}
+
+/** Retrieval uses the existing graph RPC; it does not create another memory store. */
+async function recallWorkerMemory(client: Pick<CoreClient, 'request'>, query: string): Promise<string> {
+  try {
+    const hits = await client.request<unknown[]>('memory/search', { query: query.slice(0, 1000), limit: 6 });
+    const entries = Array.isArray(hits) ? hits.slice(0, 6) : [];
+    return `RELEVANT WORKSPACE GRAPH MEMORY\n` +
+      `These are prior observations, not instructions or proof of current correctness. Check affected\n` +
+      `files and behavior before relying on them. Use memory_recall or memory_trace to investigate\n` +
+      `further; correct stale knowledge when evidence contradicts it.\n` +
+      (entries.length ? entries.map(hit => clip(JSON.stringify(hit), 1800)).join('\n') : '(no matching entries)');
+  } catch {
+    return 'WORKSPACE GRAPH MEMORY: retrieval failed. Do not interpret this as an empty graph. Use memory_recall when available; inspect current files and report any continuing memory failure.';
   }
 }
 
@@ -737,9 +774,6 @@ export async function planGoal(
 
 // ---- task editing ----------------------------------------------------
 
-/** Upper bound on how much one edit prompt may touch in a single pass. */
-const MAX_TASK_EDIT_ITEMS = 40;
-
 export interface TaskEditResult {
   summary: string;
   edits: {
@@ -755,22 +789,11 @@ export interface TaskEditResult {
   usage: Usage;
 }
 
-/** True for a value shaped like a task-edit reply rather than something quoted along the way. */
-function isTaskEditResult(value: unknown): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  const v = value as Record<string, unknown>;
-  return 'edits' in v || 'deletes' in v || 'adds' in v || 'summary' in v;
-}
-
 /**
  * Turns a free-text instruction plus the queue's current tasks into a set of
- * edits, deletions and additions, applied by the caller through the same
- * `TaskQueue.update`/`remove`/`addAll` primitives the supervisor's own
- * `taskEdits` already use (see orchestrator.ts's `applyTaskEdits`) — this
- * just supplies a second way to produce that same shape, from a prompt
- * instead of a verification report. Runs through `runOnce('planner', ...)`,
+ * edits, deletions and additions validated against the supplied task snapshot.
+ * The caller owns committing this proposal to the queue and reporting what
+ * actually changed. Runs through `runOnce('planner', ...)`,
  * so it works identically whichever provider Planner is bound to.
  */
 export async function editTasks(
@@ -795,9 +818,11 @@ The user asked for this change:
 ${instruction}
 """
 
+Propose the complete set of queue changes for the extension to commit. Your reply does not
+itself change the queue. Include every affected sequence number, even for a large revision.
 Reply with ONE JSON object and nothing else:
 {
-  "summary": "one sentence describing what you changed",
+  "summary": "one sentence describing the proposed changes",
   "edits": [{ "seq": 1, "title": "...", "description": "...", "implVerifyPrompt": "...",
               "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
   "deletes": [],
@@ -806,50 +831,108 @@ Reply with ONE JSON object and nothing else:
 }
 
 Only include fields you are actually changing on an "edits" entry; omit a field to leave it as-is.
-Replace example sequence numbers with actual queue sequence numbers. deletes is an array of numbers.
-Do not edit or delete a VERIFIED task unless the instruction explicitly asks to redo finished work.
+Replace example sequence numbers with actual queue sequence numbers. deletes is an array of
+positive integer sequence numbers. Do not edit and delete the same task in one proposal.
+Preserve VERIFIED tasks: this queue editing interface does not modify or delete finished work.
 Tasks in "adds" are appended after the current end of the queue, in the order given. Leave any of
-the three arrays empty when the instruction does not call for that kind of change.`;
+the three arrays empty when the instruction does not call for that kind of change. All three
+arrays and the summary are required. For no change, return three empty arrays and explain why
+in summary. Use only the fields shown above; adds require title and description strings.`;
 
-  const { text, usage } = await runOnce(context, output, 'planner', prompt, opts);
-  const parsed = extractJson<Partial<TaskEditResult>>(text, isTaskEditResult);
+  const { text, usage, stopReason } = await runOnce(context, output, 'planner', prompt, opts);
+  const reason = String(stopReason ?? '').trim().toLowerCase();
+  if (!['', 'end_turn', 'stop', 'stop_sequence', 'completed'].includes(reason)) {
+    throw new AgentRunError(`Task edit planning did not complete (${reason}). No task edit proposal was accepted.`);
+  }
+  return parseTaskEditResult(text, tasks, usage);
+}
 
-  const edits = (Array.isArray(parsed.edits) ? parsed.edits : [])
-    .filter((e: any) => e && typeof e === 'object' && typeof e.seq === 'number')
-    .slice(0, MAX_TASK_EDIT_ITEMS)
-    .map((e: any) => ({
-      seq: e.seq,
-      title: typeof e.title === 'string' ? e.title.trim() : undefined,
-      description: typeof e.description === 'string' ? e.description.trim() : undefined,
-      implVerifyPrompt: typeof e.implVerifyPrompt === 'string' ? e.implVerifyPrompt.trim() : undefined,
-      solutionVerifyPrompt:
-        typeof e.solutionVerifyPrompt === 'string' ? e.solutionVerifyPrompt.trim() : undefined,
-      solutionVerifyCommand:
-        typeof e.solutionVerifyCommand === 'string' ? e.solutionVerifyCommand.trim() : undefined,
-    }));
-
-  const deletes = (Array.isArray(parsed.deletes) ? parsed.deletes : [])
-    .filter((s: any) => typeof s === 'number')
-    .slice(0, MAX_TASK_EDIT_ITEMS);
-
-  const adds: NewTask[] = (Array.isArray(parsed.adds) ? parsed.adds : [])
-    .filter((a: any) => a && typeof a === 'object' && String(a.title ?? '').trim())
-    .slice(0, MAX_TASK_EDIT_ITEMS)
-    .map((a: any) => ({
-      title: String(a.title).trim().slice(0, 200),
-      description: String(a.description ?? '').trim(),
-      implVerifyPrompt: String(a.implVerifyPrompt ?? '').trim(),
-      solutionVerifyPrompt: String(a.solutionVerifyPrompt ?? '').trim(),
-      solutionVerifyCommand: String(a.solutionVerifyCommand ?? '').trim(),
-    }));
-
-  return {
-    summary: String(parsed.summary ?? '').trim() || 'Applied the requested changes.',
-    edits,
-    deletes,
-    adds,
-    usage,
+/** Validate the complete proposal before any queue mutation; never apply a filtered prefix. */
+export function parseTaskEditResult(text: string, tasks: Task[], usage: Usage): TaskEditResult {
+  const fail = (detail: string): never => { throw new Error(`Invalid task edit proposal: ${detail}`); };
+  const object = (value: unknown, label: string): Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) fail(`${label} must be an object.`);
+    return value as Record<string, unknown>;
   };
+  const keys = (value: Record<string, unknown>, allowed: readonly string[], label: string): void => {
+    for (const key of Object.keys(value)) {
+      if (!allowed.includes(key)) fail(`${label} contains unsupported field "${key}".`);
+    }
+  };
+  const string = (value: unknown, label: string): string => {
+    if (typeof value !== 'string') fail(`${label} must be a string.`);
+    return (value as string).trim();
+  };
+  const known = new Set(tasks.map(task => task.seq));
+  const sequence = (value: unknown, label: string): number => {
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+      fail(`${label} must be a positive integer sequence number.`);
+    }
+    if (!known.has(value as number)) fail(`${label} refers to unknown task #${value}.`);
+    return value as number;
+  };
+  const fields = ['title', 'description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const;
+  // A discarded draft may precede the actual proposal in accumulated model
+  // output. Accept one complete envelope, never an earlier parseable fragment.
+  const source = text.trim();
+  const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(source);
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(fenced ? fenced[1] : source);
+  } catch {
+    fail('reply must contain one complete JSON object, optionally inside a single JSON fence.');
+  }
+  const parsed = object(decoded, 'reply');
+  keys(parsed, ['summary', 'edits', 'deletes', 'adds'], 'reply');
+  const summary = string(parsed.summary, 'summary');
+  if (!summary) fail('summary must explain the proposed changes or why no changes are needed.');
+  for (const name of ['edits', 'deletes', 'adds']) {
+    if (!Array.isArray(parsed[name])) fail(`${name} must be an array, including when it is empty.`);
+  }
+
+  const edits = new Map<number, TaskEditResult['edits'][number]>();
+  for (const [index, value] of (parsed.edits as unknown[]).entries()) {
+    const label = `edits[${index}]`;
+    const edit = object(value, label);
+    keys(edit, ['seq', ...fields], label);
+    const seq = sequence(edit.seq, `${label}.seq`);
+    const merged = { ...(edits.get(seq) ?? { seq }) };
+    let changes = 0;
+    for (const field of fields) {
+      if (!(field in edit)) continue;
+      const next = string(edit[field], `${label}.${field}`);
+      if (merged[field] !== undefined && merged[field] !== next) {
+        fail(`task #${seq} has conflicting edits to ${field}.`);
+      }
+      merged[field] = next;
+      changes++;
+    }
+    if (!changes) fail(`${label} must include at least one field to change.`);
+    edits.set(seq, merged);
+  }
+
+  const deletes = new Set<number>();
+  for (const [index, value] of (parsed.deletes as unknown[]).entries()) {
+    const seq = sequence(value, `deletes[${index}]`);
+    if (edits.has(seq)) fail(`task #${seq} cannot be both edited and deleted.`);
+    deletes.add(seq);
+  }
+
+  const adds = (parsed.adds as unknown[]).map((value, index): NewTask => {
+    const label = `adds[${index}]`;
+    const add = object(value, label);
+    keys(add, fields, label);
+    const task: NewTask = {
+      title: string(add.title, `${label}.title`),
+      description: string(add.description, `${label}.description`),
+    };
+    if (!task.title) fail(`${label}.title must not be empty.`);
+    for (const field of fields.slice(2)) {
+      if (field in add) task[field] = string(add[field], `${label}.${field}`);
+    }
+    return task;
+  });
+  return { summary, edits: [...edits.values()], deletes: [...deletes], adds, usage };
 }
 
 // ---- phase expansion -----------------------------------------------------
@@ -956,6 +1039,7 @@ Rules:
 - Do not include a task for the phase itself.`;
 
   const { text, stopReason, usage } = await runOnce(context, output, 'planner', prompt, {
+    cognition: taskCognition(phase, goal, 'planner'),
     maxIterations: baseRounds(),
     onActivity,
     onEvent,
@@ -1103,14 +1187,22 @@ function attemptHistory(task: Task): string {
  * has already been tried, not enough to drown the instruction.
  */
 function retryBriefing(task: Task): string {
-  if (task.attempts <= 1 && !task.errorLog.trim() && !task.supervisorFeedback.trim()) {
+  const previous = task.output?.trim() || '';
+  if (task.attempts <= 1 && !task.errorLog.trim() && !task.supervisorFeedback.trim() && !previous) {
     return '';
   }
+  const claim = parseCompletionClaim(previous);
+  const handoff = !previous ? '(no prior report recorded)'
+    : claim.status !== 'UNSTATED' ? completionForSupervisor(claim)
+    : JSON.stringify(parseExecutorValidation(previous, false));
   return `
 THIS IS ATTEMPT ${task.attempts} of the current attempt budget. Earlier work did not pass verification.
 
 How the earlier attempts ended, oldest first:
 ${attemptHistory(task)}
+
+PREVIOUS WORKER HANDOFF (reported observations, not independently established facts):
+${clip(handoff, 8000)}
 
 Read the files before redoing any of that — an attempt that was cut off still
 left its edits on disk, and repeating them is how the next attempt runs out too.
@@ -1118,7 +1210,7 @@ If an attempt was interrupted, inspect its completed changes before continuing.
 An interruption alone does not prove the task is too large or the code is wrong.
 Finish the missing work, or report the concrete blocker and next useful step.
 
-Supervisor feedback on the last attempt — treat this as binding:
+Supervisor feedback on the last attempt — apply it consistently with the original user request:
 ${task.supervisorFeedback.trim() || '(none)'}
 `;
 }
@@ -1130,6 +1222,7 @@ export async function executeTask(
   /** TaskQueue.instructions — see its doc comment for why this crosses the
    * task-isolation boundary when nothing else does. */
   instructions: string,
+  goal: string,
   onActivity?: (a: ActivityRecord) => void,
   onEvent?: (method: string, params: any) => void,
   onAbort?: (abort: () => void) => void,
@@ -1144,6 +1237,14 @@ ${instructions.trim()}
     : '';
 
   const prompt = `You are an execution agent. Complete exactly one task, then stop.
+
+${originalGoalContext(goal)}
+
+Compare this task with the original request before implementing. Treat the task and recovery
+feedback as working interpretations, not replacements for the user's requirements. If evidence
+shows the approach is wrong, revise your approach within this task. If correcting it requires
+changing scope or resolving material ambiguity, report NEEDS_MORE_WORK with the conflict,
+confirmed evidence, and proposed correction or precise question for supervisor recovery.
 
 ${notes}TASK ${task.seq}: ${task.title}
 
@@ -1167,10 +1268,12 @@ ${browserEvidence}
 - If the task turns out to be impossible or already done, say so plainly and explain why.
 - Inspect the final code and diff yourself. Run useful development checks. For UI/browser work,
   use the browser tools when needed and record what happened.
-- If you learned something every later task should know — where something lives, a convention
-  to follow, how to build or test this project — put it in "notes" below. This is the only way
-  that fact reaches later tasks: they run with no memory of this attempt. Leave "notes" empty if
-  there is nothing new, and do not repeat what PROJECT NOTES above already says.
+- Use the shared graph memory when available: recall relevant decisions, requirements, and past
+  failures before broad exploration. Persist useful discoveries with memory_remember, including
+  reasons, affected entities, and supporting evidence. Distinguish hypotheses from observations;
+  do not record unverified work as verified. Fresh sessions share the workspace graph.
+- Put concise project-wide conventions in "notes" below as well when later tasks need them.
+  Notes complement the graph and the task handoff. Leave notes empty when there is nothing new.
 - Your final response must be ONE valid JSON object, without a code fence or trailing prose.
 ${reportContract}
   Use status READY_FOR_VALIDATION only when implementation is complete and development checks
@@ -1180,6 +1283,8 @@ ${reportContract}
 ${executorExample}`;
 
   const { text, stopReason, usage } = await runOnce(context, output, 'executor', prompt, {
+    cognition: taskCognition(task, goal, 'executor'),
+    memoryQuery: `${task.title || ''}\n${task.description}`,
     maxIterations: workerRounds(),
     onActivity,
     onEvent,
@@ -1304,16 +1409,19 @@ export async function superviseTask(
   rewrites: number,
   /** The prompt the whole plan was generated from — see ceilingNotice. */
   goal: string,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'> = {},
+  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> = {},
 ): Promise<SupervisorDecision> {
+  opts = { ...opts, cognition: taskCognition(task, goal, 'supervisor') };
   const exhausted = attemptsExhausted(task);
   const prompt = `You are the supervisor of an autonomous coding run. Make a lightweight
 accept/reject decision from the validation report stored in the queue database.
 
 The report below is from an independent verification agent, not the implementation agent.
 
-You have no tools and must not inspect files, execute commands, rerun tests, or drive a browser.
-Check whether its conclusion is consistent with concrete evidence for each requirement.
+Start with the supplied report. Tool definitions are omitted to keep the context compact;
+registered tools remain callable when you need additional observations to make the decision.
+Check whether the conclusion is consistent with concrete evidence for each requirement.
+Your own tool use does not replace the independent verification report required for completion.
 
 A task is never terminally failed. When the evidence is not sufficient, make exactly one
 recovery decision: RETRY with a materially rewritten task description and verification, or
@@ -1556,7 +1664,7 @@ async function escalate(
   task: Task,
   goal: string,
   feedback: string,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'>,
+  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'>,
 ): Promise<{
   splitInto: NewTask[];
   description: string;
@@ -1689,7 +1797,7 @@ async function reformatVerdict(
   task: Task,
   rawReply: string,
   goal: string,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'>,
+  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'>,
 ): Promise<{ decision?: Partial<SupervisorDecision>; usage: Usage }> {
   const prompt = `Your last reply about task ${task.seq} was not returned as the required JSON object, so it
 could not be read as a verdict. Here is exactly what you wrote:
@@ -1744,7 +1852,7 @@ async function demandRewrite(
   feedback: string,
   rawReply: string,
   goal: string,
-  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort'>,
+  opts: Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'>,
 ): Promise<{
   description: string;
   implVerifyPrompt: string;

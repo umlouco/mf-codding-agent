@@ -85,6 +85,17 @@ type Usage struct {
 	Output     int64 `json:"output"`
 	CacheRead  int64 `json:"cacheRead"`
 	CacheWrite int64 `json:"cacheWrite"`
+	// OpenAI-compatible prompt_tokens already includes cache hits. Anthropic
+	// reports them separately. Keep billing counters unchanged, but carry the
+	// distinction into the per-turn context guard.
+	InputIncludesCache bool `json:"-"`
+}
+
+func (u Usage) ContextTokens() int64 {
+	if u.InputIncludesCache {
+		return u.Input
+	}
+	return u.Input + u.CacheRead + u.CacheWrite
 }
 
 type Turn struct {

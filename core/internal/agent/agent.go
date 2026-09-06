@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mflores/mfagent/core/internal/cognition"
 	"github.com/mflores/mfagent/core/internal/config"
 	"github.com/mflores/mfagent/core/internal/llm"
 	"github.com/mflores/mfagent/core/internal/tools"
@@ -52,6 +53,7 @@ type Agent struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
 	system   string
+	journal  cognition.Journal
 }
 
 type Session struct {
@@ -92,11 +94,12 @@ func (a *Agent) Reset(id string) {
 }
 
 type SendRequest struct {
-	SessionID     string   `json:"sessionId"`
-	Text          string   `json:"text"`
-	OpenFiles     []string `json:"openFiles"`
-	Selection     string   `json:"selection"`
-	SelectionPath string   `json:"selectionPath"`
+	SessionID     string           `json:"sessionId"`
+	Text          string           `json:"text"`
+	OpenFiles     []string         `json:"openFiles"`
+	Selection     string           `json:"selection"`
+	SelectionPath string           `json:"selectionPath"`
+	Cognition     *cognition.Scope `json:"cognition,omitempty"`
 }
 
 type SendResult struct {
@@ -108,6 +111,7 @@ type SendResult struct {
 }
 
 func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) {
+	ctx = a.startCognition(ctx, req)
 	sess := a.Session(req.SessionID)
 
 	user := req.Text
@@ -153,6 +157,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		msgs := make([]llm.Message, len(sess.Messages))
 		copy(msgs, sess.Messages)
 		a.mu.Unlock()
+		msgs = a.cognitionMessages(ctx, req.SessionID, msgs)
 
 		turn, err := a.stream(ctx, req.SessionID, llm.Request{
 			System: system, Messages: msgs, Tools: defs,
@@ -213,10 +218,15 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		sess.Messages = append(sess.Messages, llm.Message{Role: llm.RoleUser, Blocks: results})
 		a.mu.Unlock()
 
-		if repeated, detail := failures.observe(calls, results); repeated {
-			a.activity(req.SessionID, PhaseError, detail+"; stopping the tool loop")
-			return a.finalReport(ctx, req, sess, system, iter, accumulated.String(),
-				halt{reason: "repeated_tool_error", detail: detail})
+		// Persistent operational memory diagnoses repeated observations without
+		// withdrawing the model's ability to recover. Retain the legacy stop
+		// only for hosts that have not attached an operational journal.
+		if _, observing := ctx.Value(cognitionContextKey{}).(*cognitionRun); !observing {
+			if repeated, detail := failures.observe(calls, results); repeated {
+				a.activity(req.SessionID, PhaseError, detail+"; stopping the tool loop")
+				return a.finalReport(ctx, req, sess, system, iter, accumulated.String(),
+					halt{reason: "repeated_tool_error", detail: detail})
+			}
 		}
 
 		// Cache reads and writes are context too — a provider that caches the
@@ -225,7 +235,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		// all. A provider that reports no usage fails open, as it does
 		// everywhere else usage is read.
 		if limit := a.maxContextTokens(); limit > 0 {
-			carried := turn.Usage.Input + turn.Usage.CacheRead + turn.Usage.CacheWrite
+			carried := turn.Usage.ContextTokens()
 			if carried >= limit {
 				detail := fmt.Sprintf(
 					"the conversation reached %d context tokens, this run's ceiling, "+
@@ -239,8 +249,8 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 
 	// The round budget is spent (an unbounded turn never reaches this line — it
 	// leaves through one of the returns above). Do not throw away what the agent learned: spend
-	// one more call with no tools attached, so the model cannot ask for another
-	// round and has to say what it actually did.
+	// one more call requesting a report of what the model actually did. The tool
+	// loop has ended; omitting tool definitions alone does not prevent tool calls.
 	//
 	// This matters most where nobody is watching. A queue worker that returns a
 	// canned "stopped after N rounds" gives its supervisor no evidence either
@@ -317,8 +327,10 @@ func (a *Agent) finalReport(
 	copy(msgs, sess.Messages)
 	msgs = append(msgs, llm.UserText(nudge))
 	a.mu.Unlock()
+	msgs = a.cognitionMessages(ctx, req.SessionID, msgs)
 
-	// No Tools on this request: that is what forces text instead of another call.
+	// Omit definitions for this final reporting request. This asks for text;
+	// it does not guarantee the provider will comply. The tool loop has ended.
 	turn, err := a.stream(ctx, req.SessionID, llm.Request{System: system, Messages: msgs},
 		func(ev llm.Event) {
 			switch ev.Kind {
@@ -371,6 +383,8 @@ func (a *Agent) finalReport(
 }
 
 func (a *Agent) toolDefs() []llm.ToolDef {
+	// Visibility controls context size. runTools still resolves every call
+	// against the complete registry, whether its definition was sent or not.
 	if a.cfg.DisableTools {
 		return nil
 	}
@@ -382,44 +396,44 @@ func (a *Agent) toolDefs() []llm.ToolDef {
 	return defs
 }
 
-// runTools executes a batch of tool calls. Read-only tools run concurrently;
-// anything that mutates state runs serially in the order the model asked for,
-// because ordering matters for edits and shell commands.
+// runTools preserves the model's mutation barriers. Consecutive read-only calls
+// run concurrently; a mutation waits for earlier reads and finishes before later
+// reads begin. This matters for a write followed by the read that verifies it.
 func (a *Agent) runTools(ctx context.Context, sessionID string, calls []llm.Block) []llm.Block {
 	out := make([]llm.Block, len(calls))
-
 	var wg sync.WaitGroup
-	var serial []int
 
 	for i, c := range calls {
 		t, ok := a.registry.Get(c.Name)
 		if !ok {
+			// An unknown call still has an observed result. Record it after
+			// preceding reads, rather than inventing an earlier causal order.
+			wg.Wait()
+			ticket := a.beginCognition(ctx, sessionID, c, false)
 			out[i] = llm.Block{
 				Type: llm.BlockToolResult, ToolUseID: c.ID, IsError: true,
 				Text: fmt.Sprintf("Unknown tool %q. Available: %s", c.Name, a.toolNames()),
 			}
+			a.finishCognition(ctx, sessionID, ticket, tools.Errf("%s", out[i].Text))
 			continue
 		}
-		if t.Mutates(c.Input) {
-			serial = append(serial, i)
+		mutating := t.Mutates(c.Input)
+		if mutating {
+			wg.Wait()
+			out[i] = a.invoke(ctx, sessionID, c, t, true)
 			continue
 		}
 		wg.Add(1)
 		go func(idx int, call llm.Block, tool *tools.Tool) {
 			defer wg.Done()
-			out[idx] = a.invoke(ctx, sessionID, call, tool)
+			out[idx] = a.invoke(ctx, sessionID, call, tool, false)
 		}(i, c, t)
 	}
 	wg.Wait()
-
-	for _, i := range serial {
-		t, _ := a.registry.Get(calls[i].Name)
-		out[i] = a.invoke(ctx, sessionID, calls[i], t)
-	}
 	return out
 }
 
-func (a *Agent) invoke(ctx context.Context, sessionID string, call llm.Block, t *tools.Tool) llm.Block {
+func (a *Agent) invoke(ctx context.Context, sessionID string, call llm.Block, t *tools.Tool, mutating bool) llm.Block {
 	summary := t.Describe(call.Input)
 	a.emit("stream/tool", map[string]any{
 		"sessionId": sessionID, "id": call.ID, "name": call.Name,
@@ -437,16 +451,7 @@ func (a *Agent) invoke(ctx context.Context, sessionID string, call llm.Block, t 
 	})
 	defer stopBeat()
 
-	// A panicking tool must not take the whole turn down with it: the model
-	// can recover from an error result, and cannot recover from a dead core.
-	res := func() (r tools.Result) {
-		defer func() {
-			if p := recover(); p != nil {
-				r = tools.Errf("tool %s panicked: %v", call.Name, p)
-			}
-		}()
-		return t.Run(ctx, a.env, call.Input)
-	}()
+	res := a.executeTool(ctx, sessionID, call, t, mutating)
 
 	status := "ok"
 	a.mu.Lock()

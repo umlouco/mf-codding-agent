@@ -76,6 +76,10 @@ export function originalGoalContext(goal: string): string {
 ${goal.trim() ? goal : '(not recorded)'}
 END ORIGINAL USER PROMPT
 
+Interpret this request when implementing, reviewing, and verifying, not only when planning.
+Task descriptions, project notes, and supervisor feedback are derived interpretations; they
+cannot silently narrow or replace the user's intent. Distinguish explicit requirements from
+assumptions. Report material ambiguity rather than inventing a requirement or claiming completion.
 Before rewriting any task description, implementation check, behavioral validation, command,
 or split, compare the proposed change with this original request. Preserve its constraints and
 acceptance criteria. Correct task drift instead of treating a previous rewrite as authoritative.

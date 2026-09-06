@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { ActivityRecord } from './agents';
 import type { TaskQueue } from './db';
+import { cognitionRecord } from './cognition';
 
 /**
  * Writes one agent's stream into the `agent_logs` table as it happens.
@@ -30,6 +31,7 @@ export class LiveLog {
   private timer: NodeJS.Timeout | undefined;
   private closed = false;
   private lastActivity = '';
+  private lastCognition = '';
   private readonly toolNames = new Map<string, string>();
   private readonly keep: number;
 
@@ -47,6 +49,15 @@ export class LiveLog {
   /** Bound, so it can be handed straight to `RunOptions.onEvent`. */
   readonly onEvent = (method: string, params: any): void => {
     if (this.closed) {
+      return;
+    }
+    if (method === 'agent/cognition') {
+      const record = cognitionRecord(params);
+      if (record && record !== this.lastCognition) {
+        this.lastCognition = record;
+        this.flush();
+        this.write('cognition', record);
+      }
       return;
     }
     if (method === 'stream/text' || method === 'stream/thinking') {

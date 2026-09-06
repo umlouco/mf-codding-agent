@@ -1,0 +1,4 @@
+{
+  "mfagent.llm.maxContextTokens": 256000,
+  "mfagent.queue.maxContextTokens": 0
+}

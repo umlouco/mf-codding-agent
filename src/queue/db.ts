@@ -197,6 +197,32 @@ export type NewTask = Pick<Task, 'title' | 'description'> &
     >
   >;
 
+type TaskEditFields = Pick<Task,
+  'title' | 'description' | 'implVerifyPrompt' | 'solutionVerifyPrompt' | 'solutionVerifyCommand'>;
+
+/** A planner proposal refers to positions in the snapshot it was given. */
+export interface TaskEditPlan {
+  edits: ({ seq: number } & Partial<TaskEditFields>)[];
+  deletes: number[];
+  adds: NewTask[];
+}
+
+/** Counts come from the committed transaction, never from a model's summary. */
+export interface TaskEditReceipt {
+  edited: number;
+  deleted: number;
+  added: number;
+  remaining: number;
+}
+
+export function taskEditSummary(receipt: TaskEditReceipt): string {
+  if (receipt.edited + receipt.deleted + receipt.added === 0) {
+    return `No tasks changed. ${receipt.remaining} tasks remain.`;
+  }
+  return `Saved queue changes: removed ${receipt.deleted}, updated ${receipt.edited}, ` +
+    `added ${receipt.added}. ${receipt.remaining} tasks remain.`;
+}
+
 export type RunState = 'IDLE' | 'RUNNING' | 'PAUSED' | 'STOPPED';
 
 /** Token counts as the core reports them. */
@@ -1004,6 +1030,110 @@ export class TaskQueue {
       this.db
         .prepare('UPDATE tasks SET seq = seq - 1, updated_at = ? WHERE seq > ?')
         .run(Date.now(), task.seq);
+    });
+  }
+
+  /**
+   * Applies one proposal to the exact task identities the planner inspected.
+   * Validation, writes, ordering and the factual audit commit together. A
+   * concurrent reorder is harmless; replacing or rewriting a target is not.
+   */
+  applyTaskEdits(snapshot: Task[], plan: TaskEditPlan): TaskEditReceipt {
+    const fields: (keyof TaskEditFields)[] = [
+      'title', 'description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand',
+    ];
+    const identityFields: (keyof Task)[] = [
+      'id', 'createdAt', ...fields, 'status', 'attempts', 'maxAttempts', 'kind', 'region',
+    ];
+    if (!Array.isArray(plan.edits) || !Array.isArray(plan.deletes) || !Array.isArray(plan.adds)) {
+      throw new Error('A task edit proposal must contain edits, deletes and adds arrays.');
+    }
+    const bySeq = new Map<number, Task>();
+    const ambiguous = new Set<number>();
+    for (const task of snapshot) {
+      if (bySeq.has(task.seq)) ambiguous.add(task.seq);
+      bySeq.set(task.seq, task);
+    }
+    const resolve = (seq: number): Task => {
+      if (!Number.isSafeInteger(seq) || seq < 1 || ambiguous.has(seq)) {
+        throw new Error(`Task selector #${seq} is invalid or ambiguous in the planner snapshot.`);
+      }
+      const target = bySeq.get(seq);
+      if (!target) throw new Error(`Task #${seq} was not in the planner snapshot.`);
+      return target;
+    };
+    const deletions = [...new Set(plan.deletes)].map(resolve);
+    const deleting = new Set(deletions.map(task => task.id));
+    const editing = new Set<number>();
+    const edits = plan.edits.map(edit => {
+      const target = resolve(edit.seq);
+      if (editing.has(target.id) || deleting.has(target.id)) {
+        throw new Error(`Task #${edit.seq} has duplicate or conflicting edit/delete operations.`);
+      }
+      editing.add(target.id);
+      const patch: Partial<TaskEditFields> = {};
+      for (const field of fields) {
+        if (edit[field] === undefined) continue;
+        if (typeof edit[field] !== 'string') throw new Error(`Task #${edit.seq} has a non-text ${field}.`);
+        patch[field] = edit[field];
+      }
+      return { target, patch };
+    });
+    for (const task of plan.adds) {
+      if (!task || typeof task.title !== 'string' || !task.title.trim()) {
+        throw new Error('Every added task must have a nonempty title.');
+      }
+    }
+
+    return this.tx(() => {
+      const targets = [...deletions, ...edits.map(edit => edit.target)];
+      for (const target of targets) {
+        const current = this.get(target.id);
+        if (!current || identityFields.some(field => current[field] !== target[field])) {
+          throw new Error(`Task #${target.seq} changed or was replaced while the planner was working. No changes were saved.`);
+        }
+        if (current.status === 'VERIFIED' || current.status === 'EXECUTING' || current.status === 'VERIFYING') {
+          throw new Error(`Task #${target.seq} is ${current.status} and cannot be changed by this planner edit. No changes were saved.`);
+        }
+      }
+      const receipt: TaskEditReceipt = { edited: 0, deleted: 0, added: 0, remaining: 0 };
+      for (const { target, patch } of edits) {
+        const changed: Partial<TaskEditFields> = {};
+        for (const field of fields) {
+          if (patch[field] !== undefined && patch[field] !== target[field]) changed[field] = patch[field];
+        }
+        if (Object.keys(changed).length === 0) continue;
+        const { sets, args } = this.buildSet(changed);
+        const info = this.db.prepare(`UPDATE tasks SET ${sets.join(', ')}, updated_at = ? WHERE id = ?`)
+          .run(...args, Date.now(), target.id);
+        if (info.changes !== 1) throw new Error(`Task #${target.seq} could not be updated.`);
+        receipt.edited += info.changes;
+        this.log(target.id, 'user', 'task-edited', JSON.stringify({ source: 'planner-proposal', changes: changed }));
+      }
+      for (const target of deletions) {
+        const info = this.db.prepare('DELETE FROM tasks WHERE id = ?').run(target.id);
+        if (info.changes !== 1) throw new Error(`Task #${target.seq} could not be deleted.`);
+        receipt.deleted += info.changes;
+        // Deleted-task foreign keys cascade. A queue-level receipt retains the
+        // original identity and title after the task itself is gone.
+        this.log(null, 'user', 'task-deleted', JSON.stringify({
+          source: 'planner-proposal', id: target.id, seq: target.seq, title: target.title,
+        }));
+      }
+      if (deletions.length) {
+        const reorder = this.db.prepare('UPDATE tasks SET seq = ?, updated_at = ? WHERE id = ?');
+        const now = Date.now();
+        this.list().forEach((task, index) => reorder.run(index + 1, now, task.id));
+      }
+      let seq = this.maxSeq();
+      for (const task of plan.adds) {
+        const id = this.insert(task, ++seq);
+        receipt.added++;
+        this.log(id, 'user', 'task-added', JSON.stringify({ source: 'planner-proposal', seq, title: task.title }));
+      }
+      receipt.remaining = this.db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n as number;
+      this.log(null, 'user', 'tasks-edited-by-prompt', taskEditSummary(receipt));
+      return receipt;
     });
   }
 

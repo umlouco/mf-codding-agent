@@ -35,8 +35,10 @@ const VALID_CLI_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 function systemSuffixFor(role: Role): string {
   if (role === 'supervisor') {
     return (
-      'You are the Supervisor of an autonomous task queue. You have no tools available: judge ' +
-      'only the text you are given in this prompt, exactly as it instructs.'
+      'You are the Supervisor of an autonomous task queue. Start with the supplied task journal ' +
+      'and evidence; use available tools when needed to resolve uncertainty. Follow the requested ' +
+      'response format. A separate formal verifier supplies the independent verification report ' +
+      'required for your completion decision.'
     );
   }
   if (role === 'executor') {
@@ -109,12 +111,6 @@ export async function runClaudeCliTurn(
   }
   if (resolved.effort && VALID_CLI_EFFORTS.has(resolved.effort)) {
     args.push('--effort', resolved.effort);
-  }
-  if (role === 'supervisor') {
-    // Parity with mfcore's own disableTools:true override for the same role
-    // (see agents.ts's overridesFor) — the supervisor judges what other
-    // agents already wrote to the database, not the live workspace.
-    args.push('--tools', '');
   }
   const maxBudget = vscode.workspace
     .getConfiguration('mfagent')

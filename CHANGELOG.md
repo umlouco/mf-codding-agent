@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix **Edit Tasks** silently applying only the first 40 requested edits, deletions, or additions. Complete revisions now commit in one database transaction, use the task identities shown to the planner, and report the actual saved counts. Invalid, interrupted, or conflicting proposals leave the queue unchanged.
+
 - Add Visual Witness layout checks: text-only executors can call `browser_layout_check` or `playwright_layout_check` to obtain criterion-based findings from the Vision role, backed by a saved screenshot and DOM measurements. Unstable captures, missing anchors, malformed model replies, and unavailable vision return incomplete evidence. Image transport now works through OpenAI-compatible, Anthropic, and VS Code model adapters; queue workers retain Vision provider bindings and account for its tokens.
 - Run browser interactions in order and isolate browser profiles per worker. Logins no longer persist between queue workers; authenticate per task or supply existing Playwright storage state. Playwright uses the installed Node CLI without shell interpolation or implicit package downloads, and cancels descendant processes on Windows/Linux. Explicit workspace extension placement keeps browser execution on the SSH host. See `docs/visual-witness.md`.
 

@@ -357,6 +357,7 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 			continue
 		}
 		if chunk.Usage != nil {
+			turn.Usage.InputIncludesCache = true
 			turn.Usage.Input = chunk.Usage.PromptTokens
 			turn.Usage.Output = chunk.Usage.CompletionTokens
 			// Note the difference from Anthropic, which reports cache reads

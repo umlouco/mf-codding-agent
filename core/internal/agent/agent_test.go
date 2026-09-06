@@ -39,7 +39,8 @@ type fakeProvider struct {
 	// round — a model that keeps calling tools without converging. Half of it is
 	// reported as cache, because a provider that caches the prefix reports most
 	// of a large conversation as anything but Input.
-	contextPerRound int64
+	contextPerRound    int64
+	inputIncludesCache bool
 }
 
 // wait burns `delay`, reporting wire activity if it was asked to, and gives up
@@ -103,6 +104,10 @@ func (f *fakeProvider) Stream(
 	if f.contextPerRound > 0 {
 		carried := int64(f.calls) * f.contextPerRound
 		usage = llm.Usage{Input: carried / 2, CacheRead: carried - carried/2, Output: 1}
+		if f.inputIncludesCache {
+			usage.Input = carried
+			usage.InputIncludesCache = true
+		}
 	}
 
 	return &llm.Turn{
@@ -229,7 +234,7 @@ func TestNestedVisionUsageIsIncluded(t *testing.T) {
 	}
 }
 
-func TestDisableToolsMakesSupervisorConclusionOnly(t *testing.T) {
+func TestDisableToolsOmitsDefinitionsForSupervisor(t *testing.T) {
 	fake := &fakeProvider{finalText: `{"verdict":"VERIFIED"}`}
 	a := newTestAgent(t, fake, 10)
 	a.cfg.DisableTools = true
@@ -446,6 +451,21 @@ func TestUnboundedTurnStopsOnContextPressure(t *testing.T) {
 // Cache reads are context. A provider that caches the prefix reports a small
 // Input for a conversation that is anything but, so counting Input alone would
 // leave exactly the longest runs with no backstop.
+func TestContextPressureDoesNotDoubleCountOpenAICache(t *testing.T) {
+	fake := &fakeProvider{contextPerRound: 400, inputIncludesCache: true, answerAfter: 2, finalText: "verified"}
+	a := newTestAgent(t, fake, -1)
+	a.cfg.MaxContextTokens = 1000
+	res, err := a.Send(context.Background(), SendRequest{SessionID: "cached", Text: "implement and verify"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Round two carries 800 tokens, including 400 cached. Adding the cache
+	// again would stop the worker just before its normal completion.
+	if res.StopReason != "end_turn" || fake.toolless != 0 || res.Text != "verified" {
+		t.Fatalf("premature handoff: %+v", res)
+	}
+}
+
 func TestContextPressureCountsCachedTokens(t *testing.T) {
 	fake := &fakeProvider{contextPerRound: 400, finalText: "done"}
 	a := newTestAgent(t, fake, -1)

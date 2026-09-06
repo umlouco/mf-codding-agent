@@ -47,7 +47,7 @@ export interface CoreConfig {
   embedding: CoreRole;
   memoryEnabled: boolean;
   memoryPath: string;
-  /** When true, the model receives no tool definitions. */
+  /** Omit tool definitions to save context; registered tools remain callable. */
   disableTools: boolean;
   /**
    * Tool-calling rounds per turn. 0 leaves the core on its own default, and a

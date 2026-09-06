@@ -73,8 +73,9 @@ type Config struct {
 	MemoryEnabled bool   `json:"memoryEnabled"`
 	MemoryPath    string `json:"memoryPath"`
 
-	// DisableTools creates a conclusion-only turn. Queue supervisors use it so
-	// verification commands, browser runs, and code inspection stay executor work.
+	// DisableTools omits tool definitions from model requests to save context.
+	// The name is retained for wire compatibility; registered tools remain
+	// callable when the model requests them, including in supervisor turns.
 	DisableTools bool `json:"disableTools"`
 
 	// Tool-calling rounds allowed in one turn. Zero means the built-in default,

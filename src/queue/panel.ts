@@ -7,7 +7,7 @@ import { getStore } from '../providers/instance';
 import type { Skill } from '../providers/store';
 import { discoverInstalledSkills } from '../skills';
 import { editTasks, planGoal } from './agents';
-import { Task, TaskQueue } from './db';
+import { Task, TaskQueue, taskEditSummary } from './db';
 import { LiveLog } from './liveLog';
 import { Orchestrator } from './orchestrator';
 import { notifySkillsChanged, onDidChangeSkills } from './registry';
@@ -394,11 +394,9 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   /**
    * Edits, adds to, or removes from the existing task list from a free-text
    * instruction — as opposed to `generate`, which only ever produces a brand
-   * new list. Applies the result through the exact same primitives
-   * (`update`/`remove`/`addAll`, matched by `seq`, skipping VERIFIED tasks)
-   * `orchestrator.ts`'s `applyTaskEdits` already uses for the supervisor's
-   * own rewrites, so a prompt-driven edit shows up in task history the same
-   * way a supervisor rewrite does.
+   * new list. The planner proposes changes against a captured task snapshot;
+   * the database resolves those references to stable IDs and commits the whole
+   * revision together. Only the committed receipt is reported as completed work.
    */
   private async applyTaskEditPrompt(instruction: string): Promise<void> {
     const queue = this.queue;
@@ -421,46 +419,16 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     const live = new LiveLog(queue, null, 'planner');
     live.note('plan', `editing the task list: ${instruction.trim()}`);
     try {
+      const snapshot = queue.list();
       const result = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'Editing the task list…' },
-        () => editTasks(this.context, this.output, queue.list(), instruction, { onEvent: live.onEvent }),
+        () => editTasks(this.context, this.output, snapshot, instruction, { onEvent: live.onEvent }),
       );
 
-      const bySeq = new Map(queue.list().map((t) => [t.seq, t]));
-      let changed = 0;
-      for (const edit of result.edits) {
-        const target = bySeq.get(edit.seq);
-        if (!target || target.status === 'VERIFIED') {
-          continue;
-        }
-        queue.update(target.id, {
-          title: edit.title ?? target.title,
-          description: edit.description ?? target.description,
-          implVerifyPrompt: edit.implVerifyPrompt ?? target.implVerifyPrompt,
-          solutionVerifyPrompt: edit.solutionVerifyPrompt ?? target.solutionVerifyPrompt,
-          solutionVerifyCommand: edit.solutionVerifyCommand ?? target.solutionVerifyCommand,
-        });
-        queue.log(target.id, 'user', 'task-edited', 'edited by prompt');
-        changed++;
-      }
-      for (const seq of result.deletes) {
-        const target = bySeq.get(seq);
-        if (!target || target.status === 'VERIFIED') {
-          continue;
-        }
-        queue.remove(target.id);
-        changed++;
-      }
-      if (result.adds.length) {
-        queue.addAll(result.adds);
-        changed += result.adds.length;
-      }
-      queue.log(null, 'user', 'tasks-edited-by-prompt', result.summary);
-
-      live.note('plan', result.summary);
-      void vscode.window.showInformationMessage(
-        changed ? result.summary : 'Nothing changed — the plan may already match your instruction.',
-      );
+      const receipt = queue.applyTaskEdits(snapshot, result);
+      const summary = taskEditSummary(receipt);
+      live.note('plan', summary);
+      void vscode.window.showInformationMessage(summary);
     } catch (e: any) {
       live.note('error', `edit failed: ${e?.message ?? e}`);
       void vscode.window.showErrorMessage(`Could not edit tasks: ${e?.message ?? e}`);

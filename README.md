@@ -11,16 +11,28 @@ testing**. Plus MCP, so you can plug in anything else, and an autonomous task
 queue — planner, executors, verifiers and a supervisor loop — brokered through a
 SQLite database you can watch live.
 
-The extension host stays a thin shim: spawn the core, pump JSON-RPC, render the
-webviews, and adapt the editor's APIs for a process that cannot call them.
-Everything real happens in a single compiled Go binary.
+The TypeScript extension host integrates with VS Code and owns the durable task
+queue and worker orchestration. A compiled Go core runs individual agent turns,
+tools, graph memory, MCP clients, and browser work.
+
+The architectural direction is to keep identity, behavioral rules, and automatic
+recovery in the program, with LLMs supplying knowledge and reasoning. See
+[Runtime identity and model reasoning](docs/runtime-identity.md) for the principles,
+their mapping to TypeScript, Go, and Python, and the current enforcement gaps.
+
+The [cognitive runtime](docs/cognitive-runtime.md) now records tool intentions and
+outcomes in `.mfagent/cognition.db`, carries operational memory across replacement
+workers, and selects unresolved evidence for each model request. It tracks
+possible changes, interrupted operations, repeated observations, and exact-action
+recoveries in deterministic code. Damaged working snapshots can be reconstructed
+from the verified journal; an independent Python auditor checks its consistency.
 
 ---
 
 ## Why it's built this way
 
-VS Code only loads JavaScript in its extension host, so a shim is unavoidable. The
-shim is kept as small as it can be: spawn the core, pump JSON-RPC, render a webview.
+VS Code loads JavaScript in its extension host, which handles editor integration,
+webviews, and queue orchestration. The host and core communicate over JSON-RPC.
 The agent loop, tools, memory, MCP clients and browser driver all live in Go and ship
 as one static binary with no runtime dependencies — the same pattern `gopls` and
 `rust-analyzer` use.
@@ -450,16 +462,18 @@ it goes.
 
 ### Executor-owned validation
 
-The executor owns the expensive verification work. In the same turn that edits
-the code it inspects the final diff, runs configured commands and test suites,
-and drives the browser for UI work. It finishes with a structured PASS, FAIL, or
-INCOMPLETE report containing the observed evidence for every check.
+The executor checks its changes during implementation. A fresh independent
+verification worker then inspects the final diff, runs the required commands and
+test suites, and drives the browser for UI work. It finishes with a structured
+PASS, FAIL, or INCOMPLETE report containing the observed evidence for every check.
 
 That report is written to `validation_report` in `.mfagent/queue.db` before the
-task enters `VERIFYING`. The supervisor receives no tools at all: it reads this
-database report, checks that the conclusion is consistent and adequately
-supported, and either validates the task or sends it back with revised
-instructions. It never reads code, executes a command, or reruns browser tests.
+supervisor's completion decision. The supervisor starts with this report, checks
+that the conclusion is consistent and adequately supported, and either validates
+the task or sends it back with revised instructions. Its Go model requests omit
+tool definitions to save context; configured tools remain callable if it needs
+additional observations. CLI supervisors also retain their available tools.
+Supervisor tool use does not replace the independent verification report.
 
 ### What is worked out for you
 

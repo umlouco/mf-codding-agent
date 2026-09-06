@@ -62,6 +62,9 @@ func TestStreamAsksForUsageAndRecordsIt(t *testing.T) {
 	if turn.Usage.CacheRead != 900 {
 		t.Errorf("cache read = %d, want 900", turn.Usage.CacheRead)
 	}
+	if turn.Usage.ContextTokens() != 1200 {
+		t.Fatalf("context = %d, want 1200 (cache is already included)", turn.Usage.ContextTokens())
+	}
 	if turn.Text() != "hi" {
 		t.Errorf("text = %q, want %q", turn.Text(), "hi")
 	}

@@ -16,9 +16,10 @@ import {
 } from './agents';
 import { NewTask, QueueStats, Task, TaskQueue } from './db';
 import { LiveLog } from './liveLog';
-import { JOURNAL_EVENTS, ProgressDecision, reviewProgress, VALIDATION_FAILED } from './monitor';
+import { JOURNAL_EVENTS, ProgressDecision, reviewProgress, shellWaitViolation, VALIDATION_FAILED } from './monitor';
 import { completionForSupervisor } from './validation';
 import { runVerification } from './verification';
+import { cognitionRecord } from './cognition';
 
 /**
  * The cron engine.
@@ -67,6 +68,8 @@ interface Review {
   gen: number;
   /** Last time this review's core said anything — its liveness, as above. */
   lastActivityAt: number;
+  /** Set only by a validator when its shell tool exceeds the tool's own bound. */
+  validationToolViolation?: string;
   /** Kills the core process, which rejects the request wedged on it. */
   abort?: () => void;
 }
@@ -466,6 +469,20 @@ export class Orchestrator implements vscode.Disposable {
     if (!this.supervising || !r) {
       return;
     }
+    if (r.validationToolViolation) {
+      const note = r.validationToolViolation;
+      this.queue.log(r.taskId, 'validator', VALIDATION_FAILED, note);
+      const current = this.queue.get(r.taskId);
+      if (current?.status === 'VERIFYING') {
+        this.queue.update(r.taskId, {
+          errorLog: appendAttempt(current.errorLog, `[attempt ${current.attempts}] independent validation did not complete: ${note}`),
+        });
+      }
+      this.log(`task ${r.seq} — recovering validator: ${note}`);
+      this.abandonReview();
+      this.changed();
+      return;
+    }
     const quiet = Date.now() - r.lastActivityAt;
     if (quiet < this.silentMs) {
       return;
@@ -632,7 +649,7 @@ export class Orchestrator implements vscode.Disposable {
           onAbort: (abort) => {
             review.abort = abort;
           },
-          onEvent: live.onEvent,
+          onEvent: this.observerEvents(task.id, 'supervisor', live),
           onActivity: (activity) => {
             review.lastActivityAt = activity.at;
             live.activity(activity);
@@ -785,13 +802,27 @@ export class Orchestrator implements vscode.Disposable {
     return true;
   }
 
+  /** Runtime observations are durable evidence of execution, never liveness heartbeats. */
+  private observerEvents(taskId: number, actor: string, live: LiveLog) {
+    let lastCognition = '';
+    return (method: string, params: any): void => {
+      live.onEvent(method, params);
+      if (method === 'agent/cognition') {
+        const record = cognitionRecord(params);
+        if (record && record !== lastCognition) {
+          this.queue.log(taskId, actor, 'cognition', record);
+          lastCognition = record;
+        }
+      }
+    };
+  }
+
   /**
    * Journals one agent's stream into the task as it happens.
    *
    * Both the worker and the validator write through this, and it exists because
-   * that journal is now the only thing `reviewProgress` gets to look at — the
-   * supervisor has no tools and cannot read the workspace, so an agent whose
-   * reasoning never lands here is an agent the supervisor is judging blind. Tool
+   * that journal is the supervisor's starting evidence. Reasoning recorded here
+   * lets a routine review assess direction without reconstructing every step. Tool
    * calls alone do not carry a wrong premise or a rabbit hole; the model saying
    * what it thinks it is doing does.
    *
@@ -805,6 +836,7 @@ export class Orchestrator implements vscode.Disposable {
     const pendingTools = new Map<string, { name: string; input: unknown }>();
     let kind = '';
     let buffer = '';
+    let lastCognition = '';
     // The same stream at token granularity, for the view — see liveLog.ts.
     const live = new LiveLog(this.queue, taskId, actor);
 
@@ -820,6 +852,15 @@ export class Orchestrator implements vscode.Disposable {
 
     const onEvent = (method: string, params: any): void => {
       live.onEvent(method, params);
+      if (method === 'agent/cognition') {
+        flush();
+        const record = cognitionRecord(params);
+        if (record && record !== lastCognition) {
+          this.queue.log(taskId, actor, 'cognition', record);
+          lastCognition = record;
+        }
+        return;
+      }
       if (method === 'stream/text' || method === 'stream/thinking') {
         const next = method === 'stream/thinking' ? 'reasoning' : 'response';
         if (kind && kind !== next) {
@@ -869,20 +910,26 @@ export class Orchestrator implements vscode.Disposable {
         this.context,
         this.output,
         task,
+        this.queue.getMeta('goal'),
         (activity) => {
+          if (review.gen !== this.reviewGen) return;
           review.lastActivityAt = activity.at;
+          review.validationToolViolation = shellWaitViolation(activity.phase, activity.detail) || undefined;
           journal.live.activity(activity);
           if (this.queue.recordActivity(task.id, activity.phase, activity.detail, 'validator')) {
             this.changed();
           }
         },
-        journal.onEvent,
+        (method, params) => {
+          if (review.gen === this.reviewGen) journal.onEvent(method, params);
+        },
         (abort) => {
+          if (review.gen !== this.reviewGen) { abort(); return; }
           review.abort = abort;
         },
       );
       journal.flush();
-      if (this.queue.get(task.id)?.status !== 'VERIFYING') {
+      if (review.gen !== this.reviewGen || this.queue.get(task.id)?.status !== 'VERIFYING') {
         this.log(`task ${task.seq} moved while validation ran; validator response ignored`);
         return;
       }
@@ -897,6 +944,7 @@ export class Orchestrator implements vscode.Disposable {
       this.log(`task ${task.seq} — independent verification response stored`);
     } catch (error: any) {
       journal.flush();
+      if (review.gen !== this.reviewGen) return;
       const message = String(error?.message ?? error);
       // Recorded twice on purpose, because two different readers need it. The
       // journal entry is what `failedValidations` counts, so the next progress
@@ -953,7 +1001,7 @@ export class Orchestrator implements vscode.Disposable {
           onAbort: (abort) => {
             review.abort = abort;
           },
-          onEvent: live.onEvent,
+          onEvent: this.observerEvents(task.id, 'supervisor', live),
           onActivity: (a) => {
             review.lastActivityAt = a.at;
             live.activity(a);
@@ -1189,6 +1237,7 @@ export class Orchestrator implements vscode.Disposable {
         this.output,
         task,
         this.queue.instructions,
+        this.queue.getMeta('goal'),
         (a) => {
           journal.live.activity(a);
           if (this.queue.recordActivity(task.id, a.phase, a.detail)) {
@@ -1260,8 +1309,8 @@ export class Orchestrator implements vscode.Disposable {
       // A worker that died mid-turn — a dropped connection, a crashed core, or
       // abandonExecution killing it on purpose — still edited real files. Send
       // it to the supervisor with an empty validation report. The supervisor
-      // cannot inspect the workspace, so it will reject the missing evidence
-      // and use the journal/error history to shape the next attempt.
+      // uses the journal and any needed tools to decide recovery; completion
+      // still requires an independent verification report.
       const applied = this.queue.finishExecution(task.id, attempt, {
         status: 'VERIFYING',
         output: '',
@@ -1318,7 +1367,7 @@ export class Orchestrator implements vscode.Disposable {
             this.changed();
           }
         },
-        live.onEvent,
+        this.observerEvents(task.id, 'planner', live),
         (abort) => {
           this.executionAbort = abort;
         },

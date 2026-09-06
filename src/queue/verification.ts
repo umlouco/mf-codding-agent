@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import type { Task, Usage } from './db';
 import { ActivityRecord, coreHalted, runOnce, RunOptions, workerRounds } from './agents';
 import { parseExecutorValidation, serializeValidation } from './validation';
-import { browserEvidence, verificationExample, reportContract } from './prompts';
+import { browserEvidence, verificationExample, reportContract, originalGoalContext } from './prompts';
+import { taskCognition } from './cognition';
 
 export interface VerificationOutcome {
   text: string;
@@ -16,6 +17,7 @@ export async function runVerification(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   task: Task,
+  goal: string,
   onActivity?: (activity: ActivityRecord) => void,
   onEvent?: (method: string, params: any) => void,
   onAbort?: (abort: () => void) => void,
@@ -25,6 +27,14 @@ do not trust the implementation agent's claims. Read the current workspace, insp
 changes, and run the required checks. Do not edit production files, test fixtures, tests, or expected
 results. If a harness needs correction, report the exact problem for the executor to fix.
 Use existing checks and browser tools; normal generated test output is allowed.
+
+${originalGoalContext(goal)}
+
+Independently interpret the original requirements relevant to this task. Compare them with the
+implementation AND the supplied checks: a narrowed task or passing script cannot override the
+client's requested behavior. Report FAIL for an observed violation, or INCOMPLETE for material
+ambiguity or missing evidence, and explain the mismatch and required follow-up in remaining.
+Do not claim that this task's PASS establishes delivery of the entire original request.
 
 TASK ${task.seq}: ${task.title}
 ${task.description}
@@ -58,6 +68,8 @@ Replace this example's values with observations; leave remaining empty only when
 ${verificationExample}`;
 
   const result = await runOnce(context, output, 'executor', prompt, {
+    cognition: taskCognition(task, goal, 'verifier'),
+    memoryQuery: `${task.title || ''}\n${task.description}`,
     maxIterations: workerRounds(),
     onActivity,
     onEvent,

@@ -2,7 +2,7 @@
   "name": "mf-agent",
   "displayName": "MF Agent",
   "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
-  "version": "0.1.19",
+  "version": "0.1.21",
   "publisher": "mflores",
   "license": "MIT",
   "pricing": "Free",
@@ -313,9 +313,9 @@
         },
         "mfagent.queue.maxContextTokens": {
           "type": "number",
-          "default": 32768,
-          "minimum": 4096,
-          "description": "Context ceiling for queue workers, additionally capped by llm.maxContextTokens. A conservative default for local models; set at or below your inference server context size."
+          "default": 0,
+          "minimum": 0,
+          "description": "Optional smaller context ceiling for queue workers. Set to 0 (default) to inherit llm.maxContextTokens. Values of at least 4096 impose an additional cap; smaller values inherit. Match the global setting to the model/server context budget."
         },
         "mfagent.queue.maxRounds": {
           "type": "number",

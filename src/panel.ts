@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { randomUUID } from 'crypto';
 import { CoreClient, InitResult } from './core';
 import { planGoal } from './queue/agents';
 import { TaskQueue } from './queue/db';
@@ -30,7 +31,7 @@ export class ChatPanel {
   private static plan: { queue: TaskQueue; changed: () => void } | undefined;
 
   private panel: vscode.WebviewPanel;
-  private sessionId = 's1';
+  private sessionId: string;
   private busy = false;
   private init?: InitResult;
   /**
@@ -53,6 +54,8 @@ export class ChatPanel {
     private readonly output: vscode.OutputChannel,
   ) {
     this.panel = panel;
+    const savedSession = context.workspaceState.get<string>('mfagent.chatSessionId');
+    this.sessionId = savedSession || `chat:${randomUUID()}`;
     const notifySub = core.onNotification((method, params) => this.onCoreNotification(method, params));
 
     panel.webview.options = {
@@ -162,7 +165,9 @@ export class ChatPanel {
 
   async newSession(): Promise<void> {
     await this.core.request('chat/reset', { sessionId: this.sessionId });
-    this.sessionId = 's' + Date.now();
+    const sessionId = `chat:${randomUUID()}`;
+    await this.context.workspaceState.update('mfagent.chatSessionId', sessionId);
+    this.sessionId = sessionId;
     this.post({ type: 'clear' });
     this.postStatus();
     this.reveal();
@@ -218,8 +223,11 @@ export class ChatPanel {
     }
 
     try {
+      // Persist before starting work so a reloaded panel keeps this conversation's memory.
+      await this.context.workspaceState.update('mfagent.chatSessionId', this.sessionId);
       await this.core.request('chat/send', {
         sessionId: this.sessionId,
+        cognition: { workId: this.sessionId, observer: 'executor' },
         text,
         openFiles,
         selection,

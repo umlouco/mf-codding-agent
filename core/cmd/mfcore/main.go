@@ -20,6 +20,7 @@ import (
 
 	"github.com/mflores/mfagent/core/internal/agent"
 	"github.com/mflores/mfagent/core/internal/browser"
+	"github.com/mflores/mfagent/core/internal/cognition"
 	"github.com/mflores/mfagent/core/internal/config"
 	"github.com/mflores/mfagent/core/internal/llm"
 	"github.com/mflores/mfagent/core/internal/mcp"
@@ -31,14 +32,15 @@ import (
 var version = "0.1.0"
 
 type server struct {
-	conn     *rpc.Conn
-	cfg      *config.Config
-	registry *tools.Registry
-	env      *tools.Env
-	mem      *memory.Store
-	mcpMgr   *mcp.Manager
-	brw      *browser.Browser
-	ag       *agent.Agent
+	conn      *rpc.Conn
+	cfg       *config.Config
+	registry  *tools.Registry
+	env       *tools.Env
+	mem       *memory.Store
+	cognition *cognition.Store
+	mcpMgr    *mcp.Manager
+	brw       *browser.Browser
+	ag        *agent.Agent
 
 	sessionMu sync.Mutex
 	curSess   string
@@ -99,6 +101,9 @@ func (s *server) shutdown() {
 	if s.mem != nil {
 		_ = s.mem.Close()
 	}
+	if s.cognition != nil {
+		_ = s.cognition.Close()
+	}
 	tools.KillAllBgProcs()
 }
 
@@ -138,6 +143,7 @@ type initResult struct {
 	Model     string   `json:"model"`
 	Tools     []string `json:"tools"`
 	Memory    bool     `json:"memory"`
+	Cognition bool     `json:"cognition"`
 	MemPath   string   `json:"memoryPath,omitempty"`
 	Vision    string   `json:"visionModel,omitempty"`
 	Embedding string   `json:"embeddingModel,omitempty"`
@@ -161,6 +167,18 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	s.cfg = &cfg
 
 	var warnings []string
+	// Operational experience is always local and deterministic. It remains
+	// available when optional graph retrieval and embeddings are disabled.
+	if s.cognition != nil {
+		_ = s.cognition.Close()
+		s.cognition = nil
+	}
+	journal, err := cognition.Open(filepath.Join(cfg.WorkspaceRoot, ".mfagent", "cognition.db"))
+	if err != nil {
+		warnings = append(warnings, "runtime memory unavailable: "+err.Error())
+	} else {
+		s.cognition = journal
+	}
 
 	s.env = &tools.Env{
 		Root: cfg.WorkspaceRoot,
@@ -303,6 +321,9 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 
 	s.ag = agent.New(&cfg, provider, s.registry, s.env,
 		func(method string, payload any) { _ = s.conn.Notify(method, payload) }, system)
+	if s.cognition != nil {
+		s.ag.SetCognition(s.cognition)
+	}
 
 	var toolNames []string
 	for _, t := range s.registry.List() {
@@ -312,7 +333,8 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	res := &initResult{
 		Version: version, Provider: provType, Model: provModel,
 		Tools: toolNames, Memory: s.mem != nil, MCP: mcpNames, Warnings: warnings,
-		Vision: visModel, EditorTools: editorTools,
+		Cognition: s.cognition != nil,
+		Vision:    visModel, EditorTools: editorTools,
 	}
 	if s.mem != nil {
 		res.MemPath = s.mem.Path()
@@ -606,7 +628,7 @@ func (s *server) onToolsInvoke(ctx context.Context, params json.RawMessage) (any
 	if len(a.Input) == 0 {
 		a.Input = json.RawMessage(`{}`)
 	}
-	res := t.Run(ctx, s.env, a.Input)
+	res := s.ag.InvokeDirectTool(ctx, llm.Block{Name: a.Name, Input: a.Input}, t)
 	return map[string]any{"output": res.Output, "isError": res.IsError, "meta": res.Meta}, nil
 }
 
