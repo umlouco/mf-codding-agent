@@ -1,0 +1,123 @@
+import type { NewTask, Task } from './db';
+
+export type ScopeRole = 'executor' | 'validator';
+export interface ScopeAssessment {
+  action: 'KEEP' | 'SPLIT';
+  reason: string;
+  execution: { shape: 'focused' | 'cohesive' | 'broad' | 'unknown'; reason: string };
+  verification: { shape: 'focused' | 'cohesive' | 'broad' | 'unknown'; reason: string };
+  requirements: { key: string; criterion: string }[];
+  parts: ScopePart[];
+}
+export interface ScopePart extends NewTask {
+  key: string;
+  dependsOn: string[];
+  integration: boolean;
+  handoff: string;
+  covers: string[];
+}
+
+function required(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`Scope decision requires ${label}.`);
+  return value.trim();
+}
+
+/** Reject incomplete plans as a whole: never silently truncate or drop a branch. */
+export function parseScopeAssessment(raw: any, task: Task): ScopeAssessment {
+  if (!raw || !['KEEP', 'SPLIT'].includes(raw.action)) throw new Error('Scope action must be KEEP or SPLIT.');
+  const reason = required(raw.reason, 'reason');
+  const dimensions = ['execution', 'verification'] as const;
+  for (const dimension of dimensions) {
+    if (!['focused', 'cohesive', 'broad', 'unknown'].includes(raw[dimension]?.shape)) {
+      throw new Error(`Scope decision requires the ${dimension} shape.`);
+    }
+    required(raw[dimension].reason, `${dimension} evidence and coupling rationale`);
+  }
+  if (raw.action === 'KEEP') {
+    if (dimensions.some(d => raw[d].shape === 'broad')) {
+      throw new Error('An independently divisible broad scope requires SPLIT, not KEEP.');
+    }
+    return { action: 'KEEP', reason, execution: raw.execution, verification: raw.verification, requirements: [], parts: [] };
+  }
+  if (!dimensions.some(d => raw[d].shape === 'broad')) throw new Error('SPLIT requires evidence of broad scope.');
+  if (!Array.isArray(raw.requirements) || !raw.requirements.length) throw new Error('SPLIT needs the original requirements inventory.');
+  const requirements = new Set<string>();
+  for (const entry of raw.requirements) {
+    const key = required(entry?.key, 'requirement key');
+    required(entry?.criterion, 'original acceptance criterion');
+    if (requirements.has(key)) throw new Error(`Duplicate requirement ${key}.`);
+    requirements.add(key);
+  }
+  if (!Array.isArray(raw.parts) || raw.parts.length < 2) throw new Error('SPLIT requires at least two complete tasks.');
+  const parts: ScopePart[] = raw.parts.map((p: any) => {
+    const key = required(p?.key, 'part key');
+    if (!Array.isArray(p.dependsOn) || !p.dependsOn.every((d: unknown) => typeof d === 'string')) {
+      throw new Error(`Part ${key} requires dependency keys.`);
+    }
+    if (!Array.isArray(p.covers) || !p.covers.length || p.covers.some((c: unknown) => !requirements.has(c as string))) {
+      throw new Error(`Part ${key} must cover known original requirements.`);
+    }
+    if (typeof p.solutionVerifyCommand !== 'string' || typeof p.integration !== 'boolean') {
+      throw new Error(`Part ${key} requires a command (possibly empty) and integration boolean.`);
+    }
+    return {
+      key, dependsOn: [...new Set<string>(p.dependsOn)], covers: p.covers,
+      integration: p.integration, handoff: required(p.handoff, `${key} progress handoff`),
+      title: required(p.title, `${key} title`), description: required(p.description, `${key} description`),
+      implVerifyPrompt: required(p.implVerifyPrompt, `${key} implementation checks`),
+      solutionVerifyPrompt: required(p.solutionVerifyPrompt, `${key} behavior checks`),
+      solutionVerifyCommand: p.solutionVerifyCommand.trim(),
+    };
+  });
+  const keys = new Set(parts.map(p => p.key));
+  if (keys.size !== parts.length) throw new Error('Duplicate split task keys.');
+  for (const part of parts) for (const dep of part.dependsOn) {
+    if (!keys.has(dep) || dep === part.key) throw new Error(`Invalid dependency ${dep} on ${part.key}.`);
+  }
+  for (const key of requirements) if (!parts.some(p => p.covers.includes(key))) {
+    throw new Error(`Split drops original requirement ${key}.`);
+  }
+  const integrations = parts.filter(p => p.integration);
+  if (integrations.length !== 1) throw new Error('SPLIT requires exactly one final integration/check task.');
+  const integration = integrations[0];
+  // The final gate follows every slice, including independent branches.
+  integration.dependsOn = parts.filter(p => p !== integration).map(p => p.key);
+  if (task.solutionVerifyCommand.trim() !== integration.solutionVerifyCommand) {
+    throw new Error('The final integration task must preserve the original required command intact.');
+  }
+  const ordered: ScopePart[] = [];
+  const done = new Set<string>();
+  while (ordered.length < parts.length) {
+    const next = parts.find(p => !done.has(p.key) && p.dependsOn.every(d => done.has(d)));
+    if (!next) throw new Error('Split dependency graph contains a cycle.');
+    ordered.push(next); done.add(next.key);
+  }
+  return { action: 'SPLIT', reason, execution: raw.execution, verification: raw.verification,
+    requirements: raw.requirements.map((r: any) => ({ key: r.key.trim(), criterion: r.criterion.trim() })), parts: ordered };
+}
+
+/** In-flight work may have advanced during review. Reconcile, never revert or blindly redo it. */
+export function replacementTasks(assessment: ScopeAssessment, task: Task, archiveKey: string): NewTask[] {
+  return assessment.parts.map(part => ({
+    title: part.title,
+    description: `${part.description}\n\nAssigned acceptance criteria:\n` +
+      assessment.requirements.filter(r => part.covers.includes(r.key)).map(r => `- ${r.criterion}`).join('\n') +
+      `\n\nProgress-preserving handoff from task ${task.id}:\n${part.handoff}\n` +
+      `Original contract, reports and journal are archived in queue metadata ${archiveKey}. ` +
+      'Inspect the current workspace/diff before acting: work may have advanced since this plan. ' +
+      'Retain completed changes and existing tests; implement only this slice\'s remaining work. ' +
+      'Do not revert unrelated or partially finished work. A split is not proof of completion.\n' +
+      `Prerequisite slices: ${part.dependsOn.join(', ') || '(none)'}.`,
+    implVerifyPrompt: part.implVerifyPrompt, solutionVerifyPrompt: part.solutionVerifyPrompt,
+    solutionVerifyCommand: part.solutionVerifyCommand, maxAttempts: task.maxAttempts,
+    kind: 'task', region: JSON.stringify({ scopeSplit: { archiveKey, key: part.key } }),
+  }));
+}
+
+/** Split work forms an ordered verification barrier even in continuous mode. */
+export function scopeBlocked(task: Task, tasks: Task[]): boolean {
+  return tasks.some(previous => {
+    if (previous.seq >= task.seq || previous.status === 'VERIFIED' || previous.kind !== 'task') return false;
+    try { return !!JSON.parse(previous.region || '{}').scopeSplit; } catch { return false; }
+  });
+}

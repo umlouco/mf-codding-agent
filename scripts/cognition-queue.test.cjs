@@ -16,7 +16,7 @@ function load(file, dependencies = {}, extra = '') {
   const exports = {};
   vm.runInNewContext(outputText, {
     exports, Buffer, setTimeout, clearTimeout,
-    require: name => dependencies[name] ?? (name === 'crypto' ? crypto : {}),
+    require: name => dependencies[name] ?? (/^\.\/(orchestrator|scope)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : name === 'crypto' ? crypto : {}),
   }, { filename: file });
   return exports;
 }

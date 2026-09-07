@@ -16,7 +16,7 @@ function load(file, dependencies = {}, extra = '') {
   vm.runInNewContext(outputText, {
     exports,
     Buffer,
-    require: (name) => dependencies[name] ?? (name === './cognition' ? cognition : {}),
+    require: (name) => dependencies[name] ?? (/^\.\/(orchestrator|scope)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : name === './cognition' ? cognition : {}),
   }, { filename: file });
   return exports;
 }
@@ -384,10 +384,12 @@ test('validator watchdog releases busy supervision and fences late reports and c
     const review = { taskId: 1, seq: 1, gen: 7, lastActivityAt: Date.now() };
     Object.assign(runner, { review, reviewGen: 7, cycle: 3, supervising: true,
       context: {}, output: {}, log: () => {}, changed: () => {},
-      queue: { getMeta: () => 'Client request', get: () => current, log: (...args) => logs.push(args),
+      scopeWatch: () => ({ preflight: async () => true, observe() {}, close() {} }),
+      queue: { list: () => [current], getMeta: () => 'Client request', get: () => current, log: (...args) => logs.push(args),
         update: (_, patch) => { patches.push(patch); Object.assign(current, patch); }, recordActivity: () => true, addUsage: () => {} },
-      streamJournal: () => ({ flush: () => {}, onEvent: (...args) => streamed.push(args), live: { activity: () => {} } }) });
+      streamJournal: () => ({ flush: () => {}, onEvent: (...args) => streamed.push(args), live: { activity: () => {}, close() {} } }) });
     const pending = runner.verifyWithExecutor(current, review);
+    await new Promise(resolve => setTimeout(resolve, 0));
     activity({ phase: 'tool', detail: 'run_shell still running after 1h51m0s', at: Date.now() });
     runner.sweepSilentReview();
     assert.equal(aborted, 1); assert.equal(runner.supervising, false); assert.equal(runner.review, null);
