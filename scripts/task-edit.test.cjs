@@ -21,7 +21,7 @@ test('task editor returns all 251 deletions and the single replacement task', as
     adds: [{ title: 'Build the SCORM editor', description: 'Develop the editor requested by the user.' }],
   };
   agents.setTestRunner(async (_, __, role, prompt) => {
-    assert.equal(role, 'planner');
+    assert.equal(role, 'supervisor');
     requestedPrompt = prompt;
     return { text: JSON.stringify(proposal), usage, stopReason: 'end_turn' };
   });

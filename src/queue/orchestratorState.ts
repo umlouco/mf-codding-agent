@@ -200,6 +200,8 @@ export abstract class OrchestratorState {
   protected abstract sweepSilentWorkers(): void;
   protected abstract get reviewIntervalMs(): number;
   protected abstract shouldReview(task: Task, latestEventId: number): boolean;
+  protected abstract correctTestingTarget(task: Task): boolean;
+  protected abstract repairTests(task: Task, reason: string): Promise<void>;
   protected abstract reviewWork(task: Task): Promise<void>;
   protected abstract pauseForRecovery(task: Task, reason: string): void;
   protected abstract serviceRecovery(task: Task): Promise<boolean>;

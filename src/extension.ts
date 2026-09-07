@@ -318,7 +318,7 @@ function registerTaskQueue(context: vscode.ExtensionContext): void {
     context.subscriptions.push(vscode.commands.registerCommand(id, fn));
 
   /** Commands must exist even with no queue behind them, or they error as unknown. */
-  const withQueue = (fn: (o: Orchestrator) => unknown) => async () => {
+  const withQueue = <A extends unknown[]>(fn: (o: Orchestrator, ...args: A) => unknown) => async (...args: A) => {
     if (!orch) {
       const pick = await vscode.window.showWarningMessage(
         `MF Agent task queue is unavailable: ${queueProblem ?? 'not open'}`,
@@ -329,7 +329,7 @@ function registerTaskQueue(context: vscode.ExtensionContext): void {
       }
       return;
     }
-    return fn(orch);
+    return fn(orch, ...args);
   };
 
   // `mfagent.queue.focus` is not registered here: VS Code creates a
@@ -339,6 +339,14 @@ function registerTaskQueue(context: vscode.ExtensionContext): void {
     if (!value) return vscode.commands.executeCommand('mfagent.queue.focus');
     if (!queueView) throw new Error('Task queue view is unavailable.');
     return queueView.configureTestingEnvironment(value);
+  });
+  reg('mfagent.queue.splitTask', (value?: { id: number; parts: import('./queue/db').NewTask[] }) => {
+    if (!orch || !value) throw new Error('Task queue and a task id with smaller parts are required.');
+    return orch.splitTask(value.id, value.parts);
+  });
+  reg('mfagent.queue.repairTests', (value?: {id:number;reason:string}) => {
+    if(!orch || !value?.reason?.trim()) throw new Error('A task and test repair description are required.');
+    orch.requestTestRepair(value.id,value.reason);
   });
   reg('mfagent.queue.start', withQueue((o) => o.start()));
   reg('mfagent.queue.pause', withQueue((o) => o.pause()));
@@ -361,8 +369,8 @@ function registerTaskQueue(context: vscode.ExtensionContext): void {
 
   reg(
     'mfagent.queue.generate',
-    withQueue(async () => {
-      const goal = await vscode.window.showInputBox({
+    withQueue(async (_o, suppliedGoal?: string) => {
+      const goal = typeof suppliedGoal === 'string' ? suppliedGoal.trim() : await vscode.window.showInputBox({
         prompt: 'What should the agents build?',
         placeHolder: 'e.g. Add a REST API for invoices with auth, validation and integration tests.',
       });
@@ -370,7 +378,7 @@ function registerTaskQueue(context: vscode.ExtensionContext): void {
         return;
       }
       await vscode.commands.executeCommand('mfagent.queue.focus');
-      queueView?.generateFromCommand(goal);
+      await queueView?.generateFromCommand(goal);
     }),
   );
 

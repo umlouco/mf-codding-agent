@@ -30,7 +30,7 @@ export async function runVerificationCommand(
   try {
     const result = await new Promise<{ output: string; isError: boolean }>(resolve => {
       const child = cp.spawn(binary, ['sh', '--json', '--dir', root, '--timeout', '10m'],
-        { cwd: root, env: { ...process.env, ...environment }, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
+        { cwd: root, env: { ...process.env, ...environment, MFAGENT_QUEUE_ROLE:'executor' }, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
       let stdout = '', stderr = '', cancelled = false, overflow = false, timedOut = false;
       // Also bound the process tree: a child inheriting stdout can outlive the
       // shell's own timeout and otherwise keep this verification promise open.

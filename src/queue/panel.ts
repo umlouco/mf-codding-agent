@@ -161,8 +161,8 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Entry point for the `Generate Task Queue` command palette action. */
-  generateFromCommand(goal: string): void {
-    void this.generate(goal, false);
+  generateFromCommand(goal: string): Promise<void> {
+    return this.generate(goal, false);
   }
 
   // ---- messages --------------------------------------------------------
@@ -399,7 +399,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   /**
    * Edits, adds to, or removes from the existing task list from a free-text
    * instruction — as opposed to `generate`, which only ever produces a brand
-   * new list. The planner proposes changes against a captured task snapshot;
+   * new list. The supervisor proposes changes against a captured task snapshot;
    * the database resolves those references to stable IDs and commits the whole
    * revision together. Only the committed receipt is reported as completed work.
    */
@@ -421,7 +421,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     this.generating = true;
     this.render();
 
-    const live = new LiveLog(queue, null, 'planner');
+    const live = new LiveLog(queue, null, 'supervisor');
     live.note('plan', `editing the task list: ${instruction.trim()}`);
     try {
       const snapshot = queue.list();
@@ -805,14 +805,14 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     <button id="generate" class="primary">Generate plan</button>
     <p class="hint">The workspace is scanned and split into regions first, then the planner scopes phases over them — each phase is explored and turned into verifiable tasks with a test command once you press Start, so planning stays fast no matter how large the project is.</p>
     <details class="termwrap" open>
-      <summary class="lbl">Planner output</summary>
+      <summary class="lbl">Planning and task editing output</summary>
       <pre id="plannerTerm" class="term"></pre>
     </details>
 
     <label class="lbl" for="editInstruction">Edit the existing tasks</label>
     <textarea id="editInstruction" rows="4" placeholder="e.g. Drop the caching task, and add integration tests for the new endpoint."></textarea>
     <button id="applyEdit">Apply edit</button>
-    <p class="hint">The planner reads the current task list and your instruction, then edits, adds or removes tasks in place — nothing already VERIFIED is touched.</p>
+    <p class="hint">The supervisor reads the current task list and your instruction, then edits, adds or removes tasks in place — nothing already VERIFIED is touched.</p>
 
     <fieldset id="testingEnvironment">
       <legend>Testing environment — applies to every task</legend>

@@ -68,6 +68,9 @@ func scriptEnv() []string {
 // satisfy it. A check that disagrees with the build about what `&&` means is
 // worse than no check at all.
 func RunScript(ctx context.Context, env *Env, dir, script string) (string, uint8, error) {
+	if err := env.CheckQueueCommand(script); err != nil {
+		return "", 1, err
+	}
 	if err := env.CheckTestingCommand(script); err != nil {
 		return "", 1, err
 	}
@@ -177,6 +180,10 @@ func dispatch(env *Env) interp.ExecHandlerFunc {
 		}
 		hc := interp.HandlerCtx(ctx)
 		b, ok := builtins[args[0]]
+		if err := env.CheckQueueCommand(strings.Join(args, " ")); err != nil {
+			fmt.Fprintln(hc.Stderr, err)
+			return interp.NewExitStatus(1)
+		}
 		if !ok || preferHostUtil(args[0]) {
 			return runOnHost(ctx, hc, args)
 		}
@@ -233,6 +240,11 @@ func confinedOpen(env *Env) interp.OpenHandlerFunc {
 		abs, err := env.Resolve(path)
 		if err != nil {
 			return nil, err
+		}
+		if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0 {
+			if err := env.CheckQueueWritePath(abs); err != nil {
+				return nil, err
+			}
 		}
 		f, err := def(ctx, abs, flag, perm)
 		if err != nil || flag&(os.O_WRONLY|os.O_RDWR) == 0 || env.FileChanged == nil {

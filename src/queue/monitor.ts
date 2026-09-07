@@ -1,6 +1,6 @@
 import { reviewTaskRequirements } from './requirements';
 import * as vscode from 'vscode';
-import type { Task, TaskEvent, Usage } from './db';
+import type { NewTask, Task, TaskEvent, Usage } from './db';
 import { attemptsExhausted, extractJson, runOnce, ReviewOptions } from './agents';
 import { completionForSupervisor, parseCompletionClaim } from './validation';
 import { recoveryRules, originalGoalContext, projectNotesContext } from './prompts';
@@ -17,6 +17,19 @@ import { isLocalScope } from './scopeContract';
  * stays a decision.
  */
 export const VALIDATION_FAILED = 'validation-failed';
+
+/** Old task text cannot override an explicitly configured deployed site. */
+export function correctLocalTestingTarget(task: Task, testingUrl: string): Partial<Task> | undefined {
+  if (!testingUrl) return;
+  const target = new URL(testingUrl);
+  if (['localhost', '127.0.0.1', '0.0.0.0', '[::1]'].includes(target.hostname)) return;
+  const patch: Partial<Task> = {};
+  for (const field of ['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand', 'splitScope'] as const) {
+    const updated = (task[field] || '').replace(/https?:\/\/(?:localhost|127(?:\.\d+){3}|0\.0\.0\.0|\[::1\])(?::\d+)?(?=[/\s'"`]|$)/gi, target.origin);
+    if (updated !== task[field]) patch[field] = updated;
+  }
+  return Object.keys(patch).length ? patch : undefined;
+}
 
 /** run_shell has a hard ten-minute maximum plus one second to drain pipes.
  * This detects a violated tool contract, not a time budget for legitimate work.
@@ -36,6 +49,8 @@ export const SUPERVISOR_ACTIONS = [
   'CONTINUE_EXECUTION',
   'STOP_AND_REWRITE_TASK',
   'STOP_AND_REWRITE_VALIDATION',
+  'STOP_AND_REWRITE_TESTS',
+  'SPLIT_TASK',
   'START_VALIDATION',
   'STOP_AND_DECOMPOSE_TASK',
 ] as const;
@@ -50,6 +65,7 @@ export interface ProgressDecision {
   implVerifyPrompt?: string;
   solutionVerifyPrompt?: string;
   solutionVerifyCommand?: string;
+  splitInto?: NewTask[];
   usage: Usage;
 }
 
@@ -110,7 +126,20 @@ function journal(events: TaskEvent[]): string {
   return lines.reverse().join('\n') || '(no journal entries yet)';
 }
 
-function normalize(raw: any, usage: Usage, task: Task, testingUrl = ""): ProgressDecision {
+function normalize(raw: any, usage: Usage, task: Task, testingUrl = "", needsRecovery = false, failedRepairs = 0): ProgressDecision {
+  if (failedRepairs >= 2 && raw?.action === 'STOP_AND_REWRITE_TESTS') {
+    throw new Error('Supervisor repair has repeatedly halted. Choose SPLIT_TASK or a materially changed task/validation contract before another repair.');
+  }
+  if (needsRecovery && raw?.action === 'CONTINUE_EXECUTION') {
+    throw new Error('The current worker was halted for a wrong testing target or repeated tool failures. CONTINUE_EXECUTION would repeat the rejected approach. Supply a concrete task/validation correction or SPLIT_TASK with smaller steps.');
+  }
+  if (raw?.action === 'SPLIT_TASK' && (!Array.isArray(raw.splitInto) || raw.splitInto.length < 2 ||
+      raw.splitInto.some((p: any) => !p || typeof p.title !== 'string' || !p.title.trim() ||
+        typeof p.description !== 'string' || !p.description.trim() ||
+        !(typeof p.solutionVerifyPrompt === 'string' && p.solutionVerifyPrompt.trim() ||
+          typeof p.solutionVerifyCommand === 'string' && p.solutionVerifyCommand.trim())))) {
+    throw new Error('SPLIT_TASK requires at least two complete splitInto parts, each with title, description and a behavior verification prompt or command.');
+  }
   if (isLocalScope(task) && ['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION'].includes(raw?.action)) {
     throw new Error('A committed local execution ticket has fixed acceptance requirements. Do not rewrite it into the parent objective. Use CONTINUE_EXECUTION with concrete local recovery guidance, START_VALIDATION when ready, or STOP_AND_DECOMPOSE_TASK for remaining work within this ticket only.');
   }
@@ -135,6 +164,10 @@ function normalize(raw: any, usage: Usage, task: Task, testingUrl = ""): Progres
     : 'CONTINUE_EXECUTION';
   return {
     action,
+    splitInto: action === 'SPLIT_TASK' ? raw.splitInto.map((p: NewTask) => ({
+      title: p.title, description: p.description, implVerifyPrompt: p.implVerifyPrompt,
+      solutionVerifyPrompt: p.solutionVerifyPrompt, solutionVerifyCommand: p.solutionVerifyCommand,
+    })) : undefined,
     reason: String(raw?.reason ?? '').trim() || 'The supervisor supplied no reason.',
     guidance: typeof raw?.guidance === 'string' ? raw.guidance.trim().slice(0, 8000) || undefined : undefined,
     rewrittenDescription: String(raw?.rewrittenDescription ?? '').trim() || undefined,
@@ -157,7 +190,10 @@ export async function reviewProgress(
   goal = '',
 ): Promise<ProgressDecision> {
   opts = { ...opts, cognition: taskCognition(task, goal, 'supervisor') };
-  const contract = opts.ownerInstructions ? await reviewTaskRequirements(context, output, task, goal, opts.ownerInstructions, opts) : undefined;
+  // A queue-assigned child already belongs to a preserved acceptance plan.
+  // Re-comparing it as a standalone project expands prerequisites back into
+  // the parent. Review its live work within the durable assigned scope below.
+  const contract = opts.ownerInstructions && !isLocalScope(task) && !task.splitScope ? await reviewTaskRequirements(context, output, task, goal, opts.ownerInstructions, opts) : undefined;
   if (contract?.correction) return contract.correction;
   const refreshed = opts.refreshProgress?.();
   if (refreshed) ({ task, events, failedValidations } = refreshed);
@@ -182,8 +218,11 @@ they support the owner requirements; explain that relationship instead of claimi
 ` : '';
   const prompt = `You supervise a coding agent by reading its durable database journal.
 Start with the supplied journal; registered tools remain callable when you need additional
-observations. Inspect only: do not edit application files, tests, notes, or queue state through
-tools. Return a decision for the extension to apply. Judge direction and work quality, not elapsed time, token use, round count,
+observations. This live review inspects evidence while an executor may still be running.
+You own test rewrites: choose STOP_AND_REWRITE_TESTS when a test file needs repair. The extension
+will stop the executor and give you a separate turn with editing tools, then independently run
+the repaired checks. Do not delegate test rewrites to the executor. Return a decision for the
+extension to apply. Judge direction and work quality, not elapsed time, token use, round count,
 or attempt count. A task may legitimately take hours. Intervene only when the evidence shows a
 rabbit hole, a wrong premise, invalid verification, or work ready for independent validation.
 Journal cognition records summarize runtime observations with their source record numbers.
@@ -199,6 +238,9 @@ older errors as the cause. Repeated "still running" tool heartbeats prove livene
 When no testing URL or existing application is supplied, a necessary server launched through
 run_shell with '&' can hold output pipes open: use shell_run_background and shell_wait_for_http.
 A configured testing URL prohibits starting a replacement server.
+If the worker was stopped for a testing-target violation or repeated unchanged tool failures,
+do not send it back to the same approach with CONTINUE_EXECUTION. Correct the concrete premise
+with STOP_AND_REWRITE_TASK/VALIDATION, or SPLIT_TASK when separate checks are being conflated.
 
 ${recoveryRules}
 
@@ -210,6 +252,8 @@ ${projectNotesContext(opts.projectNotes)}
 
 TASK ${task.seq}: ${task.title}
 ${task.description}
+
+${task.splitScope || ''}
 
 ${scopeBoundary(task)}
 
@@ -235,6 +279,7 @@ COMMAND: ${task.solutionVerifyCommand || '(none)'}
 CURRENT STATE: ${state}
 CURRENT ACTIVITY: ${task.activityPhase || '(none)'} — ${task.activityDetail || '(none)'}
 VALIDATION HISTORY: ${validationHistory}
+SUPERVISOR REPAIRS HALTED: ${opts.failedRepairs ?? 0}. After two halted repair turns, split the remaining work or change the repair contract; do not repeat the same test-repair action.
 
 THE EXECUTION AGENT'S OWN COMPLETION CLAIM (a claim about its work, not evidence
 about it — the agent cannot verify itself, which is why you decide):
@@ -266,6 +311,19 @@ are valid when they serve this task's scope and do not replace a required applic
   and any verification fields that must change with it, preserving the owner's acceptance criteria.
 - STOP_AND_REWRITE_VALIDATION: implementation may be sound but the checks are ambiguous, invalid,
   contradictory, or test the wrong thing. Supply corrected verification fields.
+- STOP_AND_REWRITE_TESTS: a test file, fixture, or validation script is broken or targets the wrong
+  environment. Explain the observed defect and desired repair in guidance. The executor is stopped;
+  YOU rewrite the test in a dedicated supervisor turn with editing tools. Preserve owner acceptance
+  criteria, repair syntax/selectors/target assumptions from evidence, and never weaken a valid test
+  to hide an application defect. Independent validation follows your repair.
+- SPLIT_TASK: stop the current executor and replace this task with smaller sequential steps.
+  Use this when failures show it is juggling independent requirements or repeatedly rewriting
+  a large test instead of completing one check. Do not wait for formal validation to split.
+  Supply splitInto with at least two parts in dependency order, each with title, complete
+  description, and its own solutionVerifyPrompt or solutionVerifyCommand. Each part must be
+  smaller than the parent and independently checkable. Preserve working files and all owner
+  requirements. The extension appends a final acceptance check using the parent's full contract;
+  do not duplicate that final check in splitInto. Use the configured testing URL in every part.
 - START_VALIDATION: implementation evidence is sufficient to stop/resume no further work and
   delegate formal verification to a fresh execution LLM.
 - STOP_AND_DECOMPOSE_TASK: repeated discovery or multiple independently checkable outcomes
@@ -282,7 +340,8 @@ Reply with one JSON object. This protocol is fixed:
   "rewrittenDescription": "required only for STOP_AND_REWRITE_TASK",
   "implVerifyPrompt": "replacement when rewriting validation",
   "solutionVerifyPrompt": "replacement when rewriting validation",
-  "solutionVerifyCommand": "replacement when rewriting validation; empty only to remove an invalid command while preserving the required check"
+  "solutionVerifyCommand": "replacement when rewriting validation; empty only to remove an invalid command while preserving the required check",
+  "splitInto": [{"title": "one small step", "description": "complete requirements for this step", "solutionVerifyPrompt": "the specific check for this step"}]
 }
 Use one action from the list above and replace example values. Omit replacement fields unless
 that action needs them. The final response must be valid JSON, with no code fence or prose.`;
@@ -293,8 +352,11 @@ that action needs them. The final response must be valid JSON, with no code fenc
   });
   const usage = { ...first.usage };
   if (contract) addUsage(usage, contract.usage);
+  const needsRecovery = task.status !== 'EXECUTING' &&
+    ['supervisor_repair_required', 'testing_target_blocked', 'repeated_tool_error', 'unchanged_tool_loop'].some(reason =>
+      task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (${reason})`));
   try {
-    return normalize(extractJson(first.text, isDecision), usage, task, contract ? undefined : opts.testingUrl);
+    return normalize(extractJson(first.text, isDecision), usage, task, contract ? undefined : opts.testingUrl, needsRecovery, opts.failedRepairs);
   } catch (error) {
     const formatPrompt = `Complete the required decision object below. Preserve a supported decision;
 if the target comparison shows a conflict with owner requirements, correct the decision and its
@@ -320,7 +382,7 @@ Do not preserve an unavailable rewrite action or demand sibling work. Keep the a
         maxIterations: 1,
       });
       addUsage(usage, second.usage);
-      return normalize(extractJson(second.text, isDecision), usage, task, contract ? undefined : opts.testingUrl);
+      return normalize(extractJson(second.text, isDecision), usage, task, contract ? undefined : opts.testingUrl, needsRecovery, opts.failedRepairs);
     } catch {
       throw new Error('The supervisor supplied no readable decision after reformatting. Preserve current work and reassess; unreadable output is not evidence that implementation is ready.');
     }

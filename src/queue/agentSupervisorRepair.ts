@@ -46,6 +46,8 @@ TASK ${task.seq}: ${task.title}
 The description that has failed ${task.attempts} times:
 ${task.description}
 
+${task.splitScope || ''}
+
 What you said was wrong with the last attempt:
 ${feedback || '(nothing recorded)'}
 
@@ -152,7 +154,7 @@ required shape — as ONE JSON object and nothing else:
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
-Set verdict to VERIFIED, REVERIFY, RETRY, or SPLIT to match the original conclusion. Use empty arrays for
+Set verdict to VERIFIED, REVERIFY, RETRY, SPLIT, or REPAIR_TESTS to match the original conclusion. Use empty arrays for
 splitInto and taskEdits when they do not apply. Return valid JSON, without code fences.
 
 If your reply above reached a clear conclusion — the work is correct, it needs another attempt,
@@ -212,6 +214,8 @@ TASK ${task.seq}: ${task.title}
 
 The description the last attempt was given, which did not work:
 ${task.description}
+
+${task.splitScope || ''}
 
 What you said was wrong with the attempt:
 ${feedback || '(you did not say)'}

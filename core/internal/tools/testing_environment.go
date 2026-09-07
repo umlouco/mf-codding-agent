@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -16,6 +18,8 @@ import (
 var credentialName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{0,47}$`)
 var literalLoopbackURL = regexp.MustCompile(`(?i)https?://(?:localhost|127(?:\.[0-9]+){3}|0\.0\.0\.0|\[::1\])(?::[0-9]+)?(?:/[^\s'"\x60<>]*)?`)
 var serverCommand = regexp.MustCompile(`(?i)(?:\bpython(?:3|\.exe)?\s+-m\s+http\.server\b|\bphp(?:\.exe)?\s+-S\s|\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|serve|start)\b|\bnpx\s+(?:serve|http-server|vite)\b)`)
+var browserSuiteCommand = regexp.MustCompile(`(?i)\b(?:playwright(?:\.cmd)?\s+test|(?:npm|pnpm|yarn)\s+(?:run\s+)?test)\b`)
+var selectedSpecArgument = regexp.MustCompile(`(?i)(?:^|\s)(?:"([^"]+\.(?:spec|test)\.[cm]?[jt]s)"|'([^']+\.(?:spec|test)\.[cm]?[jt]s)'|([^\s'"]+\.(?:spec|test)\.[cm]?[jt]s))(?:\s|$)`)
 
 // ApplyTestingProcessEnvironment affects this private core process and its children,
 // never the editor's environment. Reinitialization removes obsolete credential names.
@@ -119,6 +123,55 @@ func (e *Env) CheckTestingCommand(command string) error {
 		if err := e.CheckTestingURL(target, false); err != nil {
 			return err
 		}
+	}
+	// A runner command often contains no URL: the bad address is in its spec
+	// or configuration. Inspect those inputs before launching a browser suite.
+	if browserSuiteCommand.MatchString(command) && e.Root != "" {
+		selected := map[string]bool{}
+		for _, match := range selectedSpecArgument.FindAllStringSubmatch(command, -1) {
+			for _, arg := range match[1:] {
+				if arg != "" {
+					selected[strings.ToLower(arg[strings.LastIndexAny(arg, `/\`)+1:])] = true
+				}
+			}
+		}
+		return filepath.WalkDir(e.Root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				switch d.Name() {
+				case "node_modules", ".git", ".mfagent", "vendor", "test-results", "playwright-report":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			name := strings.ToLower(d.Name())
+			if len(selected) > 0 && !selected[name] && !strings.HasPrefix(name, "playwright.config.") {
+				return nil
+			}
+			if !(strings.Contains(name, ".spec.") || strings.Contains(name, ".test.") || strings.HasPrefix(name, "playwright.config.")) {
+				return nil
+			}
+			switch filepath.Ext(name) {
+			case ".js", ".ts", ".mjs", ".cjs", ".mts", ".cts":
+			default:
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			if !strings.HasPrefix(name, "playwright.config.") && !strings.Contains(string(data), "playwright") {
+				return nil
+			}
+			for _, target := range literalLoopbackURL.FindAllString(string(data), -1) {
+				if err := e.CheckTestingURL(target, false); err != nil {
+					return fmt.Errorf("testing target blocked: %s contains a substitute localhost URL. Use MFAGENT_TEST_URL (%s) and remove stale local test targets before running the suite", path, e.Testing.URL)
+				}
+			}
+			return nil
+		})
 	}
 	return nil
 }

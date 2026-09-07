@@ -36,7 +36,7 @@ export async function roleConfig(role: Role): Promise<RoleConfig> {
  * Rewrites the core config so an ephemeral worker binds this role's model as
  * its coding provider — the core only ever drives one model per process.
  */
-export async function overridesFor(role: Role, maxIterations = 0): Promise<Partial<CoreConfig>> {
+export async function overridesFor(role: Role, maxIterations = 0, allowTestEdits = false, verificationOnly = false): Promise<Partial<CoreConfig>> {
   const rc = await roleConfig(role);
   return {
     providers: [{
@@ -53,7 +53,8 @@ export async function overridesFor(role: Role, maxIterations = 0): Promise<Parti
     // A registered tool is not discoverable by the model without its definition.
     // Supervisors need inspection tools to resolve conflicting handoffs and notes.
     disableTools: false,
-    inspectOnly: role === 'supervisor',
+    inspectOnly: role === 'supervisor' && !allowTestEdits,
+    queueRole: verificationOnly ? 'validator' : role === 'supervisor' && allowTestEdits ? 'supervisor-repair' : role,
     // Queue workers spawn their own core processes and run unattended, often
     // several at once. The editor terminal is a single visible tab shared by
     // everything in the window: handing it to background work would steal focus
@@ -175,7 +176,7 @@ export async function runOnce(
     // mid-turn.
     onAbort?.(() => { aborted = true; client.stop(); });
     checkAborted();
-    const overrides = await overridesFor(role, maxIterations);
+    const overrides = await overridesFor(role, maxIterations, opts.allowTestEdits, opts.verificationOnly);
     if (opts.formatOnly) { overrides.disableTools = true; overrides.responseOnly = true; }
     checkAborted();
     const init = await client.initialize(overrides);

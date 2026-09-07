@@ -1,11 +1,12 @@
-import { attemptsExhausted } from './agents';
-import { Task } from './db';
+import { attemptsExhausted, runOnce, coreHalted } from './agents';
+import { Task, NewTask } from './db';
 import { LiveLog } from './liveLog';
-import { JOURNAL_EVENTS, ProgressDecision, reviewProgress, VALIDATION_FAILED } from './monitor';
-import { Review } from './orchestratorState';
+import { correctLocalTestingTarget, JOURNAL_EVENTS, ProgressDecision, reviewProgress, VALIDATION_FAILED } from './monitor';
+import { appendAttempt, Review } from './orchestratorState';
 import { OrchestratorRemediation } from './orchestratorRemediation';
 import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, recoverySucceeded, recoveryReplayLimit } from './recovery';
 import { isLocalScope } from './scopeContract';
+import { runVerificationCommand } from './command';
 
 export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
@@ -51,6 +52,17 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
   /** Lets the supervisor judge live work and choose one fixed control action. */
   protected async reviewWork(task: Task): Promise<void> {
+    if (this.correctTestingTarget(task)) return;
+    if (task.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
+      await this.repairTests(task, task.supervisorFeedback);
+      return;
+    }
+    if (task.status !== 'EXECUTING' &&
+        task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (supervisor_repair_required)`) &&
+        /queue ownership: the supervisor (?:must rewrite existing test|owns test rewrites)/.test(task.output)) {
+      await this.repairTests(task, `The executor was blocked from rewriting a supervisor-owned test. Complete the assigned test correction yourself.\n${task.output}`);
+      return;
+    }
     const state = recoveryEvidence(this.queue, task);
     const replayLimit = state.blocked || recoveryReplayLimit(state);
     if (replayLimit) {
@@ -87,6 +99,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
           recoveryContext: recoveryContext(this.queue, task),
           testingUrl: this.queue.testingUrl,
           ownerInstructions: this.queue.testingContext + this.queue.instructions,
+          failedRepairs: this.queue.countEvents(task.id, 'test-repair-halted'),
           refreshProgress: () => {
             if (gen !== this.reviewGen) throw new Error('Progress review was superseded.');
             const current = this.queue.get(task.id);
@@ -156,6 +169,122 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     }
   }
 
+  protected correctTestingTarget(task: Task): boolean {
+    if (!this.queue.testingUrl) return false;
+    const correction = correctLocalTestingTarget(task, this.queue.testingUrl);
+    if (!correction) return false;
+    this.queue.log(task.id, 'supervisor', 'testing-target-corrected', JSON.stringify({
+      configuredUrl: this.queue.testingUrl, previous: {
+        description: task.description, implVerifyPrompt: task.implVerifyPrompt,
+        solutionVerifyPrompt: task.solutionVerifyPrompt, solutionVerifyCommand: task.solutionVerifyCommand,
+      },
+    }));
+    this.stopForDecision(task, { ...correction, status: 'PENDING', validationReport: '', finishedAt: null,
+      supervisorFeedback: `The configured testing site is ${this.queue.testingUrl}. Stale localhost targets were corrected before execution. Read testing_environment; use MFAGENT_TEST_URL in tests. Preserve the required application behavior.`,
+    });
+    this.changed();
+    this.wakeAfterHandoff();
+    return true;
+  }
+
+  /** Owner and supervisor use the same fenced, ordered split operation. */
+  requestTestRepair(id: number, reason: string): void {
+    const task = this.queue.get(id);
+    if (!task || task.status === 'VERIFIED') throw new Error('Select an unfinished task for supervisor test repair.');
+    if (this.review?.taskId === id) this.abandonReview();
+    this.stopForDecision(task, {status:'VERIFYING',validationReport:'',finishedAt:null,
+      activityPhase:'needs_review',supervisorFeedback:`[SUPERVISOR_TEST_REPAIR] ${reason}`});
+    this.changed();
+    this.wakeAfterHandoff();
+  }
+
+  protected async repairTests(task: Task, reason: string): Promise<void> {
+    // Replace the completed decision's worker without releasing the current
+    // supervision cycle; a second tick must not start a concurrent repair.
+    if (this.review?.taskId === task.id) {
+      const previous=this.review;
+      this.review=null;
+      this.reviewGen++;
+      try { previous.abort?.(); } catch { /* completed reviewer already exited */ }
+    }
+    if (!this.stopForDecision(task, {status:'VERIFYING',validationReport:'',finishedAt:null,
+      supervisorFeedback:`[SUPERVISOR_TEST_REPAIR] ${reason.replace('[SUPERVISOR_TEST_REPAIR]', '').trim()}`})) return;
+    const review: Review = {taskId:task.id,seq:task.seq,gen:++this.reviewGen,lastActivityAt:Date.now()};
+    this.review = review;
+    const live = new LiveLog(this.queue, task.id, 'supervisor');
+    this.queue.log(task.id,'supervisor','test-repair-started',reason);
+    try {
+      const observe=this.observerEvents(task.id,'supervisor',live,()=>review.gen===this.reviewGen);
+      // Give the repair model the real failure first, rather than asking it
+      // to guess a syntax or selector defect from a truncated file preview.
+      const before=task.solutionVerifyCommand.trim() ? await runVerificationCommand(
+        this.context,task.solutionVerifyCommand,observe,
+        abort=>{if(review.gen!==this.reviewGen){abort();return;}review.abort=abort;},
+        a=>{if(review.gen!==this.reviewGen)return;review.lastActivityAt=a.at;live.activity(a);},
+      ) : '(No command supplied; inspect the reported failure before changing the test.)';
+      if(review.gen!==this.reviewGen)return;
+      const result = await runOnce(this.context,this.output,'supervisor',
+        `You are the SUPERVISOR and own test repairs. The executor has been stopped.\n` +
+        `Read and rewrite the defective test, fixture or validation script yourself using editing tools.\n` +
+        `Preserve acceptance criteria; do not hide application defects by weakening assertions.\n` +
+        `Do not change application implementation or the task database. Task-list changes use your decision protocol.\n` +
+        `Use the configured testing environment and credential references. Run a focused check of your repair.\n` +
+        `Return a factual handoff listing changed files and observed checks. Independent verification follows; you cannot approve your own repair.\n\n` +
+        `${this.queue.contextInstructions}\nOriginal goal: ${this.queue.getMeta('goal')}\n` +
+        `Task: ${task.title}\n${task.description}\n${task.splitScope || ''}\n` +
+        `Implementation check: ${task.implVerifyPrompt}\nBehavior check: ${task.solutionVerifyPrompt}\nCommand: ${task.solutionVerifyCommand}\n` +
+        `Observed check BEFORE repair (not validation of your changes):\n${before}\n` +
+        `Fix the concrete reported failure first. Do not make identical old/new edits or cosmetic selector changes.\n` +
+        `Repair requested: ${reason}\nPrevious evidence: ${task.output.slice(0,8000)}`, {
+          allowTestEdits:true,
+          onAbort:abort=>{if(review.gen!==this.reviewGen){abort();return;}review.abort=abort;},
+          onEvent:observe,
+          onActivity:a=>{if(review.gen!==this.reviewGen)return;review.lastActivityAt=a.at;live.activity(a);this.queue.recordActivity(task.id,a.phase,a.detail,'supervisor');},
+        });
+      if(review.gen!==this.reviewGen)return;
+      this.queue.addUsage(task.id,result.usage);
+      const halted = coreHalted(result.stopReason);
+      this.queue.update(task.id,{output:result.text,validationReport:'',
+        supervisorFeedback:reason.replace('[SUPERVISOR_TEST_REPAIR]', '').trim(),
+        ...(halted ? {errorLog:appendAttempt(this.queue.get(task.id)!.errorLog,
+          `[attempt ${task.attempts}] supervisor test repair halted (${result.stopReason}). Reassess or split the repair; do not repeat an unchanged repair.`)} : {})});
+      this.queue.log(task.id,'supervisor','test-repair-finished',result.text);
+      if(halted) this.queue.log(task.id,'supervisor','test-repair-halted',result.stopReason);
+      // A halted turn may have fixed the file before getting stuck. Check the
+      // current files; a failed required command goes straight to supervision.
+      await this.verifyWithExecutor(this.queue.get(task.id)!,review);
+    } finally {
+      live.close();
+      if(this.review===review)this.review=null;
+      this.changed();
+    }
+  }
+
+  splitTask(id: number, parts: NewTask[]): number {
+    const task = this.queue.get(id);
+    if (!task || task.status === 'VERIFIED') throw new Error('Select an unfinished task to split.');
+    if (!Array.isArray(parts) || parts.length < 2 || parts.some(p => !p?.title?.trim() ||
+        !p.description?.trim() || (!p.solutionVerifyPrompt?.trim() && !p.solutionVerifyCommand?.trim()))) {
+      throw new Error('Supply at least two complete smaller steps, each with its own behavior check.');
+    }
+    // Keep the original acceptance check after the smaller implementation steps.
+    // Completed children alone cannot silently weaken the parent's requirements.
+    const acceptance: NewTask = {
+      title: `Final acceptance: ${task.title}`,
+      description: `Verify the assembled work from the preceding split steps against every requirement below. Preserve their implementation; repair only concrete remaining failures.\n\n${task.description}`,
+      implVerifyPrompt: task.implVerifyPrompt,
+      solutionVerifyPrompt: task.solutionVerifyPrompt || task.description,
+      solutionVerifyCommand: task.solutionVerifyCommand,
+    };
+    if (this.review?.taskId === id) this.abandonReview();
+    if (!this.stopForDecision(task, { status: 'PENDING', finishedAt: null })) return 0;
+    const count = this.queue.splitTask(id, [...parts, acceptance], true);
+    this.reviewed.delete(id);
+    this.changed();
+    this.wakeAfterHandoff();
+    return count;
+  }
+
   protected async applyProgressDecision(
     snapshot: Task,
     decision: ProgressDecision,
@@ -188,7 +317,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       await this.replanOrPause(task, decision.reason);
       return;
     }
-    if (isLocalScope(task) && decision.action.startsWith('STOP_AND_REWRITE')) {
+    if (isLocalScope(task) && ['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION'].includes(decision.action)) {
       throw new Error('Recovery cannot change the accepted scope of a committed child task. Supply local execution guidance instead.');
     }
     const retry = decision.action.startsWith('STOP_AND_REWRITE') ||
@@ -197,6 +326,12 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     if (retry && !await this.allowRecovery(task, decision.action)) return;
     this.queue.log(task.id, 'supervisor', `action:${decision.action}`, decision.reason);
     switch (decision.action) {
+      case 'STOP_AND_REWRITE_TESTS':
+        await this.repairTests(task, decision.guidance || decision.reason);
+        return;
+      case 'SPLIT_TASK':
+        this.splitTask(task.id, decision.splitInto ?? []);
+        return;
       case 'CONTINUE_EXECUTION':
         if (task.status === 'VERIFYING' && !task.validationReport.trim()) {
           this.queue.update(task.id, {

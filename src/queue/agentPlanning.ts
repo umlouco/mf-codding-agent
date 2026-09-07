@@ -35,6 +35,7 @@ export async function generatePhases(
   maxFilesPerRegion: number,
   onEvent?: (method: string, params: any) => void,
   onCancellable?: (cancel: () => void) => void,
+  role: 'planner' | 'supervisor' = 'planner',
 ): Promise<NewTask[]> {
   const regionList = regions
     .map((r) => `- ${r.path}  (${r.fileCount} file(s)${languageSummary(r.languages)})`)
@@ -77,12 +78,12 @@ Rules:
 - Order phases in the sequence they should be expanded and executed.
 - Do not invent paths that are not in the REGIONS list.`;
 
-  const { text } = await runOnce(context, output, 'planner', prompt, {
+  const { text } = await runOnce(context, output, role, prompt, {
     maxIterations: baseRounds(),
     onEvent,
     onCancellable,
   });
-  output.appendLine(`[queue:planner] raw phase reply is ${text.length} chars`);
+  output.appendLine(`[queue:${role}] raw phase reply is ${text.length} chars`);
 
   let parsed = extractJson<unknown>(text, isPlan);
   parsed = unwrapArray(parsed);
@@ -162,7 +163,8 @@ export async function planGoal(
   );
   const regions = await runScanCommand(context, root, maxPerRegion);
   output.appendLine(`[queue:planner] scanned workspace into ${regions.length} region(s)`);
-  const phases = await generatePhases(context, output, goal, regions, maxPerRegion, onEvent, onCancellable);
+  const phases = await generatePhases(context, output, goal, regions, maxPerRegion, onEvent, onCancellable,
+    queue.list().length ? 'supervisor' : 'planner');
   queue.setMeta('goal', goal);
   return phases;
 }
@@ -273,14 +275,14 @@ Rules:
   linters) that already work in this repo — do not invent scripts that do not exist.
 - Do not include a task for the phase itself.`;
 
-  const { text, stopReason, usage } = await runOnce(context, output, 'planner', prompt, {
-    cognition: taskCognition(phase, goal, 'planner'),
+  const { text, stopReason, usage } = await runOnce(context, output, 'supervisor', prompt, {
+    cognition: taskCognition(phase, goal, 'supervisor'),
     maxIterations: baseRounds(),
     onActivity,
     onEvent,
     onAbort,
   });
-  output.appendLine(`[queue:planner] phase ${phase.seq} raw reply is ${text.length} chars`);
+  output.appendLine(`[queue:supervisor] phase ${phase.seq} raw reply is ${text.length} chars`);
   const cutOff = stopReason === 'max_iterations';
 
   let parsed: unknown;

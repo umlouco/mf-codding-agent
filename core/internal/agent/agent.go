@@ -65,6 +65,7 @@ type Session struct {
 }
 
 func New(cfg *config.Config, p llm.Provider, r *tools.Registry, env *tools.Env, emit Emitter, system string) *Agent {
+	env.QueueRole = cfg.QueueRole
 	return &Agent{
 		cfg: cfg, provider: p, registry: r, env: env, emit: emit,
 		sessions: map[string]*Session{}, system: system,
@@ -133,7 +134,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	sess.Messages = append(sess.Messages, llm.UserText(user))
 	system := a.system
 	if a.cfg.InspectOnly {
-		system = "This turn is an inspection-only supervisor review. Read available evidence and return the requested decision or guidance. The executor owns file changes, command execution, and application testing. Mutating tools and arbitrary commands are unavailable in this role.\n\n" + system
+		system = "This turn is a live inspection-only review. Read evidence and return the requested decision. The supervisor owns test rewrites: request STOP_AND_REWRITE_TESTS to stop the executor and enter a dedicated supervisor repair turn with editing tools. Mutating tools and arbitrary commands are unavailable during this live inspection.\n\n" + system
 	}
 	if a.cfg.ResponseOnly {
 		system = "You review supplied text and evidence. Follow the current request and its response schema exactly. You cannot inspect files or execute tools in this turn. Do not propose tool calls, XML checks, or an investigation. Owner requirements outrank derived task instructions and prior agent conclusions. Preserve required behavior and assertions. Return the requested decision using only the supplied information; distinguish missing evidence from a proven defect."
@@ -243,6 +244,21 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		a.mu.Lock()
 		sess.Messages = append(sess.Messages, llm.Message{Role: llm.RoleUser, Blocks: results})
 		a.mu.Unlock()
+
+		// A fixed-target rejection is an invalid premise, not a transient tool
+		// error to retry for another model round. Hand the evidence back now.
+		for _, toolResult := range results {
+			if toolResult.IsError && strings.HasPrefix(toolResult.Text, "queue ownership:") {
+				result.Text = "Execution stopped: " + toolResult.Text
+				result.StopReason = "supervisor_repair_required"
+				return result, nil
+			}
+			if toolResult.IsError && strings.HasPrefix(toolResult.Text, "testing environment:") {
+				result.Text = "Execution stopped: " + toolResult.Text + ". Supervisor must correct the testing target before resuming."
+				result.StopReason = "testing_target_blocked"
+				return result, nil
+			}
+		}
 
 		// VS Code's completion tool expresses an intent to hand work back. It
 		// does not verify the work, but ignoring it can leave the model calling
@@ -561,6 +577,9 @@ func (a *Agent) toolNames() string {
 }
 
 func (a *Agent) toolAllowed(t *tools.Tool) bool {
+	if !tools.QueueToolAllowed(a.cfg.QueueRole, t.Name) {
+		return false
+	}
 	// Shell command classification is for scheduling, not an inspection
 	// guarantee. A reviewer uses dedicated read tools instead of arbitrary
 	// commands, browser scripts or third-party tools that can change state.

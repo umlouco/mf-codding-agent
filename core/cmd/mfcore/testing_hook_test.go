@@ -25,3 +25,22 @@ func TestCLITestingHook(t *testing.T) {
 		}
 	}
 }
+
+func TestCLIQueueOwnershipWithoutTestingURL(t *testing.T) {
+	t.Setenv("MFAGENT_TEST_URL", "")
+	t.Setenv("MFAGENT_QUEUE_ROLE", "executor")
+	for _, tc := range []struct {
+		input string
+		code  int
+	}{
+		{`{"tool_name":"mcp__mfagent__task_queue_update","tool_input":{"id":29,"description":"weaker task"}}`, 2},
+		{`{"tool_name":"mcp__mfagent__task_queue_list","tool_input":{}}`, 0},
+		{`{"tool_name":"Bash","tool_input":{"command":"sqlite3 .mfagent/queue.db"}}`, 2},
+		{`{"tool_name":"Bash","tool_input":{"command":"node --check playwright-tests/form.spec.js"}}`, 0},
+	} {
+		var out bytes.Buffer
+		if got := runTestingHook(strings.NewReader(tc.input), &out); got != tc.code {
+			t.Fatalf("got %d want %d: %s", got, tc.code, out.String())
+		}
+	}
+}

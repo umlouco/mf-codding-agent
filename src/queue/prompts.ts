@@ -12,8 +12,9 @@ export const codingWorkflow = `Work in this order:
    nearby tests. Confirm APIs, dependencies, and commands in the repository before using them.
 2. Choose the smallest change that satisfies the task. Reuse existing patterns. Preserve public
    interfaces and unrelated user edits. Do not add a dependency unless the task needs it.
-3. Implement the change, including relevant error paths and boundary cases. For a bug, add or
-   update a focused regression test when the repository supports it.
+3. Implement the assigned application change, including relevant error paths and boundary cases.
+   Existing test rewrites and all task-list/acceptance changes belong to the supervisor. Report
+   the exact needed correction and hand off; do not rewrite your own orders or existing tests.
    Use file-writing/editing tools for source and configuration text. They preserve text without
    shell quoting or redirection encoding. Use the shell for builds, tests, and commands.
 4. Run the relevant checks and read their actual output. Inspect the final diff for unintended

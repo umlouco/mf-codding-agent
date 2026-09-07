@@ -43,7 +43,7 @@ export interface ExecutionOutcome {
  * or is ready to validate.
  */
 export function coreHalted(stopReason: string): boolean {
-  return stopReason === 'repeated_tool_error' || stopReason === 'unchanged_tool_loop' || stopReason === 'context_limit' || stopReason === 'max_iterations';
+  return stopReason === 'supervisor_repair_required' || stopReason === 'testing_target_blocked' || stopReason === 'repeated_tool_error' || stopReason === 'unchanged_tool_loop' || stopReason === 'context_limit' || stopReason === 'max_iterations';
 }
 
 export async function executeTask(
@@ -75,6 +75,8 @@ confirmed evidence, and proposed correction or precise question for supervisor r
 ${notes}TASK ${task.seq}: ${task.title}
 
 ${task.description}
+
+${task.splitScope || ''}
 ${retry}
 Own the implementation. Run ordinary development checks while you work, but do
 not make the final verification decision. A supervisor watches your database
@@ -91,6 +93,9 @@ ${codingWorkflow}
 ${browserEvidence}
 
 - Stay inside this task. Do not start the next one, and do not refactor unrelated code.
+- The supervisor owns rewrites of existing tests, test fixtures and validation scripts.
+  Do not rewrite those files to repair a failed check. Report the exact test defect and request
+  supervisor test repair in your handoff. Implement application fixes when the test is valid.
 - If the task turns out to be impossible or already done, say so plainly and explain why.
 - Inspect the final code and diff yourself. Run useful development checks. For UI/browser work,
   use the browser tools when needed and record what happened.

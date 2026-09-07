@@ -52,6 +52,8 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       return;
     }
 
+    if (this.correctTestingTarget(task)) return;
+
     // Attempts may reset after a rewrite. Process generation and the committed
     // claim identity fence callbacks as well as final results; old workers cannot
     // release the replacement's abort handle or contaminate its journal.

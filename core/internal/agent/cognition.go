@@ -60,9 +60,15 @@ func (a *Agent) InvokeDirectTool(ctx context.Context, call llm.Block, tool *tool
 func (a *Agent) executeTool(ctx context.Context, sessionID string, call llm.Block, tool *tools.Tool, mutating bool) tools.Result {
 	recorded := call
 	recorded.Input = a.env.RedactTestingInput(call.Input)
+	if err := a.env.CheckQueueOwnership(call.Name, call.Input, mutating); err != nil {
+		ticket := a.beginCognition(ctx, sessionID, recorded, false)
+		result := tools.Errf("%v", err)
+		a.finishCognition(ctx, sessionID, ticket, result)
+		return result
+	}
 	if !a.toolAllowed(tool) {
 		ticket := a.beginCognition(ctx, sessionID, recorded, false)
-		result := tools.Errf("tool %s is unavailable during an inspection-only supervisor review. Use read-only inspection tools and return guidance or a decision; the executor owns edits and test execution", call.Name)
+		result := tools.Errf("tool %s is unavailable during this live inspection-only review. Request STOP_AND_REWRITE_TESTS to stop the executor and let the supervisor repair the test with editing tools", call.Name)
 		a.finishCognition(ctx, sessionID, ticket, result)
 		return result
 	}

@@ -4,11 +4,48 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/mflores/mfagent/core/internal/config"
 )
+
+func TestPlaywrightRunnerChecksExistingSpecTarget(t *testing.T) {
+	e := &Env{Root: t.TempDir(), Testing: config.TestingEnvironment{URL: "https://app.example.test/project/"}}
+	file := filepath.Join(e.Root, "form.spec.js")
+	if err := os.WriteFile(file, []byte(`const {test}=require('@playwright/test'); test('form',async({page})=>page.goto('http://localhost:8000/project/'));`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CheckTestingCommand("npx playwright test form.spec.js"); err == nil || !strings.Contains(err.Error(), "form.spec.js") {
+		t.Fatalf("stale spec was not blocked: %v", err)
+	}
+	if err := e.CheckTestingCommand("node --check playwright-tests/form.spec.js"); err != nil {
+		t.Fatalf("syntax inspection incorrectly launched browser target checks: %v", err)
+	}
+	if err := os.WriteFile(file, []byte(`const {test}=require('@playwright/test'); test('form',async({page})=>page.goto(process.env.MFAGENT_TEST_URL));`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CheckTestingCommand("npx playwright test form.spec.js"); err != nil {
+		t.Fatal(err)
+	}
+	// An unrelated unit fixture is not a browser target.
+	if err := os.WriteFile(filepath.Join(e.Root, "url.test.js"), []byte(`assert(parse('http://localhost:1234/'));`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CheckTestingCommand("npm test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.Root, "unrelated.spec.js"), []byte(`const {test}=require('@playwright/test'); const url='http://localhost:1234/';`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CheckTestingCommand("npx playwright test form.spec.js --grep navigation"); err != nil {
+		t.Fatalf("unselected suite blocked a focused step: %v", err)
+	}
+	if err := e.CheckTestingCommand("npx playwright test"); err == nil {
+		t.Fatal("full suite accepted the stale target")
+	}
+}
 
 func TestTestingTargetEnforcement(t *testing.T) {
 	e := &Env{Root: t.TempDir(), Testing: config.TestingEnvironment{URL: "https://app.example.test/project/"}}

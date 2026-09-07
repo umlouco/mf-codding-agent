@@ -56,7 +56,7 @@ export async function runVerification(
   onAbort?.(() => { aborted = true; stopModel?.(); session.stop(); });
   const checkActive = () => { if (aborted) throw new VerificationPlanError('Verification cancelled.', 'cancelled'); };
   const options: RunOptions = {
-    cognition: taskCognition(task, goal, 'verifier'), formatOnly: true, maxIterations: 1,
+    verificationOnly: true, cognition: taskCognition(task, goal, 'verifier'), formatOnly: true, maxIterations: 1,
     onActivity, onEvent: observe,
     onAbort: abort => { stopModel = abort; if (aborted) abort(); },
   };
@@ -64,6 +64,7 @@ export async function runVerification(
 TASK ${task.seq}: ${task.title}
 Assigned requirements (this task's share, not unfinished sibling work):
 ${task.description}
+${task.splitScope || ''}
 Required implementation inspection:
 ${task.implVerifyPrompt || 'Inspect the actual implementation and diff.'}
 Required behavioral verification:
@@ -90,6 +91,8 @@ files since those receipts, recheck the affected behavior; historical PASS is no
 Produce an executable plan, not claims that checks already passed. The HOST executes every step;
 you cannot create observations by describing them. Do not edit production files, fixtures, tests,
 expected output, requirements, or task rows. Normal build/test output is allowed.
+If a test file needs rewriting, report its concrete defect for supervisor-owned repair;
+the implementation executor must not rewrite the tests used to check its work.
 A passing script cannot override the client's requested behavior. Keep checks INCOMPLETE for material
 ambiguity or missing evidence instead of silently narrowing the owner's requirements.
 

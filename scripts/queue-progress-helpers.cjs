@@ -22,7 +22,7 @@ function load(file, dependencies = {}, extra = '') {
   });
   const exports = {};
   vm.runInNewContext(outputText, {
-    exports, process, Buffer, __dirname, setTimeout, clearTimeout,
+    exports, process, Buffer, URL, __dirname, setTimeout, clearTimeout,
     require: name => {
       if (name in dependencies) return dependencies[name];
       if (/^\.\/(orchestrator|scope|recovery|workInventory|verificationAuthority|verificationRecovery)/.test(name)) return load('src/queue/' + name.slice(2) + '.ts', dependencies);
@@ -86,7 +86,7 @@ function fixture(t) {
 
 function orchestrator(queue, dependencies) {
   const { Orchestrator } = load('src/queue/orchestrator.ts', {
-    vscode, './liveLog': { LiveLog }, './cognition': cognition, ...dependencies,
+    vscode, './liveLog': { LiveLog }, './cognition': cognition, './validation': validation, ...dependencies,
   });
   const runner = Object.create(Orchestrator.prototype);
   Object.assign(runner, { queue, output, context: {}, changed() {}, wakeAfterHandoff() {}, reviewGen: 0,

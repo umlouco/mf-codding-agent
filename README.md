@@ -510,7 +510,20 @@ hours is fine as long as it is still arriving; a socket that delivers nothing
 for `llm.idleMinutes` is dropped, and the worker records that it stopped before
 it goes.
 
-### Executor-owned validation
+### Supervisor-owned contracts and independent verification
+
+The supervisor owns task-list rewrites, splitting, verification criteria, and
+repairs to existing tests. Executors follow the assigned contract and report
+blockers. Queue mutation tools are unavailable to autonomous workers; supervisor
+decisions go through the extension's checked queue transitions. Native tool calls
+and CLI hooks reject executor attempts to rewrite existing tests or directly edit
+queue storage.
+
+For a defective test, the supervisor requests `STOP_AND_REWRITE_TESTS` during live
+review or `REPAIR_TESTS` after validation. The extension stops the executor before
+starting a supervisor turn with editing tools. A fresh verification worker then
+checks the repaired test. Split steps retain their assigned scope across restarts,
+with the original full acceptance check retained as the final step.
 
 The executor checks its changes during implementation. A fresh independent
 verification worker then inspects the final diff, runs the required commands and

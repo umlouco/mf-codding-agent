@@ -154,8 +154,8 @@ test('executor, independent verifier, and phase expansion use durable bindings w
   reply = JSON.stringify([{ title: 'Exercise persistence', description: 'Verify continuity after restart',
     implVerifyPrompt: 'Read state', solutionVerifyPrompt: 'Restart', solutionVerifyCommand: '' }]);
   await agents.expandPhase({}, output, { ...task, kind: 'phase' }, goal);
-  assert.deepEqual(calls.map(call => call.role), ['executor', 'executor', 'executor', 'planner']);
-  assert.deepEqual(calls.map(call => call.opts.cognition.observer), ['executor', 'verifier', 'verifier', 'planner']);
+  assert.deepEqual(calls.map(call => call.role), ['executor', 'executor', 'executor', 'supervisor']);
+  assert.deepEqual(calls.map(call => call.opts.cognition.observer), ['executor', 'verifier', 'verifier', 'supervisor']);
   assert.equal(new Set(calls.map(call => call.opts.cognition.workId)).size, 1);
 });
 

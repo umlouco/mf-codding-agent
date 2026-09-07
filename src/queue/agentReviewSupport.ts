@@ -11,7 +11,7 @@ import { squash } from './agentHistory';
  * one outcome an unattended overnight run must not have. Every path out of a
  * failed attempt goes back through the supervisor rewriting the task.
  */
-export type Verdict = 'VERIFIED' | 'REVERIFY' | 'RETRY' | 'SPLIT' | 'RESET_FROM';
+export type Verdict = 'VERIFIED' | 'REVERIFY' | 'RETRY' | 'SPLIT' | 'REPAIR_TESTS' | 'RESET_FROM';
 
 /**
  * Whether this task has spent the attempt budget its plan gave it.
@@ -55,7 +55,8 @@ If the evidence is not sufficient, choose exactly one:
  - SPLIT, when scope is the obstacle: the report reads as several unfinished threads rather than
    one unfinished thing, or no single agent can hold all of this at once. Return the ordered
    smaller tasks that replace it.
- - RETRY, for a code or test setup defect requiring executor changes, or a task that has drifted
+ - REPAIR_TESTS, for a test or harness defect requiring a supervisor-owned rewrite;
+ - RETRY, for an application code defect requiring executor changes, or a task that has drifted
    from the owner's requirements. Preserve the goal and required behavior. Write a self-contained task
    using the observed failures, completed work, and a concrete different approach.
 REVERIFY retains the implementation and its attempt count. A rewritten or split implementation

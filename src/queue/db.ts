@@ -123,6 +123,8 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
 export type TaskKind = 'task' | 'phase';
 
 export interface Task {
+  /** Durable scope of a split implementation step; only the queue creates it. */
+  splitScope?: string;
   id: number;
   title: string;
   description: string;
@@ -265,6 +267,7 @@ const COLUMNS = `
   impl_verify_prompt      AS implVerifyPrompt,
   solution_verify_prompt  AS solutionVerifyPrompt,
   solution_verify_command AS solutionVerifyCommand,
+  split_scope AS splitScope,
   status, seq, output,
   validation_report AS validationReport,
   error_log           AS errorLog,
@@ -393,6 +396,7 @@ export class TaskQueue {
     // rather than living in one of its own.
     this.addColumn('kind', "TEXT NOT NULL DEFAULT 'task'");
     this.addColumn('region', "TEXT NOT NULL DEFAULT ''");
+    this.addColumn('split_scope', "TEXT NOT NULL DEFAULT ''");
 
     // A database written before this build may still carry `no_report_streak`.
     // Nothing reads it: a worker that dies without reporting now goes to the
@@ -994,6 +998,7 @@ export class TaskQueue {
     implVerifyPrompt: 'impl_verify_prompt',
     solutionVerifyPrompt: 'solution_verify_prompt',
     solutionVerifyCommand: 'solution_verify_command',
+    splitScope: 'split_scope',
     status: 'status',
     seq: 'seq',
     output: 'output',
@@ -1206,12 +1211,20 @@ export class TaskQueue {
    *
    * Returns the number of tasks inserted.
    */
-  splitTask(id: number, parts: NewTask[]): number {
+  splitTask(id: number, parts: NewTask[], hasFinalAcceptance = false): number {
     return this.tx(() => {
       const task = this.get(id);
-      if (!task || parts.length < 2) {
+      if (!task || task.status === 'VERIFIED' || parts.length < 2) {
         return 0;
       }
+      if (parts.some(p => !p || !p.title?.trim() || !p.description?.trim() ||
+          (!p.solutionVerifyPrompt?.trim() && !p.solutionVerifyCommand?.trim()))) {
+        throw new Error('Every split part needs a title, a complete description, and its own behavior check. No parts were changed.');
+      }
+      // Preserve the complete acceptance contract and journal before removing
+      // the parent. Splitting is recovery, never a way to erase failed evidence.
+      this.log(null, 'supervisor', 'split-archive', JSON.stringify({ task,
+        events: this.events(id, -1) }));
       const shift = parts.length - 1;
       this.db
         .prepare('UPDATE tasks SET seq = seq + ?, updated_at = ? WHERE seq > ?')
@@ -1220,9 +1233,18 @@ export class TaskQueue {
 
       parts.forEach((p, i) => {
         const newId = this.insert(
-          { ...p, seq: task.seq + i, maxAttempts: p.maxAttempts ?? task.maxAttempts },
+          { ...p, status: 'PENDING', kind: 'task', seq: task.seq + i, maxAttempts: p.maxAttempts ?? task.maxAttempts },
           task.seq + i,
         );
+        if (hasFinalAcceptance && i < parts.length - 1) {
+          this.db.prepare('UPDATE tasks SET split_scope = ? WHERE id = ?').run(
+            `QUEUE-ASSIGNED SPLIT STEP ${i + 1} OF ${parts.length - 1}\n` +
+            `Parent: ${task.title}. A separate final acceptance task retains the full parent requirements.\n` +
+            `Complete and verify ONLY this step's assigned scope. Requirements assigned to sibling steps or final acceptance are not missing work in this step. Do not expand this step into the whole project or replace its focused check with full-site validation.\n` +
+            `Assigned contract: ${JSON.stringify({title:p.title,description:p.description,
+              implVerifyPrompt:p.implVerifyPrompt,solutionVerifyPrompt:p.solutionVerifyPrompt,
+              solutionVerifyCommand:p.solutionVerifyCommand})}\nEND SPLIT STEP SCOPE`, newId);
+        }
         // What the original cost was really spent, so it moves to the first
         // part rather than disappearing with the row. Attributing all of it to
         // one part is imprecise, but the queue total stays honest, and that is

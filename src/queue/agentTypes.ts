@@ -47,9 +47,13 @@ export interface TurnResult {
 
 export const NO_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-export type ReviewOptions = Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> & { projectNotes?: string; recoveryContext?: string };
+export type ReviewOptions = Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> & { projectNotes?: string; failedRepairs?: number; recoveryContext?: string };
 
 export interface RunOptions {
+  /** Only the dedicated supervisor test-repair turn may edit while supervising. */
+  allowTestEdits?: boolean;
+  /** Validators may inspect and execute checks but cannot rewrite workspace files. */
+  verificationOnly?: boolean;
   /** Repair a response using supplied evidence without starting another tool investigation. */
   formatOnly?: boolean;
   /** Durable work identity; independent from this disposable process and conversation. */

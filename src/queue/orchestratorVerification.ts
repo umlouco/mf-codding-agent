@@ -27,6 +27,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
 
   /** Delegates formal verification to a fresh execution LLM and persists its response. */
   protected async verifyWithExecutor(task: Task, review: Review): Promise<void> {
+    if (this.correctTestingTarget(task)) return;
     const ownerContext = JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
       this.queue.testingContext, this.queue.instructions]);
     const accepts = () => review.gen === this.reviewGen &&
@@ -184,6 +185,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         this.queue.getMeta('goal'),
         {
           projectNotes: this.queue.contextInstructions,
+          failedRepairs: this.queue.countEvents(task.id, 'test-repair-halted'),
           recoveryContext: recoveryContext(this.queue, task),
           onAbort: (abort) => {
             if (!accepts()) { abort(); return; }
@@ -261,6 +263,9 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       return;
     }
     switch (decision.verdict) {
+      case 'REPAIR_TESTS':
+        await this.repairTests(task, decision.feedback);
+        break;
       case 'REVERIFY': {
         this.queue.update(task.id, {
           finishedAt: null, supervisorFeedback: decision.feedback,
@@ -404,12 +409,15 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         continue;
       }
       const description = edit.description?.trim() || target.description;
-      this.queue.update(target.id, {
+      const patch = {
         description,
         implVerifyPrompt: edit.implVerifyPrompt ?? target.implVerifyPrompt,
         solutionVerifyPrompt: edit.solutionVerifyPrompt ?? target.solutionVerifyPrompt,
         solutionVerifyCommand: edit.solutionVerifyCommand ?? target.solutionVerifyCommand,
-      });
+      };
+      if (!Object.entries(patch).some(([key,value]) => target[key as keyof Task] !== value)) continue;
+      this.stopForDecision(target, {...patch,validationReport:'',finishedAt:null,
+        ...(target.status === 'EXECUTING' ? {status:'PENDING' as const} : {})});
       if (description !== target.description) {
         this.queue.log(target.id, 'supervisor', 'task-edited', description.slice(0, 8000));
         this.log(`supervisor rewrote task ${edit.seq}`);

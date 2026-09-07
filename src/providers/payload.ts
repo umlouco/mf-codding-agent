@@ -43,6 +43,7 @@ export interface CoreRole {
 export interface CoreConfig {
   responseOnly?: boolean;
   inspectOnly?: boolean;
+  queueRole?: 'planner' | 'supervisor' | 'executor' | 'validator' | 'supervisor-repair';
   testingEnvironment: TestingEnvironment;
   workspaceRoot: string;
   providers: CoreProvider[];

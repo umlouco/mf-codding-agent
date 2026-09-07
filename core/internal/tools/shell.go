@@ -186,6 +186,9 @@ func RegisterShell(r *Registry) {
 			if err := env.CheckTestingCommand(a.Command); err != nil {
 				return Errf("%v", err)
 			}
+			if err := env.CheckQueueCommand(a.Command); err != nil {
+				return Errf("%v", err)
+			}
 			low := strings.ToLower(a.Command)
 			for _, d := range deniedPatterns {
 				if strings.Contains(low, strings.ToLower(d)) {

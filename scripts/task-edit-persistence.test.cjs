@@ -142,7 +142,7 @@ test('changed or replaced targets reject the entire proposal before unrelated ch
     ['content', (queue, target) => queue.update(target.id, { description: 'Changed while planning' })],
     ['attempt', (queue, target) => queue.update(target.id, { attempts: target.attempts + 1 })],
     ['status', (queue, target) => queue.update(target.id, { status: 'FAILED' })],
-    ['replacement', (queue, target) => queue.splitTask(target.id, [task('New identity A'), task('New identity B')])],
+    ['replacement', (queue, target) => queue.splitTask(target.id, [task('New identity A', {solutionVerifyPrompt:'Check A'}), task('New identity B', {solutionVerifyPrompt:'Check B'})])],
   ];
   for (const [name, mutate] of cases) {
     const { queue, open } = fixture(t, [task('Keep original'), task(`Target ${name}`)]);

@@ -47,7 +47,7 @@ function systemSuffixFor(role: Role): string {
   if (role === 'executor') {
     return 'You are a task queue worker. Follow the current task role: implement coding tasks, ' +
       'or independently check verification tasks without editing source or tests. ' +
-      'Use the final response format requested by the task.';
+      'Only the supervisor may rewrite task-list entries, instructions, validation criteria or existing tests. Report defects and request supervisor repair; do not rewrite your orders. Use the final response format requested by the task.';
   }
   return (
     'You are the Planner for an autonomous task queue running inside this workspace. Read the ' +
@@ -126,7 +126,7 @@ export async function runClaudeCliTurn(
     const mcp = resolveMcpBinary(getContext());
     if (!mcp) throw new Error('The bundled task queue testing tools are unavailable. Rebuild or reinstall MF Agent.');
     args.push('--mcp-config', JSON.stringify({ mcpServers: { mfagent: { command: mcp, args: ['--workspace', cwd] } } }));
-    if (testing.url) {
+    if (queue) {
       const core = resolveCoreBinary(getContext()).path;
       if (!core) throw new Error('The testing environment enforcement tool is unavailable.');
       const quote = (text: string) => "'" + text.replace(/'/g, process.platform === 'win32' ? "''" : "'\\''") + "'";
@@ -154,7 +154,7 @@ export async function runClaudeCliTurn(
 
   const proc = cp.spawn(bin, args, {
     cwd,
-    env: { ...process.env, ...(testing ? testingProcessEnvironment(testing) : {}) },
+    env: { ...process.env, MFAGENT_QUEUE_ROLE: opts.verificationOnly ? 'validator' : role === 'supervisor' && opts.allowTestEdits ? 'supervisor-repair' : role, ...(testing ? testingProcessEnvironment(testing) : {}) },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });

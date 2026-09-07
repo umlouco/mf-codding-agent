@@ -24,8 +24,7 @@ export interface TaskEditResult {
  * Turns a free-text instruction plus the queue's current tasks into a set of
  * edits, deletions and additions validated against the supplied task snapshot.
  * The caller owns committing this proposal to the queue and reporting what
- * actually changed. Runs through `runOnce('planner', ...)`,
- * so it works identically whichever provider Planner is bound to.
+ * actually changed. Existing task-list rewrites always use the supervisor.
  */
 export async function editTasks(
   context: vscode.ExtensionContext,
@@ -70,7 +69,7 @@ the three arrays empty when the instruction does not call for that kind of chang
 arrays and the summary are required. For no change, return three empty arrays and explain why
 in summary. Use only the fields shown above; adds require title and description strings.`;
 
-  const { text, usage, stopReason } = await runOnce(context, output, 'planner', prompt, opts);
+  const { text, usage, stopReason } = await runOnce(context, output, 'supervisor', prompt, opts);
   const reason = String(stopReason ?? '').trim().toLowerCase();
   if (!['', 'end_turn', 'stop', 'stop_sequence', 'completed'].includes(reason)) {
     throw new AgentRunError(`Task edit planning did not complete (${reason}). No task edit proposal was accepted.`);

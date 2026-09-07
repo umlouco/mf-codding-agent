@@ -17,8 +17,8 @@ export abstract class OrchestratorExpansion extends OrchestratorExecution {
   protected async runExpansion(task: Task, attempt: number, gen: number, current: () => boolean): Promise<void> {
     this.log(`expanding phase ${task.seq} — ${task.title} (attempt ${task.attempts})`);
     const goal = this.queue.getMeta('goal');
-    const live = new LiveLog(this.queue, task.id, 'planner');
-    const observe = this.observerEvents(task.id, 'planner', live);
+    const live = new LiveLog(this.queue, task.id, 'supervisor');
+    const observe = this.observerEvents(task.id, 'supervisor', live);
 
     let result: PhaseExpansion;
     try {

@@ -46,6 +46,7 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	if err := tools.ApplyTestingProcessEnvironment(cfg.TestingEnvironment); err != nil {
 		return nil, err
 	}
+	_ = os.Setenv("MFAGENT_QUEUE_ROLE", cfg.QueueRole)
 	if cfg.WorkspaceRoot == "" {
 		wd, _ := os.Getwd()
 		cfg.WorkspaceRoot = wd

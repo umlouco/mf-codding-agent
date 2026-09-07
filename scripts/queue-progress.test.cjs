@@ -56,7 +56,7 @@ test('a cancelled review cannot overwrite replacement activity with its late err
 
 
 test('a delayed progress decision cannot act on superseded worker evidence', async t => {
-  for (const action of ['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION', 'START_VALIDATION', 'CONTINUE_EXECUTION']) {
+  for (const action of ['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION', 'START_VALIDATION', 'CONTINUE_EXECUTION', 'SPLIT_TASK']) {
     const queue = fixture(t);
     const current = queue.claimNext();
     queue.log(current.id, 'executor', 'tool', 'write_file(test.js) → ok: initial draft');
@@ -397,4 +397,229 @@ test('review evidence survives thousands of heartbeats and excludes superseded e
   const runner = orchestrator(queue, {});
   runner.reviewed.set(second.id, { attempt: second.attempts, at: 0, eventId: evidence[0].id });
   assert.equal(runner.shouldReview(second, evidence[0].id), false, 'heartbeats do not buy another review');
+});
+
+
+test('live split fences the old worker, preserves evidence, and retains the full acceptance gate', async t => {
+  const queue = fixture(t);
+  queue.addAll([{title:'Later task',description:'Existing later work'}]);
+  const current = queue.claimNext();
+  queue.update(current.id, {solutionVerifyPrompt:'All original requirements', solutionVerifyCommand:'npm test'});
+  queue.log(current.id,'executor','tool','failed test evidence');
+  queue.addUsage(current.id,{input:23,output:17,cacheRead:4,cacheWrite:2});
+  const runner = orchestrator(queue, {});
+  let aborted = false;
+  runner.executionAbort = () => { aborted = true; };
+  const parts = Array.from({length:8},(_,i)=>({title:`Small check ${i+1}`,description:`Implement check ${i+1}`,solutionVerifyPrompt:`Only check ${i+1}`,status:'VERIFIED'}));
+  await runner.applyProgressDecision(queue.get(current.id),{action:'SPLIT_TASK',reason:'Eight independent checks are being conflated',splitInto:parts,usage},{gen:0});
+  assert.equal(aborted,true);
+  assert.equal(queue.get(current.id),undefined);
+  assert.equal(queue.finishExecution(current.id,current.attempts,{status:'VERIFIED'}),false);
+  const rows = queue.list();
+  assert.equal(rows.length,10);
+  assert.ok(rows.every(row=>row.status==='PENDING'));
+  assert.equal(rows[8].solutionVerifyPrompt,'All original requirements');
+  assert.equal(rows[8].solutionVerifyCommand,'npm test');
+  assert.equal(rows[9].title,'Later task');
+  assert.equal(rows[0].tokensIn,23);
+  const archive = queue.events(null,100).find(e=>e.kind==='split-archive');
+  assert.match(archive.message,/failed test evidence/);
+  assert.match(archive.message,/All original requirements/);
+});
+
+test('invalid split is rejected before stopping or changing the parent', t => {
+  const queue=fixture(t); const current=queue.claimNext(); const runner=orchestrator(queue,{});
+  runner.executionAbort=()=>assert.fail('invalid split stopped useful work');
+  assert.throws(()=>runner.splitTask(current.id,[{title:'A',description:'A'},{title:'B',description:'B'}]),/behavior check/);
+  assert.equal(queue.get(current.id).status,'EXECUTING');
+  assert.equal(queue.list().length,1);
+});
+
+test('a deployed target corrects stale localhost task text before any executor starts',async t=>{
+  const queue=fixture(t);
+  queue.setMeta('testingUrl','https://application.example.test/plugins/');
+  const row=queue.list()[0];
+  queue.update(row.id,{description:'Test http://127.0.0.1:18780/plugins/ and http://localhost:18780/wp-login.php',solutionVerifyPrompt:'Open http://localhost:18780/plugins/'});
+  const monitor=load('src/queue/monitor.ts');
+  const runner=orchestrator(queue,{'./monitor':monitor,'./agents':{executeTask:()=>assert.fail('wrong target reached executor')}});
+  await runner.pump();
+  const corrected=queue.get(row.id);
+  assert.equal(corrected.status,'PENDING');
+  assert.match(corrected.description,/https:\/\/application.example.test\/plugins\//);
+  assert.match(corrected.description,/https:\/\/application.example.test\/wp-login.php/);
+  assert.doesNotMatch(corrected.description,/localhost|127\.0\.0\.1/);
+  assert.equal(queue.countEvents(row.id,'testing-target-corrected'),1);
+});
+
+test('split steps retain their scope across reload and bypass the whole-project requirements rewrite',async t=>{
+  const queue=fixture(t); const current=queue.claimNext();
+  orchestrator(queue,{}).splitTask(current.id,[{title:'Parse test',description:'Repair syntax only; browser assertions are a later step.',solutionVerifyPrompt:'node --check passes'},{title:'Test browser',description:'Run actual form checks',solutionVerifyPrompt:'Real browser assertions pass'}]);
+  const reopened=TaskQueue.open(queue.path);
+  const child=reopened.list()[0];
+  const acceptance=reopened.list()[2];
+  reopened.close();
+  assert.match(child.splitScope,/Repair syntax only/);
+  assert.equal(acceptance.splitScope,'','final acceptance still receives the full requirements comparison');
+  const deps=agents(); let prompt='';
+  const monitor=load('src/queue/monitor.ts',{
+    './agents':{...deps,runOnce:async(_c,_o,_r,text)=>{prompt=text;return {text:JSON.stringify({action:'CONTINUE_EXECUTION',reason:'Parsing repair supports the later browser checks'}),usage};}},
+    './requirements':{reviewTaskRequirements:()=>assert.fail('split prerequisite was reinterpreted as the entire owner project')},
+    './validation':validation,'./prompts':prompts,'./cognition':cognition,
+  });
+  await monitor.reviewProgress({},output,child,[],0,{ownerInstructions:notes},goal);
+  assert.match(prompt,/Requirements assigned to sibling steps/);
+  assert.match(prompt,/Repair syntax only/);
+});
+
+test('a wrong-target handoff cannot buy another identical execution attempt with CONTINUE',async()=>{
+  let calls=0;
+  const module=agents();
+  const monitor=load('src/queue/monitor.ts',{
+    './agents':{...module,runOnce:async()=>{calls++;return {text:JSON.stringify({action:'CONTINUE_EXECUTION',reason:'Try again'}),usage};}},
+    './validation':validation,'./prompts':prompts,'./cognition':cognition,
+  });
+  await assert.rejects(monitor.reviewProgress({},output,{...task,status:'VERIFYING',errorLog:'[attempt 1] the core stopped the turn (testing_target_blocked).'},[],0,{},goal),/no readable decision/);
+  assert.equal(calls,2,'one corrective formatting opportunity, no resumed worker');
+});
+
+test('test rewrites stop the executor and run on the supervisor before independent validation',async t=>{
+  const queue=fixture(t);
+  queue.update(queue.list()[0].id,{solutionVerifyCommand:'node --check form.spec.js'});
+  const current=queue.claimNext();
+  let stopped=false;let repaired=false;let validated=false;
+  const runner=orchestrator(queue,{'./command':{runVerificationCommand:async()=>{
+    assert.equal(stopped,true);return 'exit=1 SyntaxError at form.spec.js:96';
+  }},'./agents':{
+    coreHalted:()=>false,
+    runOnce:async(_context,_output,role,prompt,opts)=>{
+      assert.equal(stopped,true,'executor must stop before editing supervisor starts');
+      assert.equal(role,'supervisor');assert.equal(opts.allowTestEdits,true);
+      assert.match(prompt,/own test repairs/);
+      assert.match(prompt,/exit=1 SyntaxError at form.spec.js:96/,'supervisor receives the actual pre-repair failure');
+      assert.equal(queue.get(current.id).status,'VERIFYING');
+      repaired=true;
+      return {text:'Repaired syntax in the test; parsing check passed.',usage,stopReason:'end_turn'};
+    },
+  }});
+  runner.executionAbort=()=>{stopped=true;};
+  runner.verifyWithExecutor=async()=>{assert.equal(repaired,true);validated=true;};
+  await runner.applyProgressDecision(current,{action:'STOP_AND_REWRITE_TESTS',reason:'Broken test syntax',usage},{gen:0});
+  assert.equal(validated,true);
+  assert.equal(queue.get(current.id).status,'VERIFYING','supervisor cannot approve its own repair');
+  assert.equal(queue.countEvents(current.id,'test-repair-finished'),1);
+});
+
+test('stopping supervisor test repair prevents its late handoff from starting validation',async t=>{
+  const queue=fixture(t);const current=queue.claimNext();
+  let finish;
+  const runner=orchestrator(queue,{'./agents':{coreHalted:()=>false,runOnce:()=>new Promise(resolve=>{finish=resolve;})}});
+  runner.verifyWithExecutor=()=>assert.fail('cancelled supervisor repair started validation');
+  const pending=runner.applyProgressDecision(current,{action:'STOP_AND_REWRITE_TESTS',reason:'Repair test',usage},{gen:0});
+  // Recovery admission now precedes starting the dedicated repair process.
+  while (!finish) await new Promise(resolve => setImmediate(resolve));
+  runner.reviewGen++;
+  finish({text:'Late repair report',usage,stopReason:'end_turn'});
+  await pending;
+  assert.equal(queue.get(current.id).output,'');
+});
+
+test('a host-blocked executor test rewrite goes straight to supervisor repair',async t=>{
+  const queue=fixture(t);const current=queue.claimNext();
+  queue.update(current.id,{status:'VERIFYING',errorLog:'[attempt 1] the core stopped the turn (supervisor_repair_required).',output:'Execution stopped: queue ownership: the supervisor must rewrite existing test form.spec.js.'});
+  const runner=orchestrator(queue,{});let repaired=false;
+  runner.repairTests=async(row,reason)=>{assert.equal(row.id,current.id);assert.match(reason,/supervisor-owned test/);repaired=true;};
+  await runner.reviewWork(queue.get(current.id));
+  assert.equal(repaired,true);
+});
+
+test('failed required command preserves host evidence for supervision without permitting verifier edits',async()=>{
+  const command = 'node --check form.spec.js';
+  let calls = 0;
+  const verifier=load('src/queue/verification.ts',{
+    ...verificationDependencies({result:()=>({output:'exit=1 SyntaxError: missing )',isError:true,meta:{exitCode:1}})}),
+    './validation':validation,'./prompts':prompts,'./cognition':cognition,
+    './agents':{coreHalted:()=>false,runOnce:async(_c,_o,_role,_prompt,opts)=>{
+      assert.equal(opts.verificationOnly,true);
+      assert.equal(opts.formatOnly,true,'planning/reporting cannot rewrite the failed test');
+      return {text:JSON.stringify(++calls===1 ? verificationPlanReply(command) : {...report(),conclusion:'INCOMPLETE',
+        behaviorEvidence:'Host receipt states: exit=1 SyntaxError: missing )',remaining:'Supervisor must repair the test syntax.'}),usage,stopReason:'end_turn'};
+    }}});
+  const result=await verifier.runVerification({},output,{...task,solutionVerifyCommand:command},goal);
+  const evidence=JSON.parse(result.validationReport);
+  assert.equal(evidence.conclusion,'INCOMPLETE');
+  assert.equal(evidence.observedTools[0].status,'error');
+  assert.match(evidence.behaviorEvidence,/SyntaxError/);
+  assert.equal(evidence.verificationReceipts[0].passed,false);
+  assert.equal(calls,2,'host planning and evidence reporting retain the new verification workflow');
+});
+
+test('a supervisor verdict cannot approve a contract changed while its model was running',async t=>{
+  const queue=fixture(t);const current=queue.claimNext();
+  queue.update(current.id,{status:'VERIFYING',validationReport:JSON.stringify(report())});
+  let finish;
+  const runner=orchestrator(queue,{'./agents':{superviseTask:()=>new Promise(r=>{finish=r;})}});
+  const pending=runner.supervise(queue.get(current.id));
+  queue.update(current.id,{solutionVerifyPrompt:'Also check the new required boundary'});
+  finish({verdict:'VERIFIED',feedback:'Old checks passed',usage});await pending;
+  assert.equal(queue.get(current.id).status,'VERIFYING');
+  assert.equal(queue.countEvents(current.id,'verdict:VERIFIED'),0);
+});
+
+test('task rewrites fence an active executor and invalidate its old validation',t=>{
+  const queue=fixture(t);const current=queue.claimNext();
+  queue.update(current.id,{validationReport:JSON.stringify(report())});
+  const runner=orchestrator(queue,{});let stopped=false;runner.executionAbort=()=>{stopped=true;};
+  runner.applyTaskEdits({taskEdits:[{seq:current.seq,solutionVerifyCommand:'run corrected check'}]},current.seq);
+  assert.equal(stopped,true);
+  assert.equal(queue.get(current.id).status,'PENDING');
+  assert.equal(queue.get(current.id).validationReport,'');
+});
+
+test('supervisor test repair receives the rewritten contract and cannot reuse its old PASS',async t=>{
+  const queue=fixture(t);const current=queue.claimNext();
+  queue.update(current.id,{status:'VERIFYING',validationReport:JSON.stringify(report())});
+  const runner=orchestrator(queue,{'./agents':{superviseTask:async()=>({verdict:'REPAIR_TESTS',feedback:'Correct the test',usage,
+    taskEdits:[{seq:current.seq,description:'Repair the real selector from observed DOM',solutionVerifyCommand:'run corrected check'}]})}});
+  let repaired=false;runner.repairTests=async row=>{
+    assert.equal(row.description,'Repair the real selector from observed DOM');
+    assert.equal(row.solutionVerifyCommand,'run corrected check');
+    assert.equal(row.validationReport,'');repaired=true;
+  };
+  await runner.supervise(queue.get(current.id));assert.equal(repaired,true);
+});
+
+test('a halted supervisor repair checks current files before repeating work',async t=>{
+  const queue=fixture(t);const current=queue.claimNext();
+  const runner=orchestrator(queue,{'./agents':{coreHalted:()=>true,runOnce:async()=>({text:'Partial repair',stopReason:'repeated_tool_error',usage})}});
+  let checked=false;runner.verifyWithExecutor=async()=>{checked=true;};
+  await runner.repairTests(current,'Fix the test syntax');
+  assert.equal(checked,true);assert.equal(queue.countEvents(current.id,'test-repair-halted'),1);
+  assert.match(queue.get(current.id).errorLog,/supervisor test repair halted/);
+  assert.ok(!queue.get(current.id).supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]'));
+});
+
+test('repeated halted repairs require a new supervisor plan instead of an identical third repair',async()=>{
+  const module=agents();let calls=0;
+  module.setTestRunner(async(_c,_o,role,prompt)=>{
+    assert.equal(role,'supervisor');calls++;
+    if(calls===1)return {text:JSON.stringify({verdict:'REPAIR_TESTS',feedback:'Repair the same broken spec',taskEdits:[]}),usage};
+    assert.match(prompt,/Supervisor test repair has halted 2 times/);
+    return {text:JSON.stringify({splitInto:[
+      {title:'Repair parser failure',description:'Correct the reported unmatched delimiter',implVerifyPrompt:'Inspect the delimiter correction',solutionVerifyPrompt:'The test parses',solutionVerifyCommand:'node --check form.spec.js'},
+      {title:'Repair navigation',description:'Use the observed public login route',implVerifyPrompt:'Inspect the navigation target',solutionVerifyPrompt:'Actual browser login succeeds',solutionVerifyCommand:''}
+    ],feedback:'Complete parsing before browser navigation'}),usage};
+  });
+  const result=await module.superviseTask({},output,{...task,status:'VERIFYING',validationReport:JSON.stringify({...report(),conclusion:'INCOMPLETE'})},0,goal,{failedRepairs:2});
+  assert.equal(result.verdict,'SPLIT');assert.equal(result.splitInto.length,2);assert.equal(calls,2);
+});
+
+test('a cancelled final supervisor error cannot overwrite the replacement worker activity',async t=>{
+  const queue=fixture(t);const current=queue.claimNext();queue.update(current.id,{status:'VERIFYING',validationReport:JSON.stringify(report())});
+  let reject;
+  const runner=orchestrator(queue,{'./agents':{superviseTask:()=>new Promise((_r,j)=>{reject=j;})}});
+  const pending=runner.supervise(queue.get(current.id));runner.reviewGen++;
+  queue.recordActivity(current.id,'model_wait','replacement supervisor is alive','supervisor');
+  reject(new Error('old process exited'));await pending;
+  assert.equal(queue.get(current.id).activityDetail,'replacement supervisor is alive');
+  assert.equal(queue.countEvents(current.id,'error'),0);
 });

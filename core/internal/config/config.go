@@ -61,7 +61,8 @@ type EditorToolDef struct {
 }
 
 type Config struct {
-	ResponseOnly bool `json:"responseOnly"`
+	QueueRole    string `json:"queueRole"`
+	ResponseOnly bool   `json:"responseOnly"`
 	// InspectOnly keeps supervisor reviews from becoming a second writer.
 	InspectOnly        bool               `json:"inspectOnly"`
 	TestingEnvironment TestingEnvironment `json:"testingEnvironment"`

@@ -129,8 +129,8 @@ test('an actual successful recovery split removes its parent without pausing or 
   const runner = runnerFor(queue);
   runner.performRecovery = async () => {
     const count = queue.splitTask(task.id, [
-      { title: 'First bounded outcome', description: 'Retain existing changes and prove the first behavior.' },
-      { title: 'Second bounded outcome', description: 'Prove the second behavior after the first.' },
+      { title: 'First bounded outcome', description: 'Retain existing changes and prove the first behavior.', solutionVerifyPrompt: 'Exercise the first behavior.' },
+      { title: 'Second bounded outcome', description: 'Prove the second behavior after the first.', solutionVerifyPrompt: 'Exercise the second behavior.' },
     ]);
     assert.equal(count, 2);
     runner.abandonReview();

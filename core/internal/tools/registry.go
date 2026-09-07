@@ -76,6 +76,7 @@ func (t *Tool) Describe(input json.RawMessage) string {
 
 // Env is the ambient context every tool receives.
 type Env struct {
+	QueueRole     string
 	Root          string
 	Testing       config.TestingEnvironment
 	testingMu     sync.Mutex

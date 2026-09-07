@@ -75,6 +75,7 @@ func runSh(argv []string) int {
 	// Nothing here writes to the UI: there is no editor attached to a script
 	// run from the command line.
 	env := &tools.Env{
+		QueueRole:   os.Getenv("MFAGENT_QUEUE_ROLE"),
 		Root:        root,
 		Testing:     tools.TestingFromEnvironment(),
 		Emit:        func(string, any) {},

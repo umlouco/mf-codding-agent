@@ -47,6 +47,16 @@ for (const [role, omitDefinitions] of [
       });
 
       const overrides = await overridesFor(role, 12);
+      if(role==='executor') {
+        const verification = await overridesFor('executor',12,false,true);
+        assert.equal(verification.queueRole,'validator');
+        assert.equal(verification.inspectOnly,false,'validator retains command and browser tools with file ownership enforced separately');
+      }
+      if(role==='supervisor') {
+        const repair=await overridesFor(role,12,true);
+        assert.equal(repair.inspectOnly,false,'dedicated supervisor repair has editing tools');
+        assert.equal(repair.queueRole,'supervisor-repair','repair does not impersonate an executor');
+      }
       assert.equal(overrides.disableTools, omitDefinitions);
       const mcpServers = [{ name: 'workspace-tools', url: 'http://tools.test/mcp', enabled: true }];
       const payload = { providers: [], memoryEnabled, mcpServers };
@@ -65,6 +75,7 @@ for (const [role, omitDefinitions] of [
       assert.equal(config.mcpServers, mcpServers, 'role preserves the configured MCP servers');
       assert.equal(config.disableTools, omitDefinitions, 'definition omission survives initialization');
       assert.equal(config.inspectOnly, role === 'supervisor', 'supervisor inspection is enforced separately from executor capabilities');
+      assert.equal(config.queueRole,role,'native tool boundary receives the actual queue role');
       assert.equal(config.coding.model, 'configured-model');
       assert.equal(config.coding.providerId, `queue-${role}`);
       assert.equal(config.maxIterations, 12);

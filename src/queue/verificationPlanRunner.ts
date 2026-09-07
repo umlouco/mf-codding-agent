@@ -36,7 +36,7 @@ export class VerificationSession {
     this.checkActive();
     // inspectOnly forbids browser navigation and tests; disableTools prevents a
     // model loop here, while direct typed calls retain the core's tool safeguards.
-    await this.client.initialize({ disableTools: true, editorTerminal: false, memoryEnabled: false });
+    await this.client.initialize({ disableTools: true, editorTerminal: false, memoryEnabled: false, queueRole: 'validator' });
     this.checkActive();
     const listed = await this.client.request<VerificationCapability[]>('tools/list');
     this.checkActive();

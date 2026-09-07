@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 
 	"github.com/mflores/mfagent/core/internal/tools"
 )
@@ -20,7 +22,14 @@ func runTestingHook(input io.Reader, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "Testing environment: invalid tool hook input.")
 		return 2
 	}
-	env := &tools.Env{Testing: tools.TestingFromEnvironment()}
+	root, _ := os.Getwd()
+	env := &tools.Env{Root: root, QueueRole: os.Getenv("MFAGENT_QUEUE_ROLE"), Testing: tools.TestingFromEnvironment()}
+	name := strings.ToLower(event.Name)
+	mutating := !strings.Contains(name, "read") && !strings.Contains(name, "glob") && !strings.Contains(name, "grep") && !strings.HasSuffix(name, "_list") && !strings.HasSuffix(name, "_stats")
+	if err := env.CheckQueueOwnership(event.Name, event.Input, mutating); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	env.MarkTestingOpened()
 	if err := env.CheckTestingTool(event.Name, event.Input); err != nil {
 		fmt.Fprintln(stderr, env.RedactTestingSecrets(err.Error()))

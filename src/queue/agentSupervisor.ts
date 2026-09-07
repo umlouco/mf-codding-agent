@@ -37,9 +37,9 @@ Your own tool use does not replace the independent verification report required 
 
 A task is never terminally failed. When the evidence is not sufficient, make exactly one
 recovery decision: REVERIFY for a missing/invalid check or report without an observed code defect,
-RETRY for an observed implementation or test setup defect that needs editing, or
-SPLIT into several smaller ordered tasks. Use SPLIT only when scope is the obstacle; use RETRY
-for a focused correction that requires changes to code or test setup.
+REPAIR_TESTS for a test/harness defect that YOU must rewrite after the executor stops,
+RETRY for an observed application implementation defect, or SPLIT into smaller ordered tasks.
+All task-list rewrites and test repairs belong to you. The executor follows the assigned contract.
 Whether the work passes is decided by the evidence alone and never by how many attempts it took.
 
 ${originalGoalContext(goal)}
@@ -66,6 +66,8 @@ TASK ${task.seq}: ${task.title}
 ${rewriteNotice(rewrites)}
 Requirements:
 ${task.description}
+
+${task.splitScope || ''}
 
 Required implementation check:
 ${task.implVerifyPrompt || 'the described code exists and is coherent'}
@@ -97,7 +99,10 @@ Reply with ONE JSON object and nothing else:
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
 
-Set verdict to VERIFIED, REVERIFY, RETRY, or SPLIT. Use empty splitInto unless splitting; use empty taskEdits
+Set verdict to VERIFIED, REVERIFY, RETRY, SPLIT, or REPAIR_TESTS. Choose REPAIR_TESTS when an existing
+test or validation script needs rewriting: the extension stops execution and gives YOU a test-editing
+turn, then independently runs the repaired checks. Do not delegate test rewrites to the executor.
+Use empty splitInto unless splitting; use empty taskEdits
 unless making edits. Replace example strings with concrete instructions, not placeholders.
 In feedback, state the original requirement this task covers and why the actual evidence satisfies
 it or what remains missing. Never accept report formatting or a demonstration as a replacement for
@@ -148,7 +153,7 @@ decisions: reverify it, correct it, or split it. There is no fail or give-up ver
   // FAIL is no longer in the protocol. A model that has seen it elsewhere still
   // emits it, and it means "I have run out of ideas" — which is a reason to
   // rewrite the task, never a reason to end the run.
-  let verdict: Verdict = (['VERIFIED', 'REVERIFY', 'RETRY', 'SPLIT'] as string[]).includes(named)
+  let verdict: Verdict = (['VERIFIED', 'REVERIFY', 'RETRY', 'SPLIT', 'REPAIR_TESTS'] as string[]).includes(named)
     ? (named as Verdict)
     : 'RETRY';
 
@@ -170,6 +175,17 @@ decisions: reverify it, correct it, or split it. There is no fail or give-up ver
     taskEdits,
     usage: total,
   };
+
+  if (settled === 'REPAIR_TESTS' && (opts.failedRepairs ?? 0) >= 2 &&
+      !rewritten(taskEdits.find(e => e.seq === task.seq)?.description, task.description)) {
+    const recovery = await escalate(context, output, task, goal,
+      `Supervisor test repair has halted ${opts.failedRepairs} times. Split the remaining repair into concrete smaller checks or supply a materially different repair plan. ${feedback}`, opts);
+    addUsage(total, recovery.usage);
+    if (recovery.splitInto.length >= 2) return {...decision, verdict:'SPLIT', splitInto:recovery.splitInto, taskEdits:[], usage:total};
+    if (rewritten(recovery.description, task.description)) return {...decision,
+      taskEdits:[{seq:task.seq,description:recovery.description}], feedback:recovery.feedback || feedback, usage:total};
+    throw new AgentRunError('Repeated supervisor repair requires smaller steps or a changed repair plan; unchanged repair was not started.');
+  }
 
   if (settled !== 'RETRY') {
     if (settled === 'REVERIFY' || settled === 'VERIFIED') {

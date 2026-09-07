@@ -10,6 +10,20 @@ import (
 	"github.com/mflores/mfagent/core/internal/tools"
 )
 
+func TestWrongTestingTargetHandsOffWithoutAnotherModelRequest(t *testing.T) {
+	provider := &cognitionProvider{rounds: [][]llm.Block{{{Type: llm.BlockToolUse, ID: "wrong-target", Name: "browser_open", Input: json.RawMessage(`{"url":"http://localhost:8000/"}`)}}}}
+	a := newTestAgent(t, provider, 24)
+	a.env.Testing.URL = "https://app.example.test/project/"
+	a.registry.Add(&tools.Tool{Name: "browser_open", Run: func(context.Context, *tools.Env, json.RawMessage) tools.Result {
+		t.Fatal("blocked target reached browser")
+		return tools.Ok("unreachable")
+	}})
+	result, err := a.Send(context.Background(), SendRequest{SessionID: "target", Text: "Test the configured application"})
+	if err != nil || result.StopReason != "testing_target_blocked" || len(provider.requests) != 1 {
+		t.Fatalf("result=%+v err=%v requests=%d", result, err, len(provider.requests))
+	}
+}
+
 func TestEditorCompletionHandsOffWithoutReenteringToolLoop(t *testing.T) {
 	provider := &cognitionProvider{rounds: [][]llm.Block{{cognitionCall("complete", "editor__task_complete")}}}
 	a := newTestAgent(t, provider, 24)

@@ -210,9 +210,12 @@ func (s *server) handleToolsList(_ context.Context, req *rpcRequest) {
 		OutputSchema map[string]any `json:"outputSchema,omitempty"`
 		Annotations  map[string]any `json:"annotations,omitempty"`
 	}
-	entries := make([]toolEntry, len(s.tools))
-	for i, t := range s.tools {
-		entries[i] = toolEntry{t.Name, t.Description, t.InputSchema, t.OutputSchema, t.Annotations}
+	entries := make([]toolEntry, 0, len(s.tools))
+	for _, t := range s.tools {
+		if !tools.QueueToolAllowed(os.Getenv("MFAGENT_QUEUE_ROLE"), t.Name) {
+			continue
+		}
+		entries = append(entries, toolEntry{t.Name, t.Description, t.InputSchema, t.OutputSchema, t.Annotations})
 	}
 	result := map[string]any{"tools": entries}
 	s.sendResult(req.ID, result)
@@ -225,6 +228,10 @@ func (s *server) handleToolsCall(ctx context.Context, req *rpcRequest) {
 	}
 	if err := json.Unmarshal(req.Params, &call); err != nil {
 		s.sendError(req.ID, -32602, "invalid params: "+err.Error())
+		return
+	}
+	if !tools.QueueToolAllowed(os.Getenv("MFAGENT_QUEUE_ROLE"), call.Name) {
+		s.sendError(req.ID, -32602, "Task-list writes require a supervisor decision applied by the extension; autonomous workers cannot edit the queue through MCP.")
 		return
 	}
 
