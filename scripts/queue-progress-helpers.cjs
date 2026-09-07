@@ -25,7 +25,7 @@ function load(file, dependencies = {}, extra = '') {
     exports, process, Buffer, __dirname, setTimeout, clearTimeout,
     require: name => {
       if (name in dependencies) return dependencies[name];
-      if (/^\.\/(orchestrator|scope|recovery|workInventory)/.test(name)) return load('src/queue/' + name.slice(2) + '.ts', dependencies);
+      if (/^\.\/(orchestrator|scope|recovery|workInventory|verificationAuthority|verificationRecovery)/.test(name)) return load('src/queue/' + name.slice(2) + '.ts', dependencies);
       if (['fs', 'path', 'crypto', 'node:sqlite'].includes(name)) return require(name);
       if (name === 'better-sqlite3') throw new Error('Use built-in SQLite in tests');
       return {};

@@ -4,6 +4,7 @@ import { QueueStats } from './db';
 import { OrchestratorState, OrchestratorStatus, RunMode, WATCHDOG_MS } from './orchestratorState';
 import { recoveryKey, resumeRecovery } from './recovery';
 import { restoreScopedContracts } from './scopeContract';
+import { hasOutstandingRecovery, recoveryJobKey } from './recoverySchedule';
 
 export abstract class OrchestratorControl extends OrchestratorState {
 
@@ -97,8 +98,8 @@ export abstract class OrchestratorControl extends OrchestratorState {
       return;
     }
     // Activation/configuration restoration calls start only for RUNNING queues.
-    // Starting a non-running queue is an explicit operator retry, not a watchdog
-    // retry. Release recovery latches without resetting tasks or acceptance checks.
+    // Explicit Start resumes operator controls. Legacy pauses become scheduled
+    // recovery; new recovery deadlines and failure histories are never reset.
     if (this.queue.runState !== 'RUNNING') {
       const restored = restoreScopedContracts(this.queue);
       if (restored) this.log(`restored ${restored} admitted local contract(s) expanded by earlier supervisor rewrites`);
@@ -173,7 +174,10 @@ export abstract class OrchestratorControl extends OrchestratorState {
     this.abandonReview();
     this.abandonExecution();
     this.queue.resetAll();
-    for (const task of this.queue.list()) this.queue.setMeta(recoveryKey(task), '');
+    for (const task of this.queue.list()) {
+      this.queue.setMeta(recoveryKey(task), '');
+      this.queue.setMeta(recoveryJobKey(task), '');
+    }
     // resetAll zeroes `attempts`, so a stale entry here would read as a review
     // of the attempt about to start rather than of the run just thrown away.
     this.reviewed.clear();
@@ -210,6 +214,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
   }
 
   protected finish(): void {
+    if (!this.queue.isComplete() || hasOutstandingRecovery(this.queue)) return;
     this.disarm();
     this.queue.setRunState('IDLE');
     this.changed();

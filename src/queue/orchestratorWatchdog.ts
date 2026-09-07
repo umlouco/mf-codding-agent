@@ -3,6 +3,7 @@ import { OrchestratorControl } from './orchestratorControl';
 import { appendAttempt } from './orchestratorState';
 import { scopeBlocked } from './scopePlan';
 import { recoveryFailure } from './recovery';
+import { deferRecoveryJob, hasOutstandingRecovery, hasRecoveryJob } from './recoverySchedule';
 
 export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
@@ -38,7 +39,7 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       this.sweepSilentWorkers();
 
       const active = this.queue.activeTask();
-      if (active?.kind === 'task' && active.activityPhase !== 'scope_review') {
+      if (active?.kind === 'task' && active.activityPhase !== 'scope_review' && !await this.serviceRecovery(active)) {
         await this.reviewWork(active);
       }
 
@@ -51,6 +52,7 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
         if (!current || current.status !== 'VERIFYING' || scopeBlocked(current, this.queue.list())) {
           continue;
         }
+        if (await this.serviceRecovery(current)) continue;
         if (!current.validationReport.trim()) {
           if (current.activityPhase === 'ready_for_validation') {
             await this.startIndependentVerification(current);
@@ -59,12 +61,12 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
           }
           current = this.queue.get(task.id);
         }
-        if (current?.status === 'VERIFYING' && current.validationReport.trim()) {
+        if (current?.status === 'VERIFYING' && current.validationReport.trim() && !hasRecoveryJob(this.queue, current)) {
           await this.supervise(current);
         }
       }
 
-      if (this.cycle === cycle && this.queue.isComplete()) {
+      if (this.cycle === cycle && this.queue.isComplete() && !hasOutstandingRecovery(this.queue)) {
         this.finish();
         return;
       }
@@ -153,6 +155,11 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     this.changed();
     const task = this.queue.get(r.taskId);
     if (task) {
+      if (hasRecoveryJob(this.queue, task)) {
+        const job = deferRecoveryJob(this.queue, task, note);
+        this.queue.recordActivity(task.id, 'recovery_waiting', `${note}; next autonomous recovery: ${new Date(job.dueAt).toISOString()}.`, 'supervisor');
+        return;
+      }
       const limit = recoveryFailure(this.queue, task, 'silent-review');
       if (limit) this.pauseForRecovery(task, limit);
     }
@@ -232,13 +239,14 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
         this.queue.log(task.id, 'system', 'silent', `${note}; sent to supervisor`);
         this.log(`task ${task.seq} — ${note}; sent directly to the supervisor`);
       } else {
-        this.queue.update(task.id, {
-          status: 'PENDING',
+        this.stopForDecision(task, {
+          status: 'VERIFYING',
           errorLog: appendAttempt(task.errorLog, `[attempt ${task.attempts}] ${note}.`),
           finishedAt: null,
         });
         this.queue.log(task.id, 'system', 'silent', note);
-        this.log(`task ${task.seq} — ${note}; requeued`);
+        this.pauseForRecovery(this.queue.get(task.id)!, `Phase expansion worker vanished: ${note}`);
+        this.log(`phase ${task.seq} — ${note}; scheduled a changed planning approach`);
       }
       this.changed();
     }

@@ -1,78 +1,97 @@
 import type { Task } from './db';
 import { OrchestratorWatchdog } from './orchestratorWatchdog';
-import type { ScopeRole } from './scopePlan';
-import type { ScopeSupervisor } from './scopeSupervisor';
-import { blockRecovery, recoveryRequest, recoveryState } from './recovery';
+import type { Review } from './orchestratorState';
+import { acknowledgeRecovery, recoveryRequest, recoveryState } from './recovery';
+import { beginRecoveryAttempt, completeRecoveryJob, deferRecoveryJob, hasRecoveryJob,
+  readRecoveryJob, RecoveryOutcome, scheduleRecoveryJob } from './recoverySchedule';
 
-/** One bounded re-plan, then a durable stop. Never erase or declare work done. */
+/** Exhausted strategies become durable scheduled work. Only the operator stops a run. */
 export abstract class OrchestratorRecovery extends OrchestratorWatchdog {
-  protected abstract scopeWatch(task: Task, role: ScopeRole, current: () => boolean,
-    activity: (phase: string, detail: string, at: number) => void): ScopeSupervisor;
+  protected abstract performRecovery(task: Task, reason: string): Promise<RecoveryOutcome>;
 
   protected async allowRecovery(task: Task, reason: string): Promise<boolean> {
+    if (hasRecoveryJob(this.queue, task)) return false;
     const limit = recoveryRequest(this.queue, task);
     if (!limit) return true;
     await this.replanOrPause(task, `${limit} Proposed action: ${reason}`);
     return false;
   }
 
-  protected pauseForRecovery(task: Task, reason: string): void {
-    const existing = recoveryState(this.queue, task).blocked;
-    const message = existing && reason === existing ? existing :
-      `${reason} Work and verification evidence are preserved. Press Start to explicitly retry with a new bounded recovery budget; ` +
-      'no task reset or requirements change is needed.';
-    blockRecovery(this.queue, task, message);
-    this.queue.log(task.id, 'supervisor', 'recovery-blocked', message);
-    this.pause();
-    this.queue.update(task.id, { supervisorFeedback: message, activityPhase: 'recovery_blocked', activityDetail: message });
-    this.log(`task ${task.seq}: ${message}`);
+  /** Compatibility entry point for old call sites; this never calls pause/stop. */
+  protected pauseForRecovery(snapshot: Task, reason: string): void {
+    const task = this.queue.get(snapshot.id);
+    if (!task || task.status === 'VERIFIED' || this.disposed || this.queue.runState !== 'RUNNING') return;
+    const existed = hasRecoveryJob(this.queue, task);
+    if (!this.stopForDecision(task, { status: 'VERIFYING', activityPhase: 'recovery_waiting' })) return;
+    if (this.review?.taskId === task.id) this.abandonReview();
+    const current = this.queue.get(task.id)!;
+    const job = scheduleRecoveryJob(this.queue, current, reason);
+    const detail = `${job.lastError || job.reason} Autonomous recovery is scheduled for ${new Date(job.dueAt).toISOString()}; ` +
+      'the queue remains running and all work, requirements and verification evidence are retained.';
+    this.queue.recordActivity(task.id, 'recovery_waiting', detail, 'supervisor');
+    if (!existed) this.log(`task ${task.seq}: recovery scheduled, not paused: ${reason}`);
     this.changed();
+    if (!existed) this.wakeAfterHandoff();
   }
 
-  protected async replanOrPause(snapshot: Task, reason: string): Promise<void> {
+  protected async replanOrPause(task: Task, reason: string): Promise<void> {
+    this.pauseForRecovery(task, reason);
+  }
+
+  /** Called before either review lane. No provider call occurs before persisted dueAt. */
+  protected async serviceRecovery(snapshot: Task): Promise<boolean> {
     let task = this.queue.get(snapshot.id);
-    if (!task || this.disposed || this.queue.runState !== 'RUNNING') return;
+    if (!task) return false;
     const blocked = recoveryState(this.queue, task).blocked;
-    if (blocked) { this.pauseForRecovery(task, blocked); return; }
-    // Freeze the work before planning so a replaying worker cannot veto every split
-    // as stale. Existing source edits, handoff, reports and journal stay intact.
-    this.stopForDecision(task, { status: 'VERIFYING', activityPhase: 'needs_review' });
-    this.abandonReview();
-    task = this.queue.get(snapshot.id)!;
+    if (blocked && !hasRecoveryJob(this.queue, task)) this.pauseForRecovery(task, blocked);
+    const pending = readRecoveryJob(this.queue, task);
+    if (!pending?.active) return false;
+    if (this.disposed || this.queue.runState !== 'RUNNING') return true;
+    const job = beginRecoveryAttempt(this.queue, task);
+    if (!job) return true;
+    // A PENDING/EXECUTING legacy row must not be claimed while diagnosis is in flight.
+    this.stopForDecision(task, { status: 'VERIFYING', activityPhase: 'recovery_diagnosing' });
+    task = this.queue.get(task.id)!;
     const frozen = task;
-    const ownerContext = JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions]);
-    const gen = ++this.reviewGen;
-    const review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now(),
-      scope: undefined as ScopeSupervisor | undefined };
+    const ownerContext = JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
+      this.queue.testingContext, this.queue.instructions]);
+    const unchanged = () => {
+      const current = this.queue.get(frozen.id);
+      return current && (['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand', 'region'] as const)
+        .every(key => current[key] === frozen[key]) &&
+        ownerContext === JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
+          this.queue.testingContext, this.queue.instructions]);
+    };
+    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now() };
     this.review = review;
     this.supervising = true;
-    // Persist BEFORE awaiting the planner: a crash cannot buy another recovery.
-    blockRecovery(this.queue, task, `${reason} Automatic scope re-plan was already requested.`);
-    this.queue.log(task.id, 'supervisor', 'recovery-replan', reason);
-    const current = () => {
-      const latest = this.queue.get(frozen.id);
-      return gen === this.reviewGen && latest?.status === 'VERIFYING' &&
-        (['startedAt', 'attempts', 'description', 'implVerifyPrompt', 'solutionVerifyPrompt',
-          'solutionVerifyCommand', 'validationReport', 'region'] as const).every(key => latest[key] === frozen[key]) &&
-        ownerContext === JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions]);
-    };
-    const scope = this.scopeWatch(task, 'executor', current, (phase, detail, at) => {
-        if (!current()) return;
-        review.lastActivityAt = at;
-        this.queue.recordActivity(task!.id, phase, detail, 'supervisor');
-      });
-    review.scope = scope;
+    this.queue.recordActivity(task.id, 'recovery_diagnosing', `Bounded recovery attempt ${job.attempts}: ${job.reason}`, 'supervisor');
+    this.changed();
     try {
-      await scope.preflight(true);
-      if (!current()) return; // Split applied, contract edited or user stopped.
-      this.pauseForRecovery(task, `${reason} Scope review did not produce a complete, safe replacement plan.`);
+      const result = await this.performRecovery(task, job.lastError ? `${job.reason}\nLast recovery failure: ${job.lastError}` : job.reason);
+      if (this.disposed || this.queue.runState !== 'RUNNING') return true;
+      const current = this.queue.get(task.id);
+      if (!current || review.gen !== this.reviewGen) return true;
+      if (result.status === 'applied') {
+        acknowledgeRecovery(this.queue, current);
+        completeRecoveryJob(this.queue, current);
+        this.reviewed.delete(task.id);
+      } else {
+        if (!unchanged()) return true;
+        const deferred = deferRecoveryJob(this.queue, current, result.reason, result.retryAfterMs, result.strategy);
+        this.queue.recordActivity(task.id, 'recovery_waiting', `${result.reason} Next autonomous recovery: ${new Date(deferred.dueAt).toISOString()}.`, 'supervisor');
+      }
     } catch (error: any) {
-      if (current()) {
-        this.pauseForRecovery(task, `${reason} Re-plan failed: ${error?.message ?? error}`);
+      if (!this.disposed && this.queue.runState === 'RUNNING' && review.gen === this.reviewGen && unchanged()) {
+        const reason = String(error?.message ?? error);
+        const deferred = deferRecoveryJob(this.queue, task, reason);
+        this.queue.recordActivity(task.id, 'recovery_waiting', `${reason} Next autonomous recovery: ${new Date(deferred.dueAt).toISOString()}.`, 'supervisor');
+        this.log(`task ${task.seq}: recovery deferred after error; queue remains running: ${reason}`);
       }
     } finally {
-      scope.close();
-      if (this.review === review) { this.review = null; this.supervising = false; }
+      if (this.review === review) this.review = null;
+      this.changed();
     }
+    return true;
   }
 }

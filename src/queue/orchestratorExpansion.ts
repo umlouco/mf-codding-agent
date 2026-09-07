@@ -11,10 +11,8 @@ export abstract class OrchestratorExpansion extends OrchestratorExecution {
    * Expands one phase into the tasks — or, occasionally, the smaller phases —
    * it should have been.
    *
-   * Unlike a task's result this never enters VERIFYING: a planning decision
-   * is not a functional check, so success replaces the phase row outright via
-   * `expandTask`, and failure puts it straight back to PENDING, the same as a
-   * worker that stopped mid-turn in `pump()` above.
+   * Success replaces the phase atomically. Failure enters scheduled diagnosis,
+   * not functional verification or an immediate unchanged expansion retry.
    */
   protected async runExpansion(task: Task, attempt: number, gen: number, current: () => boolean): Promise<void> {
     this.log(`expanding phase ${task.seq} — ${task.title} (attempt ${task.attempts})`);
@@ -47,21 +45,7 @@ export abstract class OrchestratorExpansion extends OrchestratorExecution {
       live.close();
       if (!current()) return;
       const msg = String(e?.message ?? e);
-      const applied = this.queue.finishExecution(task.id, attempt, {
-        status: 'PENDING',
-        finishedAt: null,
-        errorLog: appendAttempt(
-          task.errorLog,
-          `[attempt ${task.attempts}] the expansion agent stopped before reporting: ${msg}.`,
-        ),
-      });
-      if (applied) {
-        this.queue.recordActivity(task.id, 'stopped', msg);
-        this.queue.log(task.id, 'planner', 'stopped', msg);
-        this.log(`phase ${task.seq} stopped without reporting: ${msg}; awaiting another attempt`);
-      } else {
-        this.log(`phase ${task.seq} — its worker stopped after the run moved past this attempt; ignoring it`);
-      }
+      this.deferPhaseRecovery(task, attempt, `the expansion agent stopped before reporting: ${msg}`);
       if (this.executionGen === gen) this.executionAbort = null;
       this.changed();
       return;
@@ -110,22 +94,23 @@ export abstract class OrchestratorExpansion extends OrchestratorExecution {
       return;
     }
 
-    // Nothing usable, and nothing left for code to try splitting further —
-    // the same shape as a task RETRY: back to PENDING with a note, no attempt
-    // limit that ends this phase.
+    // An empty plan is unfinished work, not permission to loop the same planner.
     const note = result.cutOff
       ? 'cut off before producing a usable task list, and the region could not be split any further'
       : 'produced no usable tasks';
-    const applied = this.queue.finishExecution(task.id, attempt, {
-      status: 'PENDING',
-      finishedAt: null,
-      errorLog: appendAttempt(task.errorLog, `[attempt ${task.attempts}] ${note}.`),
-    });
-    if (applied) {
-      this.queue.log(task.id, 'planner', 'retry', note);
-      this.log(`phase ${task.seq} ${note}; awaiting another attempt`);
-    }
+    this.deferPhaseRecovery(task, attempt, note);
     this.changed();
+  }
+
+  private deferPhaseRecovery(task: Task, attempt: number, reason: string): void {
+    const applied = this.queue.finishExecution(task.id, attempt, {
+      status: 'VERIFYING', finishedAt: null,
+      errorLog: appendAttempt(task.errorLog, `[attempt ${task.attempts}] ${reason}.`),
+    });
+    if (!applied) return;
+    this.queue.log(task.id, 'planner', 'expansion-failed', reason);
+    this.pauseForRecovery(this.queue.get(task.id)!, `Phase expansion needs a changed planning approach: ${reason}`);
+    this.log(`phase ${task.seq}: ${reason}; autonomous recovery scheduled, phase retained`);
   }
 
   /**

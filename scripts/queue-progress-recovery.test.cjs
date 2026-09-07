@@ -1,4 +1,5 @@
 const { fs, os, path, vm, assert, test, ts, load, vscode, prompts, validation, cognition, TaskQueue, LiveLog, usage, output, notes, goal, report, task, agents, fixture, orchestrator } = require('./queue-progress-helpers.cjs');
+const { verificationDependencies, verificationPlanReply } = require('./queue-verification-helpers.cjs');
 
 
 test('cancellation during asynchronous startup never restarts a disposed worker', async () => {
@@ -73,11 +74,13 @@ test('a three-task queue reaches completion after a verification retry without r
       reply = { report: 'Implementation ready', completion: {
         status: 'READY_FOR_VALIDATION', summary: 'Inspect the deployed form', filesChanged: [], developmentChecks: [],
       } };
+    } else if (prompt.startsWith('You are the independent verification planner.')) {
+      reply = verificationPlanReply('', true);
     } else if (prompt.startsWith('You are the independent verification')) {
       verifications++;
-      opts.onEvent('stream/tool', { id: 'browser', name: 'browser_eval', status: 'ok', output: 'Both transitions passed' });
       reply = { validation: verifications === 1
         ? { ...report(), conclusion: 'INCOMPLETE', remaining: 'The hide transition was not checked' } : report() };
+      reply.validation.checks = reply.validation.checks.map(check => ({ ...check, stepId: 'states' }));
     } else if (prompt.startsWith('You supervise a coding agent')) {
       preliminaryReviews++;
       reply = { action: 'START_VALIDATION', reason: 'Implementation ready' };
@@ -89,7 +92,7 @@ test('a three-task queue reaches completion after a verification retry without r
     return { text: JSON.stringify(reply), stopReason: 'end_turn', usage };
   };
   module.setTestRunner(run);
-  const deps = { './agents': { ...module, runOnce: run }, './validation': validation,
+  const deps = { ...verificationDependencies(), './agents': { ...module, runOnce: run }, './validation': validation,
     './prompts': prompts, './cognition': cognition };
   const monitor = load('src/queue/monitor.ts', deps);
   const verifier = load('src/queue/verification.ts', deps);

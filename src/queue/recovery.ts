@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import type { Task, TaskQueue } from './db';
 import { recoveryEvents } from './recoveryJournal';
+import { readRecoveryJob, recoveryJobKey, scheduleRecoveryJob } from './recoverySchedule';
 
 /** A recovery budget belongs to unfinished work, not to a mutable description. */
 export interface RecoveryState {
@@ -17,6 +18,7 @@ export interface RecoveryState {
   failures: Record<string, number>;
   blocked?: string;
   blockedContract?: string;
+  remedy?: { recoveries: number; revision: number; cursor: number; repeats: number };
 }
 
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -34,9 +36,7 @@ export function recoveryState(queue: TaskQueue, task: Task): RecoveryState {
         ['cursor', 'revision', 'repeats', 'recoveries', 'unchanged', 'checkpoint'].some(key =>
           !Number.isSafeInteger((state as any)[key]) || (state as any)[key] < 0)) throw Error('Invalid ledger');
   } catch { state = fresh(); }
-  // Automatic rewrites and reloads do not renew recovery. An explicit Start from
-  // a stopped/paused queue is handled separately by resumeRecovery below.
-  if (state.blocked && state.blockedContract !== contract(task)) state = fresh();
+  // Changes to prose, process restarts and Start do not erase failed strategies.
   return state;
 }
 
@@ -44,23 +44,37 @@ export function saveRecovery(queue: TaskQueue, task: Task, state: RecoveryState)
   queue.setMeta(recoveryKey(task), JSON.stringify(state));
 }
 
-/** An operator's Start is not an automatic retry. Keep the old ledger as evidence
- * and grant one new bounded recovery epoch without resetting task progress.
- */
+/** Migrate a legacy automatic pause into scheduled work, without renewing its budget. */
 export function resumeRecovery(queue: TaskQueue, task: Task): boolean {
   const state = recoveryState(queue, task);
-  if (!state.blocked || task.status === 'VERIFIED') return false;
+  if (!state.blocked || task.status === 'VERIFIED' || readRecoveryJob(queue, task)) return false;
   const archiveKey = `${recoveryKey(task)}:resume:${queue.countEvents(task.id, 'recovery-resumed') + 1}`;
   queue.setMeta(archiveKey, JSON.stringify(state));
-  const next: RecoveryState = { ...state, blocked: undefined, blockedContract: undefined,
-    cursor: Math.max(state.cursor, queue.latestWorkerToolEventId(task.id)),
-    repeats: 0, recoveries: 0, unchanged: 0, failures: {}, checkpoint: state.revision,
-    saturated: false, seen: state.saturated ? [] : state.seen };
-  saveRecovery(queue, task, next);
-  queue.log(task.id, 'system', 'recovery-resumed', JSON.stringify({ archiveKey,
-    reason: 'Operator explicitly pressed Start. Previous recovery evidence retained; task requirements and progress unchanged.' }));
-  queue.recordActivity(task.id, 'recovery_resumed', 'Recovery pause released by explicit Start.', 'system');
+  scheduleRecoveryJob(queue, task, state.blocked);
+  queue.log(task.id, 'system', 'recovery-resumed', JSON.stringify({ archiveKey, jobKey: recoveryJobKey(task),
+    reason: 'Legacy recovery pause migrated to autonomous scheduled work. Failed strategies and task evidence retained.' }));
+  queue.recordActivity(task.id, 'recovery_waiting', 'Autonomous recovery scheduled; existing evidence retained.', 'system');
   return true;
+}
+
+/** Only admitting a changed recovery strategy establishes a new observation checkpoint.
+ * Cumulative counters and fingerprints remain intact; waiting or restarting never does this.
+ */
+export function acknowledgeRecovery(queue: TaskQueue, task: Task): void {
+  const state = recoveryEvidence(queue, task);
+  state.blocked = undefined;
+  state.blockedContract = undefined;
+  state.remedy = { recoveries: state.recoveries, revision: state.revision, cursor: state.cursor, repeats: state.repeats };
+  saveRecovery(queue, task, state);
+}
+
+export function recoveryReplayLimit(state: RecoveryState): string {
+  const previous = state.remedy;
+  const repeats = previous && state.revision <= previous.revision ? state.repeats - previous.repeats : state.repeats;
+  if (state.saturated && (!previous || state.cursor - previous.cursor >= 6)) {
+    return 'The observation ledger is full; obtain a bounded new recovery strategy without forgetting prior outcomes.';
+  }
+  return repeats >= 6 ? 'Six repeated completed tool outcomes without a new observation.' : '';
 }
 
 /** Distinguish new observations from replay. Novelty is NOT acceptance evidence.
@@ -108,8 +122,9 @@ export function recoveryRequest(queue: TaskQueue, task: Task): string {
   state.unchanged = state.checkpoint === state.revision ? state.unchanged + 1 : 0;
   state.checkpoint = state.revision;
   saveRecovery(queue, task, state);
-  if (state.unchanged >= 3) return 'Three recovery requests without a new completed tool outcome.';
-  if (state.recoveries >= 6) return 'Six recovery requests on the same unfinished task, including rewrites and verification retries.';
+  const requests = state.recoveries - (state.remedy?.recoveries ?? 0);
+  if (Math.min(state.unchanged, requests) >= 3) return 'Three recovery requests without a new completed tool outcome.';
+  if (requests >= 6) return 'Six recovery requests on the same unfinished task, including rewrites and verification retries.';
   return '';
 }
 

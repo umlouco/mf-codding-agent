@@ -5,7 +5,7 @@ core/**
 scripts/**
 src/**
 node_modules/**
-out/**/*.map
+out/**
 **/*.ts
 **/tsconfig.json
 esbuild.mjs

@@ -6,10 +6,13 @@ import { OrchestratorScope } from './orchestratorScope';
 import { scopeBlocked } from './scopePlan';
 import { appendAttempt, Review } from './orchestratorState';
 import { runVerification } from './verification';
-import { recoveryFailure, recoveryState, recoverySucceeded } from './recovery';
+import { recoveryFailure, recoveryState, recoverySucceeded, recoveryContext } from './recovery';
+import { hasRecoveryJob } from './recoverySchedule';
 import { boundedTask } from './scopeBoundary';
 import { verdictReplacementTasks } from './scopeVerdict';
-import { isLocalScope, scopedContract, scopeContractFields } from './scopeContract';
+import { isLocalScope } from './scopeContract';
+import { verificationAuthority } from './verificationAuthority';
+import { implementationRetryProblem } from './verificationRecovery';
 
 /** A verdict belongs to one claim, contract and report, not merely a row ID. */
 function sameVerificationSnapshot(current: Task | undefined, snapshot: Task): boolean {
@@ -24,12 +27,16 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
 
   /** Delegates formal verification to a fresh execution LLM and persists its response. */
   protected async verifyWithExecutor(task: Task, review: Review): Promise<void> {
+    const ownerContext = JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
+      this.queue.testingContext, this.queue.instructions]);
     const accepts = () => review.gen === this.reviewGen &&
+      ownerContext === JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
+        this.queue.testingContext, this.queue.instructions]) &&
       sameVerificationSnapshot(this.queue.get(task.id), task);
     if (!accepts()) return;
     if (scopeBlocked(task, this.queue.list())) return;
     const blocked = recoveryState(this.queue, task).blocked;
-    if (blocked) { this.pauseForRecovery(task, blocked); return; }
+    if (blocked && !hasRecoveryJob(this.queue, task)) { this.pauseForRecovery(task, blocked); return; }
     this.log(`task ${task.seq} — supervisor started independent verification`);
     this.queue.log(task.id, 'supervisor', 'validation-started', 'delegated to execution LLM');
     const journal = this.streamJournal(task.id, 'validator', accepts);
@@ -63,6 +70,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
           review.abort = abort;
         },
         this.queue.contextInstructions,
+        verificationAuthority(this.queue, task),
       );
       journal.flush();
       if (!accepts()) {
@@ -80,6 +88,13 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
     } catch (error: any) {
       journal.flush();
       if (!accepts()) return;
+      if (error?.usage) {
+        this.queue.addUsage(task.id, error.usage);
+        delete error.usage;
+      }
+      if (typeof error?.validationReport === 'string' && error.validationReport.trim()) {
+        this.queue.update(task.id, { validationReport: error.validationReport });
+      }
       const message = String(error?.message ?? error);
       // Recorded twice on purpose, because two different readers need it. The
       // journal entry is what `failedValidations` counts, so the next progress
@@ -99,6 +114,13 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         });
       }
       this.log(`task ${task.seq} — validator stopped: ${message}; supervisor will reassess`);
+      if (error?.name === 'VerificationPlanError') {
+        // The recovery scheduler owns its review and must set a new deadline
+        // after this failed await. Re-scheduling here would invalidate its fence.
+        if (hasRecoveryJob(this.queue, task)) throw error;
+        await this.replanOrPause(this.queue.get(task.id) ?? task,
+          `Host verification needs a changed executable plan: ${message}`);
+      }
     } finally {
       scope.close();
       journal.live.close();
@@ -138,7 +160,11 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
     // From here until the verdict lands there is a turn running that only this
     // record can account for — see sweepSilentReview.
     const gen = ++this.reviewGen;
+    const ownerContext = JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
+      this.queue.testingContext, this.queue.instructions]);
     const accepts = () => gen === this.reviewGen &&
+      ownerContext === JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
+        this.queue.testingContext, this.queue.instructions]) &&
       sameVerificationSnapshot(this.queue.get(task.id), task);
     const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now() };
     this.review = review;
@@ -158,6 +184,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         this.queue.getMeta('goal'),
         {
           projectNotes: this.queue.contextInstructions,
+          recoveryContext: recoveryContext(this.queue, task),
           onAbort: (abort) => {
             if (!accepts()) { abort(); return; }
             review.abort = abort;
@@ -202,10 +229,21 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
 
     this.queue.addUsage(task.id, decision.usage);
     recoverySucceeded(this.queue, task, 'verification-review');
+    const retryProblem = ['RETRY', 'RESET_FROM'].includes(decision.verdict) ? implementationRetryProblem(task) : '';
+    if (retryProblem) {
+      this.queue.log(task.id, 'supervisor', 'retry-evidence-rejected', decision.feedback);
+      decision = { ...decision, verdict: 'REVERIFY', feedback: retryProblem, taskEdits: [], splitInto: undefined, escalated: false };
+    }
+    // Keep the diagnosis and any admitted correction even when the next action
+    // needs scheduled recovery. Previously the sixth correction was discarded.
+    this.queue.log(task.id, 'supervisor', `verdict:${decision.verdict}`, decision.feedback);
+    if (decision.verdict !== 'SPLIT') {
+      this.applyTaskEdits(decision, task.seq);
+      task = this.queue.get(task.id) ?? task;
+    }
     if (['RETRY', 'REVERIFY', 'RESET_FROM'].includes(decision.verdict) &&
         !await this.allowRecovery(task, decision.verdict)) return;
     if (!accepts()) return;
-    this.queue.log(task.id, 'supervisor', `verdict:${decision.verdict}`, decision.feedback);
     if (decision.verdict === 'SPLIT') {
       // A supplied plan has already been decided. Asking another planner whether
       // to split discards that decision and can leave the original runnable forever.
@@ -222,12 +260,10 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       this.changed();
       return;
     }
-    this.applyTaskEdits(decision, task.seq);
-
     switch (decision.verdict) {
       case 'REVERIFY': {
         this.queue.update(task.id, {
-          validationReport: '', finishedAt: null, supervisorFeedback: decision.feedback,
+          finishedAt: null, supervisorFeedback: decision.feedback,
         });
         const verification: Review = {
           taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now(),
@@ -356,24 +392,12 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         }
         continue;
       }
+      if (decision.verdict === 'REVERIFY') {
+        this.queue.log(target.id, 'supervisor', isLocalScope(target) ? 'scope-edit-rejected' : 'verification-edit-rejected',
+          'Verification adapts a disposable host plan, never the stored task contract or required command.');
+        continue;
+      }
       if (isLocalScope(target)) {
-        const command = edit.solutionVerifyCommand?.trim();
-        const commandOnly = decision.verdict === 'REVERIFY' && target.seq === currentSeq &&
-          target.status === 'VERIFYING' && !!command && command !== target.solutionVerifyCommand.trim() &&
-          Object.keys(edit).every(key => key === 'seq' || key === 'solutionVerifyCommand');
-        const admitted = commandOnly ? scopedContract(this.queue, target) : undefined;
-        if (admitted && scopeContractFields.every(field => target[field] === admitted.contract[field])) {
-          const region = JSON.parse(target.region);
-          region.scopeSplit.contract = { ...admitted.contract, solutionVerifyCommand: command };
-          // Keep the syntax-corrected invocation and its admitted baseline in the
-          // same SQL update. No acceptance prose or sibling scope is re-authored.
-          this.queue.update(target.id, { solutionVerifyCommand: command, region: JSON.stringify(region) });
-          this.queue.log(target.id, 'supervisor', 'check-fixed', JSON.stringify({
-            source: 'scoped-reverify-command', oldCommand: target.solutionVerifyCommand, newCommand: command,
-          }));
-          this.log(`supervisor corrected the check invocation for local task ${target.seq}; acceptance criteria retained`);
-          continue;
-        }
         this.queue.log(target.id, 'supervisor', 'scope-edit-rejected',
           'The replacement contract is fixed. Use feedback to change the implementation approach, not its assigned outcome or checks.');
         this.log(`task ${target.seq}: retained its assigned replacement contract instead of re-authoring it`);

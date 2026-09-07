@@ -59,7 +59,7 @@ function fixture(t, overrides = {}, dependencies = {}) {
   const calls = [];
   const agents = { extractJson: text => JSON.parse(text), attemptsExhausted: task => task.attempts >= task.maxAttempts,
     runOnce: async (...args) => { calls.push(args); return { text: JSON.stringify(reply), usage }; }, ...overrides };
-  const load = loader({ './agents': agents, './command': {}, ...dependencies });
+  const load = loader({ './agents': agents, './command': {}, './verificationPlanRunner': {}, ...dependencies });
   const { TaskQueue } = load('src/queue/db.ts');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mf-scope-'));
   const queue = TaskQueue.open(path.join(dir, 'queue.sqlite'));

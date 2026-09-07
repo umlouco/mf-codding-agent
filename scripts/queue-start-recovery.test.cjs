@@ -2,91 +2,94 @@ const { test } = require('node:test');
 const { assert, fixture, drain } = require('./queue-scope-helpers.cjs');
 
 function blockedQueue(t, status = 'VERIFYING', runState = 'PAUSED') {
-  let executions = 0, reviews = 0;
-  const f = fixture(t, { executeTask: async () => { executions++; return new Promise(() => {}); } }, {
-    './monitor': { JOURNAL_EVENTS: 80, VALIDATION_FAILED: 'validation-failed',
-      reviewProgress: async () => { reviews++; return { action: 'CONTINUE_EXECUTION', reason: 'Resume preserved work.',
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }; } },
-  });
+  let executions = 0, recoveries = 0;
+  const f = fixture(t, { executeTask: async () => { executions++; return new Promise(() => {}); } }, { './verificationPlanRunner': {} });
   const task = f.queue.list()[0];
   f.queue.update(task.id, { status, attempts: 3, output: 'Retain implemented work.',
-    validationReport: '', errorLog: 'Retain failure evidence.', supervisorFeedback: 'Existing report.',
-    activityPhase: 'recovery_blocked', activityDetail: 'Blocked before Start.' });
+    validationReport: 'Retain previous independent evidence.', errorLog: 'Retain failure evidence.',
+    supervisorFeedback: 'Existing report.', activityPhase: 'recovery_blocked', activityDetail: 'Blocked before Start.' });
   const recovery = f.load('src/queue/recovery.ts');
-  f.queue.log(task.id, 'executor', 'tool', 'read_file(a) → ok\nunchanged');
+  const schedule = f.load('src/queue/recoverySchedule.ts');
+  f.queue.log(task.id, 'executor', 'tool', 'read_file(a) -> ok\nunchanged');
   const state = recovery.recoveryEvidence(f.queue, f.queue.get(task.id));
   Object.assign(state, { repeats: 39, recoveries: 6, unchanged: 3, failures: { 'progress-review': 3 } });
   recovery.saveRecovery(f.queue, f.queue.get(task.id), state);
   recovery.blockRecovery(f.queue, f.queue.get(task.id), 'Repeated old outcomes.');
   f.queue.setRunState(runState);
   f.runner.scopeWatch = () => ({ preflight: async () => true, observe() {}, close() {} });
-  // Stop actual timers after each case; retain the actual public Start path.
+  f.runner.performRecovery = async () => { recoveries++; return { status: 'deferred', reason: 'A changed strategy needs evidence.' }; };
+  f.runner.reviewWork = async () => assert.fail('Ordinary review cannot bypass recovery.');
+  f.runner.supervise = async () => assert.fail('An old report cannot bypass recovery.');
   t.after(() => { f.runner.disposed = true; f.runner.disarm(); clearInterval(f.runner.watchdog); });
-  return { ...f, task: f.queue.get(task.id), recovery, executions: () => executions, reviews: () => reviews };
+  return { ...f, task: f.queue.get(task.id), recovery, schedule, executions: () => executions, recoveries: () => recoveries };
 }
 
-test('Start releases a paused recovery latch and reaches a worker without resetting tasks', async t => {
+test('Start migrates a legacy paused recovery into autonomous work without resetting tasks or counters', async t => {
   const f = blockedQueue(t, 'PAUSED');
   f.runner.start();
   await drain();
   assert.equal(f.queue.runState, 'RUNNING');
-  assert.equal(f.executions(), 1);
+  assert.equal(f.executions(), 0, 'Start must not relaunch the exhausted unchanged strategy');
   const after = f.queue.get(f.task.id);
-  assert.equal(after.status, 'EXECUTING');
+  assert.equal(after.status, 'VERIFYING');
   for (const field of ['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand',
-    'output', 'validationReport', 'errorLog']) assert.equal(after[field], f.task[field], field);
-  assert.equal(after.attempts, 4, 'Start does not erase the task attempt history');
+    'output', 'validationReport', 'errorLog', 'attempts']) assert.equal(after[field], f.task[field], field);
   const state = f.recovery.recoveryState(f.queue, after);
-  assert.equal(state.blocked, undefined);
-  assert.equal(state.repeats, 0);
-  assert.equal(state.recoveries, 0);
+  assert.equal(state.repeats, 39);
+  assert.equal(state.recoveries, 6);
+  assert.equal(f.schedule.readRecoveryJob(f.queue, after).active, true);
   assert.equal(f.queue.countEvents(after.id, 'recovery-resumed'), 1);
 });
 
-test('the reported VERIFYING state reaches supervision instead of re-pausing one second after Start', async t => {
+test('the reported VERIFYING state reaches scheduled recovery and stays RUNNING after the real Start timer', async t => {
   const f = blockedQueue(t);
   f.runner.start();
   await new Promise(resolve => setTimeout(resolve, 1100));
-  assert.equal(f.reviews(), 1, 'actual progress review must reach the provider, not just a mocked reviewWork method');
-  assert.equal(f.executions(), 1, 'actual tick hands preserved work back to an executor');
+  assert.equal(f.recoveries(), 1, 'actual Start/tick must reach the autonomous recovery lane');
+  assert.equal(f.executions(), 0);
   assert.equal(f.queue.runState, 'RUNNING');
-  assert.equal(f.queue.get(f.task.id).status, 'EXECUTING');
+  assert.equal(f.queue.get(f.task.id).status, 'VERIFYING');
   assert.equal(f.queue.get(f.task.id).output, f.task.output);
+  assert.ok(f.schedule.readRecoveryJob(f.queue, f.task).dueAt > Date.now());
 });
 
-test('automatic RUNNING restoration and repeated Start while already running do not renew recovery', async t => {
+test('automatic RUNNING restoration and repeated Start preserve future deadlines and failed strategies', async t => {
   const f = blockedQueue(t, 'VERIFYING', 'RUNNING');
+  f.schedule.scheduleRecoveryJob(f.queue, f.task, 'Existing recovery job.');
+  f.schedule.rememberRecoveryStrategy(f.queue, f.task, 'failed-strategy-fingerprint');
+  f.schedule.deferRecoveryJob(f.queue, f.task, 'Wait for a useful diagnostic.', 60_000);
+  const before = JSON.stringify(f.schedule.readRecoveryJob(f.queue, f.task));
   f.runner.start();
   f.runner.start();
-  assert.match(f.recovery.recoveryState(f.queue, f.task).blocked, /Repeated/);
-  assert.equal(f.queue.countEvents(f.task.id, 'recovery-resumed'), 0);
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  assert.equal(f.recoveries(), 0);
+  assert.equal(JSON.stringify(f.schedule.readRecoveryJob(f.queue, f.task)), before);
+  assert.equal(f.queue.runState, 'RUNNING');
 });
 
-test('explicit restart preserves and archives recovery history while new failed retries remain bounded', async t => {
+test('explicit Stop then Start does not reset a durable recovery job or its failure budget', async t => {
   const f = blockedQueue(t, 'VERIFYING', 'STOPPED');
+  f.schedule.scheduleRecoveryJob(f.queue, f.task, 'Existing recovery job.');
+  f.schedule.rememberRecoveryStrategy(f.queue, f.task, 'failed-strategy');
+  f.schedule.beginRecoveryAttempt(f.queue, f.task);
+  f.schedule.deferRecoveryJob(f.queue, f.task, 'Recovery provider is unavailable.', 60_000);
+  const before = JSON.stringify(f.schedule.readRecoveryJob(f.queue, f.task));
   f.runner.start();
-  const task = f.queue.get(f.task.id);
-  const event = f.queue.events(task.id, -1).find(e => e.kind === 'recovery-resumed');
-  assert.ok(event);
-  const archiveKey = JSON.parse(event.message).archiveKey;
-  const archived = JSON.parse(f.queue.getMeta(archiveKey));
-  assert.equal(archived.repeats, 39);
-  assert.equal(archived.recoveries, 6);
-  assert.equal(archived.failures['progress-review'], 3);
-  assert.match(archived.blocked, /Repeated/);
-  assert.equal(f.recovery.recoveryRequest(f.queue, task), '');
-  assert.equal(f.recovery.recoveryRequest(f.queue, task), '');
-  assert.match(f.recovery.recoveryRequest(f.queue, task), /Three recovery/);
-  assert.equal(f.queue.get(task.id).description, f.task.description);
+  await f.runner.runNow();
+  assert.equal(f.recoveries(), 0);
+  assert.equal(JSON.stringify(f.schedule.readRecoveryJob(f.queue, f.task)), before);
+  assert.equal(f.recovery.recoveryState(f.queue, f.task).recoveries, 6);
+  assert.equal(f.queue.get(f.task.id).description, f.task.description);
 });
 
-test('Start skips old unread tool events rather than immediately reconstructing the previous block', async t => {
+test('Start retains unread replay evidence rather than laundering it into a fresh budget', async t => {
   const f = blockedQueue(t);
-  for (let i = 0; i < 20; i++) f.queue.log(f.task.id, 'executor', 'tool', 'read_file(a) → ok\nunchanged');
+  for (let i = 0; i < 20; i++) f.queue.log(f.task.id, 'executor', 'tool', 'read_file(a) -> ok\nunchanged');
   const watermark = f.queue.latestWorkerToolEventId(f.task.id);
   f.runner.start();
   const state = f.recovery.recoveryEvidence(f.queue, f.task);
   assert.equal(state.cursor, watermark);
-  assert.equal(state.repeats, 0);
-  assert.equal(state.blocked, undefined);
+  assert.equal(state.repeats, 59);
+  assert.equal(state.recoveries, 6);
+  assert.equal(f.schedule.readRecoveryJob(f.queue, f.task).active, true);
 });

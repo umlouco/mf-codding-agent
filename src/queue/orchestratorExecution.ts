@@ -5,6 +5,7 @@ import { completionForSupervisor } from './validation';
 import { scopeBlocked } from './scopePlan';
 import { recoveryState } from './recovery';
 import { boundedTask } from './scopeBoundary';
+import { hasRecoveryJob } from './recoverySchedule';
 
 export abstract class OrchestratorExecution extends OrchestratorVerification {
 
@@ -29,7 +30,8 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     if (this.disposed || this.queue.runState !== 'RUNNING') {
       return;
     }
-    if (this.mode === 'lockstep' && this.queue.awaitingVerification().length > 0) {
+    const awaiting = this.queue.awaitingVerification();
+    if ((this.mode === 'lockstep' && awaiting.length > 0) || awaiting.some(task => task.kind === 'phase')) {
       return;
     }
 
@@ -37,7 +39,10 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     if (next && scopeBlocked(next, this.queue.list())) return;
     if (next) {
       const blocked = recoveryState(this.queue, next).blocked;
-      if (blocked) { this.pauseForRecovery(next, blocked); return; }
+      if (blocked || hasRecoveryJob(this.queue, next)) {
+        this.pauseForRecovery(next, blocked || 'Continue scheduled recovery before launching another unchanged worker.');
+        return;
+      }
     }
     const task = this.queue.claimNext();
     if (!task) {

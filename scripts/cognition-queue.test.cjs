@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const ts = require('typescript');
+const { verificationDependencies, verificationPlanReply } = require('./queue-verification-helpers.cjs');
 
 function load(file, dependencies = {}, extra = '') {
   if (file === 'src/queue/agents.ts') return require('./queue-agent-loader.cjs').loadQueueAgents(dependencies);
@@ -140,11 +141,12 @@ test('executor, independent verifier, and phase expansion use durable bindings w
   let reply = '{}';
   const runner = async (_, __, role, prompt, opts) => {
     calls.push({ role, opts });
-    return { text: reply, stopReason: 'end_turn', usage };
+    return { text: prompt.startsWith('You are the independent verification planner.') ? JSON.stringify(verificationPlanReply()) : reply, stopReason: 'end_turn', usage };
   };
   agents.setTestRunner(runner);
   await agents.executeTask({}, output, task, '', goal);
   const verifier = load('src/queue/verification.ts', {
+    ...verificationDependencies(),
     './agents': { ...agents, runOnce: runner }, './cognition': cognition,
     './prompts': prompts, './validation': validation,
   });
@@ -152,8 +154,8 @@ test('executor, independent verifier, and phase expansion use durable bindings w
   reply = JSON.stringify([{ title: 'Exercise persistence', description: 'Verify continuity after restart',
     implVerifyPrompt: 'Read state', solutionVerifyPrompt: 'Restart', solutionVerifyCommand: '' }]);
   await agents.expandPhase({}, output, { ...task, kind: 'phase' }, goal);
-  assert.deepEqual(calls.map(call => call.role), ['executor', 'executor', 'planner']);
-  assert.deepEqual(calls.map(call => call.opts.cognition.observer), ['executor', 'verifier', 'planner']);
+  assert.deepEqual(calls.map(call => call.role), ['executor', 'executor', 'executor', 'planner']);
+  assert.deepEqual(calls.map(call => call.opts.cognition.observer), ['executor', 'verifier', 'verifier', 'planner']);
   assert.equal(new Set(calls.map(call => call.opts.cognition.workId)).size, 1);
 });
 

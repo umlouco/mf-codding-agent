@@ -3,11 +3,11 @@ import { Task } from './db';
 import { LiveLog } from './liveLog';
 import { JOURNAL_EVENTS, ProgressDecision, reviewProgress, VALIDATION_FAILED } from './monitor';
 import { Review } from './orchestratorState';
-import { OrchestratorRecovery } from './orchestratorRecovery';
-import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, recoverySucceeded } from './recovery';
+import { OrchestratorRemediation } from './orchestratorRemediation';
+import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, recoverySucceeded, recoveryReplayLimit } from './recovery';
 import { isLocalScope } from './scopeContract';
 
-export abstract class OrchestratorProgress extends OrchestratorRecovery {
+export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
   /**
    * How often the supervisor may look in on a task that is still executing.
@@ -52,10 +52,9 @@ export abstract class OrchestratorProgress extends OrchestratorRecovery {
   /** Lets the supervisor judge live work and choose one fixed control action. */
   protected async reviewWork(task: Task): Promise<void> {
     const state = recoveryEvidence(this.queue, task);
-    if (state.blocked || state.saturated || state.repeats >= 6) {
-      await this.replanOrPause(task, state.blocked || (state.saturated
-        ? 'The observation ledger is full; re-plan unfinished work rather than forgetting prior outcomes.'
-        : 'Six repeated completed tool outcomes without a new observation.'));
+    const replayLimit = state.blocked || recoveryReplayLimit(state);
+    if (replayLimit) {
+      await this.replanOrPause(task, replayLimit);
       return;
     }
     const evidenceEventId = decisionEvidence(this.queue, task);

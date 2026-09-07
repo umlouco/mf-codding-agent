@@ -202,6 +202,7 @@ export abstract class OrchestratorState {
   protected abstract shouldReview(task: Task, latestEventId: number): boolean;
   protected abstract reviewWork(task: Task): Promise<void>;
   protected abstract pauseForRecovery(task: Task, reason: string): void;
+  protected abstract serviceRecovery(task: Task): Promise<boolean>;
   protected abstract applyProgressDecision(
     snapshot: Task,
     decision: ProgressDecision,

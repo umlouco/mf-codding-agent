@@ -3,6 +3,7 @@ const {
 } = require('./queue-progress-helpers.cjs');
 
 const recovery = load('src/queue/recovery.ts');
+const schedule = load('src/queue/recoverySchedule.ts');
 const { formatToolEvent } = load('src/queue/orchestratorState.ts');
 const plain = value => JSON.parse(JSON.stringify(value));
 const completed = (queue, task, output = 'unchanged contents', elapsed = 1, actor = 'executor') => {
@@ -81,77 +82,71 @@ test('new completed outcomes and new mutating tool starts still fence older revi
   }
 });
 
-test('three no-evidence recoveries cause one scope re-plan, then preserve work and pause durably', async t => {
+test('three no-evidence recoveries preserve work and schedule autonomous recovery durably', async t => {
   const queue = fixture(t);
   const original = queue.claimNext();
   queue.update(original.id, { output: 'Implementation remains in the working tree.',
-    validationReport: 'The first transition has passed; the second remains unchecked.' });
+    validationReport: 'The first transition passed; the second remains unchecked.' });
   const task = queue.get(original.id);
   const runner = runnerFor(queue);
   let cancelled = 0;
   runner.executionAbort = () => { cancelled++; };
-  const scope = scopeCounter(runner);
   assert.equal(await runner.allowRecovery(task, 'CONTINUE_EXECUTION'), true);
   assert.equal(await runner.allowRecovery(task, 'STOP_AND_REWRITE_TASK'), true);
   assert.equal(await runner.allowRecovery(task, 'START_VALIDATION'), false);
-  assert.equal(scope.calls, 1);
   assert.equal(cancelled, 1);
-  assert.equal(queue.runState, 'PAUSED');
-  assert.equal(queue.get(task.id).output, task.output);
-  assert.equal(queue.get(task.id).validationReport, task.validationReport);
-  assert.equal(queue.get(task.id).description, task.description);
-  assert.equal(queue.countEvents(task.id, 'recovery-replan'), 1);
-  assert.match(recovery.recoveryState(queue, task).blocked, /Three recovery requests/);
-  queue.resumePaused();
+  assert.equal(queue.runState, 'RUNNING');
+  for (const field of ['output', 'validationReport', 'description']) assert.equal(queue.get(task.id)[field], task[field]);
+  assert.equal(queue.countEvents(task.id, 'recovery-scheduled'), 1);
+  assert.match(schedule.readRecoveryJob(queue, task).reason, /Three recovery requests/);
+  const before = plain(schedule.readRecoveryJob(queue, task));
   const restarted = runnerFor(queue);
-  const retryScope = scopeCounter(restarted);
-  await restarted.replanOrPause(queue.get(task.id), 'Automatic runner restoration without an explicit Start.');
-  assert.equal(retryScope.calls, 0, 'restarting the runner cannot buy another paid scope review');
-  assert.equal(queue.runState, 'PAUSED');
-  assert.equal(queue.countEvents(task.id, 'recovery-replan'), 1);
+  await restarted.replanOrPause(queue.get(task.id), 'Automatic runner restoration.');
+  assert.deepEqual(plain(schedule.readRecoveryJob(queue, task)), before);
+  assert.equal(queue.runState, 'RUNNING');
 });
 
-test('six recoveries cap changing observations, description rewrites and reset attempt counters', async t => {
+test('six recoveries escalate changing observations without erasing cumulative budgets', async t => {
   const queue = fixture(t);
   const original = queue.claimNext();
   const runner = runnerFor(queue);
-  const scope = scopeCounter(runner);
   for (let i = 1; i <= 6; i++) {
-    queue.update(original.id, { description: `Same unfinished outcome, revised wording ${i}.`, attempts: 0 });
+    queue.update(original.id, { description: 'Same unfinished outcome, revised wording ' + i, attempts: 0 });
     const task = queue.get(original.id);
-    completed(queue, task, `Novel discovery ${i}`);
+    completed(queue, task, 'Novel discovery ' + i);
     assert.equal(await runner.allowRecovery(task, 'STOP_AND_REWRITE_TASK'), i < 6);
   }
   const state = recovery.recoveryState(queue, queue.get(original.id));
   assert.equal(state.recoveries, 6);
   assert.equal(state.unchanged, 0);
-  assert.equal(scope.calls, 1);
-  assert.equal(queue.runState, 'PAUSED');
-  assert.match(state.blocked, /Six recovery requests/);
+  assert.equal(queue.runState, 'RUNNING');
+  assert.match(schedule.readRecoveryJob(queue, original).reason, /Six recovery requests/);
 });
 
-test('an actual successful scope split ends recovery without pausing or reviving the parent', async t => {
+test('an actual successful recovery split removes its parent without pausing or reviving it', async t => {
   const queue = fixture(t);
   const task = queue.claimNext();
   const runner = runnerFor(queue);
-  const scope = scopeCounter(runner, async () => {
+  runner.performRecovery = async () => {
     const count = queue.splitTask(task.id, [
       { title: 'First bounded outcome', description: 'Retain existing changes and prove the first behavior.' },
       { title: 'Second bounded outcome', description: 'Prove the second behavior after the first.' },
     ]);
     assert.equal(count, 2);
     runner.abandonReview();
-    return false;
-  });
+    return { status: 'applied' };
+  };
   await runner.replanOrPause(task, 'Decompose independently verifiable remaining outcomes.');
-  assert.equal(scope.calls, 1);
+  assert.ok(queue.get(task.id), 'planning is scheduled before a replacement exists');
+  await runner.serviceRecovery(queue.get(task.id));
   assert.equal(queue.get(task.id), undefined);
   assert.equal(queue.runState, 'RUNNING');
   assert.deepEqual(queue.list().map(task => task.title), ['First bounded outcome', 'Second bounded outcome']);
   assert.ok(queue.list().every(task => task.status === 'PENDING'));
+  assert.equal(schedule.hasOutstandingRecovery(queue), false);
 });
 
-test('three failed progress reviews trigger a bounded re-plan instead of another supervisor loop', async t => {
+test('three failed progress reviews schedule diagnosis instead of another ordinary supervisor loop', async t => {
   const queue = fixture(t);
   const task = queue.claimNext();
   queue.update(task.id, { status: 'VERIFYING', output: 'Preserved worker handoff.' });
@@ -160,14 +155,12 @@ test('three failed progress reviews trigger a bounded re-plan instead of another
     JOURNAL_EVENTS: 80, VALIDATION_FAILED: 'validation-failed',
     reviewProgress: async () => { calls++; throw Error('Supervisor returned an invalid decision.'); },
   } });
-  const scope = scopeCounter(runner);
   for (let i = 0; i < 3; i++) await runner.reviewWork(queue.get(task.id));
   assert.equal(calls, 3);
   assert.equal(queue.countEvents(task.id, 'monitor-error'), 3);
-  assert.equal(scope.calls, 1);
-  assert.equal(queue.runState, 'PAUSED');
+  assert.equal(queue.runState, 'RUNNING');
   assert.equal(queue.get(task.id).output, 'Preserved worker handoff.');
-  assert.match(recovery.recoveryState(queue, task).blocked, /Three unsuccessful progress-review decisions/);
+  assert.match(schedule.readRecoveryJob(queue, task).reason, /Three unsuccessful progress-review decisions/);
 });
 
 test('review-error counters are lane-specific and only a successful decision resets that lane', t => {
@@ -182,40 +175,37 @@ test('review-error counters are lane-specific and only a successful decision res
   assert.match(recovery.recoveryFailure(queue, task, 'silent-review'), /Three unsuccessful/);
 });
 
-test('six replayed completed outcomes freeze a live worker before its repetition can veto planning', async t => {
+test('six replayed completed outcomes freeze a live worker and schedule recovery before further repetition', async t => {
   const queue = fixture(t);
   const task = queue.claimNext();
   completed(queue, task);
   recovery.recoveryEvidence(queue, task);
   for (let i = 0; i < 6; i++) completed(queue, task, 'unchanged contents', i + 2);
   let cancelled = 0;
-  const runner = runnerFor(queue, { './monitor': { reviewProgress: async () => assert.fail('No further ordinary review is needed.') } });
+  const runner = runnerFor(queue, { './monitor': { reviewProgress: async () => assert.fail('Ordinary review is not recovery.') } });
   runner.executionAbort = () => { cancelled++; };
-  const scope = scopeCounter(runner, async () => {
-    assert.equal(cancelled, 1, 'freeze replaying work before invoking the scope planner');
-    assert.equal(queue.get(task.id).status, 'VERIFYING');
-    assert.ok(recovery.recoveryState(queue, task).blocked, 'persist the spent re-plan before awaiting the provider');
-    return true;
-  });
   await runner.reviewWork(task);
-  assert.equal(scope.calls, 1);
-  assert.equal(queue.runState, 'PAUSED');
+  assert.equal(cancelled, 1);
+  assert.equal(queue.get(task.id).status, 'VERIFYING');
+  assert.equal(schedule.readRecoveryJob(queue, task).active, true);
+  assert.equal(queue.runState, 'RUNNING');
 });
 
-test('a failed scope re-plan is not retried on restart and cannot imply completion', async t => {
+test('a failed recovery waits before retrying and never implies completion or pause', async t => {
   const queue = fixture(t);
   const task = queue.claimNext();
   const runner = runnerFor(queue);
-  const scope = scopeCounter(runner, async () => { throw Error('Incomplete replacement plan.'); });
+  let calls = 0;
+  runner.performRecovery = async () => { calls++; throw Error('Incomplete replacement plan.'); };
   await runner.replanOrPause(task, 'Repeated unsuccessful recovery.');
-  assert.equal(scope.calls, 1);
-  assert.equal(queue.runState, 'PAUSED');
-  assert.match(queue.get(task.id).supervisorFeedback, /Incomplete replacement plan/);
+  await runner.serviceRecovery(queue.get(task.id));
+  assert.equal(calls, 1);
+  assert.equal(queue.runState, 'RUNNING');
+  assert.match(schedule.readRecoveryJob(queue, task).lastError, /Incomplete replacement plan/);
   assert.notEqual(queue.get(task.id).status, 'VERIFIED');
-  queue.resumePaused();
-  await runner.replanOrPause(queue.get(task.id), 'Retry unchanged');
-  assert.equal(scope.calls, 1);
-  assert.equal(queue.runState, 'PAUSED');
+  await runner.serviceRecovery(queue.get(task.id));
+  assert.equal(calls, 1);
+  assert.equal(queue.runState, 'RUNNING');
 });
 
 test('alternating previously seen outcomes across worker attempts is still repetition', t => {
@@ -260,21 +250,21 @@ test('recovery ledger survives closing and reopening the queue and retains pre-c
   assert.equal(reopened.recoveryEvidence(queue, task).repeats, 1);
 });
 
-test('automatic rewrites cannot renew the budget, but an operator-edited blocked contract can', t => {
+test('description rewrites and changed handoff prose cannot erase recovery evidence', t => {
   const queue = fixture(t);
   const original = queue.claimNext();
   recovery.recoveryRequest(queue, original);
-  queue.update(original.id, { description: 'Automatic rewording before pausing.' });
+  queue.update(original.id, { description: 'Automatic rewording before recovery.' });
   let task = queue.get(original.id);
   assert.equal(recovery.recoveryState(queue, task).recoveries, 1);
-  recovery.blockRecovery(queue, task, 'Operator intervention required.');
-  queue.update(task.id, { attempts: 0, output: 'Different handoff prose is not a new contract.' });
+  recovery.blockRecovery(queue, task, 'Legacy exhausted strategy.');
+  queue.update(task.id, { attempts: 0, output: 'Different handoff prose.' });
   task = queue.get(task.id);
-  assert.equal(recovery.recoveryState(queue, task).blocked, 'Operator intervention required.');
+  assert.equal(recovery.recoveryState(queue, task).blocked, 'Legacy exhausted strategy.');
   queue.update(task.id, { description: 'A revised bounded operator contract.' });
   const state = recovery.recoveryState(queue, queue.get(task.id));
-  assert.equal(state.blocked, undefined);
-  assert.equal(state.recoveries, 0);
+  assert.equal(state.blocked, 'Legacy exhausted strategy.');
+  assert.equal(state.recoveries, 1);
 });
 
 test('a successful ordinary progress review clears its failure count without changing acceptance status', async t => {
@@ -327,27 +317,24 @@ test('changes outside the readable output excerpt are still new outcome evidence
   assert.ok(recovery.decisionEvidence(queue, task) > before);
 });
 
-test('an operator edit during recovery planning cannot receive a stale pause or activity', async t => {
+test('an operator edit during recovery cannot receive stale waiting activity', async t => {
   for (const reject of [false, true]) {
     const queue = fixture(t);
     const task = queue.claimNext();
     const runner = runnerFor(queue);
-    let settle, activity;
-    runner.scopeWatch = (_task, _role, _current, onActivity) => {
-      activity = onActivity;
-      return { preflight: () => new Promise((resolve, fail) => {
-        settle = () => reject ? fail(Error('late planner error')) : resolve(true);
-      }), close() {} };
-    };
-    const pending = runner.replanOrPause(task, 'Repeated old outcome');
+    let settle;
+    runner.performRecovery = () => new Promise((resolve, fail) => {
+      settle = () => reject ? fail(Error('late planner error')) : resolve({ status: 'deferred', reason: 'late diagnosis' });
+    });
+    await runner.replanOrPause(task, 'Repeated old outcome');
+    const pending = runner.serviceRecovery(queue.get(task.id));
     queue.update(task.id, { description: 'Operator supplied a new diagnosis.', supervisorFeedback: 'Keep this new feedback',
       activityPhase: 'operator_edited', activityDetail: 'new state' });
-    activity('scope_review', 'stale activity', Date.now());
     settle();
     await pending;
     assert.equal(queue.runState, 'RUNNING');
     assert.equal(queue.get(task.id).supervisorFeedback, 'Keep this new feedback');
     assert.equal(queue.get(task.id).activityPhase, 'operator_edited');
-    assert.equal(recovery.recoveryState(queue, queue.get(task.id)).blocked, undefined);
+    assert.equal(schedule.readRecoveryJob(queue, task).attempts, 1);
   }
 });

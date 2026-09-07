@@ -1,6 +1,8 @@
 export type ValidationConclusion = 'PASS' | 'FAIL' | 'INCOMPLETE';
 
 export interface ValidationCheck {
+  /** Host-plan receipt identity; required by the typed verification pipeline. */
+  stepId?: string;
   kind: 'inspection' | 'command' | 'test' | 'browser' | 'other';
   name: string;
   passed: boolean;
@@ -207,6 +209,7 @@ function normalizeCheck(raw: unknown): ValidationCheck | undefined {
       : 'other';
   return {
     kind,
+    ...(typeof value.stepId === 'string' && value.stepId.trim() ? { stepId: value.stepId.trim() } : {}),
     name: clean(value.name, 500) || 'unnamed check',
     passed: value.passed === true,
     evidence: clean(value.evidence),

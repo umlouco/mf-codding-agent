@@ -47,7 +47,7 @@ export interface TurnResult {
 
 export const NO_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-export type ReviewOptions = Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> & { projectNotes?: string };
+export type ReviewOptions = Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> & { projectNotes?: string; recoveryContext?: string };
 
 export interface RunOptions {
   /** Repair a response using supplied evidence without starting another tool investigation. */

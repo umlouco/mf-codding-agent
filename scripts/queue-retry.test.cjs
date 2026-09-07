@@ -6,6 +6,7 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const ts = require('typescript');
+const { verificationDependencies, verificationPlanReply } = require('./queue-verification-helpers.cjs');
 
 function load(file, dependencies = {}, extra = '') {
   if (file === 'src/queue/agents.ts') return require('./queue-agent-loader.cjs').loadQueueAgents(dependencies);
@@ -17,7 +18,7 @@ function load(file, dependencies = {}, extra = '') {
   vm.runInNewContext(outputText, {
     exports,
     Buffer,
-    require: (name) => dependencies[name] ?? (/^\.\/(orchestrator|scope|recovery|workInventory)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : name === './cognition' ? cognition : name === 'crypto' ? require('node:crypto') : {}),
+    require: (name) => dependencies[name] ?? (/^\.\/(orchestrator|scope|recovery|workInventory|verificationAuthority|verificationRecovery)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : name === './cognition' ? cognition : name === 'crypto' ? require('node:crypto') : {}),
   }, { filename: file });
   return exports;
 }
@@ -140,7 +141,7 @@ test('rendered worker and recovery prompts contain valid JSON examples', async (
     captured.push({ role, prompt });
     const reply = prompt.startsWith('You are the planner for an autonomous task queue.')
       ? { summary: 'No task changes proposed.', edits: [], deletes: [], adds: [] }
-      : response;
+      : prompt.startsWith('You are the independent verification planner.') ? verificationPlanReply() : response;
     return { text: JSON.stringify(reply), stopReason: '', usage: {
       input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
     } };
@@ -155,6 +156,7 @@ test('rendered worker and recovery prompts contain valid JSON examples', async (
   await agents.reformatVerdict({}, output, current, 'The checks passed.', 'Correct conditional behavior', {});
   await agents.editTasks({}, output, [current], 'Clarify the check');
   const verifier = load('src/queue/verification.ts', {
+    ...verificationDependencies(),
     './agents': { ...agents, runOnce: runner }, './validation': validation, './prompts': prompts,
   });
   await verifier.runVerification({}, output, current, 'Correct conditional behavior');
@@ -162,7 +164,7 @@ test('rendered worker and recovery prompts contain valid JSON examples', async (
     './agents': { ...agents, runOnce: runner }, './validation': validation, './prompts': prompts,
   });
   await monitor.reviewProgress({}, output, { ...current, output: '' }, [], 0, {}, 'Correct conditional behavior');
-  assert.equal(captured.length, 8);
+  assert.equal(captured.length, 9);
   for (const { prompt } of captured) {
     assert.ok(!prompt.includes('undefined'), 'unresolved prompt interpolation');
     const examples = prompt.match(/^\{\n[\s\S]*?^\}/gm) ?? [];
@@ -234,6 +236,9 @@ test('worker budgets apply to execution and verification, with halted turns unve
   const options = [];
   const runner = async (_, __, role, prompt, opts) => {
     options.push(opts);
+    if (prompt.startsWith('You are the independent verification planner.')) {
+      return { text: JSON.stringify(verificationPlanReply()), stopReason: '', usage: {} };
+    }
     assert.match(prompt, /queue report schema below controls/);
     return { text: JSON.stringify({ validation: passingValidation() }), stopReason: 'max_iterations',
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
@@ -242,11 +247,13 @@ test('worker budgets apply to execution and verification, with halted turns unve
   const result = await agents.executeTask({}, {}, task(), '', 'Correct behavior');
   assert.equal(result.cutOff, true);
   const verifier = load('src/queue/verification.ts', {
+    ...verificationDependencies(),
     './agents': { ...agents, runOnce: runner }, './validation': validation, './prompts': prompts,
   });
   const checked = await verifier.runVerification({}, {}, task(), 'Correct behavior');
   assert.equal(JSON.parse(checked.validationReport).conclusion, 'INCOMPLETE');
-  assert.ok(options.every(o => o.maxIterations === 80));
+  assert.equal(options[0].maxIterations, 80);
+  assert.ok(options.slice(1).every(o => o.maxIterations === 1 && o.formatOnly));
 });
 
 test('queue context respects the smaller local or global ceiling', () => {
@@ -415,11 +422,13 @@ test('execution and independent verification retain client intent across task re
     seen.push(prompt);
     assert.equal(typeof opts.onActivity, 'function', 'goal must not shift activity callback');
     assert.equal(typeof opts.onAbort, 'function', 'cancellation callback preserved');
-    return { text: JSON.stringify({ validation: passingValidation() }), stopReason: '',
+    return { text: JSON.stringify(prompt.startsWith('You are the independent verification planner.')
+      ? verificationPlanReply() : { validation: passingValidation() }), stopReason: '',
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
   };
   agents.setTestRunner(runner);
   const verifier = load('src/queue/verification.ts', {
+    ...verificationDependencies(),
     './agents': { ...agents, runOnce: runner }, './validation': validation, './prompts': prompts,
   });
   for (const attempts of [1, 3]) {
@@ -429,7 +438,7 @@ test('execution and independent verification retain client intent across task re
       () => {}, () => {}, () => {});
     await verifier.runVerification({}, {}, rewritten, goal, () => {}, () => {}, () => {});
   }
-  assert.equal(seen.length, 4);
+  assert.equal(seen.length, 6);
   for (const prompt of seen) {
     assert.ok(prompt.includes(goal), 'full client input survives narrowing and retries');
     assert.equal(prompt.split(goal).length, 2, 'include original once to avoid context duplication');

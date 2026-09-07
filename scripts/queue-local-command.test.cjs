@@ -23,7 +23,7 @@ async function local(t) {
   return { ...f, task: f.queue.get(claimed.id), validated, setReply: value => { reply = value; } };
 }
 
-test('local REVERIFY corrects only command syntax and runs verification with its updated admitted invocation', async t => {
+test('local REVERIFY leaves saved and admitted commands immutable while host verification adapts its own plan', async t => {
   const f = await local(t);
   f.setReply({ verdict: 'REVERIFY', feedback: 'Correct the unsupported test-runner flag; retain the same required checks.',
     taskEdits: [{ seq: f.task.seq, solutionVerifyCommand: newCommand }], usage });
@@ -32,21 +32,20 @@ test('local REVERIFY corrects only command syntax and runs verification with its
   await f.runner.supervise(f.task);
   const current = f.queue.get(f.task.id);
   const { scopedContract, hasAdmittedScope } = f.load('src/queue/scopeContract.ts');
-  assert.equal(current.solutionVerifyCommand, newCommand);
-  assert.equal(scopedContract(f.queue, current).contract.solutionVerifyCommand, newCommand);
+  assert.equal(current.solutionVerifyCommand, oldCommand);
+  assert.equal(scopedContract(f.queue, current).contract.solutionVerifyCommand, oldCommand);
   assert.equal(hasAdmittedScope(f.queue, current), true);
-  for (const field of ['description', 'implVerifyPrompt', 'solutionVerifyPrompt']) {
+  for (const field of ['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'region']) {
     assert.equal(current[field], f.task[field]);
   }
-  assert.ok(updates.some(({ id, patch }) => id === f.task.id && patch.solutionVerifyCommand === newCommand &&
-    JSON.parse(patch.region).scopeSplit.contract.solutionVerifyCommand === newCommand),
-  'the command and admitted baseline change together in one update');
+  assert.ok(updates.every(({ patch }) => !('solutionVerifyCommand' in patch) && !('region' in patch)),
+    'runtime verification must not rewrite the persistent acceptance adapter or admitted baseline');
   assert.equal(f.validated.length, 1);
-  assert.equal(f.validated[0].solutionVerifyCommand, newCommand);
+  assert.equal(f.validated[0].solutionVerifyCommand, oldCommand);
   assert.equal(current.validationReport, 'New independent evidence.');
-  const audit = JSON.parse(f.queue.events(current.id, -1).find(event => event.kind === 'check-fixed').message);
-  assert.deepEqual(audit, { source: 'scoped-reverify-command', oldCommand, newCommand });
-  assert.equal(f.queue.list()[1].solutionVerifyCommand, oldCommand, 'siblings retain their assigned checks');
+  assert.equal(f.queue.countEvents(current.id, 'check-fixed'), 0);
+  assert.equal(f.queue.countEvents(current.id, 'scope-edit-rejected'), 1);
+  assert.equal(f.queue.list()[1].solutionVerifyCommand, oldCommand);
 });
 
 test('local command recovery rejects RETRY, empty commands, prose edits, siblings and drifted baselines', async t => {
@@ -71,4 +70,19 @@ test('local command recovery rejects RETRY, empty commands, prose edits, sibling
     assert.equal(f.queue.countEvents(f.task.id, 'scope-edit-rejected'), 1);
     assert.equal(f.queue.countEvents(f.task.id, 'check-fixed'), 0);
   }
+});
+
+test('the real supervisor parser cannot launder broad REVERIFY edits into a command-only contract rewrite', async t => {
+  const f = await local(t);
+  const { loadQueueAgents } = require('./queue-agent-loader.cjs');
+  const agents = loadQueueAgents({ vscode: { workspace: {
+    getConfiguration: () => ({ get: (_, fallback) => fallback }),
+  } } });
+  agents.setTestRunner(async () => ({ text: JSON.stringify({ verdict: 'REVERIFY',
+    feedback: 'Correct the failed checking tool.', taskEdits: [{ seq: f.task.seq,
+      description: 'Broaden this child to include sibling work.', solutionVerifyCommand: newCommand }] }),
+    stopReason: 'end_turn', usage }));
+  const decision = await agents.superviseTask({}, { appendLine() {} }, f.task, 0, 'Keep the assigned outcome.');
+  assert.equal(decision.verdict, 'REVERIFY');
+  assert.equal(decision.taskEdits.length, 0);
 });

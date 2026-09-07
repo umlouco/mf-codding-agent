@@ -55,6 +55,8 @@ ${ceilingNotice(task)}
 
 ${recoveryRules}
 
+${opts.recoveryContext || ''}
+
 Judge the structured current-attempt evidence, not its presentation. A successful command check
 with concrete output does not need the same command duplicated verbatim in another evidence field.
 An allowed-value list does not mean every allowed value must occur unless the requirement explicitly
@@ -106,11 +108,11 @@ Choose VERIFIED only when the verification agent concluded PASS and its database
 concrete implementation and behaviour evidence plus successful required commands/tests. Do not
 independently repeat the checks. Choose REVERIFY when the verifier must finish checks, correct its invocation, authenticate at the
 supplied URL, or complete its report. Put the exact missing checks in feedback and leave splitInto
-empty. If the saved command itself has invalid syntax or quoting, REVERIFY may include one taskEdits
-entry for this task containing ONLY a complete nonempty solutionVerifyCommand replacement. Preserve
-every assertion and the same success conditions. Saved commands run in the portable POSIX shell on
-all hosts. Never waive a required command by saying to ignore it, or replace assertions with echo PASS.
-For other REVERIFY decisions leave taskEdits empty. Preserve implementation and acceptance criteria. A report format problem
+empty. Always leave taskEdits empty for REVERIFY, including malformed saved commands. The independent
+verifier compiles a disposable host-executed plan and diagnoses adapters without editing task rows.
+Preserve the assigned acceptance criteria and genuine owner-required assertions. Tool names are RPC
+capabilities, not shell executables. Put the observed adapter problem in feedback, never replace the
+saved command or the admitted scope baseline. A report format problem
 must not be converted into new product requirements, a tool-call quota, or a requirement to
 produce a particular table. Choose RETRY when evidence identifies changes the executor must make;
 include a materially rewritten description for task ${task.seq}. Choose SPLIT when
@@ -171,11 +173,7 @@ decisions: reverify it, correct it, or split it. There is no fail or give-up ver
 
   if (settled !== 'RETRY') {
     if (settled === 'REVERIFY' || settled === 'VERIFIED') {
-      decision.taskEdits = settled === 'REVERIFY' && named === 'REVERIFY'
-        ? taskEdits.filter(e => e.seq === task.seq && typeof e.solutionVerifyCommand === 'string' &&
-          e.solutionVerifyCommand.trim() && e.solutionVerifyCommand.trim() !== task.solutionVerifyCommand.trim())
-          .slice(0, 1).map(e => ({ seq: task.seq, solutionVerifyCommand: e.solutionVerifyCommand!.trim() }))
-        : [];
+      decision.taskEdits = [];
       decision.splitInto = undefined;
     }
     return decision;
