@@ -9,6 +9,7 @@ const { test } = require('node:test');
 const ts = require('typescript');
 
 function load(file, dependencies = {}, extra = '') {
+  if (file === 'src/queue/agents.ts') return require('./queue-agent-loader.cjs').loadQueueAgents(dependencies);
   const source = readFileSync(path.join(__dirname, '..', file), 'utf8');
   const { outputText } = ts.transpileModule(source + extra, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -40,7 +41,7 @@ function agentModule(extraDependencies = {}) {
   return load('src/queue/agents.ts', {
     vscode, './cognition': cognition, './prompts': prompts, './validation': validation,
     ...extraDependencies,
-  }, '\nexport function setTestRunner(runner: typeof runOnce) { runOnce = runner; }');
+  });
 }
 
 test('durable identity follows work through rewrites, fresh attempts, and different observers', () => {

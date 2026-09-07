@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { QueueStats } from './db';
 import { OrchestratorState, OrchestratorStatus, RunMode, WATCHDOG_MS } from './orchestratorState';
 import { recoveryKey, resumeRecovery } from './recovery';
+import { restoreScopedContracts } from './scopeContract';
 
 export abstract class OrchestratorControl extends OrchestratorState {
 
@@ -99,6 +100,8 @@ export abstract class OrchestratorControl extends OrchestratorState {
     // Starting a non-running queue is an explicit operator retry, not a watchdog
     // retry. Release recovery latches without resetting tasks or acceptance checks.
     if (this.queue.runState !== 'RUNNING') {
+      const restored = restoreScopedContracts(this.queue);
+      if (restored) this.log(`restored ${restored} admitted local contract(s) expanded by earlier supervisor rewrites`);
       for (const task of this.queue.list()) {
         if (resumeRecovery(this.queue, task)) this.reviewed.delete(task.id);
       }

@@ -25,6 +25,26 @@ Child ticket metadata accompanies executor, verifier, requirements, and progress
 Global acceptance remains at the final gate rather than being redundantly assigned as a
 new implementation demand to every ticket.
 
+## A split is a committed replacement
+
+The parent row is deleted in the same database transaction that creates all replacement
+rows. Its full contract, reports, journal and cost are retained through the archive and
+replacement receipt. A complete supervisor `SPLIT` result is applied directly, not discarded
+in favor of another planning call. Incomplete plans fail as a whole; no six-child truncation.
+
+Each local ticket stores its admitted acceptance contract. Automatic recovery may change
+the implementation approach through guidance, but cannot rewrite that contract into the
+retired parent's entire job. Local tickets do not undergo another whole-owner requirements
+rewrite or static scope preflight before work. Live evidence and explicit recovery can still
+justify decomposing the remaining local work. Whole-project acceptance is not local ownership.
+The existing command-only `REVERIFY` repair remains available: it must preserve the admitted
+prose contract, updates only the saved invocation, and journals the old and new command.
+
+Explicit Start also checks for earlier extension-authored contract expansion. Restoration
+requires an exact retained supervisor response matching the current changed fields and its
+applied journal event; ambiguous or owner-edited contracts are not overwritten. The prior
+task/report is archived, and attempts, output, source changes and completed siblings remain.
+
 ## Recovery is durable and finite
 
 - Completed tool outcomes have content fingerprints independent of timing. Full inputs and

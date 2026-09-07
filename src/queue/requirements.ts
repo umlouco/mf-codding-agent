@@ -3,12 +3,18 @@ import { extractJson, runOnce, type ReviewOptions } from './agents';
 import type { Task, Usage } from './db';
 import type { ProgressDecision } from './monitor';
 import { scopeBoundary } from './scopeBoundary';
+import { isLocalScope } from './scopeContract';
 
 /** Keep the owner comparison independent of accumulated execution/recovery advice. */
 export async function reviewTaskRequirements(
   context: vscode.ExtensionContext, output: vscode.OutputChannel, task: Task,
   goal: string, ownerInstructions: string, opts: ReviewOptions,
 ): Promise<{ correction?: ProgressDecision; usage: Usage }> {
+  // The split already assigned this outcome. Comparing one child with the whole
+  // owner objective here resurrected the retired parent as new child requirements.
+  // Owner constraints still reach progress, workers and validation; total coverage
+  // is judged by the partition/final gate, not re-authored on every local retry.
+  if (isLocalScope(task)) return { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
   const prompt = `Review the task contract below against the owner's request and standing instructions.
 This is a requirements comparison, not a progress review or an implementation task.
 The task is a derived proposal and may be wrong. Do not assume its approach is authorized.

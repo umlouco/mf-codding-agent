@@ -8,6 +8,7 @@ const { test } = require('node:test');
 const ts = require('typescript');
 
 function load(file, dependencies = {}, extra = '') {
+  if (file === 'src/queue/agents.ts') return require('./queue-agent-loader.cjs').loadQueueAgents(dependencies);
   const source = readFileSync(path.join(__dirname, '..', file), 'utf8');
   const { outputText } = ts.transpileModule(source + extra, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -28,10 +29,7 @@ const agents = load('src/queue/agents.ts', {
   './prompts': prompts,
   './validation': validation,
   vscode: { workspace: { getConfiguration: () => ({ get: (_, fallback) => fallback }) } },
-}, `
-export { retryBriefing, demandRewrite, escalate, reformatVerdict, queueContextCeiling, recallWorkerMemory };
-export function setTestRunner(runner: typeof runOnce) { runOnce = runner; }
-`);
+});
 const { Orchestrator } = load('src/queue/orchestrator.ts', { './agents': agents });
 test('worker budget permits sustained work and honors explicit bounded limits', () => {
   assert.equal(agents.workerRounds(), 80);
@@ -258,7 +256,7 @@ test('queue context respects the smaller local or global ceiling', () => {
     const module = load('src/queue/agents.ts', {
       vscode: { workspace: { getConfiguration: () => ({ get: () => local }) } },
       '../providers/payload': { contextCeiling: () => global },
-    }, '\nexport { queueContextCeiling };');
+    });
     assert.equal(module.queueContextCeiling(), expected);
   }
 });
@@ -346,8 +344,11 @@ test('worker startup injects graph retrieval before chat and respects disabled m
         }
       } },
       '../providers/instance': { getStore: () => ({ resolve: async () => ({ kind: 'http' }) }) },
+      '../llm/router': { getRouter: () => ({ endpointFor: async () => ({ type: 'openai-compatible' }) }) },
+      '../providers/payload': { contextCeiling: () => 128000 },
+      vscode: { workspace: { getConfiguration: () => ({ get: (_, fallback) => fallback }) } },
       '../editorFs': { registerEditorFsHandlers() {} }, '../mcpBridge': { getBridge: () => ({ attach() {} }) },
-    }, '\noverridesFor = async () => ({});');
+    });
     await module.runOnce({}, { appendLine() {} }, 'executor', 'Original task prompt', { memoryQuery: 'Registration' });
     assert.deepEqual(requests.map(r => r[0]), enabled ? ['memory/search', 'chat/send'] : ['chat/send']);
     const sent = requests.at(-1)[1].text;

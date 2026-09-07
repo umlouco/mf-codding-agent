@@ -63,7 +63,7 @@ export abstract class OrchestratorRecovery extends OrchestratorWatchdog {
       });
     review.scope = scope;
     try {
-      await scope.preflight();
+      await scope.preflight(true);
       if (!current()) return; // Split applied, contract edited or user stopped.
       this.pauseForRecovery(task, `${reason} Scope review did not produce a complete, safe replacement plan.`);
     } catch (error: any) {

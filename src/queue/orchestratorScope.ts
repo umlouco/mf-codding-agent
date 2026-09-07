@@ -22,6 +22,7 @@ export abstract class OrchestratorScope extends OrchestratorJournal {
     // split may leave an unused archive, never lose the only handoff or original contract.
     const archiveKey = `scopeSplit:${task.id}:${task.startedAt ?? task.createdAt}`;
     this.queue.setMeta(archiveKey, JSON.stringify({ task, assessment,
+      ownerContext: JSON.stringify([this.queue.getMeta('goal'), this.queue.testingContext + this.queue.instructions]),
       events: this.queue.events(task.id, -1), archivedAt: Date.now() }));
     const parts = replacementTasks(assessment, task, archiveKey);
     const count = this.queue.splitTask(task.id, parts);

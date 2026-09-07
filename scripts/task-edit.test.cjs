@@ -1,19 +1,8 @@
 // Run with: node --test scripts/task-edit.test.cjs
 // Exercise the planner-to-extension proposal contract without starting a model or VS Code.
-const { readFileSync } = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const ts = require('typescript');
-
-const source = readFileSync(path.join(__dirname, '..', 'src/queue/agents.ts'), 'utf8');
-const { outputText } = ts.transpileModule(source +
-  '\nexport function setTestRunner(runner: typeof runOnce) { runOnce = runner; }', {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
-});
-const agents = {};
-vm.runInNewContext(outputText, { exports: agents, Buffer, require: () => ({}) });
+const agents = require('./queue-agent-loader.cjs').loadQueueAgents();
 
 const usage = { input: 15, output: 20, cacheRead: 0, cacheWrite: 0 };
 const tasks = Array.from({ length: 251 }, (_, index) => ({

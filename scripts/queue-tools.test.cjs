@@ -8,6 +8,7 @@ const { test } = require('node:test');
 const ts = require('typescript');
 
 function load(file, dependencies = {}, extra = '') {
+  if (file === 'src/queue/agents.ts') return require('./queue-agent-loader.cjs').loadQueueAgents(dependencies);
   const source = readFileSync(path.join(__dirname, '..', file), 'utf8');
   const { outputText } = ts.transpileModule(source + extra, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -43,7 +44,7 @@ for (const [role, omitDefinitions] of [
           } }),
         },
         vscode: { workspace: { getConfiguration: () => ({ get: (_, fallback) => fallback }) } },
-      }, '\nexport { overridesFor };');
+      });
 
       const overrides = await overridesFor(role, 12);
       assert.equal(overrides.disableTools, omitDefinitions);

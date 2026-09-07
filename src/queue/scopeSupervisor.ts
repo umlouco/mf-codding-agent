@@ -9,6 +9,7 @@ import { parseScopeAssessment, ScopeAssessment, ScopeRole } from './scopePlan';
 import { scopePrompt } from './scopePrompt';
 import { discoverWork, indexRepository, WorkInventory } from './workInventory';
 import { inventoryScopePlan, scopeBoundary } from './scopeBoundary';
+import { hasAdmittedScope } from './scopeContract';
 
 export interface ScopeHost {
   context: vscode.ExtensionContext;
@@ -38,8 +39,14 @@ export class ScopeSupervisor {
     return !this.closed && this.host.current() && this.host.queue.runState === 'RUNNING';
   }
 
-  async preflight(): Promise<boolean> {
-    const keep = await this.assess('preflight');
+  async preflight(forcePlanning = false): Promise<boolean> {
+    // A persisted replacement was already admitted by the planner. Re-running
+    // static scope planning on each child (or on its full acceptance gate)
+    // can regenerate the same parent population before any child gets to work.
+    // Fresh live evidence and explicit recovery may still justify a new plan.
+    const admitted = !forcePlanning && hasAdmittedScope(this.host.queue, this.host.task);
+    if (admitted) this.lastReview = Date.now();
+    const keep = admitted ? this.current() : await this.assess('preflight');
     if (keep && this.current()) {
       this.timer = setInterval(() => { void this.check(); }, 5000);
       this.timer.unref?.();

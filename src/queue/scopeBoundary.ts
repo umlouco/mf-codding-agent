@@ -54,10 +54,15 @@ export function scopeBoundary(task: Task): string {
   try {
     const split = JSON.parse(task.region || '{}').scopeSplit;
     if (!split) return '';
-    return `PERSISTED EXECUTION TICKET: ${JSON.stringify(split)}\n` +
+    const { contract: _contract, ...identity } = split;
+    return `PERSISTED EXECUTION TICKET: ${JSON.stringify(identity)}\n` +
       'The original objective and acceptance criteria are unchanged. Work is scheduled across dependency-ordered tickets ' +
       'and an unchanged final acceptance gate. Judge this ticket against its assigned outcome; missing future independent ' +
-      'work is not a defect in this ticket. Do not expand every ticket back into the entire objective.';
+      'work is not a defect in this ticket. Do not expand every ticket back into the entire objective. ' +
+      (split.integration ? 'This is the final acceptance gate: reconcile already verified children and check cross-slice behavior. ' +
+        'The original implementation population was already decomposed. Do not recreate it from the breadth of the retained acceptance criteria.' :
+        'This local contract is committed. Recovery may change implementation approach or test invocation through guidance, ' +
+        'not rewrite acceptance criteria. Parent criteria constrain this assigned slice; they do not transfer sibling ownership to it.');
   } catch { return ''; }
 }
 

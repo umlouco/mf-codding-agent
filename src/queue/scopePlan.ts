@@ -123,7 +123,8 @@ export function parseScopeAssessment(raw: any, task: Task, inventory?: WorkInven
 
 /** In-flight work may have advanced during review. Reconcile, never revert or blindly redo it. */
 export function replacementTasks(assessment: ScopeAssessment, task: Task, archiveKey: string): NewTask[] {
-  return assessment.parts.map(part => ({
+  return assessment.parts.map(part => {
+    const ticket = {
     title: part.title,
     description: `${part.description}\n\nParent acceptance criteria (${part.integration ? 'full final gate' : 'apply only to this assigned slice; sibling work is checked separately'}):\n` +
       assessment.requirements.filter(r => part.covers.includes(r.key)).map(r => `- ${r.criterion}`).join('\n') +
@@ -135,9 +136,15 @@ export function replacementTasks(assessment: ScopeAssessment, task: Task, archiv
       `Prerequisite slices: ${part.dependsOn.join(', ') || '(none)'}.`,
     implVerifyPrompt: part.implVerifyPrompt, solutionVerifyPrompt: part.solutionVerifyPrompt,
     solutionVerifyCommand: part.solutionVerifyCommand, maxAttempts: task.maxAttempts,
-    kind: 'task', region: JSON.stringify({ scopeSplit: { archiveKey, key: part.key,
-      targets: part.targets ?? [], workUnit: part.workUnit || '', integration: part.integration } }),
-  }));
+    kind: 'task' as const,
+    };
+    // Accepted requirements belong to this scheduled outcome. Recovery may change
+    // the approach, not turn a child back into its retired parent's whole job.
+    const contract = { description: ticket.description, implVerifyPrompt: ticket.implVerifyPrompt,
+      solutionVerifyPrompt: ticket.solutionVerifyPrompt, solutionVerifyCommand: ticket.solutionVerifyCommand };
+    return { ...ticket, region: JSON.stringify({ scopeSplit: { archiveKey, key: part.key,
+      targets: part.targets ?? [], workUnit: part.workUnit || '', integration: part.integration, contract } }) };
+  });
 }
 
 /** Split work forms an ordered verification barrier even in continuous mode. */

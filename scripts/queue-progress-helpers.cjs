@@ -15,6 +15,7 @@ const ts = require('typescript');
 
 
 function load(file, dependencies = {}, extra = '') {
+  if (file === 'src/queue/agents.ts') return require('./queue-agent-loader.cjs').loadQueueAgents(dependencies);
   const source = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
   const { outputText } = ts.transpileModule(source + extra, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -64,9 +65,7 @@ const task = { id: 1, seq: 1, createdAt: 1, startedAt: 10, attempts: 1, maxAttem
 
 function agents(extra = {}) {
   return load('src/queue/agents.ts', { vscode, './prompts': prompts, './validation': validation,
-    './cognition': cognition, ...extra }, `
-export function setTestRunner(runner: typeof runOnce) { runOnce = runner; }
-`);
+    './cognition': cognition, ...extra });
 }
 
 function fixture(t) {

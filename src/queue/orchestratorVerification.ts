@@ -8,6 +8,8 @@ import { appendAttempt, Review } from './orchestratorState';
 import { runVerification } from './verification';
 import { recoveryFailure, recoveryState, recoverySucceeded } from './recovery';
 import { boundedTask } from './scopeBoundary';
+import { verdictReplacementTasks } from './scopeVerdict';
+import { isLocalScope, scopedContract, scopeContractFields } from './scopeContract';
 
 /** A verdict belongs to one claim, contract and report, not merely a row ID. */
 function sameVerificationSnapshot(current: Task | undefined, snapshot: Task): boolean {
@@ -204,6 +206,22 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         !await this.allowRecovery(task, decision.verdict)) return;
     if (!accepts()) return;
     this.queue.log(task.id, 'supervisor', `verdict:${decision.verdict}`, decision.feedback);
+    if (decision.verdict === 'SPLIT') {
+      // A supplied plan has already been decided. Asking another planner whether
+      // to split discards that decision and can leave the original runnable forever.
+      // Edits accompanying SPLIT are deliberately ignored: this transition only
+      // replaces the reviewed row, and sequence numbers move when it commits.
+      if (!decision.splitInto?.length) {
+        await this.replanOrPause(task, decision.feedback || 'Supervisor requested decomposition');
+      } else {
+        try { this.applyVerdictSplit(task, decision, accepts); }
+        catch (error: any) {
+          if (accepts()) this.pauseForRecovery(task, `Replacement plan could not be committed: ${error?.message ?? error}`);
+        }
+      }
+      this.changed();
+      return;
+    }
     this.applyTaskEdits(decision, task.seq);
 
     switch (decision.verdict) {
@@ -231,11 +249,6 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         });
         this.log(`task ${task.seq} VERIFIED`);
         break;
-
-      case 'SPLIT': {
-        await this.replanOrPause(task, decision.feedback || 'Supervisor requested decomposition');
-        break;
-      }
 
       case 'RESET_FROM': {
         // A rollback throws away finished work, so it has to be the supervisor's
@@ -296,6 +309,31 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
     this.changed();
   }
 
+  /** Persist all replacements before retiring callbacks; SQL failure keeps the parent intact. */
+  protected applyVerdictSplit(snapshot: Task, decision: SupervisorDecision, current: () => boolean): boolean {
+    const task = this.queue.get(snapshot.id);
+    if (!task || !current() || this.disposed || this.queue.runState !== 'RUNNING' ||
+      !sameVerificationSnapshot(task, snapshot)) return false;
+    const archiveKey = `scopeSplit:${task.id}:${task.startedAt ?? task.createdAt}:verdict:` +
+      this.queue.countEvents(task.id, 'verdict:SPLIT');
+    const parts = verdictReplacementTasks(decision.splitInto!, task, archiveKey);
+    // A rolled-back replacement may leave an unused archive, never a missing
+    // original handoff. splitTask inserts every child and deletes the parent in one transaction.
+    this.queue.setMeta(archiveKey, JSON.stringify({ task, decision,
+      ownerContext: JSON.stringify([this.queue.getMeta('goal'), this.queue.testingContext + this.queue.instructions]),
+      events: this.queue.events(task.id, -1), archivedAt: Date.now() }));
+    if (this.queue.splitTask(task.id, parts) !== parts.length) throw Error('The original task no longer accepts this replacement.');
+    const active = this.queue.activeTask();
+    if (active && active.seq > task.seq) this.abandonExecution();
+    this.abandonReview();
+    this.reviewed.delete(task.id);
+    this.queue.log(null, 'supervisor', 'scope-split', `${archiveKey}: committed ${parts.length} ordered replacement tasks`);
+    this.log(`task ${task.seq} retired and replaced by ${parts.length} tasks; existing work preserved`);
+    this.changed();
+    this.wakeAfterHandoff();
+    return true;
+  }
+
   /** How many times the supervisor has already rewritten this task. */
   protected rewrites(task: Task): number {
     return this.queue.countEvents(task.id, 'task-edited');
@@ -316,6 +354,29 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         if (edit.seq === currentSeq) {
           this.log(`supervisor's rewrite of task ${edit.seq} could not be applied`);
         }
+        continue;
+      }
+      if (isLocalScope(target)) {
+        const command = edit.solutionVerifyCommand?.trim();
+        const commandOnly = decision.verdict === 'REVERIFY' && target.seq === currentSeq &&
+          target.status === 'VERIFYING' && !!command && command !== target.solutionVerifyCommand.trim() &&
+          Object.keys(edit).every(key => key === 'seq' || key === 'solutionVerifyCommand');
+        const admitted = commandOnly ? scopedContract(this.queue, target) : undefined;
+        if (admitted && scopeContractFields.every(field => target[field] === admitted.contract[field])) {
+          const region = JSON.parse(target.region);
+          region.scopeSplit.contract = { ...admitted.contract, solutionVerifyCommand: command };
+          // Keep the syntax-corrected invocation and its admitted baseline in the
+          // same SQL update. No acceptance prose or sibling scope is re-authored.
+          this.queue.update(target.id, { solutionVerifyCommand: command, region: JSON.stringify(region) });
+          this.queue.log(target.id, 'supervisor', 'check-fixed', JSON.stringify({
+            source: 'scoped-reverify-command', oldCommand: target.solutionVerifyCommand, newCommand: command,
+          }));
+          this.log(`supervisor corrected the check invocation for local task ${target.seq}; acceptance criteria retained`);
+          continue;
+        }
+        this.queue.log(target.id, 'supervisor', 'scope-edit-rejected',
+          'The replacement contract is fixed. Use feedback to change the implementation approach, not its assigned outcome or checks.');
+        this.log(`task ${target.seq}: retained its assigned replacement contract instead of re-authoring it`);
         continue;
       }
       const description = edit.description?.trim() || target.description;

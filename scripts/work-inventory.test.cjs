@@ -315,17 +315,14 @@ test('a changed contract or repository population during discovery invalidates t
   }
 });
 
-test('actual scope review respects a persisted child ticket instead of rediscovering the entire parent request', async t => {
+test('admitted child starts without another static planning call or rediscovering the parent request', async t => {
   const inventory = resolveWorkInventory(enumeration(), repository);
   const child = replacementTasks(parseScopeAssessment(inventoryScopePlan(contract, inventory), contract, inventory),
     contract, 'parent-archive')[1];
-  const f = supervisorFixture(t, async prompt => {
-    assert.doesNotMatch(prompt, /You are the discovery stage/);
-    assert.match(prompt, /PERSISTED EXECUTION TICKET/);
-    assert.ok(prompt.includes(inventory.units[0].key));
-    return keep('cohesive');
-  }, child);
+  const f = supervisorFixture(t, async () => assert.fail('The saved partition already admitted this child'), child);
+  f.queue.setMeta('parent-archive', JSON.stringify({ task: { ...contract, id: 999 },
+    assessment: parseScopeAssessment(inventoryScopePlan(contract, inventory), contract, inventory) }));
   assert.equal(await f.create().preflight(), true);
-  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls.length, 0);
   assert.equal(f.splits.length, 0);
 });

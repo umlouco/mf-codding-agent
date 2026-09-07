@@ -6,6 +6,7 @@ import { completionForSupervisor, parseCompletionClaim } from './validation';
 import { recoveryRules, originalGoalContext, projectNotesContext } from './prompts';
 import { taskCognition } from './cognition';
 import { scopeBoundary } from './scopeBoundary';
+import { isLocalScope } from './scopeContract';
 
 /**
  * Journal kind recording an independent validation run that did not finish.
@@ -109,7 +110,10 @@ function journal(events: TaskEvent[]): string {
   return lines.reverse().join('\n') || '(no journal entries yet)';
 }
 
-function normalize(raw: any, usage: Usage, testingUrl = ""): ProgressDecision {
+function normalize(raw: any, usage: Usage, task: Task, testingUrl = ""): ProgressDecision {
+  if (isLocalScope(task) && ['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION'].includes(raw?.action)) {
+    throw new Error('A committed local execution ticket has fixed acceptance requirements. Do not rewrite it into the parent objective. Use CONTINUE_EXECUTION with concrete local recovery guidance, START_VALIDATION when ready, or STOP_AND_DECOMPOSE_TASK for remaining work within this ticket only.');
+  }
   if (raw?.action === 'STOP_AND_REWRITE_TASK' && !(typeof raw.rewrittenDescription === 'string' && raw.rewrittenDescription.trim())) {
     throw new Error('STOP_AND_REWRITE_TASK requires rewrittenDescription containing the complete corrected task.');
   }
@@ -209,6 +213,14 @@ ${task.description}
 
 ${scopeBoundary(task)}
 
+${isLocalScope(task) ? `LOCAL EXECUTION CONTRACT IS COMMITTED: STOP_AND_REWRITE_TASK and
+STOP_AND_REWRITE_VALIDATION are not available for this ticket. Its acceptance criteria cannot
+be changed by a recovery decision. Diagnose its assigned outcome only. Use CONTINUE_EXECUTION
+with guidance to correct implementation or test invocation while retaining the required checks.
+Use START_VALIDATION when its local work is ready. Do not demand completed future siblings,
+re-inventory the parent population, or turn shared prerequisites into the whole project.
+STOP_AND_DECOMPOSE_TASK may partition only remaining work inside this assigned outcome.` : ''}
+
 ATTEMPT ${task.attempts} OF ${task.maxAttempts}
 ${attemptsExhausted(task) ? `The current attempt budget is spent. Let useful work finish or start
 validation when ready. If rewriting, supply a materially different recovery approach grounded in
@@ -282,7 +294,7 @@ that action needs them. The final response must be valid JSON, with no code fenc
   const usage = { ...first.usage };
   if (contract) addUsage(usage, contract.usage);
   try {
-    return normalize(extractJson(first.text, isDecision), usage, contract ? undefined : opts.testingUrl);
+    return normalize(extractJson(first.text, isDecision), usage, task, contract ? undefined : opts.testingUrl);
   } catch (error) {
     const formatPrompt = `Complete the required decision object below. Preserve a supported decision;
 if the target comparison shows a conflict with owner requirements, correct the decision and its
@@ -298,13 +310,17 @@ ${projectNotesContext(opts.projectNotes)}
 
 Allowed action values: ${SUPERVISOR_ACTIONS.join(', ')}.`;
     try {
-      const second = await runOnce(context, output, 'supervisor', formatPrompt, {
+      const localRepair = isLocalScope(task) ? `\nThis is a committed local ticket. The proposed contract rewrite
+was NOT applied. Complete a permitted local decision instead: CONTINUE_EXECUTION with concrete
+recovery guidance, START_VALIDATION, or STOP_AND_DECOMPOSE_TASK for local remaining work.
+Do not preserve an unavailable rewrite action or demand sibling work. Keep the accepted criteria.` : '';
+      const second = await runOnce(context, output, 'supervisor', formatPrompt + localRepair, {
         ...opts,
         formatOnly: true,
         maxIterations: 1,
       });
       addUsage(usage, second.usage);
-      return normalize(extractJson(second.text, isDecision), usage, contract ? undefined : opts.testingUrl);
+      return normalize(extractJson(second.text, isDecision), usage, task, contract ? undefined : opts.testingUrl);
     } catch {
       throw new Error('The supervisor supplied no readable decision after reformatting. Preserve current work and reassess; unreadable output is not evidence that implementation is ready.');
     }

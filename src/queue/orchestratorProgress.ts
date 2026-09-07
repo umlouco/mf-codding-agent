@@ -5,6 +5,7 @@ import { JOURNAL_EVENTS, ProgressDecision, reviewProgress, VALIDATION_FAILED } f
 import { Review } from './orchestratorState';
 import { OrchestratorRecovery } from './orchestratorRecovery';
 import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, recoverySucceeded } from './recovery';
+import { isLocalScope } from './scopeContract';
 
 export abstract class OrchestratorProgress extends OrchestratorRecovery {
 
@@ -187,6 +188,9 @@ export abstract class OrchestratorProgress extends OrchestratorRecovery {
     if (decision.action === 'STOP_AND_DECOMPOSE_TASK') {
       await this.replanOrPause(task, decision.reason);
       return;
+    }
+    if (isLocalScope(task) && decision.action.startsWith('STOP_AND_REWRITE')) {
+      throw new Error('Recovery cannot change the accepted scope of a committed child task. Supply local execution guidance instead.');
     }
     const retry = decision.action.startsWith('STOP_AND_REWRITE') ||
       (decision.action === 'CONTINUE_EXECUTION' && task.status === 'VERIFYING' && !task.validationReport.trim()) ||

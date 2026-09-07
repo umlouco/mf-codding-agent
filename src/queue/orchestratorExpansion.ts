@@ -100,7 +100,8 @@ export abstract class OrchestratorExpansion extends OrchestratorExecution {
     if (parts.length > 0) {
       const applied = this.queue.expandTask(task.id, attempt, parts);
       if (applied > 0) {
-        this.queue.log(task.id, 'planner', 'expanded', `${applied} row(s)`);
+        // expandTask already journals the committed replacement at queue level.
+        // The phase ID is retired, so another task-scoped event would violate its foreign key.
         this.log(`phase ${task.seq} expanded into ${applied} row(s)`);
       } else {
         this.log(`phase ${task.seq} — result arrived after the run moved past this attempt; discarding it`);
