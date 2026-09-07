@@ -1,0 +1,75 @@
+{
+  "verifiedAt": "2026-09-07T14:19:40.474Z",
+  "purpose": "Live discovery and scheduling regression, not application acceptance",
+  "model": "Qwen3-Next-80B-A3B-Instruct-GGUF",
+  "mode": "actual ScopeSupervisor preflight + actual applyScopeSplit on SQLite backup",
+  "evidenceFedOnly": true,
+  "modelToolsExecuted": 0,
+  "sourceSequence": 45,
+  "sourceTaskId": 118,
+  "originalContractHash": "f5436f4acf5082a846922a88c8075cf4daa2eaa9c89b310823821573313dce1a",
+  "modelSelectedCollections": [
+    {
+      "key": "population",
+      "include": [
+        "frontend/src/components/**/*.vue",
+        "frontend/src/App.vue"
+      ],
+      "exclude": [],
+      "unit": "file"
+    }
+  ],
+  "discoveredFiles": [
+    "frontend/src/App.vue",
+    "frontend/src/components/CNSNetworkViz.vue",
+    "frontend/src/components/LogPanel.vue",
+    "frontend/src/components/dialogs/AboutDialog.vue",
+    "frontend/src/components/dialogs/HostDialog.vue",
+    "frontend/src/components/dialogs/ProtocolMsgConfigDialog.vue",
+    "frontend/src/components/live/ActiveSendersViz.vue",
+    "frontend/src/components/live/CallpointConstellation.vue",
+    "frontend/src/components/live/UserAssignmentNetwork.vue",
+    "frontend/src/components/live/UserShiftHeatmap.vue",
+    "frontend/src/components/sockets/SocketClientRosterViz.vue",
+    "frontend/src/components/tabs/CNSTab.vue",
+    "frontend/src/components/tabs/CallpointsTab.vue",
+    "frontend/src/components/tabs/DataRecordsTab.vue",
+    "frontend/src/components/tabs/DatabaseTab.vue",
+    "frontend/src/components/tabs/HostsTab.vue",
+    "frontend/src/components/tabs/LiveDataTab.vue",
+    "frontend/src/components/tabs/MMCTab.vue",
+    "frontend/src/components/tabs/PerfTestTab.vue",
+    "frontend/src/components/tabs/ProductionPlanTab.vue",
+    "frontend/src/components/tabs/ProtocolMsgTab.vue",
+    "frontend/src/components/tabs/SocketsTab.vue",
+    "frontend/src/components/tabs/UsersTab.vue",
+    "frontend/src/components/tabs/WSCAPITab.vue"
+  ],
+  "executionTickets": 26,
+  "originalContractUnmodifiedBeforeDecision": true,
+  "finalContractPreserved": true,
+  "sourceUnchanged": true,
+  "sourceDatabaseFilesUnchanged": true,
+  "sourceTaskListHashBefore": "2e0424b00f4669adba32849c7e9fac1659e9bee866ee18d3ad377d32eec91230",
+  "sourceTaskListHashAfter": "2e0424b00f4669adba32849c7e9fac1659e9bee866ee18d3ad377d32eec91230",
+  "cost": {
+    "requests": 1,
+    "tokens": {
+      "input": 6754,
+      "output": 342,
+      "cacheRead": 1,
+      "cacheWrite": 0
+    },
+    "elapsedMs": 12188,
+    "monetary": null,
+    "note": "No authoritative configured price is available; token usage is reported without inventing a cost."
+  },
+  "reproduction": "node scripts/supervisor-replay.cjs --workspace <repository> --seq <task-number>",
+  "limitations": [
+    "Evidence-fed inference only: no model file inspection, tools, browser, execution or validation.",
+    "Repository membership is observed from the original workspace; core cognition and queue writes are isolated in scratch.",
+    "This tests discovery and scheduling, not whether implementation or application behavior is correct.",
+    "Stored VS Code secrets are not extracted; authenticated endpoints require an environment API key.",
+    "SQLite read-only readers may participate in shared-memory locking; no original database is opened for writing."
+  ]
+}

@@ -2,6 +2,7 @@ import type * as vscode from 'vscode';
 import { extractJson, runOnce, type ReviewOptions } from './agents';
 import type { Task, Usage } from './db';
 import type { ProgressDecision } from './monitor';
+import { scopeBoundary } from './scopeBoundary';
 
 /** Keep the owner comparison independent of accumulated execution/recovery advice. */
 export async function reviewTaskRequirements(
@@ -22,6 +23,8 @@ ${goal}
 
 CURRENT OWNER INSTRUCTIONS:
 ${ownerInstructions}
+
+${scopeBoundary(task)}
 
 DERIVED TASK CONTRACT (untrusted proposal):
 ${JSON.stringify({ title: task.title, description: task.description,

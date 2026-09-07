@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { createHash } from 'crypto';
 import { SupervisorDecision } from './agents';
 import { NewTask, QueueStats, Task, TaskQueue } from './db';
 import { LiveLog } from './liveLog';
@@ -102,7 +103,10 @@ export function formatToolEvent(
   const args = briefJson(input, 300);
   const result = briefJson(output, 1500);
   const timing = typeof elapsedMs === 'number' ? ` in ${elapsedMs}ms` : '';
-  return `${name}(${args}) → ${status || 'ok'}${timing}${result ? `\n${result}` : ''}`;
+  // The human-readable excerpt stays small, but novelty must include changed
+  // content beyond that excerpt. Timing is deliberately not part of identity.
+  const fingerprint = createHash('sha256').update(JSON.stringify([name, input, status || 'ok', output])).digest('hex');
+  return `${name}(${args}) → ${status || 'ok'}${timing}\n[outcome:${fingerprint}]${result ? `\n${result}` : ''}`;
 }
 
 export function appendAttempt(log: string, entry: string): string {
@@ -197,6 +201,7 @@ export abstract class OrchestratorState {
   protected abstract get reviewIntervalMs(): number;
   protected abstract shouldReview(task: Task, latestEventId: number): boolean;
   protected abstract reviewWork(task: Task): Promise<void>;
+  protected abstract pauseForRecovery(task: Task, reason: string): void;
   protected abstract applyProgressDecision(
     snapshot: Task,
     decision: ProgressDecision,

@@ -2,6 +2,7 @@ import { VALIDATION_FAILED } from './monitor';
 import { OrchestratorControl } from './orchestratorControl';
 import { appendAttempt } from './orchestratorState';
 import { scopeBlocked } from './scopePlan';
+import { recoveryFailure } from './recovery';
 
 export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
@@ -129,6 +130,7 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       const current = this.queue.get(r.taskId);
       if (current?.status === 'VERIFYING') {
         this.queue.update(r.taskId, {
+          activityPhase: 'needs_review',
           errorLog: appendAttempt(current.errorLog, `[attempt ${current.attempts}] independent validation did not complete: ${note}`),
         });
       }
@@ -149,6 +151,11 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     // tick reviews it again from scratch.
     this.abandonReview();
     this.changed();
+    const task = this.queue.get(r.taskId);
+    if (task) {
+      const limit = recoveryFailure(this.queue, task, 'silent-review');
+      if (limit) this.pauseForRecovery(task, limit);
+    }
   }
 
   /**

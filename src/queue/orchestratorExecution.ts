@@ -3,6 +3,8 @@ import { appendAttempt } from './orchestratorState';
 import { OrchestratorVerification } from './orchestratorVerification';
 import { completionForSupervisor } from './validation';
 import { scopeBlocked } from './scopePlan';
+import { recoveryState } from './recovery';
+import { boundedTask } from './scopeBoundary';
 
 export abstract class OrchestratorExecution extends OrchestratorVerification {
 
@@ -33,6 +35,10 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
 
     const next = this.queue.list().find(task => task.status === 'PENDING');
     if (next && scopeBlocked(next, this.queue.list())) return;
+    if (next) {
+      const blocked = recoveryState(this.queue, next).blocked;
+      if (blocked) { this.pauseForRecovery(next, blocked); return; }
+    }
     const task = this.queue.claimNext();
     if (!task) {
       if (this.queue.isComplete()) {
@@ -84,7 +90,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       const res = await executeTask(
         this.context,
         this.output,
-        task,
+        boundedTask(task),
         this.queue.contextInstructions,
         this.queue.getMeta('goal'),
         (a) => {

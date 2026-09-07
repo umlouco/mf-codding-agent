@@ -1,4 +1,5 @@
 import type { NewTask, Task } from './db';
+import type { WorkInventory } from './workInventory';
 
 export type ScopeRole = 'executor' | 'validator';
 export interface ScopeAssessment {
@@ -15,6 +16,8 @@ export interface ScopePart extends NewTask {
   integration: boolean;
   handoff: string;
   covers: string[];
+  targets?: string[];
+  workUnit?: string;
 }
 
 function required(value: unknown, label: string): string {
@@ -23,7 +26,8 @@ function required(value: unknown, label: string): string {
 }
 
 /** Reject incomplete plans as a whole: never silently truncate or drop a branch. */
-export function parseScopeAssessment(raw: any, task: Task): ScopeAssessment {
+export function parseScopeAssessment(raw: any, task: Task, inventory?: WorkInventory): ScopeAssessment {
+  if (inventory?.strategy === 'blocked') throw Error('Blocked discovery cannot authorize execution or decomposition.');
   if (!raw || !['KEEP', 'SPLIT'].includes(raw.action)) throw new Error('Scope action must be KEEP or SPLIT.');
   const reason = required(raw.reason, 'reason');
   const dimensions = ['execution', 'verification'] as const;
@@ -34,6 +38,7 @@ export function parseScopeAssessment(raw: any, task: Task): ScopeAssessment {
     required(raw[dimension].reason, `${dimension} evidence and coupling rationale`);
   }
   if (raw.action === 'KEEP') {
+    if (inventory?.strategy === 'enumerate') throw Error('An enumerated independent population requires execution tickets, not KEEP.');
     if (dimensions.some(d => raw[d].shape === 'broad')) {
       throw new Error('An independently divisible broad scope requires SPLIT, not KEEP.');
     }
@@ -62,6 +67,8 @@ export function parseScopeAssessment(raw: any, task: Task): ScopeAssessment {
     }
     return {
       key, dependsOn: [...new Set<string>(p.dependsOn)], covers: p.covers,
+      targets: Array.isArray(p.targets) && p.targets.every((s: unknown) => typeof s === 'string') ? p.targets : [],
+      workUnit: typeof p.workUnit === 'string' ? p.workUnit : '',
       integration: p.integration, handoff: required(p.handoff, `${key} progress handoff`),
       title: required(p.title, `${key} title`), description: required(p.description, `${key} description`),
       implVerifyPrompt: required(p.implVerifyPrompt, `${key} implementation checks`),
@@ -70,6 +77,19 @@ export function parseScopeAssessment(raw: any, task: Task): ScopeAssessment {
     };
   });
   const keys = new Set(parts.map(p => p.key));
+  if (inventory?.strategy === 'enumerate') for (const unit of inventory.units) {
+    const owners = parts.filter(p => p.workUnit === unit.key && !p.integration);
+    if (owners.length !== 1 || JSON.stringify(owners[0].targets) !== JSON.stringify(unit.targets)) {
+      throw Error(`Discovered unit ${unit.key} must have exactly one complete execution ticket.`);
+    }
+  }
+  if (inventory?.strategy === 'enumerate') for (const part of parts) {
+    if (part.workUnit && !inventory.units.some(unit => unit.key === part.workUnit)) {
+      throw Error(`Unknown discovered work unit ${part.workUnit}.`);
+    }
+    if (!part.workUnit && part.targets?.length) throw Error('Unassigned setup/integration tickets cannot claim discovered targets.');
+    if (part.integration && part.workUnit) throw Error('The final acceptance gate cannot replace a local execution ticket.');
+  }
   if (keys.size !== parts.length) throw new Error('Duplicate split task keys.');
   for (const part of parts) for (const dep of part.dependsOn) {
     if (!keys.has(dep) || dep === part.key) throw new Error(`Invalid dependency ${dep} on ${part.key}.`);
@@ -80,6 +100,11 @@ export function parseScopeAssessment(raw: any, task: Task): ScopeAssessment {
   const integrations = parts.filter(p => p.integration);
   if (integrations.length !== 1) throw new Error('SPLIT requires exactly one final integration/check task.');
   const integration = integrations[0];
+  if (inventory?.strategy === 'enumerate') for (const field of ['description', 'implVerifyPrompt', 'solutionVerifyPrompt'] as const) {
+    if (task[field]?.trim() && integration[field] !== task[field]) {
+      throw Error(`The final acceptance gate must preserve the original ${field} unchanged.`);
+    }
+  }
   // The final gate follows every slice, including independent branches.
   integration.dependsOn = parts.filter(p => p !== integration).map(p => p.key);
   if (task.solutionVerifyCommand.trim() !== integration.solutionVerifyCommand) {
@@ -100,7 +125,7 @@ export function parseScopeAssessment(raw: any, task: Task): ScopeAssessment {
 export function replacementTasks(assessment: ScopeAssessment, task: Task, archiveKey: string): NewTask[] {
   return assessment.parts.map(part => ({
     title: part.title,
-    description: `${part.description}\n\nAssigned acceptance criteria:\n` +
+    description: `${part.description}\n\nParent acceptance criteria (${part.integration ? 'full final gate' : 'apply only to this assigned slice; sibling work is checked separately'}):\n` +
       assessment.requirements.filter(r => part.covers.includes(r.key)).map(r => `- ${r.criterion}`).join('\n') +
       `\n\nProgress-preserving handoff from task ${task.id}:\n${part.handoff}\n` +
       `Original contract, reports and journal are archived in queue metadata ${archiveKey}. ` +
@@ -110,7 +135,8 @@ export function replacementTasks(assessment: ScopeAssessment, task: Task, archiv
       `Prerequisite slices: ${part.dependsOn.join(', ') || '(none)'}.`,
     implVerifyPrompt: part.implVerifyPrompt, solutionVerifyPrompt: part.solutionVerifyPrompt,
     solutionVerifyCommand: part.solutionVerifyCommand, maxAttempts: task.maxAttempts,
-    kind: 'task', region: JSON.stringify({ scopeSplit: { archiveKey, key: part.key } }),
+    kind: 'task', region: JSON.stringify({ scopeSplit: { archiveKey, key: part.key,
+      targets: part.targets ?? [], workUnit: part.workUnit || '', integration: part.integration } }),
   }));
 }
 

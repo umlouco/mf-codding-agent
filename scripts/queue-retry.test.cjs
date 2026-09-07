@@ -16,7 +16,7 @@ function load(file, dependencies = {}, extra = '') {
   vm.runInNewContext(outputText, {
     exports,
     Buffer,
-    require: (name) => dependencies[name] ?? (/^\.\/(orchestrator|scope)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : name === './cognition' ? cognition : {}),
+    require: (name) => dependencies[name] ?? (/^\.\/(orchestrator|scope|recovery|workInventory)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : name === './cognition' ? cognition : name === 'crypto' ? require('node:crypto') : {}),
   }, { filename: file });
   return exports;
 }
@@ -94,7 +94,9 @@ test('editor model proxy forwards image bytes rather than silently dropping them
 async function apply(current, decision) {
   const patches = [];
   const runner = Object.create(Orchestrator.prototype);
-  runner.queue = { get: () => current, log: () => {} };
+  const meta = new Map();
+  runner.queue = { get: () => current, log: () => {}, events: () => [],
+    getMeta: key => meta.get(key) || '', setMeta: (key, value) => meta.set(key, value) };
   runner.log = () => {};
   runner.stopForDecision = (_, patch) => { patches.push(patch); return true; };
   await runner.applyProgressDecision(current, { reason: 'Recover from syntax errors', ...decision }, {});

@@ -1,4 +1,5 @@
-import type * as vscode from 'vscode';
+import * as vscode from 'vscode';
+import { createHash } from 'crypto';
 import { extractJson, runOnce } from './agents';
 import { taskCognition } from './cognition';
 import type { Task, TaskQueue } from './db';
@@ -6,6 +7,8 @@ import { LiveLog } from './liveLog';
 import { ScopeEvidence } from './scopeEvidence';
 import { parseScopeAssessment, ScopeAssessment, ScopeRole } from './scopePlan';
 import { scopePrompt } from './scopePrompt';
+import { discoverWork, indexRepository, WorkInventory } from './workInventory';
+import { inventoryScopePlan, scopeBoundary } from './scopeBoundary';
 
 export interface ScopeHost {
   context: vscode.ExtensionContext;
@@ -76,8 +79,53 @@ export class ScopeSupervisor {
       evidence, queue.events(task.id, 40, true).filter(e => e.actor !== 'supervisor').reverse().map(e => ({ actor: e.actor, kind: e.kind,
         message: e.message.slice(0, 1600) })),
       queue.list().filter(t => t.id !== task.id && t.seq >= snapshot.seq).slice(0, 20)
-        .map(t => ({ seq: t.seq, title: t.title, status: t.status })));
+        .map(t => ({ seq: t.seq, title: t.title, status: t.status }))) + `\n${scopeBoundary(snapshot)}`;
     try {
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      let inventory: WorkInventory | undefined;
+      if (root && !scopeBoundary(snapshot)) {
+        const repository = indexRepository(root);
+        const key = 'workInventory:' + createHash('sha256').update(JSON.stringify([task.id, task.createdAt,
+          snapshot.description, snapshot.implVerifyPrompt, snapshot.solutionVerifyPrompt,
+          snapshot.solutionVerifyCommand, ownerContext, repository.fingerprint])).digest('hex');
+        const cached = queue.getMeta(key);
+        if (cached) inventory = JSON.parse(cached);
+        else {
+          inventory = await discoverWork(snapshot, queue.getMeta('goal'), queue.contextInstructions, repository,
+            async prompt => {
+              const result = await runOnce(this.host.context, this.host.output, 'supervisor', prompt, {
+                cognition: taskCognition(task, queue.getMeta('goal'), 'supervisor'),
+                onAbort: abort => { if (!this.current()) abort(); else this.abort = abort; },
+                onEvent: (method, params) => { if (this.current()) live.onEvent(method, params); },
+                onActivity: a => {
+                  if (!this.current()) return;
+                  live.activity(a);
+                  if (stage === 'preflight') this.host.preflightActivity('scope_review', a.detail, a.at);
+                },
+              });
+              if (!this.current()) throw Error('Discovery was superseded.');
+              queue.addUsage(task.id, result.usage);
+              return result.text;
+            }, text => extractJson(text, v => !!v && typeof v === 'object' && 'strategy' in v));
+          queue.setMeta(key, JSON.stringify(inventory));
+          queue.log(task.id, 'supervisor', 'work-inventory', JSON.stringify(inventory));
+        }
+        if (!this.current()) return false;
+        const latest = queue.get(task.id);
+        if (!latest || (['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const)
+          .some(field => latest[field] !== snapshot[field]) ||
+          ownerContext !== JSON.stringify([queue.getMeta('goal'), queue.contextInstructions])) {
+          throw Error('Contract changed during discovery; inventory cannot authorize work.');
+        }
+        if (!inventory) throw Error('Discovery returned no inventory.');
+        if (inventory.strategy === 'blocked') throw Error(`Discovery needs evidence: ${inventory.reason}`);
+        if (inventory.strategy === 'enumerate') {
+          if (indexRepository(root).fingerprint !== repository.fingerprint) throw Error('Repository membership changed during discovery; re-inventory before scheduling.');
+          const decision = parseScopeAssessment(inventoryScopePlan(snapshot, inventory), snapshot, inventory);
+          if (!this.host.split(decision, snapshot)) throw Error('Inventory-backed plan was superseded.');
+          return false;
+        }
+      }
       let decision: ScopeAssessment | undefined;
       let repair = '';
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -95,7 +143,7 @@ export class ScopeSupervisor {
         queue.addUsage(task.id, result.usage);
         try {
           decision = parseScopeAssessment(extractJson(result.text, v => !!v && typeof v === 'object' &&
-            ['KEEP', 'SPLIT'].includes((v as any).action)), snapshot);
+            ['KEEP', 'SPLIT'].includes((v as any).action)), snapshot, inventory);
           break;
         } catch (error: any) {
           if (attempt) throw error;

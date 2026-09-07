@@ -6,30 +6,46 @@ import { OrchestratorScope } from './orchestratorScope';
 import { scopeBlocked } from './scopePlan';
 import { appendAttempt, Review } from './orchestratorState';
 import { runVerification } from './verification';
+import { recoveryFailure, recoveryState, recoverySucceeded } from './recovery';
+import { boundedTask } from './scopeBoundary';
+
+/** A verdict belongs to one claim, contract and report, not merely a row ID. */
+function sameVerificationSnapshot(current: Task | undefined, snapshot: Task): boolean {
+  return !!current && current.status === 'VERIFYING' && current.status === snapshot.status &&
+    (['createdAt', 'startedAt', 'attempts', 'seq', 'title', 'kind', 'region',
+      'description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand',
+      'output', 'validationReport'] as const)
+      .every(key => current[key] === snapshot[key]);
+}
 
 export abstract class OrchestratorVerification extends OrchestratorScope {
 
   /** Delegates formal verification to a fresh execution LLM and persists its response. */
   protected async verifyWithExecutor(task: Task, review: Review): Promise<void> {
+    const accepts = () => review.gen === this.reviewGen &&
+      sameVerificationSnapshot(this.queue.get(task.id), task);
+    if (!accepts()) return;
     if (scopeBlocked(task, this.queue.list())) return;
+    const blocked = recoveryState(this.queue, task).blocked;
+    if (blocked) { this.pauseForRecovery(task, blocked); return; }
     this.log(`task ${task.seq} — supervisor started independent verification`);
     this.queue.log(task.id, 'supervisor', 'validation-started', 'delegated to execution LLM');
-    const journal = this.streamJournal(task.id, 'validator', () => review.gen === this.reviewGen);
-    const scope = this.scopeWatch(task, 'validator', () => review.gen === this.reviewGen &&
-      this.queue.get(task.id)?.status === 'VERIFYING', (phase, detail, at) => {
+    const journal = this.streamJournal(task.id, 'validator', accepts);
+    const scope = this.scopeWatch(task, 'validator', accepts, (phase, detail, at) => {
+        if (!accepts()) return;
         review.lastActivityAt = at;
         this.queue.recordActivity(task.id, phase, detail, 'supervisor');
       });
     review.scope = scope;
     try {
-      if (!await scope.preflight()) return;
+      if (!await scope.preflight() || !accepts()) return;
       const result = await runVerification(
         this.context,
         this.output,
-        task,
+        boundedTask(task),
         this.queue.getMeta('goal'),
         (activity) => {
-          if (review.gen !== this.reviewGen) return;
+          if (!accepts()) return;
           review.lastActivityAt = activity.at;
           review.validationToolViolation = shellWaitViolation(activity.phase, activity.detail) || undefined;
           journal.live.activity(activity);
@@ -38,16 +54,16 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
           }
         },
         (method, params) => {
-          if (review.gen === this.reviewGen) { journal.onEvent(method, params); scope.observe(method, params); }
+          if (accepts()) { journal.onEvent(method, params); scope.observe(method, params); }
         },
         (abort) => {
-          if (review.gen !== this.reviewGen) { abort(); return; }
+          if (!accepts()) { abort(); return; }
           review.abort = abort;
         },
         this.queue.contextInstructions,
       );
       journal.flush();
-      if (review.gen !== this.reviewGen || this.queue.get(task.id)?.status !== 'VERIFYING') {
+      if (!accepts()) {
         this.log(`task ${task.seq} moved while validation ran; validator response ignored`);
         return;
       }
@@ -61,7 +77,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       this.log(`task ${task.seq} — independent verification response stored`);
     } catch (error: any) {
       journal.flush();
-      if (review.gen !== this.reviewGen) return;
+      if (!accepts()) return;
       const message = String(error?.message ?? error);
       // Recorded twice on purpose, because two different readers need it. The
       // journal entry is what `failedValidations` counts, so the next progress
@@ -77,6 +93,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
             current.errorLog,
             `[attempt ${current.attempts}] independent validation did not complete: ${message}.`,
           ),
+          activityPhase: 'needs_review',
         });
       }
       this.log(`task ${task.seq} — validator stopped: ${message}; supervisor will reassess`);
@@ -113,11 +130,14 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
 
   /** Runs the full verification pass for one task and applies the verdict. */
   protected async supervise(task: Task): Promise<void> {
+    if (!sameVerificationSnapshot(this.queue.get(task.id), task)) return;
     this.log(`supervising task ${task.seq} — ${task.title}`);
 
     // From here until the verdict lands there is a turn running that only this
     // record can account for — see sweepSilentReview.
     const gen = ++this.reviewGen;
+    const accepts = () => gen === this.reviewGen &&
+      sameVerificationSnapshot(this.queue.get(task.id), task);
     const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now() };
     this.review = review;
 
@@ -131,18 +151,18 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       decision = await superviseTask(
         this.context,
         this.output,
-        task,
+        boundedTask(task),
         this.rewrites(task),
         this.queue.getMeta('goal'),
         {
           projectNotes: this.queue.contextInstructions,
           onAbort: (abort) => {
-            if (gen !== this.reviewGen) { abort(); return; }
+            if (!accepts()) { abort(); return; }
             review.abort = abort;
           },
-          onEvent: this.observerEvents(task.id, 'supervisor', live, () => gen === this.reviewGen),
+          onEvent: this.observerEvents(task.id, 'supervisor', live, accepts),
           onActivity: (a) => {
-            if (gen !== this.reviewGen) return;
+            if (!accepts()) return;
             review.lastActivityAt = a.at;
             live.activity(a);
             if (this.queue.recordActivity(task.id, a.phase, a.detail, 'supervisor')) {
@@ -152,6 +172,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         },
       );
     } catch (e: any) {
+      if (!accepts()) return;
       const message = String(e?.message ?? e);
       this.log(`supervisor failed on task ${task.seq}: ${message}`);
       this.queue.log(task.id, 'supervisor', 'error', message);
@@ -159,6 +180,8 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       this.queue.recordActivity(task.id, 'error', `supervisor: ${message}`, 'supervisor');
       live.note('error', `supervisor failed: ${message}`);
       this.changed();
+      const limit = recoveryFailure(this.queue, task, 'verification-review');
+      if (limit) await this.replanOrPause(task, limit);
       // Leave it in VERIFYING; the next tick tries again.
       return;
     } finally {
@@ -170,12 +193,16 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
 
     // A review the sweep already gave up on has no say: the task may have been
     // reviewed again, or reset, since this turn stopped writing.
-    if (gen !== this.reviewGen) {
+    if (!accepts()) {
       this.log(`task ${task.seq} — a verdict arrived from an abandoned review; ignoring it`);
       return;
     }
 
     this.queue.addUsage(task.id, decision.usage);
+    recoverySucceeded(this.queue, task, 'verification-review');
+    if (['RETRY', 'REVERIFY', 'RESET_FROM'].includes(decision.verdict) &&
+        !await this.allowRecovery(task, decision.verdict)) return;
+    if (!accepts()) return;
     this.queue.log(task.id, 'supervisor', `verdict:${decision.verdict}`, decision.feedback);
     this.applyTaskEdits(decision, task.seq);
 
@@ -206,26 +233,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         break;
 
       case 'SPLIT': {
-        // Legacy verdicts only suggest splitting. Re-plan through the same complete
-        // coverage/dependency contract as preflight and live reviews; their short
-        // splitInto array is not a safe replacement plan for a large migration.
-        const snapshot = this.queue.get(task.id) ?? task;
-        const scope = this.scopeWatch(snapshot, 'validator', () => gen === this.reviewGen &&
-          this.queue.get(task.id)?.status === 'VERIFYING', (phase, detail, at) => {
-            review.lastActivityAt = at;
-            this.queue.recordActivity(task.id, phase, detail, 'supervisor');
-          });
-        review.scope = scope;
-        this.review = review;
-        try {
-          if (await scope.preflight()) {
-            this.queue.update(task.id, { validationReport: '', activityPhase: 'needs_review',
-              supervisorFeedback: 'Scope assessment found a cohesive task. Reassess the concrete remaining work rather than forcing a split.' });
-          }
-        } finally {
-          scope.close();
-          if (this.review === review) this.review = null;
-        }
+        await this.replanOrPause(task, decision.feedback || 'Supervisor requested decomposition');
         break;
       }
 

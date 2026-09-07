@@ -2,6 +2,7 @@ import * as cp from 'child_process';
 import * as vscode from 'vscode';
 import { QueueStats } from './db';
 import { OrchestratorState, OrchestratorStatus, RunMode, WATCHDOG_MS } from './orchestratorState';
+import { recoveryKey } from './recovery';
 
 export abstract class OrchestratorControl extends OrchestratorState {
 
@@ -159,6 +160,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
     this.abandonReview();
     this.abandonExecution();
     this.queue.resetAll();
+    for (const task of this.queue.list()) this.queue.setMeta(recoveryKey(task), '');
     // resetAll zeroes `attempts`, so a stale entry here would read as a review
     // of the attempt about to start rather than of the run just thrown away.
     this.reviewed.clear();

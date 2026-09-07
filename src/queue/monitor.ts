@@ -5,6 +5,7 @@ import { attemptsExhausted, extractJson, runOnce, ReviewOptions } from './agents
 import { completionForSupervisor, parseCompletionClaim } from './validation';
 import { recoveryRules, originalGoalContext, projectNotesContext } from './prompts';
 import { taskCognition } from './cognition';
+import { scopeBoundary } from './scopeBoundary';
 
 /**
  * Journal kind recording an independent validation run that did not finish.
@@ -35,6 +36,7 @@ export const SUPERVISOR_ACTIONS = [
   'STOP_AND_REWRITE_TASK',
   'STOP_AND_REWRITE_VALIDATION',
   'START_VALIDATION',
+  'STOP_AND_DECOMPOSE_TASK',
 ] as const;
 
 export type SupervisorAction = typeof SUPERVISOR_ACTIONS[number];
@@ -146,7 +148,7 @@ export async function reviewProgress(
   task: Task,
   events: TaskEvent[],
   failedValidations: number,
-  opts: ReviewOptions & { testingUrl?: string; ownerInstructions?: string;
+  opts: ReviewOptions & { testingUrl?: string; ownerInstructions?: string; recoveryContext?: string;
     refreshProgress?: () => { task: Task; events: TaskEvent[]; failedValidations: number } } = {},
   goal = '',
 ): Promise<ProgressDecision> {
@@ -196,12 +198,16 @@ A configured testing URL prohibits starting a replacement server.
 
 ${recoveryRules}
 
+${opts.recoveryContext || ''}
+
 ${originalGoalContext(goal)}
 
 ${projectNotesContext(opts.projectNotes)}
 
 TASK ${task.seq}: ${task.title}
 ${task.description}
+
+${scopeBoundary(task)}
 
 ATTEMPT ${task.attempts} OF ${task.maxAttempts}
 ${attemptsExhausted(task) ? `The current attempt budget is spent. Let useful work finish or start
@@ -250,6 +256,10 @@ are valid when they serve this task's scope and do not replace a required applic
   contradictory, or test the wrong thing. Supply corrected verification fields.
 - START_VALIDATION: implementation evidence is sufficient to stop/resume no further work and
   delegate formal verification to a fresh execution LLM.
+- STOP_AND_DECOMPOSE_TASK: repeated discovery or multiple independently checkable outcomes
+  need a real inventory-backed replacement plan. Stop the worker and delegate scope planning;
+  do not rewrite another giant contract. If a complete safe split cannot be made, pause with
+  an actionable explanation rather than repeating the same approach indefinitely.
 
 ${targetContract}
 Reply with one JSON object. This protocol is fixed:

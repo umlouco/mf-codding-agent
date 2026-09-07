@@ -18,6 +18,10 @@ merely advise the worker to do less or rewrite one giant task as another giant t
 Distinguish intentional dependency exploration from drift using the task contract, actual tool
 outcomes, current diff and worker handoff. Unknown/missing evidence is not proof of excessive scope.
 Inspect targeted inventories/search results if needed; do not read every source file to plan.
+Use the discovery-stage inventory when supplied. Independent repeated work is scheduled as
+one ticket per discovered unit, shared prerequisites first, unchanged final acceptance last.
+The original whole-project request is NOT a reason to expand each execution ticket back into
+the entire objective. Decomposition changes scheduling, never acceptance requirements.
 Examples: converting Bootstrap to Tailwind throughout hundreds of Vue components needs shared
 configuration first, coherent component/route slices next, removal of old shared dependencies
 only after consumers migrate, and final regression checks last. Four files implementing one

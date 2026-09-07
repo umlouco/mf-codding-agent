@@ -3,9 +3,10 @@ import { Task } from './db';
 import { LiveLog } from './liveLog';
 import { JOURNAL_EVENTS, ProgressDecision, reviewProgress, VALIDATION_FAILED } from './monitor';
 import { Review } from './orchestratorState';
-import { OrchestratorWatchdog } from './orchestratorWatchdog';
+import { OrchestratorRecovery } from './orchestratorRecovery';
+import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, recoverySucceeded } from './recovery';
 
-export abstract class OrchestratorProgress extends OrchestratorWatchdog {
+export abstract class OrchestratorProgress extends OrchestratorRecovery {
 
   /**
    * How often the supervisor may look in on a task that is still executing.
@@ -49,7 +50,14 @@ export abstract class OrchestratorProgress extends OrchestratorWatchdog {
 
   /** Lets the supervisor judge live work and choose one fixed control action. */
   protected async reviewWork(task: Task): Promise<void> {
-    const evidenceEventId = this.queue.latestWorkerToolEventId(task.id);
+    const state = recoveryEvidence(this.queue, task);
+    if (state.blocked || state.saturated || state.repeats >= 6) {
+      await this.replanOrPause(task, state.blocked || (state.saturated
+        ? 'The observation ledger is full; re-plan unfinished work rather than forgetting prior outcomes.'
+        : 'Six repeated completed tool outcomes without a new observation.'));
+      return;
+    }
+    const evidenceEventId = decisionEvidence(this.queue, task);
     const events = this.queue.events(task.id, JOURNAL_EVENTS, true);
     const latestEventId = events.find(event => event.actor !== 'supervisor')?.id ?? 0;
     if (!this.shouldReview(task, latestEventId)) {
@@ -76,6 +84,7 @@ export abstract class OrchestratorProgress extends OrchestratorWatchdog {
         this.queue.countEvents(task.id, VALIDATION_FAILED),
         {
           projectNotes: this.queue.contextInstructions,
+          recoveryContext: recoveryContext(this.queue, task),
           testingUrl: this.queue.testingUrl,
           ownerInstructions: this.queue.testingContext + this.queue.instructions,
           refreshProgress: () => {
@@ -88,7 +97,7 @@ export abstract class OrchestratorProgress extends OrchestratorWatchdog {
               throw new Error('Task contract changed during requirements comparison; obtain a fresh review.');
             }
             task = current;
-            review.evidenceEventId = this.queue.latestWorkerToolEventId(task.id);
+            review.evidenceEventId = decisionEvidence(this.queue, task);
             return { task, events: this.queue.events(task.id, JOURNAL_EVENTS, true),
               failedValidations: this.queue.countEvents(task.id, VALIDATION_FAILED) };
           },
@@ -121,6 +130,7 @@ export abstract class OrchestratorProgress extends OrchestratorWatchdog {
       }
       this.queue.addUsage(task.id, decision.usage);
       await this.applyProgressDecision(task, decision, review);
+      if (this.queue.get(task.id)) recoverySucceeded(this.queue, task, 'progress-review');
     } catch (error: any) {
       if (gen !== this.reviewGen) {
         this.log(`task ${task.seq} — abandoned progress review error ignored`);
@@ -136,6 +146,8 @@ export abstract class OrchestratorProgress extends OrchestratorWatchdog {
       }
       live.note('error', `supervisor failed: ${message}`);
       this.log(`task ${task.seq} — progress review failed: ${message}; execution preserved`);
+      const limit = recoveryFailure(this.queue, task, 'progress-review');
+      if (limit) await this.replanOrPause(task, limit);
     } finally {
       live.close();
       if (this.review === review) {
@@ -164,14 +176,22 @@ export abstract class OrchestratorProgress extends OrchestratorWatchdog {
     // Preserve the worker and ask again with its new results; heartbeat-only
     // activity must not invalidate a useful review of slow, ongoing inference.
     if (review.evidenceEventId !== undefined &&
-        this.queue.latestWorkerToolEventId(task.id) > review.evidenceEventId) {
+        decisionEvidence(this.queue, task) > review.evidenceEventId) {
       this.queue.log(task.id, 'supervisor', 'review-outdated',
-        'New worker tool activity arrived while this review was queued or running. Decision discarded; execution preserved.');
+        'A novel completed tool outcome or a potentially mutating/test tool start arrived during review. Decision discarded; execution preserved.');
       this.reviewed.delete(task.id);
       this.log(`task ${task.seq} has newer tool evidence; obtain a fresh progress review`);
       return;
     }
 
+    if (decision.action === 'STOP_AND_DECOMPOSE_TASK') {
+      await this.replanOrPause(task, decision.reason);
+      return;
+    }
+    const retry = decision.action.startsWith('STOP_AND_REWRITE') ||
+      (decision.action === 'CONTINUE_EXECUTION' && task.status === 'VERIFYING' && !task.validationReport.trim()) ||
+      (decision.action === 'START_VALIDATION' && this.queue.countEvents(task.id, VALIDATION_FAILED) > 0);
+    if (retry && !await this.allowRecovery(task, decision.action)) return;
     this.queue.log(task.id, 'supervisor', `action:${decision.action}`, decision.reason);
     switch (decision.action) {
       case 'CONTINUE_EXECUTION':
