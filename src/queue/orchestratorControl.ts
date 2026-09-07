@@ -2,7 +2,7 @@ import * as cp from 'child_process';
 import * as vscode from 'vscode';
 import { QueueStats } from './db';
 import { OrchestratorState, OrchestratorStatus, RunMode, WATCHDOG_MS } from './orchestratorState';
-import { recoveryKey } from './recovery';
+import { recoveryKey, resumeRecovery } from './recovery';
 
 export abstract class OrchestratorControl extends OrchestratorState {
 
@@ -95,6 +95,14 @@ export abstract class OrchestratorControl extends OrchestratorState {
     if (this.queue.runState === 'RUNNING' && this.timer) {
       return;
     }
+    // Activation/configuration restoration calls start only for RUNNING queues.
+    // Starting a non-running queue is an explicit operator retry, not a watchdog
+    // retry. Release recovery latches without resetting tasks or acceptance checks.
+    if (this.queue.runState !== 'RUNNING') {
+      for (const task of this.queue.list()) {
+        if (resumeRecovery(this.queue, task)) this.reviewed.delete(task.id);
+      }
+    }
     // Anything left EXECUTING belongs to a process that no longer exists.
     this.recoverOrphaned();
     const revived = this.queue.reviveFailed();
@@ -128,7 +136,9 @@ export abstract class OrchestratorControl extends OrchestratorState {
     // prompt synchronously before the first await. Whatever that costs, it
     // must be paid after activate() has returned, not inside it.
     if (this.queue.awaitingVerification().length > 0) {
-      setTimeout(() => void this.tick(), 1000);
+      setTimeout(() => {
+        if (!this.disposed && this.queue.runState === 'RUNNING') void this.tick();
+      }, 1000);
       return;
     }
     void this.pump();

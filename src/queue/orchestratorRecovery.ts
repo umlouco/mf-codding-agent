@@ -17,8 +17,10 @@ export abstract class OrchestratorRecovery extends OrchestratorWatchdog {
   }
 
   protected pauseForRecovery(task: Task, reason: string): void {
-    const message = `${reason} Work and verification evidence are preserved. ` +
-      'Edit this task into a bounded, materially different contract or explicitly reset it before restarting.';
+    const existing = recoveryState(this.queue, task).blocked;
+    const message = existing && reason === existing ? existing :
+      `${reason} Work and verification evidence are preserved. Press Start to explicitly retry with a new bounded recovery budget; ` +
+      'no task reset or requirements change is needed.';
     blockRecovery(this.queue, task, message);
     this.queue.log(task.id, 'supervisor', 'recovery-blocked', message);
     this.pause();

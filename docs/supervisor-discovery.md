@@ -36,8 +36,10 @@ new implementation demand to every ticket.
   six repeated completed outcomes, or three failed progress/verdict reviews cause a
   bounded scope re-plan. These are intervention triggers, never completion verdicts.
 - If no safe replacement plan emerges, the queue pauses with work and evidence intact.
-  Reloading or resetting the displayed attempt count cannot erase this state. An explicit
-  queue reset, or an operator's changed contract after a pause, permits a new recovery budget.
+  Reloading or resetting the displayed attempt count cannot erase this state. Pressing Start
+  on a paused/stopped queue archives the recovery ledger and grants a new bounded recovery
+  budget without resetting tasks or changing requirements. Automatic RUNNING restoration
+  does not release the latch.
 - The bounded fingerprint store never evicts old observations to make a long replay look
   novel: exhausting it requires re-planning instead.
 - Failed independent verification leaves the direct-validation fast path and returns to

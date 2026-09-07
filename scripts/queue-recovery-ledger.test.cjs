@@ -105,7 +105,7 @@ test('three no-evidence recoveries cause one scope re-plan, then preserve work a
   queue.resumePaused();
   const restarted = runnerFor(queue);
   const retryScope = scopeCounter(restarted);
-  await restarted.replanOrPause(queue.get(task.id), 'User pressed Start without changing the task.');
+  await restarted.replanOrPause(queue.get(task.id), 'Automatic runner restoration without an explicit Start.');
   assert.equal(retryScope.calls, 0, 'restarting the runner cannot buy another paid scope review');
   assert.equal(queue.runState, 'PAUSED');
   assert.equal(queue.countEvents(task.id, 'recovery-replan'), 1);

@@ -34,14 +34,33 @@ export function recoveryState(queue: TaskQueue, task: Task): RecoveryState {
         ['cursor', 'revision', 'repeats', 'recoveries', 'unchanged', 'checkpoint'].some(key =>
           !Number.isSafeInteger((state as any)[key]) || (state as any)[key] < 0)) throw Error('Invalid ledger');
   } catch { state = fresh(); }
-  // Once paused, only an operator can edit the contract. Automatic rewrites before
-  // the pause never renew this budget; neither does reloading or clicking Start.
+  // Automatic rewrites and reloads do not renew recovery. An explicit Start from
+  // a stopped/paused queue is handled separately by resumeRecovery below.
   if (state.blocked && state.blockedContract !== contract(task)) state = fresh();
   return state;
 }
 
 export function saveRecovery(queue: TaskQueue, task: Task, state: RecoveryState): void {
   queue.setMeta(recoveryKey(task), JSON.stringify(state));
+}
+
+/** An operator's Start is not an automatic retry. Keep the old ledger as evidence
+ * and grant one new bounded recovery epoch without resetting task progress.
+ */
+export function resumeRecovery(queue: TaskQueue, task: Task): boolean {
+  const state = recoveryState(queue, task);
+  if (!state.blocked || task.status === 'VERIFIED') return false;
+  const archiveKey = `${recoveryKey(task)}:resume:${queue.countEvents(task.id, 'recovery-resumed') + 1}`;
+  queue.setMeta(archiveKey, JSON.stringify(state));
+  const next: RecoveryState = { ...state, blocked: undefined, blockedContract: undefined,
+    cursor: Math.max(state.cursor, queue.latestWorkerToolEventId(task.id)),
+    repeats: 0, recoveries: 0, unchanged: 0, failures: {}, checkpoint: state.revision,
+    saturated: false, seen: state.saturated ? [] : state.seen };
+  saveRecovery(queue, task, next);
+  queue.log(task.id, 'system', 'recovery-resumed', JSON.stringify({ archiveKey,
+    reason: 'Operator explicitly pressed Start. Previous recovery evidence retained; task requirements and progress unchanged.' }));
+  queue.recordActivity(task.id, 'recovery_resumed', 'Recovery pause released by explicit Start.', 'system');
+  return true;
 }
 
 /** Distinguish new observations from replay. Novelty is NOT acceptance evidence.
