@@ -215,6 +215,7 @@ export abstract class OrchestratorState {
   protected abstract streamJournal(taskId: number, actor: 'executor' | 'validator', accepts?: () => boolean): { flush: () => void; onEvent: (method: string, params: any) => void; live: LiveLog };
   protected abstract verifyWithExecutor(task: Task, review: Review): Promise<void>;
   protected abstract startIndependentVerification(task: Task): Promise<void>;
+  protected abstract currentHostVerification(task: Task): boolean;
   protected abstract wakeAfterHandoff(): void;
   protected abstract supervise(task: Task): Promise<void>;
   protected abstract rewrites(task: Task): number;

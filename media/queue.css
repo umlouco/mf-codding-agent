@@ -63,6 +63,17 @@ nav.tabs[hidden] { display: none; }
 
 .pane[hidden] { display: none; }
 
+/* Scroll the plan form instead of compressing its fields to fit the sidebar. */
+#pane-plan { min-height: 0; }
+#pane-plan > * { flex-shrink: 0; }
+
+#pane-plan textarea {
+  height: 10em;
+  min-height: 8em;
+  line-height: 1.5;
+  resize: vertical;
+}
+
 .lbl {
   font-size: 11px;
   color: var(--vscode-descriptionForeground);

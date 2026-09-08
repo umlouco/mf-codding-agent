@@ -8,6 +8,7 @@ import (
 )
 
 type PromptInput struct {
+	QueueRole             string
 	TestingURL            string
 	HasTestingCredentials bool
 	WorkspaceRoot         string
@@ -30,6 +31,12 @@ type PromptInput struct {
 // instead, so this string stays byte-identical across a session and the prompt
 // cache actually hits.
 func BuildSystemPrompt(in PromptInput) string {
+	if in.QueueRole == "validator" {
+		return validatorPolicy + fmt.Sprintf("\nWorkspace root: %s\nTesting URL: %s\n", in.WorkspaceRoot, in.TestingURL) + in.ProjectFacts + "\n" + in.Skills
+	}
+	if in.QueueRole == "supervisor" || in.QueueRole == "supervisor-repair" {
+		return buildSupervisorSystemPrompt(in)
+	}
 	var b strings.Builder
 
 	b.WriteString(`You are a coding agent embedded in the user's editor. You work directly in their

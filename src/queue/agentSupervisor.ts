@@ -35,7 +35,8 @@ registered tools remain callable when you need additional observations to make t
 Check whether the conclusion is consistent with concrete evidence for each requirement.
 Your own tool use does not replace the independent verification report required for completion.
 
-A task is never terminally failed. When the evidence is not sufficient, make exactly one
+The host allows at most two verification passes and two recovery decisions per task.
+When the evidence is not sufficient, make exactly one
 recovery decision: REVERIFY for a missing/invalid check or report without an observed code defect,
 REPAIR_TESTS for a test/harness defect that YOU must rewrite after the executor stops,
 RETRY for an observed application implementation defect, or SPLIT into smaller ordered tasks.
@@ -123,7 +124,7 @@ produce a particular table. Choose RETRY when evidence identifies changes the ex
 include a materially rewritten description for task ${task.seq}. Choose SPLIT when
 the remaining work is more than one agent can hold at once — a report that reads as several
 unfinished threads rather than one unfinished thing. For an unsuccessful task these are the available
-decisions: reverify it, correct it, or split it. There is no fail or give-up verdict.`;
+decisions: reverify it, correct it, or split it. The host retains unresolved tasks as FAILED after the bounded recovery allowance; never manufacture PASS to avoid that outcome.`;
 
   const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
     maxIterations: supervisorRounds(),

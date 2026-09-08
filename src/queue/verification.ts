@@ -16,8 +16,32 @@ export interface VerificationOutcome {
   usage: Usage;
 }
 
-/** Reason about requirements, execute typed checks in the host, then judge receipts. */
+/** A check has a finite lifetime even if the model keeps emitting reasoning. */
 export async function runVerification(
+  context: vscode.ExtensionContext, output: vscode.OutputChannel, task: Task, goal: string,
+  onActivity?: (activity: ActivityRecord) => void, onEvent?: (method: string, params: any) => void,
+  onAbort?: (abort: () => void) => void, projectNotes = '', authority?: VerificationAuthority,
+): Promise<VerificationOutcome> {
+  let abort: (() => void) | undefined;
+  let ended = false;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      verificationPass(context, output, task, goal,
+        a => { if (!ended) onActivity?.(a); },
+        (method, params) => { if (!ended) onEvent?.(method, params); },
+        stop => { abort = stop; onAbort?.(stop); if (ended) stop(); }, projectNotes, authority),
+      new Promise<never>((_, reject) => { deadline = setTimeout(() => {
+        ended = true;
+        abort?.();
+        reject(new VerificationPlanError('Verification exceeded its ten-minute pass limit. Review the captured checks and exact remaining work.', 'capability'));
+      }, 600_000); }),
+    ]);
+  } finally { ended = true; if (deadline) clearTimeout(deadline); }
+}
+
+/** Reason about requirements, execute typed checks in the host, then judge receipts. */
+async function verificationPass(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   task: Task,
@@ -78,9 +102,9 @@ ${admittedAuthority ? `HOST-PROVEN ADAPTER PROVENANCE (not additional acceptance
 Supervisor follow-up:
 ${task.supervisorFeedback || '(none)'}
 Executor handoff, UNVERIFIED CLAIMS only:
-${task.output?.slice(0, 8000) || '(none)'}
+${task.output?.slice(-4000) || '(none)'}
 Previous verification checkpoint (history, not proof of current state):
-${task.validationReport?.slice(0, 48000) || '(none)'}
+${task.validationReport?.slice(-8000) || '(none)'}
 Use the previous host receipts to continue unfinished checks or diagnose a failed invocation.
 Do not repeat the same failed invocation without a specific changed cause. If the executor changed
 files since those receipts, recheck the affected behavior; historical PASS is not current proof.`;
@@ -173,7 +197,13 @@ steps; list all deferred work in remaining. Do not return commentary or a second
     receipts = await session.execute(plan);
     checkActive();
     const result = await runOnce(context, output, 'executor', `You are the independent verification reporter.
-${requirements}
+${originalGoalContext(goal)}
+CURRENT TASK ${task.seq}: ${task.title}
+${task.description}
+Implementation check: ${task.implVerifyPrompt || "Inspect the assigned deliverable."}
+Behavior check: ${task.solutionVerifyPrompt || "Check the assigned outcome."}
+${task.splitScope || ''}
+${projectNotesContext(projectNotes)}
 
 The following plan and execution receipts were captured by the HOST in this verification attempt.
 ONLY these receipts establish observations. Executor handoffs, prior reports and your earlier text

@@ -95,7 +95,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         events,
         this.queue.countEvents(task.id, VALIDATION_FAILED),
         {
-          projectNotes: this.queue.contextInstructions,
+          projectNotes: this.queue.testingContext + this.queue.instructions,
           recoveryContext: recoveryContext(this.queue, task),
           testingUrl: this.queue.testingUrl,
           ownerInstructions: this.queue.testingContext + this.queue.instructions,

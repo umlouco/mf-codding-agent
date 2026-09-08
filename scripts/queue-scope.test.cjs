@@ -140,7 +140,7 @@ test('malformed preflight cannot launch work', async t => {
   assert.equal(f.queue.list()[0].status, 'VERIFYING');
 });
 
-test('actual verifier wiring supervises live drift and rejects the cancelled validator report', async t => {
+test('verification skips nested scope review and rejects reports after Stop', async t => {
   let finish, event, stopped = 0;
   const f = fixture(t, {}, { './verification': { runVerification: async (_, __, ___, ____, activity, onEvent, abort) => {
     event = onEvent; abort(() => { stopped++; });
@@ -150,12 +150,11 @@ test('actual verifier wiring supervises live drift and rejects the cancelled val
   const review = { gen: 4, taskId: original.id, seq: original.seq, lastActivityAt: Date.now() };
   Object.assign(f.runner, { review, reviewGen: 4, supervising: true });
   const running = f.runner.verifyWithExecutor(f.queue.get(original.id), review); await drain();
-  event('stream/text', { delta: 'Checking additional unrelated feature families manually.' });
-  const proposal = split(); proposal.execution = keep().execution;
-  f.setReply(proposal); review.scope.lastReview = 0;
-  await review.scope.check();
+  assert.equal(review.scope, undefined, 'validation does not launch another scope supervisor');
+  assert.equal(f.calls.length, 0, 'no scope model was called');
+  f.runner.stop();
   assert.equal(stopped, 1);
-  assert.equal(f.queue.list().length, 4);
+  assert.equal(f.queue.list().length, 2);
   event('stream/tool', { id: 'late', name: 'read_file', status: 'running', input: { path: 'late.vue' } });
   finish({ text: 'late PASS', validationReport: 'late PASS', usage });
   await running;

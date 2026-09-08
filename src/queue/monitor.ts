@@ -1,4 +1,3 @@
-import { reviewTaskRequirements } from './requirements';
 import * as vscode from 'vscode';
 import type { NewTask, Task, TaskEvent, Usage } from './db';
 import { attemptsExhausted, extractJson, runOnce, ReviewOptions } from './agents';
@@ -190,11 +189,6 @@ export async function reviewProgress(
   goal = '',
 ): Promise<ProgressDecision> {
   opts = { ...opts, cognition: taskCognition(task, goal, 'supervisor') };
-  // A queue-assigned child already belongs to a preserved acceptance plan.
-  // Re-comparing it as a standalone project expands prerequisites back into
-  // the parent. Review its live work within the durable assigned scope below.
-  const contract = opts.ownerInstructions && !isLocalScope(task) && !task.splitScope ? await reviewTaskRequirements(context, output, task, goal, opts.ownerInstructions, opts) : undefined;
-  if (contract?.correction) return contract.correction;
   const refreshed = opts.refreshProgress?.();
   if (refreshed) ({ task, events, failedValidations } = refreshed);
   const state = task.status === 'EXECUTING'
@@ -207,7 +201,7 @@ export async function reviewProgress(
       'with STOP_AND_REWRITE_TASK. Choose START_VALIDATION again only if the journal shows the cause ' +
       'was transient.'
     : 'Independent validation has not failed on this task.';
-  const targetContract = opts.testingUrl && !contract ? `
+  const targetContract = opts.testingUrl ? `
 A fixed testing environment is configured. Include this additional decision field:
 "targetCheck": {"configuredUrl": ${JSON.stringify(opts.testingUrl)}, "requiredWork": "owner behavior relevant to this task", "observedWork": "the concrete code/application/test being exercised", "preservesOwnerScope": true}
 Compare the supplied application with the actual test page or service, including authentication
@@ -248,7 +242,7 @@ ${opts.recoveryContext || ''}
 
 ${originalGoalContext(goal)}
 
-${projectNotesContext(opts.projectNotes)}
+${projectNotesContext(opts.ownerInstructions || opts.projectNotes)}
 
 TASK ${task.seq}: ${task.title}
 ${task.description}
@@ -351,26 +345,26 @@ that action needs them. The final response must be valid JSON, with no code fenc
     ...opts,
   });
   const usage = { ...first.usage };
-  if (contract) addUsage(usage, contract.usage);
   const needsRecovery = task.status !== 'EXECUTING' &&
     ['supervisor_repair_required', 'testing_target_blocked', 'repeated_tool_error', 'unchanged_tool_loop'].some(reason =>
       task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (${reason})`));
   try {
-    return normalize(extractJson(first.text, isDecision), usage, task, contract ? undefined : opts.testingUrl, needsRecovery, opts.failedRepairs);
+    return normalize(extractJson(first.text, isDecision), usage, task, opts.testingUrl, needsRecovery, opts.failedRepairs);
   } catch (error) {
-    const formatPrompt = `Complete the required decision object below. Preserve a supported decision;
-if the target comparison shows a conflict with owner requirements, correct the decision and its
-replacement fields. A formatting error alone is not evidence of an implementation defect.
+    const formatPrompt = `Correct the response format using the CURRENT TASK and decision below.
+Do not reopen the project goal, infer a different task, or investigate. Missing evidence is not a code defect.
+CURRENT TASK: ${JSON.stringify({ title: task.title, description: task.description,
+  implVerifyPrompt: task.implVerifyPrompt, solutionVerifyPrompt: task.solutionVerifyPrompt,
+  solutionVerifyCommand: task.solutionVerifyCommand, status: task.status })}
 Validation problem: ${error instanceof Error ? error.message : String(error)}
 ${targetContract}
-
-${first.text.slice(0, 6000)}
-
-${originalGoalContext(goal)}
-
-${projectNotesContext(opts.projectNotes)}
-
-Allowed action values: ${SUPERVISOR_ACTIONS.join(', ')}.`;
+PROPOSED DECISION: ${first.text.slice(-6000)}
+Return ONE JSON object: {"action":"CONTINUE_EXECUTION","reason":"concrete reason"}.
+Allowed action values: ${SUPERVISOR_ACTIONS.join(', ')}.
+For STOP_AND_REWRITE_TASK include complete rewrittenDescription and any changed verification fields.
+For STOP_AND_REWRITE_VALIDATION include changed implVerifyPrompt, solutionVerifyPrompt or solutionVerifyCommand.
+For SPLIT_TASK include splitInto with at least two complete title, description and solutionVerifyPrompt objects.
+For test repair include guidance identifying the defect. Preserve requirements. Do not return a bare action.`;
     try {
       const localRepair = isLocalScope(task) ? `\nThis is a committed local ticket. The proposed contract rewrite
 was NOT applied. Complete a permitted local decision instead: CONTINUE_EXECUTION with concrete
@@ -382,7 +376,7 @@ Do not preserve an unavailable rewrite action or demand sibling work. Keep the a
         maxIterations: 1,
       });
       addUsage(usage, second.usage);
-      return normalize(extractJson(second.text, isDecision), usage, task, contract ? undefined : opts.testingUrl, needsRecovery, opts.failedRepairs);
+      return normalize(extractJson(second.text, isDecision), usage, task, opts.testingUrl, needsRecovery, opts.failedRepairs);
     } catch {
       throw new Error('The supervisor supplied no readable decision after reformatting. Preserve current work and reassess; unreadable output is not evidence that implementation is ready.');
     }

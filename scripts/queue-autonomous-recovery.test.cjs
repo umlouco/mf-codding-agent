@@ -5,7 +5,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 function setup(t, executeTask = async () => { throw Error('Unchanged execution must not launch.'); }) {
   const f = fixture(t, { executeTask }, { './verificationPlanRunner': {} });
   const task = f.queue.claimNext();
-  f.queue.update(task.id, { status: 'VERIFYING', output: 'Preserved implementation handoff.',
+  f.queue.update(task.id, { kind: 'phase', status: 'VERIFYING', output: 'Preserved implementation handoff.',
     validationReport: 'Unsuccessful but useful independent evidence.', errorLog: 'Failure history.', attempts: 3 });
   f.schedule = f.load('src/queue/recoverySchedule.ts');
   f.recovery = f.load('src/queue/recovery.ts');
@@ -22,7 +22,7 @@ function later(f, delay = 60_000) {
   return job;
 }
 
-test('exhausting ordinary retries schedules focused recovery without automatically pausing the queue', async t => {
+test('phase recovery: exhausting ordinary retries schedules focused recovery without automatically pausing the queue', async t => {
   const f = setup(t);
   assert.equal(await f.runner.allowRecovery(f.task, 'REVERIFY'), true);
   assert.equal(await f.runner.allowRecovery(f.task, 'REVERIFY'), true);
@@ -37,7 +37,7 @@ test('exhausting ordinary retries schedules focused recovery without automatical
   assert.equal(f.schedule.readRecoveryJob(f.queue, after).active, true);
 });
 
-test('tick and Check now gate both review lanes with zero model calls before durable dueAt', async t => {
+test('phase recovery: tick and Check now gate both review lanes with zero model calls before durable dueAt', async t => {
   const f = setup(t);
   let calls = 0;
   f.runner.performRecovery = async () => { calls++; return { status: 'deferred', reason: 'Dependency remains unavailable.' }; };
@@ -52,7 +52,7 @@ test('tick and Check now gate both review lanes with zero model calls before dur
   assert.equal(f.queue.get(f.task.id).validationReport, f.task.validationReport);
 });
 
-test('failed autonomous attempts persist bounded exponential backoff and continue running', async t => {
+test('phase recovery: failed autonomous attempts persist bounded exponential backoff and continue running', async t => {
   const f = setup(t);
   let calls = 0;
   f.runner.performRecovery = async () => { calls++; throw Error('Recovery provider unavailable.'); };
@@ -75,7 +75,7 @@ test('failed autonomous attempts persist bounded exponential backoff and continu
   assert.equal(f.queue.get(f.task.id).status, 'VERIFYING');
 });
 
-test('an admitted changed strategy resumes the real execution pump without erasing failed strategy history', async t => {
+test('phase recovery: an admitted changed strategy resumes the real execution pump without erasing failed strategy history', async t => {
   let executions = 0;
   const f = setup(t, async () => { executions++; return new Promise(() => {}); });
   f.runner.scopeWatch = () => ({ preflight: async () => true, observe() {}, close() {} });
@@ -83,7 +83,7 @@ test('an admitted changed strategy resumes the real execution pump without erasi
   const fingerprint = f.schedule.recoveryStrategyFingerprint('inspect command argument handling');
   f.runner.performRecovery = async task => {
     assert.equal(f.schedule.rememberRecoveryStrategy(f.queue, task, fingerprint), true);
-    f.queue.update(task.id, { status: 'PENDING', supervisorFeedback: 'Correct argument handling; retain all acceptance criteria.' });
+    f.queue.update(task.id, { kind: 'task', status: 'PENDING', supervisorFeedback: 'Correct argument handling; retain all acceptance criteria.' });
     return { status: 'applied' };
   };
   await f.runner.runNow();
@@ -100,7 +100,7 @@ test('an admitted changed strategy resumes the real execution pump without erasi
   assert.equal(f.queue.runState, 'RUNNING');
 });
 
-test('user Stop and Pause fence in-flight recovery and never get overridden by its late result', async t => {
+test('phase recovery: user Stop and Pause fence in-flight recovery and never get overridden by its late result', async t => {
   for (const control of ['stop', 'pause']) {
     const f = setup(t);
     let settle;
@@ -118,7 +118,7 @@ test('user Stop and Pause fence in-flight recovery and never get overridden by i
   }
 });
 
-test('owner edits during recovery cannot receive stale failure activity or erased retry history', async t => {
+test('phase recovery: owner edits during recovery cannot receive stale failure activity or erased retry history', async t => {
   const f = setup(t);
   let settle;
   f.runner.performRecovery = async () => new Promise(resolve => { settle = resolve; });
@@ -134,7 +134,7 @@ test('owner edits during recovery cannot receive stale failure activity or erase
   assert.equal(f.queue.runState, 'RUNNING');
 });
 
-test('outstanding scheduled recovery prevents a false finished transition', t => {
+test('phase recovery: outstanding scheduled recovery prevents a false finished transition', t => {
   const f = setup(t);
   f.runner.pauseForRecovery(f.task, 'Unresolved work remains.');
   for (const task of f.queue.list()) f.queue.update(task.id, { status: 'VERIFIED' });
@@ -143,7 +143,7 @@ test('outstanding scheduled recovery prevents a false finished transition', t =>
   assert.equal(f.schedule.hasOutstandingRecovery(f.queue), true);
 });
 
-test('only explicit Reset clears durable jobs and their strategy history', t => {
+test('phase recovery: only explicit Reset clears durable jobs and their strategy history', t => {
   const f = setup(t);
   f.runner.pauseForRecovery(f.task, 'Unresolved work remains.');
   f.schedule.rememberRecoveryStrategy(f.queue, f.task, 'failed-invocation');

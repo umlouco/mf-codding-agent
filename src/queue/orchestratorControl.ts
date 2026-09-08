@@ -109,10 +109,6 @@ export abstract class OrchestratorControl extends OrchestratorState {
     }
     // Anything left EXECUTING belongs to a process that no longer exists.
     this.recoverOrphaned();
-    const revived = this.queue.reviveFailed();
-    if (revived > 0) {
-      this.log(`returned ${revived} task(s) retired by an earlier run to the queue`);
-    }
     this.rollbacks = 0;
     if (this.queue.runState === 'PAUSED') {
       this.queue.resumePaused();

@@ -10,6 +10,8 @@ import { editTasks, planGoal } from './agents';
 import { Task, TaskQueue, taskEditSummary } from './db';
 import { LiveLog } from './liveLog';
 import { Orchestrator } from './orchestrator';
+import { recoveryKey } from './recovery';
+import { recoveryJobKey } from './recoverySchedule';
 import { notifySkillsChanged, onDidChangeSkills } from './registry';
 import { saveTestingEnvironment } from './testingEnvironment';
 
@@ -296,11 +298,20 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           queue.update(Number(msg.id), msg.patch);
           this.render();
           break;
-        case 'setStatus':
+        case 'setStatus': {
+          const task = queue.get(Number(msg.id));
+          if (task?.status === 'FAILED' && ['PENDING', 'VERIFYING'].includes(msg.status)) {
+            queue.log(task.id, 'user', 'verification-retry', JSON.stringify({
+              recovery: queue.getMeta(recoveryKey(task)), scheduled: queue.getMeta(recoveryJobKey(task)) }));
+            queue.setMeta(recoveryKey(task), '');
+            queue.setMeta(recoveryJobKey(task), '');
+            queue.setMeta(`verificationAccepted:${task.id}`, '');
+          }
           queue.update(Number(msg.id), { status: msg.status });
           queue.log(Number(msg.id), 'user', 'status-set', msg.status);
           this.render();
           break;
+        }
         case 'deleteTask': {
           const task = queue.get(Number(msg.id));
           if (task && msg.confirm && !(await this.confirmDelete(task))) {

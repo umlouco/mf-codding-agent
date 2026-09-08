@@ -16,7 +16,7 @@ function load(file, dependencies = {}, extra = '') {
   });
   const exports = {};
   vm.runInNewContext(outputText, {
-    exports,
+    exports, setTimeout, clearTimeout,
     Buffer,
     require: (name) => dependencies[name] ?? (/^\.\/(orchestrator|scope|recovery|workInventory|verificationAuthority|verificationRecovery)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : name === './cognition' ? cognition : name === 'crypto' ? require('node:crypto') : {}),
   }, { filename: file });
@@ -395,7 +395,7 @@ test('validator watchdog releases busy supervision and fences late reports and c
     Object.assign(runner, { review, reviewGen: 7, cycle: 3, supervising: true,
       context: {}, output: {}, log: () => {}, changed: () => {},
       scopeWatch: () => ({ preflight: async () => true, observe() {}, close() {} }),
-      queue: { list: () => [current], getMeta: () => 'Client request', get: () => current, log: (...args) => logs.push(args),
+      queue: { countEvents: () => 0, setMeta() {}, list: () => [current], getMeta: () => 'Client request', get: () => current, log: (...args) => logs.push(args),
         update: (_, patch) => { patches.push(patch); Object.assign(current, patch); }, recordActivity: () => true, addUsage: () => {} },
       streamJournal: () => ({ flush: () => {}, onEvent: (...args) => streamed.push(args), live: { activity: () => {}, close() {} } }) });
     const pending = runner.verifyWithExecutor(current, review);

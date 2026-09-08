@@ -113,20 +113,31 @@ export function killTree(pid: number | undefined): void {
   }
 }
 
-/*
-There is no timeout here, and adding one back would be a mistake.
-
-A turn takes as long as the model takes, and on a local model that can be hours
-for a single reply. Killing it on a clock cannot tell the difference between
-that and a hang, and it destroys the one thing that made the attempt worth
-something: what the worker had already learned and written. The core reports its
-own liveness instead — see onActivity — so a caller that needs to know whether
-anyone is still working reads the journal rather than a stopwatch.
-
-What does still end a turn: the core dropping a connection that has gone silent,
-the core process dying (the request rejects), or an explicit cancel.
-*/
+/** Execution keeps its existing liveness policy; supervisor decisions have a bounded turn. */
 export async function runOnce(
+  context: vscode.ExtensionContext, output: vscode.OutputChannel, role: Role,
+  prompt: string, opts: RunOptions = {},
+): Promise<TurnResult> {
+  if (role !== 'supervisor') return runTurn(context, output, role, prompt, opts);
+  let stop: (() => void) | undefined;
+  let ended = false;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      runTurn(context, output, role, prompt, { ...opts,
+        onAbort: abort => { stop = abort; opts.onAbort?.(abort); if (ended) abort(); },
+        onEvent: (method, params) => { if (!ended) opts.onEvent?.(method, params); },
+        onActivity: a => { if (!ended) opts.onActivity?.(a); },
+      }),
+      new Promise<never>((_, reject) => { deadline = setTimeout(() => {
+        ended = true; stop?.();
+        reject(new AgentRunError('Supervisor decision exceeded its three-minute turn limit. Current work is preserved.'));
+      }, 180_000); }),
+    ]);
+  } finally { ended = true; if (deadline) clearTimeout(deadline); }
+}
+
+async function runTurn(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   role: Role,

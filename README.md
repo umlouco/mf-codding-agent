@@ -461,8 +461,8 @@ The extension executes a saved verification command unchanged through its portab
 shell before the independent verifier reviews it. Reports include captured tool
 observations; a required command must actually complete successfully before PASS.
 Reverification can correct command quoting while preserving task requirements.
-Ready handoffs go directly to independent verification, followed by a supervisor
-verdict. Completed stages wake the queue without waiting for the next cron tick.
+Stopped tasks go directly to focused independent verification. A current, supported
+PASS advances immediately without another supervisor model call. Completed stages wake the queue without waiting for the next cron tick.
 Heartbeats keep the activity display current but do not count
 as new evidence for another supervisor review.
 
@@ -530,18 +530,26 @@ verification worker then inspects the final diff, runs the required commands and
 test suites, and drives the browser for UI work. It finishes with a structured
 PASS, FAIL, or INCOMPLETE report containing the observed evidence for every check.
 
-That report is written to `validation_report` in `.mfagent/queue.db` before the
-supervisor's completion decision. The supervisor starts with this report, checks
-that the conclusion is consistent and adequately supported, and either validates
-the task, requests another verification pass (`REVERIFY`), or sends implementation
-back with revised instructions. A missing check or report-format error can be
-recovered without rewriting the task or rerunning working implementation. A
-productive executor handoff can also resume with unchanged requirements. Task rewrites
-retain accompanying corrections to their verification prompts and command, so the
-old check cannot silently survive a corrected task. Supervisor model requests include
-the configured tool definitions for inspection when evidence conflicts or is missing.
-CLI supervisors also retain their available tools.
-Supervisor tool use does not replace the independent verification report.
+The report is stored in `validation_report` before advancing. The host checks the
+report against captured execution receipts. A supported PASS for the current task,
+contract and owner instructions moves straight to VERIFIED; a changed contract or
+legacy report must be checked again. Validation does not launch an additional scope
+supervisor or repeat accumulated agent observations.
+
+An unsuccessful report goes to the supervisor for a focused correction. Each task
+has at most two verification passes and two recovery decisions. A verification pass
+has a ten-minute deadline; each supervisor turn has a three-minute deadline, even
+if it continues emitting reasoning. These bounds do not declare the task correct.
+Unresolved tasks become FAILED with their files, handoff, report and journal retained.
+Independent later work can proceed; split prerequisites still block dependent work.
+The finished notification distinguishes verified tasks from failures.
+
+Start and window reloads do not revive FAILED tasks or reset these allowances. After
+addressing a blocker, use that task's status selector to change FAILED to VERIFYING
+(recheck existing work) or PENDING (resume implementation), then Start. This explicit
+retry grants only that task a new allowance while retaining its earlier journal.
+Reset still resets the entire queue. Phase-expansion recovery retains its existing
+scheduler; it does not sit in front of normal task verification.
 
 ### What is worked out for you
 

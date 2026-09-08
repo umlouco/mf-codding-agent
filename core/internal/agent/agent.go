@@ -138,6 +138,12 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	}
 	if a.cfg.ResponseOnly {
 		system = "You review supplied text and evidence. Follow the current request and its response schema exactly. You cannot inspect files or execute tools in this turn. Do not propose tool calls, XML checks, or an investigation. Owner requirements outrank derived task instructions and prior agent conclusions. Preserve required behavior and assertions. Return the requested decision using only the supplied information; distinguish missing evidence from a proven defect."
+		if a.cfg.QueueRole == "supervisor" || a.cfg.QueueRole == "supervisor-repair" {
+			system = supervisorResponsePolicy
+		}
+		if a.cfg.QueueRole == "validator" {
+			system = validatorPolicy + "\nTools are unavailable in this response turn. Use only the supplied requirements and host evidence."
+		}
 	}
 	a.mu.Unlock()
 

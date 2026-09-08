@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const { assert, fixture, usage } = require('./queue-scope-helpers.cjs');
 
-test('public Start migrates a legacy blocked VERIFYING task through the real recovery and verifier lanes', async t => {
+test('public Start sends a legacy blocked task directly to fresh bounded verification', async t => {
   let verificationCalls = 0;
   const report = JSON.stringify({ conclusion: 'INCOMPLETE', summary: 'A real check remains unavailable.',
     implementationEvidence: 'Current implementation inspected.', behaviorEvidence: '',
@@ -10,7 +10,7 @@ test('public Start migrates a legacy blocked VERIFYING task through the real rec
     runVerification: async (_context, _output, task, _goal, activity, event) => {
       verificationCalls++;
       assert.equal(task.solutionVerifyCommand, 'existing-check --assert-behavior');
-      assert.equal(f.schedule.hasRecoveryJob(f.queue, task), true, 'the recovery owns verification until it finishes');
+      assert.equal(f.schedule.hasRecoveryJob(f.queue, task), false, 'the obsolete scheduled loop is retired');
       assert.match(f.recovery.recoveryState(f.queue, task).blocked, /Six recovery/,
         'legacy history is retained while the changed verifier operation runs');
       activity({ phase: 'tool', detail: 'Inspecting the changed verification adapter.', at: Date.now() });
@@ -37,13 +37,15 @@ test('public Start migrates a legacy blocked VERIFYING task through the real rec
     nextOperation: { tool: 'read_file', input: { path: 'test-config.json' } } });
   f.runner.scopeWatch = () => ({ preflight: async () => true, observe() {}, close() {} });
   f.runner.reviewWork = async () => assert.fail('Legacy recovery must not rerun ordinary review.');
-  f.runner.supervise = async () => assert.fail('The old report must not be supervised during recovery.');
+  let verdicts = 0;
+  f.runner.supervise = async task => { verdicts++; assert.equal(task.validationReport, report); };
 
   f.runner.start();
   await new Promise(resolve => setTimeout(resolve, 1200));
 
   assert.equal(verificationCalls, 1, 'the real verifyWithExecutor must reach the verifier despite the legacy blocked flag');
-  assert.equal(f.calls.length, 1, 'one real recovery decision, no repeated supervision');
+  assert.equal(f.calls.length, 0, 'no preparatory recovery or scope models');
+  assert.equal(verdicts, 1);
   assert.equal(f.queue.runState, 'RUNNING');
   const after = f.queue.get(first.id);
   assert.equal(after.status, 'VERIFYING', 'new recovery evidence is not automatic completion');
@@ -52,7 +54,7 @@ test('public Start migrates a legacy blocked VERIFYING task through the real rec
     'output', 'errorLog', 'attempts']) assert.equal(after[field], before[field], field);
   assert.equal(f.schedule.readRecoveryJob(f.queue, after).active, false);
   assert.equal(f.recovery.recoveryState(f.queue, after).recoveries, 6);
-  assert.equal(f.recovery.recoveryState(f.queue, after).blocked, undefined);
+  assert.match(f.recovery.recoveryState(f.queue, after).blocked, /Six recovery/);
   assert.equal(f.queue.countEvents(after.id, 'validation-started'), 1);
   assert.equal(f.queue.list()[1].status, 'PENDING');
 });

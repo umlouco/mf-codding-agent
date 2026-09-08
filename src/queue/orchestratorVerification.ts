@@ -6,8 +6,9 @@ import { OrchestratorScope } from './orchestratorScope';
 import { scopeBlocked } from './scopePlan';
 import { appendAttempt, Review } from './orchestratorState';
 import { runVerification } from './verification';
-import { recoveryFailure, recoveryState, recoverySucceeded, recoveryContext } from './recovery';
-import { hasRecoveryJob } from './recoverySchedule';
+import { recoveryFailure, recoverySucceeded, recoveryContext } from './recovery';
+import { completeRecoveryJob } from './recoverySchedule';
+import { storedValidationProblem } from './validation';
 import { boundedTask } from './scopeBoundary';
 import { verdictReplacementTasks } from './scopeVerdict';
 import { isLocalScope } from './scopeContract';
@@ -27,7 +28,16 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
 
   /** Delegates formal verification to a fresh execution LLM and persists its response. */
   protected async verifyWithExecutor(task: Task, review: Review): Promise<void> {
+    if (!sameVerificationSnapshot(this.queue.get(task.id), task) || review.gen !== this.reviewGen) return;
+    if (scopeBlocked(task, this.queue.list())) return;
     if (this.correctTestingTarget(task)) return;
+    if (this.queue.countEvents(task.id, 'verification-pass', true) >= 2) {
+      this.failVerification(task, 'Two verification passes did not establish completion. ' +
+        (task.supervisorFeedback || task.validationReport || 'See the validator journal for the missing check.'));
+      return;
+    }
+    this.queue.log(task.id, 'validator', 'verification-pass', 'Focused independent verification; at most two passes per task.');
+    completeRecoveryJob(this.queue, task);
     const ownerContext = JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
       this.queue.testingContext, this.queue.instructions]);
     const accepts = () => review.gen === this.reviewGen &&
@@ -35,20 +45,10 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         this.queue.testingContext, this.queue.instructions]) &&
       sameVerificationSnapshot(this.queue.get(task.id), task);
     if (!accepts()) return;
-    if (scopeBlocked(task, this.queue.list())) return;
-    const blocked = recoveryState(this.queue, task).blocked;
-    if (blocked && !hasRecoveryJob(this.queue, task)) { this.pauseForRecovery(task, blocked); return; }
     this.log(`task ${task.seq} — supervisor started independent verification`);
     this.queue.log(task.id, 'supervisor', 'validation-started', 'delegated to execution LLM');
     const journal = this.streamJournal(task.id, 'validator', accepts);
-    const scope = this.scopeWatch(task, 'validator', accepts, (phase, detail, at) => {
-        if (!accepts()) return;
-        review.lastActivityAt = at;
-        this.queue.recordActivity(task.id, phase, detail, 'supervisor');
-      });
-    review.scope = scope;
     try {
-      if (!await scope.preflight() || !accepts()) return;
       const result = await runVerification(
         this.context,
         this.output,
@@ -64,13 +64,13 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
           }
         },
         (method, params) => {
-          if (accepts()) { journal.onEvent(method, params); scope.observe(method, params); }
+          if (accepts()) { journal.onEvent(method, params); }
         },
         (abort) => {
           if (!accepts()) { abort(); return; }
           review.abort = abort;
         },
-        this.queue.contextInstructions,
+        this.queue.testingContext + this.queue.instructions,
         verificationAuthority(this.queue, task),
       );
       journal.flush();
@@ -83,6 +83,8 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         validationReport: result.validationReport,
         finishedAt: Date.now(),
       });
+      this.queue.setMeta(`verificationAccepted:${task.id}`,
+        JSON.stringify([this.verificationIdentity(task), result.validationReport]));
       this.queue.log(task.id, 'validator', 'response', result.text.slice(0, 8000));
       this.queue.log(task.id, 'validator', 'validation', result.validationReport.slice(0, 8000));
       this.log(`task ${task.seq} — independent verification response stored`);
@@ -115,15 +117,12 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         });
       }
       this.log(`task ${task.seq} — validator stopped: ${message}; supervisor will reassess`);
-      if (error?.name === 'VerificationPlanError') {
-        // The recovery scheduler owns its review and must set a new deadline
-        // after this failed await. Re-scheduling here would invalidate its fence.
-        if (hasRecoveryJob(this.queue, task)) throw error;
-        await this.replanOrPause(this.queue.get(task.id) ?? task,
-          `Host verification needs a changed executable plan: ${message}`);
-      }
+      if (!error?.validationReport) this.queue.update(task.id, { validationReport: JSON.stringify({ conclusion: 'INCOMPLETE',
+        summary: message, implementationEvidence: '', behaviorEvidence: '', checks: [], remaining: message }) });
+      this.queue.setMeta(`verificationAccepted:${task.id}`,
+        JSON.stringify([this.verificationIdentity(task), this.queue.get(task.id)!.validationReport]));
+
     } finally {
-      scope.close();
       journal.live.close();
       // Both paths above have written to the task -- tokens at least, usually
       // a report as well -- and neither had any other reason to redraw. The
@@ -133,6 +132,28 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       // reaching the view.
       this.changed();
     }
+  }
+
+  private failVerification(task: Task, reason: string): void {
+    this.queue.update(task.id, { status: 'FAILED', finishedAt: Date.now(),
+      activityPhase: 'verification_blocked', activityDetail: reason.slice(0, 4000),
+      supervisorFeedback: reason.slice(0, 8000) });
+    completeRecoveryJob(this.queue, task);
+    this.queue.log(task.id, 'system', 'verification-blocked', reason.slice(0, 8000));
+    this.log(`task ${task.seq}: verification stopped; work and evidence retained for review`);
+    this.changed();
+    this.wakeAfterHandoff();
+  }
+
+  private verificationIdentity(task: Task): string {
+    return JSON.stringify([task.createdAt, task.startedAt, task.attempts, task.title, task.kind, task.region, task.splitScope, task.description,
+      task.implVerifyPrompt, task.solutionVerifyPrompt, task.solutionVerifyCommand, task.output,
+      this.queue.getMeta('goal'), this.queue.contextInstructions, this.queue.testingContext, this.queue.instructions]);
+  }
+
+  protected currentHostVerification(task: Task): boolean {
+    return this.queue.getMeta(`verificationAccepted:${task.id}`) ===
+      JSON.stringify([this.verificationIdentity(task), task.validationReport]);
   }
 
   /** Runs the full verification pass for one task and applies the verdict. */
@@ -156,6 +177,21 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
   /** Runs the full verification pass for one task and applies the verdict. */
   protected async supervise(task: Task): Promise<void> {
     if (!sameVerificationSnapshot(this.queue.get(task.id), task)) return;
+    if (!storedValidationProblem(task.validationReport) && this.currentHostVerification(task)) {
+      this.queue.update(task.id, { status: 'VERIFIED', finishedAt: Date.now(),
+        supervisorFeedback: 'Independent verification passed the assigned checks.' });
+      completeRecoveryJob(this.queue, task);
+      this.queue.log(task.id, 'supervisor', 'verdict:VERIFIED', 'Accepted current host-backed independent verification.');
+      this.changed();
+      this.wakeAfterHandoff();
+      return;
+    }
+    if (this.queue.countEvents(task.id, 'verification-decision', true) >= 2) {
+      this.failVerification(task, 'Verification recovery did not resolve the task after two decisions. ' +
+        (task.supervisorFeedback || task.validationReport));
+      return;
+    }
+    this.queue.log(task.id, 'supervisor', 'verification-decision', 'Review only the unresolved verification result.');
     this.log(`supervising task ${task.seq} — ${task.title}`);
 
     // From here until the verdict lands there is a turn running that only this
@@ -184,7 +220,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         this.rewrites(task),
         this.queue.getMeta('goal'),
         {
-          projectNotes: this.queue.contextInstructions,
+          projectNotes: this.queue.testingContext + this.queue.instructions,
           failedRepairs: this.queue.countEvents(task.id, 'test-repair-halted'),
           recoveryContext: recoveryContext(this.queue, task),
           onAbort: (abort) => {

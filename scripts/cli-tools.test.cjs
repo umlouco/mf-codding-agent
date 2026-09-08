@@ -87,8 +87,8 @@ for (const role of ['supervisor', 'executor', 'planner']) {
     assert.doesNotMatch(suffix, /no tools available/i);
     if (role === 'supervisor') {
       assert.match(suffix, /supplied task journal/);
-      assert.match(suffix, /use available tools when needed/);
-      assert.match(suffix, /separate formal verifier supplies the independent verification report/);
+      assert.match(suffix, /inspection-only supervisor turn/);
+      assert.match(suffix, /does not replace independent verification/);
     } else if (role === 'executor') {
       assert.match(suffix, /task queue worker/);
       assert.match(suffix, /independently check verification tasks/);
@@ -99,6 +99,36 @@ for (const role of ['supervisor', 'executor', 'planner']) {
     assert.equal(result.text, 'Finished');
     assert.equal(result.usage.input, 5);
     assert.equal(result.usage.output, 2);
+  });
+}
+
+for (const formatOnly of [false, true]) {
+  test(`supervisor CLI repair authority remains explicit with formatOnly=${formatOnly}`, async () => {
+    let args;
+    const cli = loadCli((_bin, actualArgs) => {
+      args = actualArgs;
+      const proc = new EventEmitter();
+      proc.stdin = new PassThrough(); proc.stdout = new PassThrough(); proc.stderr = new PassThrough();
+      setImmediate(() => {
+        proc.stdout.end(JSON.stringify({ type: 'result', result: 'Repair handoff', stop_reason: 'end_turn' }) + '\n');
+        proc.stderr.end(); proc.emit('close', 0);
+      });
+      return proc;
+    });
+    await cli.runClaudeCliTurn({ appendLine() {} }, 'supervisor', { profile: { extra: {} } },
+      'Repair the reported test defect.', { allowTestEdits: true, formatOnly });
+    const flag = formatOnly ? '--system-prompt' : '--append-system-prompt';
+    const system = args[args.indexOf(flag) + 1];
+    assert.match(system, /engineering supervisor/);
+    if (formatOnly) {
+      assert.match(system, /tools are unavailable/);
+      assert.doesNotMatch(system, /use scoped editing tools/);
+      assert.equal(args[args.indexOf('--tools') + 1], '');
+    } else {
+      assert.match(system, /dedicated supervisor test-repair turn/);
+      assert.match(system, /Fresh independent verification must follow/);
+      assert.doesNotMatch(system, /This is an inspection-only supervisor turn/);
+    }
   });
 }
 

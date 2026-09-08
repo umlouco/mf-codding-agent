@@ -123,20 +123,17 @@ test('late validator callbacks, reports and errors remain fenced to their exact 
   }
 });
 
-test('a contract change during preflight cannot launch a validator for the old contract', async t => {
+test('a stale task snapshot cannot launch validation or consume its retry budget', async t => {
   const queue = fixture(t);
   const task = verifying(queue, false);
-  const preflight = deferred();
   const runner = orchestrator(queue, { './verification': {
     runVerification: () => assert.fail('Do not launch a stale validator'),
   } });
-  runner.scopeWatch = () => ({ preflight: () => preflight.promise, close() {} });
   const review = { taskId: task.id, seq: task.seq, gen: ++runner.reviewGen, lastActivityAt: Date.now() };
-  const pending = runner.verifyWithExecutor(task, review);
-  queue.update(task.id, { solutionVerifyPrompt: 'Owner changed the required check during preflight' });
-  preflight.resolve(true);
-  await pending;
+  queue.update(task.id, { solutionVerifyPrompt: 'Owner changed the required check' });
+  await runner.verifyWithExecutor(task, review);
   assert.equal(queue.get(task.id).validationReport, '');
+  assert.equal(queue.countEvents(task.id, 'verification-pass'), 0);
 });
 
 test('a split verdict uses bounded recovery instead of an unbounded legacy preflight', async t => {

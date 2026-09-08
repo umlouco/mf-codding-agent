@@ -3,7 +3,7 @@ import { OrchestratorControl } from './orchestratorControl';
 import { appendAttempt } from './orchestratorState';
 import { scopeBlocked } from './scopePlan';
 import { recoveryFailure } from './recovery';
-import { deferRecoveryJob, hasOutstandingRecovery, hasRecoveryJob } from './recoverySchedule';
+import { deferRecoveryJob, hasOutstandingRecovery, hasRecoveryJob, completeRecoveryJob } from './recoverySchedule';
 
 export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
@@ -52,16 +52,22 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
         if (!current || current.status !== 'VERIFYING' || scopeBlocked(current, this.queue.list())) {
           continue;
         }
-        if (await this.serviceRecovery(current)) continue;
-        if (!current.validationReport.trim()) {
-          if (current.activityPhase === 'ready_for_validation') {
-            await this.startIndependentVerification(current);
+        if (current.kind === 'phase') {
+          await this.serviceRecovery(current);
+          continue;
+        }
+        // Old scheduled recovery must not trap a stopped task in another planning loop.
+        completeRecoveryJob(this.queue, current);
+        if (!current.validationReport.trim() || !this.currentHostVerification(current)) {
+          if (current.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
+            await this.repairTests(current, current.supervisorFeedback);
           } else {
-            await this.reviewWork(current);
+            await this.startIndependentVerification(current);
           }
           current = this.queue.get(task.id);
         }
-        if (current?.status === 'VERIFYING' && current.validationReport.trim() && !hasRecoveryJob(this.queue, current)) {
+        if (this.cycle !== cycle || this.queue.runState !== 'RUNNING') break;
+        if (current?.status === 'VERIFYING' && current.validationReport.trim()) {
           await this.supervise(current);
         }
       }

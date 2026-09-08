@@ -108,7 +108,7 @@ test('a three-task queue reaches completion after a verification retry without r
   assert.ok(queue.list().every(row => row.status === 'VERIFIED'));
   assert.equal(executions, 3, 'verification retry does not rerun implementation');
   assert.equal(verifications, 4, 'only the missing verification is repeated');
-  assert.equal(verdicts, 4, 'every independent report still requires a supervisor verdict');
+  assert.equal(verdicts, 1, 'only the unsuccessful report needs a supervisor decision');
   assert.equal(preliminaryReviews, 0, 'a normal ready handoff goes directly to independent verification, still followed by a verdict');
   assert.ok(queue.list().every(row => row.output.includes('Implementation ready')), 'keep executor handoffs');
   assert.equal(queue.countEvents(queue.list()[0].id, 'task-edited'), 0);
@@ -162,38 +162,34 @@ test('fixed testing target requires an explicit scope comparison and rejects a c
 
 
 
-test('requirements review corrects derived scope before running a detailed progress investigation', async () => {
- let calls=0;
- const agentDeps={...agents(),runOnce:async(_context,_output,_role,prompt,opts)=>{
-  calls++;assert.equal(opts.formatOnly,true);assert.match(prompt,/DERIVED TASK CONTRACT/);
-  assert.ok(!prompt.includes('prior agent says fixture is correct'));
-  return {text:JSON.stringify({compatible:false,reason:'The task substitutes a demo for the requested application.',description:'Authenticate against the configured application and verify every required state transition in its actual form.',implVerifyPrompt:'Inspect real implementation.',solutionVerifyPrompt:'Verify show, hide and clear in the authenticated form.',solutionVerifyCommand:''}),usage};
- }};
- const requirements=load('src/queue/requirements.ts',{'./agents':agentDeps});
- const monitor=load('src/queue/monitor.ts',{'./agents':agentDeps,'./requirements':requirements,'./validation':validation,'./prompts':prompts,'./cognition':cognition});
- const result=await monitor.reviewProgress({},output,task,[],0,{ownerInstructions:notes,projectNotes:notes+' prior agent says fixture is correct'},goal);
- assert.equal(calls,1);assert.equal(result.action,'STOP_AND_REWRITE_TASK');assert.equal(result.solutionVerifyCommand,'');
- assert.match(result.rewrittenDescription,/actual form/);
+test('one progress decision checks the current task against owner requirements', async () => {
+ let calls = 0;
+ const monitor = load('src/queue/monitor.ts', {
+  './agents': {...agents(), runOnce: async (_, __, ___, prompt) => {
+   calls++; assert.match(prompt, /You supervise a coding agent/); assert.ok(prompt.includes(notes));
+   return {text: JSON.stringify({action:'STOP_AND_REWRITE_TASK', reason:'Use the supplied application.',
+    rewrittenDescription:'Authenticate and inspect the actual form.', solutionVerifyCommand:''}), usage};
+  }}, './validation':validation, './prompts':prompts, './cognition':cognition,
+ });
+ const result = await monitor.reviewProgress({}, output, task, [], 0, {ownerInstructions:notes}, goal);
+ assert.equal(calls, 1); assert.equal(result.action, 'STOP_AND_REWRITE_TASK');
+ assert.match(result.rewrittenDescription, /actual form/);
 });
 
-
-test('progress evidence is refreshed after the asynchronous requirements comparison', async () => {
- let compared=false;
- const module=agents();
- const monitor=load('src/queue/monitor.ts',{
-  './agents':{...module,runOnce:async(_context,_output,_role,prompt)=>{
-   assert.ok(compared);assert.match(prompt,/new successful build/);assert.match(prompt,/implementation completed while requirements were reviewed/);
-   return {text:JSON.stringify({action:'START_VALIDATION',reason:'Fresh build supports independent verification.'}),usage};
-  }},
-  './requirements':{reviewTaskRequirements:async()=>{compared=true;return {usage};}},
+test('progress uses a fresh journal without a preliminary requirements model turn', async () => {
+ let refreshed = false;
+ const monitor=load('src/queue/monitor.ts', {
+  './agents':{...agents(),runOnce:async(_,__,___,prompt)=>{
+   assert.ok(refreshed);assert.match(prompt,/new successful build/);
+   return {text:JSON.stringify({action:'START_VALIDATION',reason:'Fresh build supports verification.'}),usage};
+  }}, './requirements':{reviewTaskRequirements:()=>assert.fail('No nested requirements review')},
   './validation':validation,'./prompts':prompts,'./cognition':cognition,
  });
  await monitor.reviewProgress({},output,task,[],0,{ownerInstructions:notes,refreshProgress:()=>{
-  assert.ok(compared);
-  return {task:{...task,status:'VERIFYING',activityDetail:'implementation completed while requirements were reviewed'},events:[{id:1,at:Date.now(),actor:'executor',kind:'tool',message:'new successful build'}],failedValidations:0};
+  refreshed=true;
+  return {task,events:[{id:1,at:Date.now(),actor:'executor',kind:'tool',message:'new successful build'}],failedValidations:0};
  }},goal);
 });
-
 
 test('an incomplete requirements correction gets one repair with owner constraints retained', async () => {
  let calls=0;

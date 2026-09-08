@@ -199,6 +199,7 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	tools.RegisterLayout(s.registry, s.brw, vision)
 
 	system := agent.BuildSystemPrompt(agent.PromptInput{
+		QueueRole:             cfg.QueueRole,
 		WorkspaceRoot:         cfg.WorkspaceRoot,
 		Languages:             cfg.Languages,
 		MemoryEnabled:         s.mem != nil,

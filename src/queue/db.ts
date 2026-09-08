@@ -771,10 +771,12 @@ export class TaskQueue {
    * reads zero. `idx_events_task` makes asking the database cheaper than the
    * window scan was anyway.
    */
-  countEvents(taskId: number, kind: string): number {
+  countEvents(taskId: number, kind: string, sinceUserRetry = false): number {
     const row = this.db
-      .prepare('SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = ?')
-      .get(taskId, kind);
+      .prepare(`SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = ?
+        AND (? = 0 OR id > COALESCE((SELECT MAX(id) FROM task_events
+          WHERE task_id = ? AND actor = 'user' AND kind = 'verification-retry'), 0))`)
+      .get(taskId, kind, sinceUserRetry ? 1 : 0, taskId);
     return row.n as number;
   }
 
@@ -1411,15 +1413,14 @@ export class TaskQueue {
    * True when the run is genuinely over: every task VERIFIED, or the only ones
    * left are PAUSED because someone asked for that.
    *
-   * FAILED is counted as open on purpose. Nothing produces it any more, but a
-   * database written by an older build can still contain it, and treating it as
-   * finished is how a queue reports success with work outstanding.
+   * FAILED retains unresolved work without rerunning it forever. The completion
+   * notification reports failures separately; finishing a run is not all tasks passing.
    */
   isComplete(): boolean {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS n FROM tasks
-         WHERE status IN ('PENDING','EXECUTING','VERIFYING','FAILED')`,
+         WHERE status IN ('PENDING','EXECUTING','VERIFYING')`,
       )
       .get();
     return (row.n as number) === 0;
