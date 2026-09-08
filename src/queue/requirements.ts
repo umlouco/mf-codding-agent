@@ -46,6 +46,8 @@ If incompatible, return a complete corrected task contract preserving every rele
 field, assertion, and test direction. Require discovery of real runtime selectors/interfaces;
 do not invent them. Remove a command only when it tests the wrong thing, preserving its actual
 behavior requirements in the corrected verification prompt. Do not change unrelated tasks.
+At least one contract field must differ from the current contract; repeating it is not a
+correction. If only verification conflicts, keep the description and correct the affected checks.
 An executable command must be concrete and justified by the supplied contract. Never invent
 placeholder paths such as path/to/test or substitute an imagined filename. Leave it empty
 when runtime discovery is needed; the behavior verification prompt must still require execution.
@@ -68,6 +70,10 @@ Return the decision now. No markdown fences, conditions XML, or proposed investi
         throw new Error(`Requirements review needs a complete corrected ${field}.`);
       }
     }
+    if (!raw.compatible && !(['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const)
+      .some(field => raw[field].trim() !== task[field].trim())) {
+      throw new Error('Requirements review declared a conflict but supplied no changed contract fields. Supply a complete correction, not the current contract repeated.');
+    }
     return raw;
   };
   const usage = { ...result.usage };
@@ -81,9 +87,10 @@ Return the decision now. No markdown fences, conditions XML, or proposed investi
   }
   if (raw.compatible) return { usage };
   return { usage, correction: {
-    action: 'STOP_AND_REWRITE_TASK', reason: raw.reason,
-    rewrittenDescription: raw.description, implVerifyPrompt: raw.implVerifyPrompt,
-    solutionVerifyPrompt: raw.solutionVerifyPrompt, solutionVerifyCommand: raw.solutionVerifyCommand,
+    action: raw.description.trim() === task.description.trim() ? 'STOP_AND_REWRITE_VALIDATION' : 'STOP_AND_REWRITE_TASK',
+    reason: raw.reason,
+    rewrittenDescription: raw.description.trim(), implVerifyPrompt: raw.implVerifyPrompt.trim(),
+    solutionVerifyPrompt: raw.solutionVerifyPrompt.trim(), solutionVerifyCommand: raw.solutionVerifyCommand.trim(),
     usage,
   } };
 }

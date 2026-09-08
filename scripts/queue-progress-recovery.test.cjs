@@ -193,7 +193,7 @@ test('progress uses a fresh journal without a preliminary requirements model tur
 
 test('an incomplete requirements correction gets one repair with owner constraints retained', async () => {
  let calls=0;
- const complete={compatible:false,reason:'A fixture substitutes for the actual application.',description:task.description,implVerifyPrompt:task.implVerifyPrompt,solutionVerifyPrompt:task.solutionVerifyPrompt,solutionVerifyCommand:''};
+ const complete={compatible:false,reason:'A fixture substitutes for the actual application.',description:'Authenticate against the actual application and test both transitions.',implVerifyPrompt:task.implVerifyPrompt,solutionVerifyPrompt:task.solutionVerifyPrompt,solutionVerifyCommand:''};
  const requirements=load('src/queue/requirements.ts',{'./agents':{...agents(),runOnce:async(_context,_output,_role,prompt,opts)=>{
   calls++;assert.equal(opts.formatOnly,true);assert.ok(prompt.includes(notes));
   if(calls===1){const incomplete={...complete};delete incomplete.solutionVerifyPrompt;return {text:JSON.stringify(incomplete),usage};}
