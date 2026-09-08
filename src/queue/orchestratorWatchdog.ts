@@ -304,7 +304,16 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     if (open === 0) {
       return;
     }
-    if (s.byStatus.EXECUTING === 0 && s.byStatus.VERIFYING === 0) {
+    if (s.byStatus.VERIFYING > 0) {
+      // In lockstep pump() correctly refuses to claim later work while a
+      // verdict is outstanding. It cannot, however, make that verdict happen.
+      // A lost cron therefore used to leave VERIFYING rows untouched forever:
+      // the watchdog woke up faithfully and repeatedly called a no-op pump.
+      this.log(`${s.byStatus.VERIFYING} task(s) awaiting supervision; checking the supervisor`);
+      this.schedule('watchdog supervisor check', () => this.tick());
+      return;
+    }
+    if (s.byStatus.EXECUTING === 0) {
       this.log(`${open} pending task(s); checking the execution pump`);
     }
     this.schedule('watchdog execution pump', () => this.pump());
