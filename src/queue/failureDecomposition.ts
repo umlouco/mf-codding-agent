@@ -95,15 +95,17 @@ export function parseFailureDecomposition(text: string, task: Task,
     throw Error('Identify at least two distinct unfinished outcomes before partitioning the task.');
   }
   const known = new Set<string>();
-  const descriptions = new Set<string>();
   const remainingOutcomes: RemainingOutcome[] = value.remainingOutcomes.map((entry: any) => {
     if (!object(entry) || !nonempty(entry.id) || !nonempty(entry.description)) {
       throw Error('Every remaining outcome needs an id and a concrete unfinished behavior or observation.');
     }
     const id = entry.id.trim();
-    const description = canonical(entry.description);
-    if (known.has(id) || !description || descriptions.has(description)) throw Error('Remaining outcomes must be distinct.');
-    known.add(id); descriptions.add(description);
+    if (known.has(id)) throw Error('Remaining outcome ids must be distinct.');
+    // These are audit labels, not executable scopes. The child descriptions,
+    // ownership assignments and parent/ancestor fingerprints below establish
+    // the actual partition; rejecting a repeated high-level label can strand a
+    // valid concrete split without making it safer.
+    known.add(id);
     return { id, description: entry.description.trim() };
   });
   const claimed = new Set<string>();

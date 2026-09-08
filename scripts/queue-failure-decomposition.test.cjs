@@ -124,17 +124,20 @@ test('splitting requires a genuine structural partition, not giving all work to 
   assert.throws(() => parse(omitted), /omit unfinished outcomes/);
 });
 
-test('remaining outcomes must be concrete, distinct, and explicitly owned', () => {
+test('remaining outcomes must be concrete, uniquely identified, and explicitly owned', () => {
   assert.throws(() => parse({ ...plan(), remainingOutcomes: [] }), /at least two/);
   for (const patch of [
     { id: 'implementation' },
     { id: 'observation', description: ' ' },
-    { id: 'observation', description: plan().remainingOutcomes[0].description.toUpperCase() },
+    { id: 'implementation', description: 'A different labelled outcome.' },
   ]) {
     const invalid = plan();
     invalid.remainingOutcomes[1] = patch;
-    assert.throws(() => parse(invalid), /concrete unfinished|must be distinct/);
+    assert.throws(() => parse(invalid), /concrete unfinished|ids must be distinct/);
   }
+  const repeatedLabel = plan();
+  repeatedLabel.remainingOutcomes[1].description = repeatedLabel.remainingOutcomes[0].description;
+  assert.equal(parse(repeatedLabel).splitInto.length, 2, 'child scopes, not audit labels, define the partition');
   for (const ids of [[], ['unknown'], ['implementation', 'implementation']]) {
     const invalid = plan();
     invalid.splitInto[0].outcomeIds = ids;
