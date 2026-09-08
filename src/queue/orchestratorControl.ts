@@ -73,6 +73,28 @@ export abstract class OrchestratorControl extends OrchestratorState {
     this.output.appendLine(`[queue] ${msg}`);
   }
 
+  /**
+   * Runs work launched by a timer without creating an unhandled rejection.
+   *
+   * The cron and watchdog are deliberately fire-and-forget: the extension
+   * host must keep serving the editor while a model turn is in flight. A
+   * rejected promise from one of those callbacks used to be invisible to the
+   * queue and could leave the UI showing RUNNING with no useful work. Keep the
+   * timer alive and leave a durable breadcrumb in the output channel instead.
+   */
+  protected schedule(label: string, work: () => void | Promise<void>): void {
+    try {
+      const result = work();
+      if (result && typeof (result as Promise<void>).catch === 'function') {
+        void (result as Promise<void>).catch((error: any) => {
+          this.log(`${label} failed: ${error?.message ?? error}`);
+        });
+      }
+    } catch (error: any) {
+      this.log(`${label} failed: ${error?.message ?? error}`);
+    }
+  }
+
   // ---- controls --------------------------------------------------------
 
   /**
@@ -123,7 +145,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
     // the watchdog reads the run state, so leaving it running costs one cheap
     // query a minute and means no code path can switch the safety net off.
     if (!this.watchdog) {
-      this.watchdog = setInterval(() => this.kick(), WATCHDOG_MS);
+      this.watchdog = setInterval(() => this.schedule('watchdog check', () => this.kick()), WATCHDOG_MS);
     }
     this.changed();
     this.log(`started — cron every ${Math.round(this.intervalMs / 1000)}s, mode ${this.mode}`);
@@ -139,11 +161,14 @@ export abstract class OrchestratorControl extends OrchestratorState {
     // must be paid after activate() has returned, not inside it.
     if (this.queue.awaitingVerification().length > 0) {
       setTimeout(() => {
-        if (!this.disposed && this.queue.runState === 'RUNNING') void this.tick();
+        this.schedule('initial supervisor check', () => {
+          if (!this.disposed && this.queue.runState === 'RUNNING') return this.tick();
+          return Promise.resolve();
+        });
       }, 1000);
       return;
     }
-    void this.pump();
+    this.schedule('initial execution pump', () => this.pump());
   }
 
   stop(): void {
@@ -195,7 +220,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
     this.disarm();
     const ms = this.intervalMs;
     this.nextTickAt = Date.now() + ms;
-    this.timer = setInterval(() => void this.tick(), ms);
+    this.timer = setInterval(() => this.schedule('cron supervisor check', () => this.tick()), ms);
   }
 
   protected disarm(): void {

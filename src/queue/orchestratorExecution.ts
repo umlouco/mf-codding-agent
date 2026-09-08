@@ -71,7 +71,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     if (task.kind === 'phase') {
       await this.runExpansion(task, attempt, gen, current);
       if (this.mode === 'continuous') {
-        void this.pump();
+        this.schedule('continuous execution pump', () => this.pump());
       }
       return;
     }
@@ -208,7 +208,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     // Continuous mode keeps going without waiting for the cron. pump() will
     // no-op on its own if the database says there is nothing left to claim.
     if (this.mode === 'continuous') {
-      void this.pump();
+      this.schedule('continuous execution pump', () => this.pump());
     }
   }
 }

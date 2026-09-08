@@ -91,7 +91,7 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       return;
     }
     // The supervisor decides when the next worker starts.
-    void this.pump();
+    this.schedule('execution pump after supervision', () => this.pump());
   }
 
   /**
@@ -307,6 +307,6 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     if (s.byStatus.EXECUTING === 0 && s.byStatus.VERIFYING === 0) {
       this.log(`${open} pending task(s); checking the execution pump`);
     }
-    void this.pump();
+    this.schedule('watchdog execution pump', () => this.pump());
   }
 }

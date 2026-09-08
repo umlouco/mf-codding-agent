@@ -161,7 +161,10 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
   /** Completed stages should not wait for the periodic liveness scan. */
   protected wakeAfterHandoff(): void {
     setTimeout(() => {
-      if (!this.disposed && this.queue.runState === 'RUNNING') void this.tick();
+      this.schedule('handoff supervisor check', () => {
+        if (!this.disposed && this.queue.runState === 'RUNNING') return this.tick();
+        return Promise.resolve();
+      });
     }, 0);
   }
 

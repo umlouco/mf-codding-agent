@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { detectLanguages, memoryDbPath, workspaceRoot } from '../detect';
 import { getRouter } from '../llm/router';
-import { resolveMcpServers } from '../mcp';
+import { MCP_SERVER_NAME, resolveMcpServers } from '../mcp';
 import { EditorToolDef, getBridge } from '../mcpBridge';
 import { getActiveQueue } from '../queue/registry';
 import { discoverInstalledSkills } from '../skills';
@@ -193,6 +193,11 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
   // A server the editor alone can resolve (see DiscoveredMcpServer.problem)
   // is left out rather than sent with a placeholder where its key should be.
   const mcpServers = (await resolveMcpServers(getContext(), store))
+    // The task-queue MCP server is published by this extension for editor and
+    // external clients. Passing it back into every core turn makes the core
+    // recursively launch a second queue server from the user's stale path.
+    // Keep it visible in the MCP settings/UI, but never dial it internally.
+    .filter((s) => s.name !== MCP_SERVER_NAME)
     .filter((s) => !s.problem)
     .map((s) => ({
       ...s,
