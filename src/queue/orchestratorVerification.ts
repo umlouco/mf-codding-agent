@@ -14,6 +14,7 @@ import { verdictReplacementTasks } from './scopeVerdict';
 import { isLocalScope } from './scopeContract';
 import { verificationAuthority } from './verificationAuthority';
 import { implementationRetryProblem } from './verificationRecovery';
+import { decompositionFamily, requiresDecomposition } from './recoveryDecomposition';
 
 /** A verdict belongs to one claim, contract and report, not merely a row ID. */
 function sameVerificationSnapshot(current: Task | undefined, snapshot: Task): boolean {
@@ -29,10 +30,11 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
   /** Delegates formal verification to a fresh execution LLM and persists its response. */
   protected async verifyWithExecutor(task: Task, review: Review): Promise<void> {
     if (!sameVerificationSnapshot(this.queue.get(task.id), task) || review.gen !== this.reviewGen) return;
+    if (requiresDecomposition(task)) return;
     if (scopeBlocked(task, this.queue.list())) return;
     if (this.correctTestingTarget(task)) return;
     if (this.queue.countEvents(task.id, 'verification-pass', true) >= 2) {
-      this.failVerification(task, 'Two verification passes did not establish completion. ' +
+      this.requestFailureDecomposition(task, 'Two verification passes did not establish completion. ' +
         (task.supervisorFeedback || task.validationReport || 'See the validator journal for the missing check.'));
       return;
     }
@@ -134,17 +136,6 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
     }
   }
 
-  private failVerification(task: Task, reason: string): void {
-    this.queue.update(task.id, { status: 'FAILED', finishedAt: Date.now(),
-      activityPhase: 'verification_blocked', activityDetail: reason.slice(0, 4000),
-      supervisorFeedback: reason.slice(0, 8000) });
-    completeRecoveryJob(this.queue, task);
-    this.queue.log(task.id, 'system', 'verification-blocked', reason.slice(0, 8000));
-    this.log(`task ${task.seq}: verification stopped; work and evidence retained for review`);
-    this.changed();
-    this.wakeAfterHandoff();
-  }
-
   private verificationIdentity(task: Task): string {
     return JSON.stringify([task.createdAt, task.startedAt, task.attempts, task.title, task.kind, task.region, task.splitScope, task.description,
       task.implVerifyPrompt, task.solutionVerifyPrompt, task.solutionVerifyCommand, task.output,
@@ -177,6 +168,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
   /** Runs the full verification pass for one task and applies the verdict. */
   protected async supervise(task: Task): Promise<void> {
     if (!sameVerificationSnapshot(this.queue.get(task.id), task)) return;
+    if (requiresDecomposition(task)) return;
     if (!storedValidationProblem(task.validationReport) && this.currentHostVerification(task)) {
       this.queue.update(task.id, { status: 'VERIFIED', finishedAt: Date.now(),
         supervisorFeedback: 'Independent verification passed the assigned checks.' });
@@ -187,7 +179,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       return;
     }
     if (this.queue.countEvents(task.id, 'verification-decision', true) >= 2) {
-      this.failVerification(task, 'Verification recovery did not resolve the task after two decisions. ' +
+      this.requestFailureDecomposition(task, 'Verification recovery did not resolve the task after two decisions. ' +
         (task.supervisorFeedback || task.validationReport));
       return;
     }
@@ -292,7 +284,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       } else {
         try { this.applyVerdictSplit(task, decision, accepts); }
         catch (error: any) {
-          if (accepts()) this.pauseForRecovery(task, `Replacement plan could not be committed: ${error?.message ?? error}`);
+          if (accepts()) this.requestFailureDecomposition(task, `Replacement plan could not be committed: ${error?.message ?? error}`);
         }
       }
       this.changed();
@@ -394,6 +386,9 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
     const archiveKey = `scopeSplit:${task.id}:${task.startedAt ?? task.createdAt}:verdict:` +
       this.queue.countEvents(task.id, 'verdict:SPLIT');
     const parts = verdictReplacementTasks(decision.splitInto!, task, archiveKey);
+    if (requiresDecomposition(task)) for (const part of parts) {
+      part.region = JSON.stringify({ ...JSON.parse(part.region || '{}'), failureFamily: decompositionFamily(task) });
+    }
     // A rolled-back replacement may leave an unused archive, never a missing
     // original handoff. splitTask inserts every child and deletes the parent in one transaction.
     this.queue.setMeta(archiveKey, JSON.stringify({ task, decision,

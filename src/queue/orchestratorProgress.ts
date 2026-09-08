@@ -60,6 +60,10 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     if (task.status !== 'EXECUTING' &&
         task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (supervisor_repair_required)`) &&
         /queue ownership: the supervisor (?:must rewrite existing test|owns test rewrites)/.test(task.output)) {
+      if (this.queue.countEvents(task.id, 'test-repair-started') > 0) {
+        this.requestFailureDecomposition(task, `The executor encountered the same test-ownership blocker after a supervisor repair. Split the application and test work instead of repeating that repair.\n${task.output}`);
+        return;
+      }
       await this.repairTests(task, `The executor was blocked from rewriting a supervisor-owned test. Complete the assigned test correction yourself.\n${task.output}`);
       return;
     }
@@ -199,6 +203,10 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
   }
 
   protected async repairTests(task: Task, reason: string): Promise<void> {
+    if (this.queue.countEvents(task.id, 'test-repair-halted') > 0) {
+      this.requestFailureDecomposition(task, `A previous supervisor test repair halted. Replace this task rather than restarting the exhausted repair.\n${reason}`);
+      return;
+    }
     // Replace the completed decision's worker without releasing the current
     // supervision cycle; a second tick must not start a concurrent repair.
     if (this.review?.taskId === task.id) {
@@ -213,6 +221,18 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     this.review = review;
     const live = new LiveLog(this.queue, task.id, 'supervisor');
     this.queue.log(task.id,'supervisor','test-repair-started',reason);
+    let ownershipFailure = '';
+    const decompose = (failure: string): void => {
+      const current = this.queue.get(task.id);
+      if (review.gen !== this.reviewGen || !current) return;
+      // The repair narration is not the executor's original evidence. Keep the
+      // rejected parent's report/handoff intact for the replacement archive.
+      this.queue.update(task.id, {output:task.output, validationReport:task.validationReport,
+        errorLog:appendAttempt(current.errorLog,
+        `[attempt ${task.attempts}] supervisor test repair halted: ${failure}`)});
+      this.queue.log(task.id,'supervisor','test-repair-halted',failure);
+      this.requestFailureDecomposition(this.queue.get(task.id)!, failure);
+    };
     try {
       const observe=this.observerEvents(task.id,'supervisor',live,()=>review.gen===this.reviewGen);
       // Give the repair model the real failure first, rather than asking it
@@ -237,22 +257,37 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         `Fix the concrete reported failure first. Do not make identical old/new edits or cosmetic selector changes.\n` +
         `Repair requested: ${reason}\nPrevious evidence: ${task.output.slice(0,8000)}`, {
           allowTestEdits:true,
-          onAbort:abort=>{if(review.gen!==this.reviewGen){abort();return;}review.abort=abort;},
-          onEvent:observe,
+          onAbort:abort=>{if(review.gen!==this.reviewGen || ownershipFailure){abort();return;}review.abort=abort;},
+          onEvent:(method,params)=>{
+            if(review.gen!==this.reviewGen)return;
+            observe(method,params);
+            if(!ownershipFailure && method==='stream/tool' && params?.status==='error' &&
+                /queue ownership:/i.test(String(params.output ?? ''))) {
+              ownershipFailure=String(params.output);
+              // Persist intent before abort settles: Pause/reload must not lose
+              // this host-observed failure or restart the same repair marker.
+              this.queue.update(task.id,{output:task.output,validationReport:task.validationReport});
+              this.queue.recordActivity(task.id,'decomposition_required',ownershipFailure,'supervisor');
+              this.changed();
+              try { review.abort?.(); } catch { /* A blocked repair may already have exited. */ }
+            }
+          },
           onActivity:a=>{if(review.gen!==this.reviewGen)return;review.lastActivityAt=a.at;live.activity(a);this.queue.recordActivity(task.id,a.phase,a.detail,'supervisor');},
         });
       if(review.gen!==this.reviewGen)return;
       this.queue.addUsage(task.id,result.usage);
-      const halted = coreHalted(result.stopReason);
       this.queue.update(task.id,{output:result.text,validationReport:'',
-        supervisorFeedback:reason.replace('[SUPERVISOR_TEST_REPAIR]', '').trim(),
-        ...(halted ? {errorLog:appendAttempt(this.queue.get(task.id)!.errorLog,
-          `[attempt ${task.attempts}] supervisor test repair halted (${result.stopReason}). Reassess or split the repair; do not repeat an unchanged repair.`)} : {})});
+        supervisorFeedback:reason.replace('[SUPERVISOR_TEST_REPAIR]', '').trim()});
       this.queue.log(task.id,'supervisor','test-repair-finished',result.text);
-      if(halted) this.queue.log(task.id,'supervisor','test-repair-halted',result.stopReason);
-      // A halted turn may have fixed the file before getting stuck. Check the
-      // current files; a failed required command goes straight to supervision.
+      if (ownershipFailure || coreHalted(result.stopReason)) {
+        decompose(ownershipFailure || `Supervisor test repair stopped (${result.stopReason}).`);
+        return;
+      }
+      // Only a completed, unblocked repair proceeds to independent verification.
       await this.verifyWithExecutor(this.queue.get(task.id)!,review);
+    } catch (error: any) {
+      if (review.gen === this.reviewGen && error?.usage) this.queue.addUsage(task.id,error.usage);
+      decompose(ownershipFailure || `Supervisor test repair failed: ${String(error)}`);
     } finally {
       live.close();
       if(this.review===review)this.review=null;
@@ -277,8 +312,15 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       solutionVerifyCommand: task.solutionVerifyCommand,
     };
     if (this.review?.taskId === id) this.abandonReview();
-    if (!this.stopForDecision(task, { status: 'PENDING', finishedAt: null })) return 0;
-    const count = this.queue.splitTask(id, [...parts, acceptance], true);
+    // Persist the replacement obligation before SQL: a crash must not requeue the old parent.
+    if (!this.stopForDecision(task, { status: 'VERIFYING', activityPhase: 'decomposition_required', finishedAt: null })) return 0;
+    let count: number;
+    try { count = this.queue.splitTask(id, [...parts, acceptance], true); }
+    catch (error) {
+      const current = this.queue.get(id);
+      if (current) this.requestFailureDecomposition(current, `Replacement could not be committed: ${String(error)}`);
+      throw error;
+    }
     this.reviewed.delete(id);
     this.changed();
     this.wakeAfterHandoff();

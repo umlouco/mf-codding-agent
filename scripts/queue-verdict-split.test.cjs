@@ -103,8 +103,8 @@ test('a failed replacement insert rolls back deletion, children, ordering and ac
   }
   assert.equal(f.queue.stats().usage.input, 1, 'the attempted supervisor turn still cost tokens');
   assert.equal(f.queue.runState, 'RUNNING');
-  assert.equal(f.load('src/queue/recoverySchedule.ts').readRecoveryJob(f.queue, f.original).active, true);
-  assert.match(f.load('src/queue/recoverySchedule.ts').readRecoveryJob(f.queue, f.original).reason, /test replacement failure/);
+  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_required');
+  assert.match(f.load('src/queue/recoveryDecomposition.ts').readDecomposition(f.queue, f.original).reason, /test replacement failure/);
   assert.equal(f.calls.length, 0);
 });
 
@@ -116,7 +116,7 @@ test('incomplete supplied plans are rejected whole without deleting the task or 
     assert.equal(f.queue.get(f.original.id).status, 'VERIFYING');
     assert.equal(f.queue.get(f.original.id).validationReport, f.original.validationReport);
     assert.equal(f.queue.runState, 'RUNNING');
-  assert.equal(f.load('src/queue/recoverySchedule.ts').readRecoveryJob(f.queue, f.original).active, true);
+  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_required');
     assert.equal(f.calls.length, 0);
   }
 });
@@ -188,7 +188,7 @@ test('required acceptance command cannot disappear from the replacement plan', a
   f.queue.update(f.original.id, { solutionVerifyCommand: 'npm test' });
   await f.runner.supervise(f.queue.get(f.original.id));
   assert.equal(f.queue.runState, 'RUNNING');
-  assert.equal(f.load('src/queue/recoverySchedule.ts').readRecoveryJob(f.queue, f.original).active, true);
+  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_required');
   assert.equal(f.queue.get(f.original.id).solutionVerifyCommand, 'npm test');
-  assert.match(f.load('src/queue/recoverySchedule.ts').readRecoveryJob(f.queue, f.original).reason, /retain the original required verification command/);
+  assert.match(f.load('src/queue/recoveryDecomposition.ts').readDecomposition(f.queue, f.original).reason, /retain the original required verification command/);
 });

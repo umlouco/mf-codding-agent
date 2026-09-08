@@ -16,7 +16,7 @@ function load(file, dependencies = {}) {
   const exports = {};
   vm.runInNewContext(outputText, {
     exports, __dirname: path.dirname(absolute), process, Buffer,
-    require: name => dependencies[name] ?? {},
+    require: name => dependencies[name] ?? (/^\.\/(db|panel)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : {}),
   }, { filename: absolute });
   return exports;
 }
@@ -27,13 +27,14 @@ function fixture(t, runPlanner) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mf-edit-panel-'));
   const file = path.join(root, 'queue.db');
   const queue = database.TaskQueue.open(file);
-  const info = [], errors = [], notes = [];
+  const info = [], errors = [], notes = [], warnings = [];
   const vscode = {
     ProgressLocation: { Notification: 1 },
     window: {
       withProgress: async (_, work) => work(),
       showInformationMessage: message => info.push(message),
       showErrorMessage: message => errors.push(message),
+      showWarningMessage: message => warnings.push(message),
     },
   };
   const panel = load('src/queue/panel.ts', {
@@ -55,7 +56,7 @@ function fixture(t, runPlanner) {
     assert.ok(path.basename(root).startsWith('mf-edit-panel-'));
     fs.rmSync(root, { recursive: true, force: true });
   });
-  return { queue, file, provider, info, errors, notes };
+  return { queue, file, provider, info, errors, notes, warnings };
 }
 
 test('Edit Tasks removes all 251 requested rows and reports the committed result after reopen', async t => {
@@ -110,4 +111,35 @@ test('Edit Tasks reports a rejected revision without claiming any deletion succe
   assert.equal(f.notes.some(note => note.text === 'Removed both tasks.'), false);
   assert.equal(f.notes.some(note => note.kind === 'error'), true);
   assert.equal(f.provider.generating, false);
+});
+
+
+test('manual status controls cannot revive a failed parent or reset its recovery allowances', async t => {
+  const f = fixture(t, async () => { throw Error('No planning needed for status control'); });
+  f.provider.orch = {};
+  f.queue.addAll([{ title: 'Requires split', description: 'Original contract' }]);
+  const id = f.queue.list()[0].id;
+  f.queue.update(id, { status: 'FAILED', output: 'Failed attempt evidence' });
+  f.queue.setMeta(`failureDecomposition:v1:${id}`, 'prior rejected decomposition');
+  f.queue.setMeta(`verificationAccepted:${id}`, 'prior verification receipt');
+  await f.provider.onMessage({ type: 'setStatus', id, status: 'PENDING' });
+  assert.equal(f.queue.get(id).status, 'VERIFYING');
+  assert.equal(f.queue.get(id).activityPhase, 'decomposition_required');
+  assert.equal(f.queue.get(id).output, 'Failed attempt evidence');
+  assert.equal(f.queue.getMeta(`failureDecomposition:v1:${id}`), 'prior rejected decomposition');
+  assert.equal(f.queue.getMeta(`verificationAccepted:${id}`), 'prior verification receipt');
+  assert.equal(f.queue.countEvents(id, 'verification-retry'), 0);
+  assert.equal(f.warnings.length, 1);
+});
+
+test('FAILED is not a selectable or editable task status', async t => {
+  const f = fixture(t, async () => { throw Error('No planning needed for status control'); });
+  f.provider.orch = {};
+  f.queue.addAll([{ title: 'Ready', description: 'Original contract' }]);
+  const id = f.queue.list()[0].id;
+  await f.provider.onMessage({ type: 'setStatus', id, status: 'FAILED' });
+  await f.provider.onMessage({ type: 'updateTask', id, patch: { status: 'FAILED' } });
+  assert.equal(f.queue.get(id).status, 'PENDING');
+  assert.equal(f.errors.length, 2);
+  assert.ok(f.errors.every(error => /Unsupported task status/.test(error)));
 });

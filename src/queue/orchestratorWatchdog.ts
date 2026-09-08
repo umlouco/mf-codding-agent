@@ -4,6 +4,7 @@ import { appendAttempt } from './orchestratorState';
 import { scopeBlocked } from './scopePlan';
 import { recoveryFailure } from './recovery';
 import { deferRecoveryJob, hasOutstandingRecovery, hasRecoveryJob, completeRecoveryJob } from './recoverySchedule';
+import { requiresDecomposition } from './recoveryDecomposition';
 
 export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
@@ -52,6 +53,7 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
         if (!current || current.status !== 'VERIFYING' || scopeBlocked(current, this.queue.list())) {
           continue;
         }
+        if (await this.serviceFailureDecomposition(current)) continue;
         if (current.kind === 'phase') {
           await this.serviceRecovery(current);
           continue;
@@ -67,7 +69,7 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
           current = this.queue.get(task.id);
         }
         if (this.cycle !== cycle || this.queue.runState !== 'RUNNING') break;
-        if (current?.status === 'VERIFYING' && current.validationReport.trim()) {
+        if (current?.status === 'VERIFYING' && !requiresDecomposition(current) && current.validationReport.trim()) {
           await this.supervise(current);
         }
       }
@@ -161,6 +163,11 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     this.changed();
     const task = this.queue.get(r.taskId);
     if (task) {
+      if (requiresDecomposition(task)) {
+        this.queue.recordActivity(task.id, 'decomposition_waiting',
+          `${note}; the persisted decomposition allowance is retained, not reset.`, 'supervisor');
+        return;
+      }
       if (hasRecoveryJob(this.queue, task)) {
         const job = deferRecoveryJob(this.queue, task, note);
         this.queue.recordActivity(task.id, 'recovery_waiting', `${note}; next autonomous recovery: ${new Date(job.dueAt).toISOString()}.`, 'supervisor');

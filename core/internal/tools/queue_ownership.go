@@ -101,7 +101,7 @@ func (e *Env) CheckQueueWritePath(path string) error {
 		return fmt.Errorf("queue ownership: %s cannot rewrite workspace files; request supervisor test repair", e.QueueRole)
 	}
 	if e.QueueRole == "supervisor-repair" && !testPath(normalized) {
-		return fmt.Errorf("queue ownership: supervisor test repair cannot rewrite application file %s; return an implementation repair decision", path)
+		return fmt.Errorf("queue ownership: supervisor test repair cannot rewrite application file %s; stop this repair and request SPLIT into separate implementation and verification tasks while preserving the original owner goal", path)
 	}
 	if e.QueueRole == "executor" && testPath(normalized) {
 		if _, err := os.Stat(resolved); err == nil {

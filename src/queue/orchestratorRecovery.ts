@@ -4,6 +4,7 @@ import type { Review } from './orchestratorState';
 import { acknowledgeRecovery, recoveryRequest, recoveryState } from './recovery';
 import { beginRecoveryAttempt, completeRecoveryJob, deferRecoveryJob, hasRecoveryJob,
   readRecoveryJob, RecoveryOutcome, scheduleRecoveryJob } from './recoverySchedule';
+import { requiresDecomposition } from './recoveryDecomposition';
 
 /** Exhausted strategies become durable scheduled work. Only the operator stops a run. */
 export abstract class OrchestratorRecovery extends OrchestratorWatchdog {
@@ -21,6 +22,7 @@ export abstract class OrchestratorRecovery extends OrchestratorWatchdog {
   protected pauseForRecovery(snapshot: Task, reason: string): void {
     const task = this.queue.get(snapshot.id);
     if (!task || task.status === 'VERIFIED' || this.disposed || this.queue.runState !== 'RUNNING') return;
+    if (requiresDecomposition(task)) { this.requestFailureDecomposition(task, reason); return; }
     const existed = hasRecoveryJob(this.queue, task);
     if (!this.stopForDecision(task, { status: 'VERIFYING', activityPhase: 'recovery_waiting' })) return;
     if (this.review?.taskId === task.id) this.abandonReview();
@@ -40,6 +42,7 @@ export abstract class OrchestratorRecovery extends OrchestratorWatchdog {
 
   /** Called before either review lane. No provider call occurs before persisted dueAt. */
   protected async serviceRecovery(snapshot: Task): Promise<boolean> {
+    if (requiresDecomposition(this.queue.get(snapshot.id) ?? snapshot)) return this.serviceFailureDecomposition(snapshot);
     let task = this.queue.get(snapshot.id);
     if (!task) return false;
     const blocked = recoveryState(this.queue, task).blocked;

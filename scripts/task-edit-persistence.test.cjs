@@ -4,27 +4,11 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const sqlite = require('node:sqlite');
-const ts = require('typescript');
 
-const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'queue', 'db.ts'), 'utf8');
-const { outputText } = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
-});
-const exported = {};
-vm.runInNewContext(outputText, {
-  exports: exported, process, __dirname,
-  require: name => {
-    if (name === 'fs') return fs;
-    if (name === 'path') return path;
-    if (name === 'node:sqlite') return sqlite;
-    throw new Error(`Test deliberately excludes optional module ${name}`);
-  },
-});
-const { TaskQueue, taskEditSummary } = exported;
+const { TaskQueue, taskEditSummary } = require('./queue-scope-helpers.cjs').loader()('src/queue/db.ts');
 
 function fixture(t, tasks) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mf-task-edit-test-'));

@@ -9,7 +9,7 @@ function load(file) {
  const exports = {};
  vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname,'..',file),'utf8'), {
   compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}
- }).outputText,{exports,process,URL,__dirname,require});
+ }).outputText,{exports,process,URL,__dirname,require:name=>name.startsWith('./db') ? load('src/queue/'+name.slice(2)+'.ts') : require(name)});
  return exports;
 }
 const {TaskQueue}=load('src/queue/db.ts');

@@ -23,7 +23,7 @@ test('supported current verification advances directly with no scope or verdict 
   assert.equal(queue.claimNext().seq,2);
 });
 
-test('two failed passes retire the task without fabricating success or losing the handoff', async t => {
+test('two unsuccessful passes require decomposition without losing the handoff', async t => {
   const queue=fixture(t); const task=ready(queue); let calls=0;
   queue.addAll([{title:'Next task',description:'Independent work'}]);
   const incomplete={...report(),conclusion:'INCOMPLETE',remaining:'Authentication failed on supplied target'};
@@ -32,19 +32,21 @@ test('two failed passes retire the task without fabricating success or losing th
   }}});
   for(let i=0;i<3;i++) await runner.startIndependentVerification(queue.get(task.id));
   assert.equal(calls,2);
-  assert.equal(queue.get(task.id).status,'FAILED');
+  assert.equal(queue.get(task.id).status,'VERIFYING');
+  assert.equal(queue.get(task.id).activityPhase,'decomposition_required');
   assert.equal(queue.get(task.id).output,task.output);
   assert.equal(JSON.parse(queue.get(task.id).validationReport).conclusion,'INCOMPLETE');
   assert.equal(queue.claimNext().seq,2);
 });
 
-test('two unreadable supervisor decisions cannot keep a task in VERIFYING forever',async t=>{
+test('two unreadable supervisor decisions enter mandatory decomposition, not terminal failure',async t=>{
   const queue=fixture(t);const task=ready(queue);let calls=0;
   queue.update(task.id,{validationReport:JSON.stringify({...report(),conclusion:'INCOMPLETE'})});
   const runner=orchestrator(queue,{'./agents':{superviseTask:async()=>{calls++;throw Error('Unreadable decision');}}});
   for(let i=0;i<3;i++) await runner.supervise(queue.get(task.id));
-  assert.equal(calls,2);assert.equal(queue.get(task.id).status,'FAILED');
-  assert.equal(queue.isComplete(),true);assert.equal(queue.anyFailed(),true);
+  assert.equal(calls,2);assert.equal(queue.get(task.id).status,'VERIFYING');
+  assert.equal(queue.get(task.id).activityPhase,'decomposition_required');
+  assert.equal(queue.isComplete(),false);assert.equal(queue.anyFailed(),false);
 });
 
 test('a changed contract cannot reuse an earlier host-backed PASS',async t=>{

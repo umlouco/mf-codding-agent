@@ -25,7 +25,12 @@ export abstract class OrchestratorScope extends OrchestratorJournal {
       ownerContext: JSON.stringify([this.queue.getMeta('goal'), this.queue.testingContext + this.queue.instructions]),
       events: this.queue.events(task.id, -1), archivedAt: Date.now() }));
     const parts = replacementTasks(assessment, task, archiveKey);
-    const count = this.queue.splitTask(task.id, parts);
+    let count: number;
+    try { count = this.queue.splitTask(task.id, parts); }
+    catch (error) {
+      if (current()) this.requestFailureDecomposition(task, `Replacement could not be committed: ${String(error)}`);
+      return false;
+    }
     if (!count) return false;
 
     // Persist replacement rows first, then fence callbacks and cancel affected workers.

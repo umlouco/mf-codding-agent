@@ -202,6 +202,8 @@ export abstract class OrchestratorState {
   protected abstract shouldReview(task: Task, latestEventId: number): boolean;
   protected abstract correctTestingTarget(task: Task): boolean;
   protected abstract repairTests(task: Task, reason: string): Promise<void>;
+  protected abstract requestFailureDecomposition(task: Task, reason: string): void;
+  protected abstract serviceFailureDecomposition(task: Task): Promise<boolean>;
   protected abstract reviewWork(task: Task): Promise<void>;
   protected abstract pauseForRecovery(task: Task, reason: string): void;
   protected abstract serviceRecovery(task: Task): Promise<boolean>;

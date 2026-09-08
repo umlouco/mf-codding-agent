@@ -5,6 +5,7 @@ import { OrchestratorState, OrchestratorStatus, RunMode, WATCHDOG_MS } from './o
 import { recoveryKey, resumeRecovery } from './recovery';
 import { restoreScopedContracts } from './scopeContract';
 import { hasOutstandingRecovery, recoveryJobKey } from './recoverySchedule';
+import { requiresDecomposition } from './recoveryDecomposition';
 
 export abstract class OrchestratorControl extends OrchestratorState {
 
@@ -104,6 +105,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
       const restored = restoreScopedContracts(this.queue);
       if (restored) this.log(`restored ${restored} admitted local contract(s) expanded by earlier supervisor rewrites`);
       for (const task of this.queue.list()) {
+        if (requiresDecomposition(task)) continue;
         if (resumeRecovery(this.queue, task)) this.reviewed.delete(task.id);
       }
     }
@@ -216,12 +218,9 @@ export abstract class OrchestratorControl extends OrchestratorState {
     this.changed();
 
     const s = this.queue.stats();
-    const failed = s.byStatus.FAILED;
-    this.log(`run complete — ${s.byStatus.VERIFIED} verified, ${failed} failed`);
+    this.log(`run complete — ${s.byStatus.VERIFIED} verified`);
     void vscode.window.showInformationMessage(
-      failed > 0
-        ? `MF Agent queue finished: ${s.byStatus.VERIFIED} verified, ${failed} failed.`
-        : `MF Agent queue finished: all ${s.byStatus.VERIFIED} tasks verified.`,
+      `MF Agent queue finished: ${s.byStatus.VERIFIED} tasks verified.`,
     );
     this.notify('finished', s);
   }

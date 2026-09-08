@@ -1,6 +1,6 @@
 import type { Task } from './db';
 import type { SupervisorDecision } from './agents';
-import { OrchestratorRecovery } from './orchestratorRecovery';
+import { OrchestratorDecomposition } from './orchestratorDecomposition';
 import type { Review } from './orchestratorState';
 import { LiveLog } from './liveLog';
 import { decideRecovery, recoveryOperation } from './recoveryDecision';
@@ -11,7 +11,7 @@ import { verificationAuthority } from './verificationAuthority';
 import { implementationRetryProblem } from './verificationRecovery';
 
 /** Recovery changes the next operation, not the owner's task or its acceptance criteria. */
-export abstract class OrchestratorRemediation extends OrchestratorRecovery {
+export abstract class OrchestratorRemediation extends OrchestratorDecomposition {
   protected abstract verifyWithExecutor(task: Task, review: Review): Promise<void>;
   protected abstract applyVerdictSplit(task: Task, decision: SupervisorDecision, current: () => boolean): boolean;
 

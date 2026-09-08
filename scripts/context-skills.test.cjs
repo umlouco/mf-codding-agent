@@ -11,7 +11,7 @@ function load(file, dependencies = {}) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   });
   const exports = {};
-  vm.runInNewContext(outputText, { exports, process, __dirname, require: name => dependencies[name] ?? {} });
+  vm.runInNewContext(outputText, { exports, process, __dirname, require: name => dependencies[name] ?? (name.startsWith('./db') ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : {}) });
   return exports;
 }
 

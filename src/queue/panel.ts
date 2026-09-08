@@ -1,19 +1,15 @@
 import * as vscode from 'vscode';
 import { scheduleRestart } from '../coreRestart';
-import { mcpConnection } from '../coreStatus';
-import { discoverMcpServers } from '../mcp';
 import { getBridge } from '../mcpBridge';
 import { getStore } from '../providers/instance';
-import type { Skill } from '../providers/store';
-import { discoverInstalledSkills } from '../skills';
-import { editTasks, planGoal } from './agents';
-import { Task, TaskQueue, taskEditSummary } from './db';
-import { LiveLog } from './liveLog';
+import { TASK_STATUSES, TaskQueue } from './db';
 import { Orchestrator } from './orchestrator';
-import { recoveryKey } from './recovery';
-import { recoveryJobKey } from './recoverySchedule';
 import { notifySkillsChanged, onDidChangeSkills } from './registry';
 import { saveTestingEnvironment } from './testingEnvironment';
+import { renderQueueHtml } from './panelHtml';
+import { PlanningHost, generatePlan, applyTaskEditPrompt } from './panelPlanning';
+import { confirmAutonomy, confirmDelete, confirmReset, confirmClear, setMcpKey } from './panelPrompts';
+import { queueViewState } from './panelState';
 
 /**
  * The Task Queue sidebar.
@@ -93,7 +89,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')],
     };
-    view.webview.html = this.html(view.webview);
+    view.webview.html = renderQueueHtml(this.context, view.webview);
     view.webview.onDidReceiveMessage((msg) => void this.onMessage(msg));
     // A hidden view has nobody reading it; the poll stops with it and picks
     // up where the table is when it shows again.
@@ -260,7 +256,8 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           scheduleRestart('editor tools reset from the Task Queue', this.output);
           break;
         case 'setMcpKey':
-          await this.setMcpKey(String(msg.name ?? ''));
+          await setMcpKey(this.context, String(msg.name ?? ''));
+          this.render();
           break;
 
         // A terminal being opened asks for what it missed: the newest rows of
@@ -272,7 +269,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
         }
 
         case 'start':
-          if (await this.confirmAutonomy(queue)) {
+          if (await confirmAutonomy(queue)) {
             orch.start();
           }
           break;
@@ -283,7 +280,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           orch.pause();
           break;
         case 'reset':
-          if (await this.confirmReset()) {
+          if (await confirmReset()) {
             orch.reset();
           }
           break;
@@ -295,17 +292,18 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           break;
 
         case 'updateTask':
+          if (msg.patch?.status !== undefined && !TASK_STATUSES.includes(msg.patch.status)) {
+            throw new Error('Unsupported task status.');
+          }
           queue.update(Number(msg.id), msg.patch);
           this.render();
           break;
         case 'setStatus': {
+          if (!TASK_STATUSES.includes(msg.status)) throw new Error('Unsupported task status.');
           const task = queue.get(Number(msg.id));
-          if (task?.status === 'FAILED' && ['PENDING', 'VERIFYING'].includes(msg.status)) {
-            queue.log(task.id, 'user', 'verification-retry', JSON.stringify({
-              recovery: queue.getMeta(recoveryKey(task)), scheduled: queue.getMeta(recoveryJobKey(task)) }));
-            queue.setMeta(recoveryKey(task), '');
-            queue.setMeta(recoveryJobKey(task), '');
-            queue.setMeta(`verificationAccepted:${task.id}`, '');
+          if (task?.activityPhase.startsWith('decomposition_')) {
+            void vscode.window.showWarningMessage('This task requires replacement by smaller tasks. Its failure cannot be cleared by changing status.');
+            break;
           }
           queue.update(Number(msg.id), { status: msg.status });
           queue.log(Number(msg.id), 'user', 'status-set', msg.status);
@@ -314,7 +312,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
         }
         case 'deleteTask': {
           const task = queue.get(Number(msg.id));
-          if (task && msg.confirm && !(await this.confirmDelete(task))) {
+          if (task && msg.confirm && !(await confirmDelete(task))) {
             break;
           }
           queue.remove(Number(msg.id));
@@ -331,7 +329,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           this.render();
           break;
         case 'clearQueue':
-          if (await this.confirmClear()) {
+          if (await confirmClear()) {
             queue.replaceAll([]);
             this.render();
           }
@@ -352,278 +350,18 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async generate(goal: string, append: boolean): Promise<void> {
-    const queue = this.queue;
-    if (!queue) {
-      void vscode.window.showWarningMessage(
-        `The task queue is unavailable: ${this.problem ?? 'not open'}`,
-      );
-      return;
-    }
-    if (!goal?.trim()) {
-      void vscode.window.showInformationMessage('Describe what you want built first.');
-      return;
-    }
-    if (this.generating) {
-      return;
-    }
-    this.generating = true;
-    this.render();
-
-    // Planning has no task yet, so its stream is the queue's own — the
-    // Planner terminal on the Plan tab.
-    const live = new LiveLog(queue, null, 'planner');
-    live.note('plan', `planning: ${goal.trim()}`);
-    try {
-      await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'Scanning the workspace and scoping a plan…' },
-        async (progress) => {
-          const phases = await planGoal(
-            this.context,
-            this.output,
-            queue,
-            goal,
-            (method, params) => {
-              live.onEvent(method, params);
-              if (method === 'stream/tool' && params?.status === 'running') {
-                progress.report({ message: params.name });
-              }
-            },
-          );
-          const n = append ? queue.addAll(phases) : queue.replaceAll(phases);
-          live.note('plan', `${n} phase(s) written to the queue`);
-          void vscode.window.showInformationMessage(
-            `Generated ${n} phase(s). Press Start to expand and run them.`,
-          );
-        },
-      );
-    } catch (e: any) {
-      live.note('error', `planning failed: ${e?.message ?? e}`);
-      void vscode.window.showErrorMessage(`Could not generate a plan: ${e?.message ?? e}`);
-    } finally {
-      live.close();
-      this.generating = false;
-      this.render();
-    }
+  private planningHost(): PlanningHost {
+    return { context: this.context, output: this.output, queue: this.queue,
+      problem: this.problem, generating: this.generating,
+      setGenerating: value => { this.generating = value; }, render: () => this.render() };
   }
 
-  /**
-   * Edits, adds to, or removes from the existing task list from a free-text
-   * instruction — as opposed to `generate`, which only ever produces a brand
-   * new list. The supervisor proposes changes against a captured task snapshot;
-   * the database resolves those references to stable IDs and commits the whole
-   * revision together. Only the committed receipt is reported as completed work.
-   */
-  private async applyTaskEditPrompt(instruction: string): Promise<void> {
-    const queue = this.queue;
-    if (!queue) {
-      void vscode.window.showWarningMessage(
-        `The task queue is unavailable: ${this.problem ?? 'not open'}`,
-      );
-      return;
-    }
-    if (!instruction.trim()) {
-      void vscode.window.showInformationMessage('Describe the change to make first.');
-      return;
-    }
-    if (this.generating) {
-      return;
-    }
-    this.generating = true;
-    this.render();
-
-    const live = new LiveLog(queue, null, 'supervisor');
-    live.note('plan', `editing the task list: ${instruction.trim()}`);
-    try {
-      const snapshot = queue.list();
-      const result = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'Editing the task list…' },
-        () => editTasks(this.context, this.output, snapshot, instruction, { onEvent: live.onEvent }),
-      );
-
-      const receipt = queue.applyTaskEdits(snapshot, result);
-      const summary = taskEditSummary(receipt);
-      live.note('plan', summary);
-      void vscode.window.showInformationMessage(summary);
-    } catch (e: any) {
-      live.note('error', `edit failed: ${e?.message ?? e}`);
-      void vscode.window.showErrorMessage(`Could not edit tasks: ${e?.message ?? e}`);
-    } finally {
-      live.close();
-      this.generating = false;
-      this.render();
-    }
+  private generate(goal: string, append: boolean): Promise<void> {
+    return generatePlan(this.planningHost(), goal, append);
   }
 
-  /**
-   * Gives one discovered MCP server a key of its own, without touching the
-   * file it came from.
-   *
-   * A server from VS Code's user `mcp.json` or the `mfagent.mcpServers`
-   * setting carries whatever credential is written there, and when the
-   * server rejects it the only remedy used to be editing that file by hand —
-   * with a key in cleartext. This instead makes a copy on the settings page
-   * under the same name, which is what wins at discovery time, and files the
-   * key in the OS keychain where the copy's key belongs. The file is left as
-   * it is. A server that already lives on the settings page just gets its
-   * key replaced.
-   */
-  private async setMcpKey(name: string): Promise<void> {
-    const store = getStore();
-    const found = discoverMcpServers(this.context, store).find((s) => s.name === name);
-    if (!found) {
-      return;
-    }
-    const http = !!found.url;
-    let def = found.source === 'store' && found.id ? store.mcpServer(found.id) : undefined;
-    if (!def) {
-      const created = await store.addMcpServer(name);
-      await store.updateMcpServer(created.id, {
-        name,
-        transport: http ? 'http' : 'stdio',
-        url: found.url,
-        headers: found.headers ? { ...found.headers } : undefined,
-        command: found.command,
-        args: found.args ? [...found.args] : undefined,
-        env: found.env ? { ...found.env } : undefined,
-        enabled: true,
-        // The scheme the server itself names in its challenge. The key
-        // written at connect time replaces any header of the same name the
-        // copy inherited, which is the whole point when that one was wrong.
-        keyName: http ? 'Authorization' : '',
-        keyPrefix: http ? 'Bearer ' : undefined,
-      });
-      def = store.mcpServer(created.id);
-    }
-    if (!def) {
-      return;
-    }
-
-    let keyName = def.keyName?.trim() ?? '';
-    if (!keyName) {
-      const typed = await vscode.window.showInputBox({
-        title: `Key for MCP server "${name}"`,
-        prompt: http ? 'Which header carries the key?' : 'Which environment variable carries the key?',
-        value: http ? 'Authorization' : '',
-        placeHolder: http ? 'Authorization' : 'API_KEY',
-        ignoreFocusOut: true,
-      });
-      keyName = typed?.trim() ?? '';
-      if (!keyName) {
-        return;
-      }
-      await store.updateMcpServer(def.id, {
-        keyName,
-        keyPrefix: http && /^authorization$/i.test(keyName) ? (def.keyPrefix || 'Bearer ') : def.keyPrefix,
-      });
-      def = store.mcpServer(def.id) ?? def;
-    }
-
-    const typedKey = await vscode.window.showInputBox({
-      title: `Key for MCP server "${name}"`,
-      prompt: `Stored in the OS keychain and sent as ${keyName}${def.keyPrefix ? ` (${def.keyPrefix.trim()} …)` : ''}. Leave empty to clear.`,
-      password: true,
-      ignoreFocusOut: true,
-    });
-    if (typedKey === undefined) {
-      return;
-    }
-    let key = typedKey.trim();
-    // A key pasted with its scheme — "Bearer xyz" — would be sent as
-    // "Bearer Bearer xyz" once the prefix is added; keep just the key.
-    const prefix = def.keyPrefix?.trim();
-    if (prefix && key.toLowerCase().startsWith(`${prefix.toLowerCase()} `)) {
-      key = key.slice(prefix.length).trim();
-    }
-    await store.setMcpKey(def.id, key);
-    // The store's change event restarts the core, which is what tries the
-    // key; the row shows the result once that core has reported in.
-    this.render();
-  }
-
-  // ---- confirmations ---------------------------------------------------
-
-  /**
-   * An autonomous run approves every tool call, including shell commands, with
-   * nobody watching. That is a real decision and it gets asked once per start.
-   */
-  private async confirmAutonomy(queue: TaskQueue): Promise<boolean> {
-    const stats = queue.stats();
-    const pending = stats.byStatus.PENDING + stats.byStatus.PAUSED;
-    // A task awaiting verification is work too — the supervisor's — and the
-    // supervisor only ticks while the run is going. So is a task left
-    // EXECUTING by a process that no longer exists, which start() sends to
-    // verification. Counting only PENDING here refused to start a queue whose
-    // last task was VERIFYING, which left it with no way to ever finish.
-    const verifying = stats.byStatus.VERIFYING + stats.byStatus.EXECUTING;
-    if (pending + verifying === 0) {
-      void vscode.window.showInformationMessage(
-        'Nothing to run — no PENDING tasks and nothing awaiting verification.',
-      );
-      return false;
-    }
-    const title =
-      pending > 0
-        ? `Start the autonomous run over ${pending} task(s)` +
-          (verifying > 0 ? `, with ${verifying} awaiting verification?` : '?')
-        : `Resume supervision of ${verifying} task(s) awaiting verification?`;
-    const pick = await vscode.window.showWarningMessage(
-      title,
-      {
-        modal: true,
-        detail:
-          'Execution and Supervisor agents will edit files and run shell commands in this ' +
-          'workspace without asking for confirmation — a task the supervisor sends back is ' +
-          'executed again. Only do this in a workspace you trust, and with your work committed.',
-      },
-      'Start run',
-    );
-    return pick === 'Start run';
-  }
-
-  /**
-   * Asked only for a task that has already cost something. Deleting is not
-   * undoable and takes its attempts, output and token spend with it, which is
-   * worth one dialog — but a task nobody has run yet is not.
-   */
-  private async confirmDelete(task: Task): Promise<boolean> {
-    const spent = task.tokensIn + task.tokensCacheRead + task.tokensOut;
-    const detail = [
-      task.attempts > 0 ? `${task.attempts} attempt(s)` : '',
-      spent > 0 ? `${spent.toLocaleString()} tokens` : '',
-    ]
-      .filter(Boolean)
-      .join(' and ');
-
-    const pick = await vscode.window.showWarningMessage(
-      `Remove task ${task.seq}: ${task.title}?`,
-      {
-        modal: true,
-        detail: detail
-          ? `This task has ${detail} behind it. Removing it discards its output and history, and cannot be undone.`
-          : 'This cannot be undone.',
-      },
-      'Remove',
-    );
-    return pick === 'Remove';
-  }
-
-  private async confirmReset(): Promise<boolean> {
-    const pick = await vscode.window.showWarningMessage(
-      'Reset every task to PENDING?',
-      { modal: true, detail: 'Progress, outputs, error logs and supervisor feedback are cleared. The tasks themselves are kept.' },
-      'Reset',
-    );
-    return pick === 'Reset';
-  }
-
-  private async confirmClear(): Promise<boolean> {
-    const pick = await vscode.window.showWarningMessage(
-      'Delete the whole task queue?',
-      { modal: true, detail: 'Every task and its history is removed. This cannot be undone.' },
-      'Delete all',
-    );
-    return pick === 'Delete all';
+  private applyTaskEditPrompt(instruction: string): Promise<void> {
+    return applyTaskEditPrompt(this.planningHost(), instruction);
   }
 
   // ---- rendering -------------------------------------------------------
@@ -667,58 +405,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
       });
       return;
     }
-    const disabledMcp = new Set(queue.disabledMcpServers);
-    const enabledSkillGroups = new Set(queue.enabledSkillGroups);
-
-    this.post({
-      type: 'state',
-      tasks: queue.list() as Task[],
-      stats: queue.stats(),
-      status: orch.status(),
-      generating: this.generating,
-      dbPath: queue.path,
-      driver: queue.impl,
-      instructions: queue.instructions,
-      testingUrl: queue.testingUrl,
-      testingCredentialNames: queue.testingCredentialNames,
-      agentObservations: queue.agentObservations,
-      models: { planner: '', supervisor: '', executor: '' },
-      mcpServers: discoverMcpServers(this.context, getStore()).map((s) => ({
-        name: s.name,
-        source: s.source,
-        configured: !!(s.command || s.url),
-        enabled: !disabledMcp.has(s.name),
-        // The server's own switch, from the settings page — separate from
-        // this workspace's pick above.
-        serverEnabled: s.enabled !== false,
-        problem: s.problem,
-        // What the last core start made of it — see coreStatus.ts.
-        connection: mcpConnection(s.name),
-        canSetKey: !!(s.url || s.command),
-      })),
-      editorTools: getBridge().tree(),
-      skillGroups: [
-        ...getStore().settings.skillGroups.map((g) => ({
-          id: g.id,
-          name: g.name,
-          enabled: enabledSkillGroups.has(g.id),
-          source: 'authored' as const,
-          // The skills themselves, so a group can be unfolded rather than
-          // taken on trust from a count.
-          skills: g.skillIds
-            .map((id) => getStore().settings.skills.find((s) => s.id === id))
-            .filter((s): s is Skill => !!s)
-            .map((s) => ({ name: s.name, description: s.description ?? '' })),
-        })),
-        ...discoverInstalledSkills(vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? []).map((d) => ({
-          id: d.group.id,
-          name: d.group.name,
-          enabled: enabledSkillGroups.has(d.group.id),
-          source: 'installed' as const,
-          skills: [{ name: d.skill.name, description: d.skill.description ?? '' }],
-        })),
-      ],
-    });
+    this.post(queueViewState(this.context, queue, orch, this.generating));
     // Role models come from the profile store, which is async. Push them as a
     // follow-up so the rest of the view is not held up by a keychain read.
     void this.postRoleModels();
@@ -741,155 +428,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private html(webview: vscode.Webview): string {
-    const nonce = String(Math.random()).slice(2) + Date.now().toString(36);
-    const css = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'queue.css'),
-    );
-    const js = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'queue.js'),
-    );
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src ${webview.cspSource}`,
-      `script-src 'nonce-${nonce}'`,
-      `font-src ${webview.cspSource}`,
-    ].join('; ');
 
-    return /* html */ `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy" content="${csp}" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<link href="${css}" rel="stylesheet" />
-<title>MF Agent — Task Queue</title>
-</head>
-<body>
-  <section id="pane-unavailable" class="pane unavailable" hidden>
-    <h2>Task queue unavailable</h2>
-    <p id="reason" class="reason"></p>
-    <p id="host" class="hint"></p>
-    <div class="row">
-      <button id="retry" class="primary">Retry</button>
-      <button id="openFolder" class="ghost" hidden>Open Folder</button>
-      <button id="showLog2" class="ghost">Show log</button>
-    </div>
-  </section>
-
-  <nav class="tabs">
-    <button class="tab active" data-pane="run">Run</button>
-    <button class="tab" data-pane="plan">Plan</button>
-    <button class="tab" data-pane="context">Context</button>
-  </nav>
-
-  <section id="pane-context" class="pane" hidden>
-    <div class="picker-bar">
-      <input id="ctxFilter" class="picker-search" type="search" placeholder="Filter tools, servers and skills…" aria-label="Filter the context list" />
-      <span id="ctxCount" class="picker-count" title="Everything switched on for this workspace">0 selected</span>
-    </div>
-    <p class="hint">What is checked here is what every agent in this workspace gets, in Chat and in every Task Queue run alike. Check a group to take all of it.</p>
-
-    <h3 class="section-title">
-      Tools
-      <button id="ctxDefaults" class="ghost hdr-action" title="Back to the built-in edit, execute, read and search sets">Restore defaults</button>
-    </h3>
-    <p class="hint">Everything <code>vscode.lm.tools</code> offers, grouped by where it comes from. A checked tool reaches the agent as <code>editor__&lt;name&gt;</code> and the editor runs it. <code>edit</code>, <code>execute</code>, <code>read</code> and <code>search</code> start on; the rest is opt-in, because every definition travels with every request.</p>
-    <div id="editorToolTree" class="tree"></div>
-
-    <h3 class="section-title">MCP servers</h3>
-    <p class="hint">Servers the agent's core dials itself, separately from the editor — from your VS Code user <code>mcp.json</code> and the <code>mfagent.mcpServers</code> setting.</p>
-    <div id="mcpList" class="tree"></div>
-
-    <h3 class="section-title">Skill groups</h3>
-    <p class="hint">Injected into the agent's system prompt; unfold a group to read what it carries. Author them in Settings, or use "MF Agent: Install Skill Pack" (<code>npx skills add &lt;repo&gt; -g -a &lt;agent&gt;</code>) — installed packs appear here on their own.</p>
-    <div id="skillGroupList" class="tree"></div>
-  </section>
-
-  <section id="pane-plan" class="pane" hidden>
-    <label class="lbl" for="goal">What should the agents build?</label>
-    <textarea id="goal" rows="6" placeholder="e.g. Add a REST API for invoices with auth, validation and integration tests."></textarea>
-    <div class="row">
-      <label class="chk"><input id="append" type="checkbox" /> Append to queue</label>
-    </div>
-    <button id="generate" class="primary">Generate plan</button>
-    <p class="hint">The workspace is scanned and split into regions first, then the planner scopes phases over them — each phase is explored and turned into verifiable tasks with a test command once you press Start, so planning stays fast no matter how large the project is.</p>
-    <details class="termwrap" open>
-      <summary class="lbl">Planning and task editing output</summary>
-      <pre id="plannerTerm" class="term"></pre>
-    </details>
-
-    <label class="lbl" for="editInstruction">Edit the existing tasks</label>
-    <textarea id="editInstruction" rows="4" placeholder="e.g. Drop the caching task, and add integration tests for the new endpoint."></textarea>
-    <button id="applyEdit">Apply edit</button>
-    <p class="hint">The supervisor reads the current task list and your instruction, then edits, adds or removes tasks in place — nothing already VERIFIED is touched.</p>
-
-    <fieldset id="testingEnvironment">
-      <legend>Testing environment — applies to every task</legend>
-      <label class="lbl" for="testingUrl">Testing URL</label>
-      <input id="testingUrl" type="url" placeholder="https://your-application.example/path/" />
-      <p class="hint">Agents must use this application instead of creating another test server. Leave blank for projects that only need terminal access.</p>
-      <label class="lbl">Credentials</label>
-      <div id="testingCredentials"></div>
-      <button id="addTestingCredential" type="button">Add credential</button>
-      <button id="saveTestingEnvironment" type="button">Save testing environment</button>
-      <p class="hint">Use names such as username, password, token, or database_password. Values stay in secure storage and are available to browser and terminal tools. Leave a saved value blank to keep it. Saving restarts active workers with these settings.</p>
-      <p id="testingSaved" class="hint" role="status"></p>
-    </fieldset>
-    <label class="lbl" for="instructions">Project notes (sent to every task)</label>
-    <textarea id="instructions" rows="6" placeholder="e.g. Use Go with Wails; test with Playwright.&#10;The class list lives in classes.md.&#10;Build with build.ps1."></textarea>
-    <p class="hint">Your standing instructions reach execution, verification and supervisor reviews. Agents record their findings separately below; those findings cannot change your requirements or test environment.</p>
-    <details class="termwrap">
-      <summary class="lbl">Agent findings (confirm before relying on them)</summary>
-      <pre id="agentObservations" class="term"></pre>
-    </details>
-  </section>
-
-  <section id="pane-run" class="pane">
-    <div id="controls" class="row">
-      <button id="start" class="primary" title="Start the autonomous run">Start</button>
-      <button id="pause" title="Pause after the current task">Pause</button>
-      <button id="stop" title="Stop the run">Stop</button>
-      <button id="reset" title="Return every task to PENDING">Reset</button>
-      <span class="spacer"></span>
-      <button id="runNow" class="ghost" title="Run a supervision cycle now">Check now</button>
-    </div>
-
-    <div class="row">
-      <label class="lbl" for="cron">Supervisor checks</label>
-      <select id="cron" title="How often the supervisor wakes up to verify finished tasks. Saved with this task list.">
-        <option value="0">Use setting</option>
-        <option value="30">every 30 seconds</option>
-        <option value="60">every 60 seconds</option>
-        <option value="120">every 2 minutes</option>
-        <option value="300">every 5 minutes</option>
-        <option value="600">every 10 minutes</option>
-        <option value="900">every 15 minutes</option>
-        <option value="1800">every 30 minutes</option>
-      </select>
-    </div>
-
-    <div id="runbar"></div>
-    <div id="counts" class="counts"></div>
-    <div id="tasks" class="tasks"></div>
-
-    <div class="row foot">
-      <button id="addTask" class="ghost">Add task</button>
-      <button id="clearQueue" class="ghost">Clear queue</button>
-      <span class="spacer"></span>
-      <button id="genDocs" class="ghost">Generate Docs</button>
-      <span class="spacer"></span>
-      <button id="openSettings" class="ghost">Settings</button>
-      <button id="showLog" class="ghost">Log</button>
-    </div>
-    <p id="dbinfo" class="hint"></p>
-  </section>
-
-  <script nonce="${nonce}" src="${js}"></script>
-</body>
-</html>`;
-  }
 }
 
 /**

@@ -124,7 +124,10 @@ produce a particular table. Choose RETRY when evidence identifies changes the ex
 include a materially rewritten description for task ${task.seq}. Choose SPLIT when
 the remaining work is more than one agent can hold at once — a report that reads as several
 unfinished threads rather than one unfinished thing. For an unsuccessful task these are the available
-decisions: reverify it, correct it, or split it. The host retains unresolved tasks as FAILED after the bounded recovery allowance; never manufacture PASS to avoid that outcome.`;
+decisions: reverify it, correct it, or split it. Exhausted recovery requires at least two smaller,
+complete replacement tasks grounded in the original planning prompt. The host commits all children
+and deletes the original atomically; it never marks the task FAILED or reruns that parent.
+Do not duplicate the parent, repeat a rejected approach, weaken acceptance, or manufacture PASS.`;
 
   const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
     maxIterations: supervisorRounds(),
