@@ -145,23 +145,26 @@ test('remaining outcomes must be concrete, uniquely identified, and explicitly o
   }
 });
 
-test('coverage cannot drop, paraphrase, replace, or duplicate original acceptance fields', () => {
+test('coverage binds model-selected fields to the exact durable contract', () => {
   assert.throws(() => parse({ ...plan(), coverage: undefined }), /coverage map/);
   const missing = plan();
   missing.coverage.pop();
   assert.throws(() => parse(missing), /drops original acceptance/);
   for (const patch of [
-    { requirement: 'A weaker acceptance criterion.' },
     { field: 'inventedRequirement' },
     { outcomeIds: ['nonexistent'] },
   ]) {
     const invalid = plan();
     Object.assign(invalid.coverage[0], patch);
-    assert.throws(() => parse(invalid), /Coverage must retain|distinct existing outcomeIds/);
+    assert.throws(() => parse(invalid), /known original|distinct existing outcomeIds/);
   }
+  const paraphrased = plan();
+  paraphrased.coverage[0].requirement = 'A weaker acceptance criterion.';
+  assert.equal(api.parseFailureDecomposition(JSON.stringify(paraphrased), task).decomposition.coverage[0].requirement,
+    task.description, 'the host ignores an untrusted requirement echo');
   const duplicate = plan();
   duplicate.coverage.push(duplicate.coverage[0]);
-  assert.throws(() => parse(duplicate), /without substitutions or duplicates/);
+  assert.throws(() => parse(duplicate), /cannot duplicate/);
 });
 
 test('every declared outcome must serve existing requirements rather than inventing unrelated work', () => {

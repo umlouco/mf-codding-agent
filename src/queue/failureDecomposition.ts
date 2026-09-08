@@ -124,15 +124,20 @@ export function parseFailureDecomposition(text: string, task: Task,
   const required = fields.filter(field => task[field].trim());
   const covered = new Set<ContractField>();
   const justified = new Set<string>();
-  const coverage: Coverage[] = value.coverage.map((entry: any) => {
-    if (!object(entry) || !required.includes(entry.field) || covered.has(entry.field) ||
-        typeof entry.requirement !== 'string' || entry.requirement.trim() !== task[entry.field as ContractField].trim()) {
-      throw Error('Coverage must retain each nonempty original contract field exactly, without substitutions or duplicates.');
+  const coverage: Coverage[] = value.coverage.flatMap((entry: any) => {
+    // The task description can exceed the planner's output budget.  A planner
+    // therefore names fields and their outcome owners; the host, not model
+    // text, binds those names to the exact durable contract values.
+    if (!object(entry) || !fields.includes(entry.field)) {
+      throw Error('Coverage must name known original contract fields.');
     }
-    covered.add(entry.field);
-    const ids = outcomeIds(entry.outcomeIds, known, `Coverage for ${entry.field}`);
+    const field = entry.field as ContractField;
+    if (!required.includes(field)) return [];
+    if (covered.has(field)) throw Error('Coverage cannot duplicate an original contract field.');
+    covered.add(field);
+    const ids = outcomeIds(entry.outcomeIds, known, `Coverage for ${field}`);
     for (const id of ids) justified.add(id);
-    return { field: entry.field, requirement: entry.requirement.trim(), outcomeIds: ids };
+    return [{ field, requirement: task[field].trim(), outcomeIds: ids }];
   });
   if (covered.size !== required.length) throw Error('The decomposition drops original acceptance requirements.');
   if (justified.size !== known.size) throw Error('Every unfinished outcome must serve an original requirement.');
@@ -140,7 +145,9 @@ export function parseFailureDecomposition(text: string, task: Task,
   return { verdict: 'SPLIT', feedback: value.feedback.trim(), taskEdits: [], usage: { ...usage },
     splitInto: parts.map(part => ({ title: part.title.trim(), description: part.description.trim(),
       implVerifyPrompt: part.implVerifyPrompt!.trim(), solutionVerifyPrompt: part.solutionVerifyPrompt!.trim(),
-      solutionVerifyCommand: part.solutionVerifyCommand!.trim() })),
+      // An empty parent command deliberately quarantines a malformed legacy
+      // command.  Do not let a planner revive it in a replacement child.
+      solutionVerifyCommand: task.solutionVerifyCommand.trim() ? part.solutionVerifyCommand!.trim() : '' })),
     decomposition: { remainingOutcomes, coverage, assignments } };
 }
 
@@ -207,7 +214,8 @@ Return ONE JSON object with verdict SPLIT, concrete feedback, remainingOutcomes,
    "implVerifyPrompt":"inspect second outcome","solutionVerifyPrompt":"exercise second outcome",
    "solutionVerifyCommand":"","outcomeIds":["b"]}],"taskEdits":[]}
 Include exactly one coverage entry for EACH nonempty original description, implVerifyPrompt,
-solutionVerifyPrompt, and solutionVerifyCommand field, copying its entire value verbatim. Map each
+solutionVerifyPrompt, and solutionVerifyCommand field. Each entry needs only field and outcomeIds:
+the host binds those names to the exact durable values, so do NOT echo long requirements. Map each
 to the outcomes that preserve it. Every outcome must serve at least one original contract field.
 The coverage map is a traceable plan, not fabricated evidence that the behavior is already correct.
 Replace every example with concrete task-specific content. Do not investigate or edit files here.
