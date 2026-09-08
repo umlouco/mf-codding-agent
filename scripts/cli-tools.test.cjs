@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const ts = require('typescript');
 
-function loadCli(spawn, overrides = {}) {
+function loadCli(spawn, overrides = {}, runtime = { getuid: () => 1000, geteuid: () => 1000 }) {
   const file = 'src/queue/claudeCli.ts';
   const source = readFileSync(path.join(__dirname, '..', file), 'utf8');
   const { outputText } = ts.transpileModule(source, {
@@ -30,13 +30,71 @@ function loadCli(spawn, overrides = {}) {
   vm.runInNewContext(outputText, {
     exports,
     Buffer,
-    process,
+    process: { ...process, ...runtime },
     require: (name) => {
       assert.ok(Object.hasOwn(dependencies, name), `unexpected dependency: ${name}`);
       return dependencies[name];
     },
   }, { filename: file });
   return exports;
+}
+
+for (const runtime of [
+  { platform: 'linux', getuid: () => 0, geteuid: () => 0 },
+  { platform: 'darwin', getuid: () => 0, geteuid: () => 0 },
+  { platform: 'linux', getuid: () => 1000, geteuid: () => 0 },
+  { platform: 'linux', getuid: () => 0, geteuid: () => 1000 },
+  { platform: 'win32', getuid: undefined, geteuid: undefined },
+]) {
+  for (const [role, opts] of [
+    ['planner', {}], ['supervisor', {}], ['executor', {}],
+    ['supervisor', { allowTestEdits: true }],
+    ['planner', { formatOnly: true }],
+    ['supervisor', { formatOnly: true }],
+    ['executor', { formatOnly: true, verificationOnly: true }],
+  ]) {
+    const root = runtime.getuid?.() === 0 || runtime.geteuid?.() === 0;
+    test(`${role} starts with ${JSON.stringify(opts)} on ${runtime.platform}, uid=${runtime.getuid?.()}, euid=${runtime.geteuid?.()}`, async () => {
+      let invocation;
+      const plan = '[{"title":"Audit publishing readiness","description":"Inspect plugin","regionPaths":["."]}]';
+      const cli = loadCli((bin, args, options) => {
+        invocation = { args: Array.from(args), options, input: '' };
+        const proc = new EventEmitter();
+        proc.stdin = new PassThrough(); proc.stdout = new PassThrough(); proc.stderr = new PassThrough();
+        proc.stdin.on('data', chunk => { invocation.input += chunk; });
+        setImmediate(() => {
+          if (root && args[args.indexOf('--permission-mode') + 1] === 'bypassPermissions') {
+            proc.stdout.end();
+            proc.stderr.end('--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons');
+            proc.emit('close', 1);
+          } else {
+            proc.stdout.end(JSON.stringify({ type: 'result', result: plan, stop_reason: 'end_turn' }) + '\n');
+            proc.stderr.end(); proc.emit('close', 0);
+          }
+        });
+        return proc;
+      }, {}, runtime);
+      const result = await cli.runClaudeCliTurn({ appendLine() {} }, role, { model: 'configured' }, 'Plan publishing checks.', opts);
+      assert.equal(result.text, plan);
+      assert.equal(invocation.input, 'Plan publishing checks.');
+      const args = invocation.args;
+      assert.equal(args[args.indexOf('--permission-mode') + 1], root || opts.formatOnly ? 'dontAsk' : 'bypassPermissions');
+      assert.ok(!args.includes('--dangerously-skip-permissions'));
+      assert.equal(invocation.options.env.MFAGENT_QUEUE_ROLE, opts.verificationOnly ? 'validator' : opts.allowTestEdits ? 'supervisor-repair' : role);
+      if (opts.formatOnly) {
+        assert.equal(args[args.indexOf('--tools') + 1], '');
+        assert.ok(!args.includes('--allowedTools'));
+      } else if (root) {
+        const allowed = args[args.indexOf('--allowedTools') + 1].split(',');
+        for (const name of ['Read', 'Glob', 'Grep', 'Bash', 'Edit', 'Write', 'WebFetch', 'WebSearch']) {
+          assert.ok(allowed.includes(name), `${name} has an explicit unattended approval`);
+        }
+        assert.ok(!allowed.includes('*'), 'unanchored wildcard approvals are ignored by Claude');
+        assert.ok(!allowed.includes('mcp__mfagent__*'), 'only approve MCP when configured');
+        assert.ok(!args.includes('--tools'), 'retain the available tool set');
+      }
+    });
+  }
 }
 
 for (const role of ['supervisor', 'executor', 'planner']) {
@@ -165,7 +223,8 @@ test('CLI tool evidence retains streamed arguments and distinguishes failed resu
 });
 
 
-test('CLI turns receive fixed fields, private credentials, built-in testing tools and an execution hook', async () => {
+for (const uid of [0, 1000]) {
+test(`CLI turns retain testing tools, private credentials and execution hook for uid=${uid}`, async () => {
  let invocation;
  const testing={url:'https://app.example.test/project/',credentials:{password:'private-cli-secret'}};
  const cli=loadCli((bin,args,options)=>{
@@ -176,12 +235,14 @@ test('CLI turns receive fixed fields, private credentials, built-in testing tool
   '../providers/instance':{getContext:()=>({})},
   '../detect':{workspaceRoot:()=> 'workspace',resolveMcpBinary:()=> 'C:/tool folder/mfagent-mcp.exe',resolveCoreBinary:()=>({path:"C:/tool's folder/mfcore.exe"})},
   './testingEnvironment':{loadTestingEnvironment:async()=>testing,testingProcessEnvironment:()=>({MFAGENT_TEST_URL:testing.url,MFAGENT_CREDENTIAL_PASSWORD:testing.credentials.password}),testingPrompt:text=>text,redactTestingSecrets:text=>text},
- });
+ }, { getuid: () => uid, geteuid: () => uid });
  await cli.runClaudeCliTurn({appendLine(){}},'executor',{model:'configured',profile:{extra:{}}},'Test the app.',{});
  const args=invocation.args;
  const mcp=JSON.parse(args[args.indexOf('--mcp-config')+1]);assert.equal(mcp.mcpServers.mfagent.command,'C:/tool folder/mfagent-mcp.exe');
+ if(uid===0) assert.ok(args[args.indexOf('--allowedTools')+1].split(',').includes('mcp__mfagent__*'));
  const settings=JSON.parse(args[args.indexOf('--settings')+1]);const hook=settings.hooks.PreToolUse[0].hooks[0];
  assert.match(hook.command,/testing-hook/);if(process.platform==='win32'){assert.equal(hook.shell,'powershell');assert.match(hook.command,/tool''s folder/)}
  assert.equal(invocation.options.env.MFAGENT_CREDENTIAL_PASSWORD,'private-cli-secret');
  assert.ok(!JSON.stringify(args).includes('private-cli-secret'));
 });
+}
