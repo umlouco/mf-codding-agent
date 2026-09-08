@@ -13,7 +13,11 @@ import { admitDecomposition, decompositionAncestry, decompositionDigest,
 // Changing this is a host-strategy change, not new workspace evidence. It
 // grants one newly bounded replacement-planning lane after a deployed parser
 // or prompt repair, while preserving all prior rejected plans and their spend.
-const DECOMPOSITION_STRATEGY = 'failure-decomposition-v3';
+// v4 also snapshots the repaired current verification contract.  Earlier
+// planners could be in flight while an operator removed a malformed saved
+// command; their reply then echoed the superseded command and was correctly
+// rejected.  Let the repaired, current contract receive one bounded plan.
+const DECOMPOSITION_STRATEGY = 'failure-decomposition-v4';
 
 /** A rejected/exhausted task has only one exit: commit its complete replacement and retire its row. */
 export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
