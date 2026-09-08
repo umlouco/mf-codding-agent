@@ -10,6 +10,11 @@ import { admitDecomposition, decompositionAncestry, decompositionDigest,
   decompositionWorkspaceRevision, readDecomposition, requiresDecomposition,
   saveDecomposition, scheduleDecomposition } from './recoveryDecomposition';
 
+// Changing this is a host-strategy change, not new workspace evidence. It
+// grants one newly bounded replacement-planning lane after a deployed parser
+// or prompt repair, while preserving all prior rejected plans and their spend.
+const DECOMPOSITION_STRATEGY = 'failure-decomposition-v2';
+
 /** A rejected/exhausted task has only one exit: commit its complete replacement and retire its row. */
 export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
   protected abstract applyVerdictSplit(task: Task, decision: SupervisorDecision, current: () => boolean): boolean;
@@ -54,7 +59,7 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
       row.description, row.implVerifyPrompt, row.solutionVerifyPrompt, row.solutionVerifyCommand,
       row.region, row.splitScope, row.output, row.validationReport]);
     const contractAtStart = contract(task);
-    const fingerprint = decompositionDigest([ownerAtStart, contractAtStart, workspace, evidence]);
+    const fingerprint = decompositionDigest([DECOMPOSITION_STRATEGY, ownerAtStart, contractAtStart, workspace, evidence]);
     if (!admitDecomposition(this.queue, task, job, fingerprint)) {
       // A crash on the last admitted call must not leave a row claiming to be planning forever.
       if ((job.inputs[fingerprint] ?? 0) >= 3 && task.activityPhase !== 'decomposition_waiting') {

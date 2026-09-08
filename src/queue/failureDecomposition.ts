@@ -188,6 +188,10 @@ may check sibling handoffs, but must not redo their implementation or take owner
 Preserve the original prompt's intent WITHOUT expanding this task to unrelated original-goal work.
 Unfinished siblings are not defects in the current task. Preserve all substantive acceptance criteria
 and the exact saved command in at least one appropriate replacement. Never weaken assertions to pass.
+If that saved command looks malformed, mixes RPC tool names into shell text, or has an inverted
+absence assertion, do NOT rewrite it here and do NOT make "repair the command" a replacement task.
+Copy it byte-for-byte into the appropriate final child. The independent verifier may diagnose and
+adapt an adapter invocation while retaining every assertion; this decomposition only partitions work.
 
 Return ONE JSON object with verdict SPLIT, concrete feedback, remainingOutcomes, coverage, splitInto:
 {"verdict":"SPLIT","feedback":"observed cause and changed division of work",
@@ -204,7 +208,9 @@ Include exactly one coverage entry for EACH nonempty original description, implV
 solutionVerifyPrompt, and solutionVerifyCommand field, copying its entire value verbatim. Map each
 to the outcomes that preserve it. Every outcome must serve at least one original contract field.
 The coverage map is a traceable plan, not fabricated evidence that the behavior is already correct.
-Replace every example with concrete task-specific content. Do not investigate or edit files here.`;
+Replace every example with concrete task-specific content. Do not investigate or edit files here.
+Before answering, verify these host rules yourself: every remainingOutcomes description is distinct;
+every outcome is assigned exactly once; and at least one child preserves the saved command exactly.`;
 }
 
 /** Two bounded decisions at most; invalid output is returned to the durable scheduler, never retried here forever. */
