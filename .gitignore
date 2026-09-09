@@ -11,3 +11,4 @@ core/mfagent-mcp.exe
 *.db-wal
 *.db-shm
 .env
+.mfagent/replay/

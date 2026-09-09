@@ -61,6 +61,8 @@ type EditorToolDef struct {
 }
 
 type Config struct {
+	// NativeFS opts standalone hosts into native writes; editors keep buffer-aware RPC.
+	NativeFS     bool   `json:"nativeFS"`
 	QueueRole    string `json:"queueRole"`
 	ResponseOnly bool   `json:"responseOnly"`
 	// InspectOnly keeps supervisor reviews from becoming a second writer.
