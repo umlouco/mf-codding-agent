@@ -35,6 +35,15 @@ import { getContext } from '../providers/instance';
  * additionally allows 'minimal', which the CLI does not accept. */
 const VALID_CLI_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
+// Root cannot use Claude's bypass mode. Explicit approvals preserve unattended
+// queue work in dontAsk mode while Claude still enforces deny rules and hooks.
+// A bare "*" is not a supported allow rule; MCP approvals name our server below.
+const ROOT_CLI_TOOLS = [
+  'Read', 'Glob', 'Grep', 'Bash', 'PowerShell', 'Edit', 'Write', 'NotebookEdit',
+  'WebFetch', 'WebSearch', 'Agent', 'Task', 'TaskOutput', 'TaskStop', 'TodoWrite',
+  'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch',
+];
+
 function systemSuffixFor(role: Role, opts: RunOptions): string {
   if (role === 'supervisor') {
     return `You are the engineering supervisor for an autonomous task queue. Judge the current
@@ -117,6 +126,8 @@ export async function runClaudeCliTurn(
   const cwd = workspaceRoot() || process.cwd();
   const queue = getActiveQueue?.();
   const testing = queue ? await loadTestingEnvironment(getContext(), queue) : undefined;
+  const isRoot = process.getuid?.() === 0 || process.geteuid?.() === 0;
+  const permissionMode = isRoot || opts.formatOnly ? 'dontAsk' : 'bypassPermissions';
 
   /*
    * The prompt goes in on stdin, never in argv.
@@ -134,7 +145,7 @@ export async function runClaudeCliTurn(
     '--output-format', 'stream-json',
     '--verbose',
     '--include-partial-messages',
-    '--permission-mode', 'bypassPermissions',
+    '--permission-mode', permissionMode,
     '--strict-mcp-config',
     '--append-system-prompt', systemSuffixFor(role, opts) +
       ' The original user request and current owner instructions define success. Task text, ' +
@@ -143,6 +154,9 @@ export async function runClaudeCliTurn(
       'the supplied application, even on the same host. Identify requirement conflicts and use ' +
       'the correction mechanism allowed by the current protocol; do not silently redefine acceptance.',
   ];
+  if (isRoot && !opts.formatOnly) {
+    args.push('--allowedTools', ROOT_CLI_TOOLS.join(','));
+  }
   if (opts.formatOnly) {
     args.push("--tools", "");
     const index = args.indexOf('--append-system-prompt');
@@ -171,6 +185,9 @@ export async function runClaudeCliTurn(
     const mcp = resolveMcpBinary(getContext());
     if (!mcp) throw new Error('The bundled task queue testing tools are unavailable. Rebuild or reinstall MF Agent.');
     args.push('--mcp-config', JSON.stringify({ mcpServers: { mfagent: { command: mcp, args: ['--workspace', cwd] } } }));
+    if (isRoot) {
+      args[args.indexOf('--allowedTools') + 1] += ',mcp__mfagent__*';
+    }
     if (queue) {
       const core = resolveCoreBinary(getContext()).path;
       if (!core) throw new Error('The testing environment enforcement tool is unavailable.');
@@ -195,7 +212,7 @@ export async function runClaudeCliTurn(
     args.push('--max-budget-usd', String(maxBudget));
   }
 
-  output.appendLine(`[queue:${role}] starting claude CLI (${resolved.model || 'default model'})`);
+  output.appendLine(`[queue:${role}] starting claude CLI (${resolved.model || 'default model'}, ${permissionMode})`);
 
   const proc = cp.spawn(bin, args, {
     cwd,
