@@ -240,6 +240,7 @@ func RegisterFS(r *Registry) {
 		Name: "edit_file",
 		Description: "Replace an exact string in a file. old_string must appear exactly once " +
 			"unless replace_all is true. Include surrounding context to disambiguate. " +
+			"CRLF and LF line endings are equivalent; replacements preserve the file's line-ending style. " +
 			"Preferred over write_file for changes to existing code.",
 		Mutating: true,
 		Schema: obj(map[string]any{
@@ -451,28 +452,4 @@ func applyEditRaw(abs, oldStr, newStr string, all bool) (string, int, error) {
 	}
 	reads.mark(abs)
 	return text, n, nil
-}
-
-func replaceIn(text, oldStr, newStr string, all bool) (string, int, error) {
-	if oldStr == "" {
-		return "", 0, fmt.Errorf("old_string must not be empty")
-	}
-	if oldStr == newStr {
-		return "", 0, fmt.Errorf("old_string and new_string are identical")
-	}
-	count := strings.Count(text, oldStr)
-	if count == 0 {
-		// A CRLF file with an LF-normalised search string is the usual culprit.
-		if strings.Contains(text, "\r\n") && strings.Count(strings.ReplaceAll(text, "\r\n", "\n"), oldStr) > 0 {
-			return "", 0, fmt.Errorf("old_string not found (file uses CRLF line endings; match them or re-read the file)")
-		}
-		return "", 0, fmt.Errorf("old_string not found; read_file the current file, then copy a smaller unique exact block without line numbers. For a deliberate full-file replacement, use write_file after reading it. No change was applied")
-	}
-	if count > 1 && !all {
-		return "", 0, fmt.Errorf("old_string appears %d times; add surrounding context or set replace_all", count)
-	}
-	if all {
-		return strings.ReplaceAll(text, oldStr, newStr), count, nil
-	}
-	return strings.Replace(text, oldStr, newStr, 1), 1, nil
 }

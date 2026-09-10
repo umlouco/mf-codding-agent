@@ -1,0 +1,170 @@
+[
+  {
+    "name": "LF search in CRLF file preserves surrounding bytes",
+    "text": "before\r\nα😀\r\n  old\r\n  value\r\nafter\r\n",
+    "edits": [{"old_string": "  old\n  value", "new_string": "  new\n  result"}],
+    "want": "before\r\nα😀\r\n  new\r\n  result\r\nafter\r\n", "count": 1
+  },
+  {
+    "name": "exact CRLF search normalizes replacement",
+    "text": "a\r\nb\r\nend",
+    "edits": [{"old_string": "a\r\nb", "new_string": "x\ny"}],
+    "want": "x\r\ny\r\nend", "count": 1
+  },
+  {
+    "name": "CRLF input in LF file",
+    "text": "a\nb\nend",
+    "edits": [{"old_string": "a\r\nb", "new_string": "x\r\ny"}],
+    "want": "x\ny\nend", "count": 1
+  },
+  {
+    "name": "single line match inherits file EOL",
+    "text": "before\r\nold\r\nend",
+    "edits": [{"old_string": "old", "new_string": "new\nvalue"}],
+    "want": "before\r\nnew\r\nvalue\r\nend", "count": 1
+  },
+  {
+    "name": "CRLF replacement does not double carriage returns",
+    "text": "a\r\nb\r\n",
+    "edits": [{"old_string": "a\nb", "new_string": "x\r\ny\nnext"}],
+    "want": "x\r\ny\r\nnext\r\n", "count": 1
+  },
+  {
+    "name": "replace all uses original offsets",
+    "text": "α😀\r\na\r\nb\r\nmiddle\r\na\r\nb\r\nend",
+    "edits": [{"old_string": "a\nb", "new_string": "longer\nnew", "replace_all": true}],
+    "want": "α😀\r\nlonger\r\nnew\r\nmiddle\r\nlonger\r\nnew\r\nend", "count": 2
+  },
+  {
+    "name": "duplicate normalized matches rejected",
+    "text": "a\r\nb\r\na\r\nb",
+    "edits": [{"old_string": "a\nb", "new_string": "new"}],
+    "error": "appears 2 times"
+  },
+  {
+    "name": "mixed line endings cannot hide ambiguity",
+    "text": "a\nb\r\na\r\nb",
+    "edits": [{"old_string": "a\nb", "new_string": "new"}],
+    "error": "appears 2 times"
+  },
+  {
+    "name": "mixed line endings preserved outside matches",
+    "text": "before\nold\r\nvalue\r\nafter\nlast\r\n",
+    "edits": [{"old_string": "old\nvalue", "new_string": "new\nresult"}],
+    "want": "before\nnew\r\nresult\r\nafter\nlast\r\n", "count": 1
+  },
+  {
+    "name": "replace all preserves each matched EOL style",
+    "text": "a\nb\nsep\r\na\r\nb\r\n",
+    "edits": [{"old_string": "a\nb", "new_string": "x\ny", "replace_all": true}],
+    "want": "x\ny\nsep\r\nx\r\ny\r\n", "count": 2
+  },
+  {
+    "name": "sequential batch matches prior CRLF replacement",
+    "text": "before\r\na\r\nb\r\nend",
+    "edits": [
+      {"old_string": "a\nb", "new_string": "x\ny"},
+      {"old_string": "x\ny", "new_string": "final\nvalue"}
+    ],
+    "want": "before\r\nfinal\r\nvalue\r\nend", "count": 2
+  },
+  {
+    "name": "failed batch writes nothing",
+    "text": "a\r\nb\r\nend",
+    "edits": [
+      {"old_string": "a\nb", "new_string": "x\ny"},
+      {"old_string": "missing", "new_string": "new"}
+    ],
+    "error": "old_string not found"
+  },
+  {
+    "name": "missing text remains an error",
+    "text": "a\r\nb",
+    "edits": [{"old_string": "a\nc", "new_string": "new"}],
+    "error": "old_string not found"
+  },
+  {
+    "name": "indentation must still match exactly",
+    "text": "  a\r\n  b",
+    "edits": [{"old_string": "a\n b", "new_string": "new"}],
+    "error": "old_string not found"
+  },
+  {
+    "name": "line ending only change is a no-op",
+    "text": "a\r\nb",
+    "edits": [{"old_string": "a\nb", "new_string": "a\r\nb"}],
+    "error": "identical"
+  },
+  {
+    "name": "delete complete CRLF block",
+    "text": "before\r\na\r\nb\r\nend",
+    "edits": [{"old_string": "a\nb\n", "new_string": ""}],
+    "want": "before\r\nend", "count": 1
+  },
+  {
+    "name": "newline match removes both CRLF bytes",
+    "text": "a\r\nb",
+    "edits": [{"old_string": "\n", "new_string": " / "}],
+    "want": "a / b", "count": 1
+  },
+  {
+    "name": "LF literal replacement preserves dollar signs",
+    "text": "a\nb\nend",
+    "edits": [{"old_string": "a\nb", "new_string": "$&\n$1"}],
+    "want": "$&\n$1\nend", "count": 1
+  },
+  {
+    "name": "single line file defaults to LF",
+    "text": "old",
+    "edits": [{"old_string": "old", "new_string": "new\r\nvalue"}],
+    "want": "new\nvalue", "count": 1
+  },
+  {
+    "name": "standalone carriage returns remain literal",
+    "text": "before\ra\r\nb\r\nend",
+    "edits": [{"old_string": "a\nb", "new_string": "x\ry\nz"}],
+    "want": "before\rx\ry\r\nz\r\nend", "count": 1
+  },
+  {
+    "name": "empty search is rejected",
+    "text": "a\r\nb",
+    "edits": [{"old_string": "", "new_string": "new"}],
+    "error": "old_string must not be empty"
+  },
+  {
+    "name": "identical search and replacement rejected",
+    "text": "a\r\nb",
+    "edits": [{"old_string": "a\nb", "new_string": "a\nb"}],
+    "error": "identical"
+  },
+  {
+    "name": "ordinary LF single-line edit",
+    "text": "before\nold\nend\n",
+    "edits": [{"old_string": "old", "new_string": "new"}],
+    "want": "before\nnew\nend\n", "count": 1
+  },
+  {
+    "name": "overlapping matches remain non-overlapping",
+    "text": "a\r\na\r\na",
+    "edits": [{"old_string": "a\na", "new_string": "x\ny", "replace_all": true}],
+    "want": "x\r\ny\r\na", "count": 1
+  },
+  {
+    "name": "batch ambiguity aborts prior edit",
+    "text": "start\r\na\r\nb\r\na\r\nb",
+    "edits": [
+      {"old_string": "start", "new_string": "changed"},
+      {"old_string": "a\nb", "new_string": "new"}
+    ],
+    "error": "appears 2 times"
+  },
+  {
+    "name": "batch replace all retains normalized matching",
+    "text": "start\r\na\r\nb\r\na\r\nb",
+    "edits": [
+      {"old_string": "start", "new_string": "changed"},
+      {"old_string": "a\nb", "new_string": "x\ny", "replace_all": true}
+    ],
+    "want": "changed\r\nx\r\ny\r\nx\r\ny", "count": 3
+  }
+]

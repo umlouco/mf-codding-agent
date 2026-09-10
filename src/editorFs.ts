@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CoreClient } from './core';
+import { matchEdits, replaceIn } from './textEdits';
 
 /**
  * Applies the core's file-mutation tools (write_file, edit_file, multi_edit)
@@ -91,17 +92,17 @@ async function handleEdit(params: { path: string; edits: EditParam[] }): Promise
 
   if (params.edits.length === 1) {
     const e = params.edits[0];
-    const positions = matchRanges(original, e.old_string, e.new_string, !!e.replace_all);
+    const matches = matchEdits(original, e.old_string, e.new_string, !!e.replace_all);
     const edit = new vscode.WorkspaceEdit();
-    for (const pos of positions) {
+    for (const match of matches) {
       const range = new vscode.Range(
-        document.positionAt(pos),
-        document.positionAt(pos + e.old_string.length),
+        document.positionAt(match.start),
+        document.positionAt(match.end),
       );
-      edit.replace(uri, range, e.new_string);
+      edit.replace(uri, range, match.replacement);
     }
     await commit(document, abs, edit);
-    return { replacements: positions.length };
+    return { replacements: matches.length };
   }
 
   // Several edits in one call: fold sequentially over the text, exactly
@@ -121,61 +122,4 @@ async function handleEdit(params: { path: string; edits: EditParam[] }): Promise
   edit.replace(uri, fullRange(document), text);
   await commit(document, abs, edit);
   return { replacements: total };
-}
-
-/** Every start index of `needle` in `haystack`, non-overlapping, in order. */
-function findAll(haystack: string, needle: string): number[] {
-  const out: number[] = [];
-  let from = 0;
-  for (;;) {
-    const idx = haystack.indexOf(needle, from);
-    if (idx === -1) {
-      return out;
-    }
-    out.push(idx);
-    from = idx + needle.length;
-  }
-}
-
-/** Shared validation both matching functions below need. */
-function checkMatch(text: string, oldStr: string, newStr: string, positions: number[], all: boolean): void {
-  if (!oldStr) {
-    throw new Error('old_string must not be empty');
-  }
-  if (oldStr === newStr) {
-    throw new Error('old_string and new_string are identical');
-  }
-  if (positions.length === 0) {
-    const normalized = text.replace(/\r\n/g, '\n');
-    if (text.includes('\r\n') && findAll(normalized, oldStr).length > 0) {
-      throw new Error('old_string not found (file uses CRLF line endings; match them or re-read the file)');
-    }
-    throw new Error('old_string not found; read_file the current file, then copy a smaller unique exact block without line numbers. For a deliberate full-file replacement, use write_file after reading it. No change was applied');
-  }
-  if (positions.length > 1 && !all) {
-    throw new Error(`old_string appears ${positions.length} times; add surrounding context or set replace_all`);
-  }
-}
-
-/** The offsets a single-edit call should replace — mirrors fs.go's replaceIn's
- * validation, but returns positions instead of the rewritten text, since the
- * caller applies each as its own small range edit rather than rewriting the
- * whole document. */
-function matchRanges(text: string, oldStr: string, newStr: string, all: boolean): number[] {
-  const positions = findAll(text, oldStr);
-  checkMatch(text, oldStr, newStr, positions, all);
-  return all ? positions : [positions[0]];
-}
-
-/** Direct port of core/internal/tools/fs.go's replaceIn, used for multi_edit's
- * sequential fold — see handleEdit above for why this stays text-based rather
- * than range-based. */
-function replaceIn(text: string, oldStr: string, newStr: string, all: boolean): { text: string; count: number } {
-  const positions = findAll(text, oldStr);
-  checkMatch(text, oldStr, newStr, positions, all);
-  if (all) {
-    return { text: text.split(oldStr).join(newStr), count: positions.length };
-  }
-  const idx = positions[0];
-  return { text: text.slice(0, idx) + newStr + text.slice(idx + oldStr.length), count: 1 };
 }
