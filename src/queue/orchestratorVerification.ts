@@ -15,6 +15,7 @@ import { isLocalScope } from './scopeContract';
 import { verificationAuthority } from './verificationAuthority';
 import { implementationRetryProblem } from './verificationRecovery';
 import { decompositionFamily, requiresDecomposition } from './recoveryDecomposition';
+import { verificationBudget } from './verificationBudget';
 
 /** A verdict belongs to one claim, contract and report, not merely a row ID. */
 function sameVerificationSnapshot(current: Task | undefined, snapshot: Task): boolean {
@@ -34,6 +35,11 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
     if (this.requireBootstrapRepair(task)) return;
     if (scopeBlocked(task, this.queue.list())) return;
     if (this.correctTestingTarget(task)) return;
+    const budget = verificationBudget(this.queue, task);
+    if (budget.exhausted) {
+      this.requestFailureDecomposition(task, budget.reason);
+      return;
+    }
     if (this.queue.countEvents(task.id, 'verification-pass', true) >= 2) {
       this.requestFailureDecomposition(task, 'Two verification passes did not establish completion. ' +
         (task.supervisorFeedback || task.validationReport || 'See the validator journal for the missing check.'));
@@ -75,6 +81,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         },
         this.queue.testingContext + this.queue.instructions,
         verificationAuthority(this.queue, task),
+        budget,
       );
       journal.flush();
       if (!accepts()) {
@@ -91,6 +98,9 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       this.queue.log(task.id, 'validator', 'response', result.text.slice(0, 8000));
       this.queue.log(task.id, 'validator', 'validation', result.validationReport.slice(0, 8000));
       this.log(`task ${task.seq} — independent verification response stored`);
+      if (budget.exhausted && storedValidationProblem(result.validationReport)) {
+        this.requestFailureDecomposition(this.queue.get(task.id)!, budget.reason);
+      }
     } catch (error: any) {
       journal.flush();
       if (!accepts()) return;
@@ -124,6 +134,9 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         summary: message, implementationEvidence: '', behaviorEvidence: '', checks: [], remaining: message }) });
       this.queue.setMeta(`verificationAccepted:${task.id}`,
         JSON.stringify([this.verificationIdentity(task), this.queue.get(task.id)!.validationReport]));
+      if (error?.code === 'interaction_budget' || budget.exhausted) {
+        this.requestFailureDecomposition(this.queue.get(task.id)!, budget.reason);
+      }
 
     } finally {
       journal.live.close();

@@ -311,6 +311,12 @@
           "maximum": 200,
           "description": "Tool rounds per executor or verifier turn. At the limit, preserve progress and hand off to automatic supervisor recovery; this never counts as a passing check."
         },
+        "mfagent.queue.verificationMaxInteractions": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "description": "Maximum LLM request/response interactions for verifying one task, shared across verification passes and reloads. Planning, plan correction, reporting and vision-backed checks each consume an interaction; ordinary tools, streamed chunks and elapsed time do not. If the budget is exhausted without a passing host-backed report, preserve evidence and require smaller replacement tasks."
+        },
         "mfagent.queue.maxContextTokens": {
           "type": "number",
           "default": 0,

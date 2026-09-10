@@ -2,6 +2,17 @@ import { QueueMetadata } from './dbMetadata';
 import { COLUMNS, TASK_STATUSES, Task, QueueStats, TaskStatus, Usage, TaskEvent, LogRow } from './dbModel';
 
 export class QueueJournal extends QueueMetadata {
+  /** Reserve before dispatch; retries/reloads and concurrent hosts cannot overspend. */
+  reserveVerificationInteraction(taskId: number, limit: number, stage: string): number | undefined {
+    return this.tx(() => {
+      const task = this.get(taskId);
+      const used = this.countEvents(taskId, 'verification-interaction');
+      if (!task || task.status !== 'VERIFYING' || task.activityPhase.startsWith('decomposition_') || used >= limit) return;
+      this.log(taskId, 'validator', 'verification-interaction', `${used + 1}/${limit}: ${stage}`);
+      return used + 1;
+    });
+  }
+
   stats(): QueueStats {
     const rows = this.db
       .prepare('SELECT status, COUNT(*) AS n FROM tasks GROUP BY status')

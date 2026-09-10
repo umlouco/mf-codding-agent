@@ -7,6 +7,7 @@ import { taskCognition } from './cognition';
 import { VerificationSession } from './verificationPlanRunner';
 import { parseVerificationPlan, VerificationPlan, VerificationPlanError, VerificationReceipt } from './verificationPlan';
 import type { VerificationAuthority } from './verificationAuthority';
+import { VerificationBudget, verificationBudget } from './verificationBudget';
 
 export { VerificationPlanError } from './verificationPlan';
 export interface VerificationOutcome {
@@ -41,8 +42,9 @@ export async function runVerification(
   context: vscode.ExtensionContext, output: vscode.OutputChannel, task: Task, goal: string,
   onActivity?: (activity: ActivityRecord) => void, onEvent?: (method: string, params: any) => void,
   onAbort?: (abort: () => void) => void, projectNotes = '', authority?: VerificationAuthority,
+  budget = verificationBudget(),
 ): Promise<VerificationOutcome> {
-  return verificationPass(context, output, task, goal, onActivity, onEvent, onAbort, projectNotes, authority);
+  return verificationPass(context, output, task, goal, onActivity, onEvent, onAbort, projectNotes, authority, budget);
 }
 
 /** Reason about requirements, execute typed checks in the host, then judge receipts. */
@@ -56,6 +58,7 @@ async function verificationPass(
   onAbort?: (abort: () => void) => void,
   projectNotes = '',
   authority?: VerificationAuthority,
+  budget: VerificationBudget = verificationBudget(),
 ): Promise<VerificationOutcome> {
   const admittedAuthority = authority?.source === 'extension-generated' && authority.adapter === task.solutionVerifyCommand
     ? authority : undefined;
@@ -73,7 +76,11 @@ async function verificationPass(
     }
     onEvent?.(method, params);
   };
-  const session = new VerificationSession(context, output, observe, onActivity);
+  const reserveInteraction = (stage: string) => {
+    budget.consume(stage);
+    onActivity?.({ phase: 'verification_budget', detail: `LLM interaction ${budget.used}/${budget.limit}: ${stage}`, at: Date.now() });
+  };
+  const session = new VerificationSession(context, output, observe, onActivity, reserveInteraction);
   let aborted = false;
   const usage: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   const recordUsage = (value?: Usage) => {
@@ -84,6 +91,11 @@ async function verificationPass(
   let stopModel: (() => void) | undefined;
   onAbort?.(() => { aborted = true; stopModel?.(); session.stop(); });
   const checkActive = () => { if (aborted) throw new VerificationPlanError('Verification cancelled.', 'cancelled'); };
+  const ask = async (prompt: string, options: RunOptions) => {
+    checkActive();
+    reserveInteraction(options.verificationStage || 'plan');
+    return runOnce(context, output, 'executor', prompt, options);
+  };
   const options: RunOptions = {
     verificationOnly: true, verificationStage: 'plan', cognition: taskCognition(task, goal, 'verifier'), formatOnly: true, maxIterations: 1,
     onActivity, onEvent: observe,
@@ -125,7 +137,7 @@ files since those receipts, recheck the affected behavior; historical PASS is no
       receipts = await session.execute(mandatory);
       checkActive();
     }
-    let planning = await runOnce(context, output, 'executor', `You are the independent verification planner.
+    let planning = await ask(`You are the independent verification planner.
 Produce an executable plan, not claims that checks already passed. The HOST executes every step;
 you cannot create observations by describing them. Do not edit production files, fixtures, tests,
 expected output, requirements, or task rows. Normal build/test output is allowed.
@@ -185,7 +197,7 @@ ${verificationPlanShape}`, options);
       // Invalid plans have executed nothing. One bounded correction is cheaper
       // than launching another verifier with the same malformed instructions.
       observe('verification/plan-rejected', { taskId: task.id, problem: String(error?.message ?? error), rejectedPlan: planning.text });
-      planning = await runOnce(context, output, 'executor', `Repair a rejected verification plan, not the task.
+      planning = await ask(`Repair a rejected verification plan, not the task.
 The host rejected the complete plan BEFORE any step executed. No observations were produced.
 Exact validation error: ${String(error?.message ?? error)}
 ${requirements}
@@ -211,7 +223,7 @@ ${verificationPlanShape}`, options);
     checkpoint = { ...plan, sourceCommand: task.solutionVerifyCommand, effectiveCommand, commandAuthority: admittedAuthority };
     receipts = await session.execute(plan);
     checkActive();
-    const result = await runOnce(context, output, 'executor', `You are the independent verification reporter.
+    const result = await ask(`You are the independent verification reporter.
 ${originalGoalContext(goal)}
 CURRENT TASK ${task.seq}: ${task.title}
 ${task.description}
@@ -281,9 +293,10 @@ ${verificationExample.replace(/"kind":/g, '"stepId": "receipt-id", "kind":')}`, 
       observedTools: observations, verificationPlan: checkpoint,
       verificationReceipts: receipts } as typeof report), stopReason: result.stopReason, usage };
   } catch (cause: any) {
+    receipts = session.receipts;
     const error = cause instanceof VerificationPlanError ? cause : new VerificationPlanError(String(cause?.message ?? cause), aborted ? 'cancelled' : 'planning');
     error.usage = usage;
-    if (receipts.length) error.validationReport = JSON.stringify({ conclusion: 'INCOMPLETE',
+    error.validationReport = JSON.stringify({ conclusion: 'INCOMPLETE',
       summary: 'Verification reporting did not finish; host execution receipts are preserved.',
       implementationEvidence: '', behaviorEvidence: '', checks: [], remaining: error.message,
       observedTools: observations, verificationPlan: checkpoint, verificationReceipts: receipts });

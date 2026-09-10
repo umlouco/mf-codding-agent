@@ -5,7 +5,7 @@ import type { Usage } from './db';
 export class VerificationPlanError extends Error {
   usage?: Usage;
   validationReport?: string;
-  constructor(message: string, readonly code: 'planning' | 'invalid_plan' | 'capability' | 'cancelled' = 'invalid_plan') {
+  constructor(message: string, readonly code: 'planning' | 'invalid_plan' | 'capability' | 'cancelled' | 'interaction_budget' = 'invalid_plan') {
     super(message); this.name = 'VerificationPlanError';
   }
 }

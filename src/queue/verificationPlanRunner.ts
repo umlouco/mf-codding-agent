@@ -18,11 +18,14 @@ export class VerificationSession {
   private testing?: TestingEnvironment;
   private mandatoryReceipt?: VerificationReceipt;
   capabilities: VerificationCapability[] = [];
+  /** Keep partial receipts if the next model-backed check cannot be admitted. */
+  receipts: VerificationReceipt[] = [];
   readonly usage: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
   constructor(context: vscode.ExtensionContext, output: vscode.OutputChannel,
     private readonly onEvent: (method: string, params: any) => void,
-    private readonly onActivity?: (activity: ActivityRecord) => void) {
+    private readonly onActivity?: (activity: ActivityRecord) => void,
+    private readonly beforeModel?: (stage: string) => void) {
     this.client = new CoreClient(context, output);
     registerEditorFsHandlers(this.client);
     getBridge().attach(this.client);
@@ -50,7 +53,7 @@ export class VerificationSession {
 
   async execute(plan: VerificationPlan): Promise<VerificationReceipt[]> {
     plan = this.requiredPlan(plan);
-    const receipts: VerificationReceipt[] = [];
+    const receipts = this.receipts = [] as VerificationReceipt[];
     const failedInvocations = new Set<string>();
     for (const step of plan.steps) {
       this.checkActive();
@@ -73,6 +76,7 @@ export class VerificationSession {
         continue;
       }
       const id = `verification-${Date.now()}-${step.id}`;
+      if (waitsForModel) this.beforeModel?.(`vision: ${name}`);
       this.activity(`verification check ${step.id}: ${step.requirement}`);
       this.emit('stream/tool', { id, name, status: 'running', input });
       const timer = setInterval(() => this.activity(`verification check ${step.id} is awaiting its tool result`), 5000);
