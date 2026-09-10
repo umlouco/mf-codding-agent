@@ -4,7 +4,7 @@ import { appendAttempt } from './orchestratorState';
 import { scopeBlocked } from './scopePlan';
 import { recoveryFailure } from './recovery';
 import { deferRecoveryJob, hasOutstandingRecovery, hasRecoveryJob, completeRecoveryJob } from './recoverySchedule';
-import { requiresDecomposition } from './recoveryDecomposition';
+import { DECOMPOSITION_OUTPUT_IDLE_MS, deferDecomposition, readDecomposition, requiresDecomposition } from './recoveryDecomposition';
 
 export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
@@ -157,11 +157,15 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       return;
     }
     const quiet = Date.now() - r.lastActivityAt;
-    if (quiet < this.silentMs) {
+    const stalledPlanner = r.lastModelOutputAt !== undefined &&
+      Date.now() - r.lastModelOutputAt >= Math.min(this.silentMs, DECOMPOSITION_OUTPUT_IDLE_MS);
+    if (quiet < this.silentMs && !stalledPlanner) {
       return;
     }
 
-    const note = `the supervisor went silent for ${Math.round(quiet / 60_000)} minute(s)`;
+    const note = stalledPlanner
+      ? `Replacement planner produced no model output for ${Math.round((Date.now() - r.lastModelOutputAt!) / 1000)} seconds; transport heartbeats are not progress`
+      : `the supervisor went silent for ${Math.round(quiet / 60_000)} minute(s)`;
     this.queue.log(r.taskId, 'supervisor', 'silent', `${note}; abandoning the review`);
     this.log(`task ${r.seq} — ${note}; abandoning the review and retrying next tick`);
     // The task stays in VERIFYING on purpose: nothing was judged, so the next
@@ -171,8 +175,10 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     const task = this.queue.get(r.taskId);
     if (task) {
       if (requiresDecomposition(task)) {
-        this.queue.recordActivity(task.id, 'decomposition_waiting',
-          `${note}; the persisted decomposition allowance is retained, not reset.`, 'supervisor');
+        const job = readDecomposition(this.queue, task);
+        if (job) deferDecomposition(this.queue, task, job, note);
+        else this.queue.recordActivity(task.id, 'decomposition_waiting', note, 'supervisor');
+        this.changed();
         return;
       }
       if (hasRecoveryJob(this.queue, task)) {

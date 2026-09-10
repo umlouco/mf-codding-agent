@@ -53,6 +53,8 @@ export interface Review {
   gen: number;
   /** Last time this review's core said anything — its liveness, as above. */
   lastActivityAt: number;
+  /** Replacement planning: transport heartbeats do not count as model output. */
+  lastModelOutputAt?: number;
   /** Worker evidence available when this review's prompt was assembled. */
   evidenceEventId?: number;
   /** Set only by a validator when its shell tool exceeds the tool's own bound. */

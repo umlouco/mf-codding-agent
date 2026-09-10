@@ -16,6 +16,9 @@ export interface DecompositionJob {
 }
 
 export const decompositionKey = (task: Task) => `failureDecomposition:v1:${task.id}:${task.createdAt}`;
+// A response-only replacement planner must produce output, not just keep a
+// transport alive. This is an idle bound, not a cap on a streaming plan's runtime.
+export const DECOMPOSITION_OUTPUT_IDLE_MS = 120_000;
 export const requiresDecomposition = (task: Task) => task.status === 'FAILED' ||
   task.activityPhase?.startsWith('decomposition_') === true;
 export const decompositionDigest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -40,6 +43,23 @@ export function readDecomposition(queue: TaskQueue, task: Task): DecompositionJo
 
 export function saveDecomposition(queue: TaskQueue, task: Task, job: DecompositionJob): void {
   queue.setMeta(decompositionKey(task), JSON.stringify(job));
+}
+
+/** Failure and watchdog recovery share durable backoff; neither renews spend. */
+export function deferDecomposition(queue: TaskQueue, task: Task, job: DecompositionJob,
+  error: string, invalidPlan = false): string {
+  const attempts = job.inputs[job.fingerprint] ?? 0;
+  job.lastError = error;
+  job.awaitingChange = invalidPlan || attempts >= 3;
+  job.dueAt = Date.now() + Math.min(300_000, 15_000 * 2 ** Math.max(0, attempts - 1));
+  saveDecomposition(queue, task, job);
+  const next = job.awaitingChange
+    ? 'Recovery blocked: change the planner/provider, workspace, or owner requirements before retrying. No unchanged model retry.'
+    : `Provider/commit retry after ${new Date(job.dueAt).toISOString()}.`;
+  const detail = `${error} ${next}`;
+  queue.recordActivity(task.id, 'decomposition_waiting', detail, 'supervisor');
+  queue.log(task.id, 'supervisor', 'decomposition-deferred', detail);
+  return detail;
 }
 
 export function scheduleDecomposition(queue: TaskQueue, task: Task, reason: string): DecompositionJob {

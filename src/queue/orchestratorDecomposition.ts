@@ -9,8 +9,8 @@ import { decisionEvidence } from './recovery';
 import { plannerIdentity } from './agents';
 import { requiresPlaywright } from './playwrightPolicy';
 import { admitDecomposition, decompositionAncestry, decompositionDigest,
-  decompositionWorkspaceRevision, readDecomposition, requiresDecomposition,
-  saveDecomposition, scheduleDecomposition } from './recoveryDecomposition';
+  decompositionWorkspaceRevision, deferDecomposition, readDecomposition, requiresDecomposition,
+  scheduleDecomposition } from './recoveryDecomposition';
 
 // Changing this is a host-strategy change, not new workspace evidence. It
 // grants one newly bounded replacement-planning lane after a deployed parser
@@ -89,7 +89,8 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
       }
       return true;
     }
-    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now() };
+    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen,
+      lastActivityAt: Date.now(), lastModelOutputAt: Date.now() };
     this.review = review;
     const accepts = () => {
       const current = this.queue.get(task!.id);
@@ -102,6 +103,7 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     this.queue.recordActivity(task.id, 'decomposition_planning',
       'Supervisor is replacing the rejected task; the original cannot execute again.', 'supervisor');
     const live = new LiveLog(this.queue, task.id, 'supervisor');
+    const onEvent = this.observerEvents(task.id, 'supervisor', live, accepts);
     this.changed();
     try {
       const decision = await decideFailureDecomposition(this.context, this.output, task, {
@@ -118,8 +120,23 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
         previousInvalidPlan: job.invalidPlan, previousError: job.lastError,
       }, {
         onAbort: abort => { if (!accepts()) abort(); else review.abort = abort; },
-        onEvent: this.observerEvents(task.id, 'supervisor', live, accepts),
-        onActivity: activity => { if (accepts()) { review.lastActivityAt = activity.at; live.activity(activity); } },
+        onEvent: (method, params) => {
+          if (!accepts()) return;
+          if ((method === 'stream/text' || method === 'stream/thinking') &&
+              typeof params?.delta === 'string' && params.delta.trim()) {
+            review.lastModelOutputAt = review.lastActivityAt = Date.now();
+          }
+          onEvent(method, params);
+        },
+        onActivity: activity => {
+          if (!accepts()) return;
+          review.lastActivityAt = Date.now();
+          live.activity(activity);
+          // Preserve the recovery phase while exposing which provider/stage is
+          // actually waiting. A heartbeat is visibility, not forward progress.
+          if (this.queue.recordActivity(task!.id, 'decomposition_planning',
+            `${activity.phase}: ${activity.detail || 'Replacement planner is active.'}`, 'supervisor')) this.changed();
+        },
       });
       if (!accepts()) return true;
       this.queue.addUsage(task.id, decision.usage);
@@ -130,14 +147,9 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     } catch (error: any) {
       if (!accepts()) return true;
       if (error?.usage) this.queue.addUsage(task.id, error.usage);
-      job.lastError = String(error?.message ?? error);
       job.invalidPlan = typeof error?.invalidPlan === 'string' ? error.invalidPlan : job.invalidPlan;
-      job.awaitingChange = error?.invalidDecomposition === true || typeof error?.invalidPlan === 'string' || job.inputs[fingerprint] >= 3;
-      saveDecomposition(this.queue, task, job);
-      const next = job.awaitingChange ? 'Waiting for changed workspace, owner requirements, or observed evidence; no unchanged model retry.' :
-        `Provider/commit retry after ${new Date(job.dueAt).toISOString()}.`;
-      this.queue.recordActivity(task.id, 'decomposition_waiting', `${job.lastError} ${next}`, 'supervisor');
-      this.queue.log(task.id, 'supervisor', 'decomposition-deferred', `${job.lastError} ${next}`);
+      const next = deferDecomposition(this.queue, task, job, String(error?.message ?? error),
+        error?.invalidDecomposition === true || typeof error?.invalidPlan === 'string');
       this.log(`task ${task.seq}: replacement not committed; original evidence retained. ${next}`);
     } finally {
       live.close();
