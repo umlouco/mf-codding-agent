@@ -290,8 +290,8 @@
         "mfagent.llm.idleMinutes": {
           "type": "number",
           "default": 30,
-          "minimum": 1,
-          "description": "How long a model reply may deliver nothing at all before the connection is treated as dropped. This is not a limit on how long a reply may take — every byte received resets it, so a slow local model can stream for hours."
+          "minimum": 0,
+          "description": "Minutes without transport bytes before an optional idle cancellation. Set to 0 to wait indefinitely, including silent model loading and prefill. This never limits total response duration."
         },
         "mfagent.llm.maxContextTokens": {
           "type": "number",

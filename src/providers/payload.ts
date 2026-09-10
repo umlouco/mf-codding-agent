@@ -44,6 +44,7 @@ export interface CoreConfig {
   responseOnly?: boolean;
   inspectOnly?: boolean;
   queueRole?: 'planner' | 'supervisor' | 'executor' | 'validator' | 'supervisor-repair';
+  verificationStage?: 'plan' | 'report';
   testingEnvironment: TestingEnvironment;
   workspaceRoot: string;
   providers: CoreProvider[];
@@ -65,7 +66,7 @@ export interface CoreConfig {
    * disables it. This is what bounds a turn that has no round ceiling.
    */
   maxContextTokens: number;
-  /** Seconds a reply may deliver nothing before the connection counts as dropped. */
+  /** Seconds without transport bytes before expiry; negative disables idle cancellation. */
   llmIdleSeconds: number;
   /** How often a waiting turn writes an activity record. */
   activitySeconds: number;
@@ -226,7 +227,7 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     // can say "continue". Queue workers override it per role in queue/agents.ts.
     maxIterations: 0,
     maxContextTokens: contextCeiling(),
-    llmIdleSeconds: Math.max(1, cfg.get<number>('llm.idleMinutes', 30)) * 60,
+    llmIdleSeconds: cfg.get<number>('llm.idleMinutes', 30) === 0 ? -1 : Math.max(1, cfg.get<number>('llm.idleMinutes', 30)) * 60,
     activitySeconds: Math.max(5, cfg.get<number>('activityIntervalSeconds', 30)),
     languages,
     mcpServers,

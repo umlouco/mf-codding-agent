@@ -350,8 +350,12 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         decisionEvidence(this.queue, task) > review.evidenceEventId) {
       this.queue.log(task.id, 'supervisor', 'review-outdated',
         'A novel completed tool outcome or a potentially mutating/test tool start arrived during review. Decision discarded; execution preserved.');
-      this.reviewed.delete(task.id);
-      this.log(`task ${task.seq} has newer tool evidence; obtain a fresh progress review`);
+      // Slow inference must not turn stale results into back-to-back model calls.
+      // Keep the old evidence cursor so the new evidence is still reviewed later.
+      const previous = this.reviewed.get(task.id);
+      this.reviewed.set(task.id, { attempt: task.attempts, at: Date.now(),
+        eventId: previous?.eventId ?? review.evidenceEventId });
+      this.log(`task ${task.seq} has newer tool evidence; fresh review will respect the review interval`);
       return;
     }
 
@@ -372,7 +376,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         await this.repairTests(task, decision.guidance || decision.reason);
         return;
       case 'SPLIT_TASK':
-        this.splitTask(task.id, decision.splitInto ?? []);
+        this.requestFailureDecomposition(task, decision.reason || 'Supervisor requested decomposition.');
         return;
       case 'CONTINUE_EXECUTION':
         if (task.status === 'VERIFYING' && !task.validationReport.trim()) {

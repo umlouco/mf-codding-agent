@@ -11,6 +11,19 @@ import { getBridge } from '../mcpBridge';
 import { Usage } from './db';
 import { clip } from './agentHistory';
 
+/** Effective planner configuration, excluding secrets, for durable recovery identity. */
+export function plannerIdentity(): unknown[] {
+  const store = getStore();
+  const own = store.settings.roles.planner;
+  const coding = store.settings.roles.coding;
+  const binding = own?.profileId ? own : { profileId: coding?.profileId || '',
+    model: own?.model || coding?.model || '', effort: own?.effort || coding?.effort || '' };
+  const profile = store.profiles.find(value => value.id === binding.profileId);
+  return [binding, profile && {
+    providerId: profile.providerId, baseURL: profile.baseURL, cliPath: profile.extra?.cliPath,
+  }];
+}
+
 /**
  * Resolves a queue role to an endpoint.
  *
@@ -36,8 +49,8 @@ export async function roleConfig(role: Role): Promise<RoleConfig> {
  * Rewrites the core config so an ephemeral worker binds this role's model as
  * its coding provider — the core only ever drives one model per process.
  */
-export async function overridesFor(role: Role, maxIterations = 0, allowTestEdits = false, verificationOnly = false): Promise<Partial<CoreConfig>> {
-  const rc = await roleConfig(role);
+export async function overridesFor(role: Role, maxIterations = 0, allowTestEdits = false, verificationOnly = false, providerRole: Role = role): Promise<Partial<CoreConfig>> {
+  const rc = await roleConfig(providerRole);
   return {
     providers: [{
       id: `queue-${role}`,
@@ -113,28 +126,12 @@ export function killTree(pid: number | undefined): void {
   }
 }
 
-/** Execution keeps its existing liveness policy; supervisor decisions have a bounded turn. */
+/** Model latency is not failure. Wait for the response or explicit cancellation. */
 export async function runOnce(
   context: vscode.ExtensionContext, output: vscode.OutputChannel, role: Role,
   prompt: string, opts: RunOptions = {},
 ): Promise<TurnResult> {
-  if (role !== 'supervisor') return runTurn(context, output, role, prompt, opts);
-  let stop: (() => void) | undefined;
-  let ended = false;
-  let deadline: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      runTurn(context, output, role, prompt, { ...opts,
-        onAbort: abort => { stop = abort; opts.onAbort?.(abort); if (ended) abort(); },
-        onEvent: (method, params) => { if (!ended) opts.onEvent?.(method, params); },
-        onActivity: a => { if (!ended) opts.onActivity?.(a); },
-      }),
-      new Promise<never>((_, reject) => { deadline = setTimeout(() => {
-        ended = true; stop?.();
-        reject(new AgentRunError('Supervisor decision exceeded its three-minute turn limit. Current work is preserved.'));
-      }, 180_000); }),
-    ]);
-  } finally { ended = true; if (deadline) clearTimeout(deadline); }
+  return runTurn(context, output, role, prompt, opts);
 }
 
 async function runTurn(
@@ -151,12 +148,13 @@ async function runTurn(
   // core is even spawned, means every caller downstream (orchestrator.ts,
   // monitor.ts, every prompt builder in this file) needs no changes: they
   // only ever see RunOptions in, TurnResult out.
-  const resolved = await getStore().resolve(role);
+  const providerRole = opts.planningOnly ? 'planner' : role;
+  const resolved = await getStore().resolve(providerRole);
   if (resolved.kind === 'openai-compatible' && resolved.baseURL === '' && !resolved.profile) {
     throw new AgentRunError(`No supported provider is configured for the ${role} role. Select a provider for this role in MF Agent settings.`);
   }
   if (resolved.kind === 'claude-cli') {
-    return runClaudeCliTurn(output, role, resolved, prompt, opts);
+    return runClaudeCliTurn(output, providerRole, resolved, prompt, opts);
   }
 
   const client = new CoreClient(context, output);
@@ -187,7 +185,8 @@ async function runTurn(
     // mid-turn.
     onAbort?.(() => { aborted = true; client.stop(); });
     checkAborted();
-    const overrides = await overridesFor(role, maxIterations, opts.allowTestEdits, opts.verificationOnly);
+    const overrides = await overridesFor(role, maxIterations, opts.allowTestEdits, opts.verificationOnly, providerRole);
+    if (opts.verificationOnly) overrides.verificationStage = opts.verificationStage || 'report';
     if (opts.formatOnly) { overrides.disableTools = true; overrides.responseOnly = true; }
     checkAborted();
     const init = await client.initialize(overrides);

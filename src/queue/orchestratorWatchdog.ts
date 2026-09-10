@@ -1,4 +1,4 @@
-import { VALIDATION_FAILED } from './monitor';
+import { JOURNAL_EVENTS, VALIDATION_FAILED } from './monitor';
 import { OrchestratorControl } from './orchestratorControl';
 import { appendAttempt } from './orchestratorState';
 import { scopeBlocked } from './scopePlan';
@@ -41,7 +41,14 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
       const active = this.queue.activeTask();
       if (active?.kind === 'task' && active.activityPhase !== 'scope_review' && !await this.serviceRecovery(active)) {
-        await this.reviewWork(active);
+        // Startup and model transport heartbeats contain no completed work to
+        // assess. In particular, do not make a second local-model request while
+        // the fresh executor is still waiting for its first response. The journal
+        // filters prior claims and unfinished tool starts; overload has its own
+        // immediate stream handler and needs no scheduled supervisor review.
+        const hasOutcome = this.queue.events(active.id, JOURNAL_EVENTS, true)
+          .some(event => event.actor === 'executor' && event.kind === 'tool');
+        if (hasOutcome) await this.reviewWork(active);
       }
 
       const pending = this.queue.awaitingVerification();

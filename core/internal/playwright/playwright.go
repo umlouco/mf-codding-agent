@@ -59,6 +59,12 @@ func (s *Setup) Ready() error {
 
 // Detect inspects the workspace without running anything.
 func Detect(root string) *Setup {
+	// Owner-selected suite location keeps test dependencies and artifacts out of
+	// application repositories. The target URL/credentials still come from the
+	// fixed testing environment inherited by this process.
+	if external := strings.TrimSpace(os.Getenv("MFAGENT_PLAYWRIGHT_ROOT")); external != "" {
+		root = external
+	}
 	s := &Setup{Root: root}
 	s.NodePath, _ = exec.LookPath("node")
 	s.NpxPath, _ = exec.LookPath("npx")

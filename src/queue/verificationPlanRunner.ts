@@ -6,6 +6,7 @@ import type { ActivityRecord } from './agentTypes';
 import type { Usage } from './db';
 import { getActiveQueue } from './registry';
 import { loadTestingEnvironment, redactTestingSecrets, TestingEnvironment } from './testingEnvironment';
+import { enforcePlaywright, isMandatoryPlaywrightStep } from './playwrightPolicy';
 import { VerificationCapability, VerificationPlan, VerificationPlanError, VerificationReceipt,
   verificationInvocation, verificationReceipt } from './verificationPlan';
 
@@ -15,6 +16,7 @@ export class VerificationSession {
   private cancelled = false;
   private unavailable = false;
   private testing?: TestingEnvironment;
+  private mandatoryReceipt?: VerificationReceipt;
   capabilities: VerificationCapability[] = [];
   readonly usage: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
@@ -47,11 +49,17 @@ export class VerificationSession {
   }
 
   async execute(plan: VerificationPlan): Promise<VerificationReceipt[]> {
+    plan = this.requiredPlan(plan);
     const receipts: VerificationReceipt[] = [];
     const failedInvocations = new Set<string>();
     for (const step of plan.steps) {
       this.checkActive();
+      if (isMandatoryPlaywrightStep(step) && this.mandatoryReceipt) {
+        receipts.push({ ...this.mandatoryReceipt, stepId: step.id, requirement: step.requirement });
+        continue;
+      }
       const name = step.kind === 'shell' ? 'unix' : step.name!;
+      const waitsForModel = name === 'browser_layout_check' || name === 'playwright_layout_check';
       const timeoutMs = step.timeoutMs ?? 120000;
       const input = step.kind === 'shell' ? { command: step.command!, timeout_ms: timeoutMs } : step.input!;
       const fingerprint = verificationInvocation(step);
@@ -72,7 +80,10 @@ export class VerificationSession {
       try {
         const result = await Promise.race([
           this.client.request<{ output: string; isError: boolean; meta?: any; usage?: Usage }>('tools/invoke', { name, input }),
-          new Promise<never>((_, reject) => { deadline = setTimeout(() => {
+          new Promise<never>((_, reject) => {
+            // Capture operations have their own bounds; the following vision model wait does not.
+            if (waitsForModel) return;
+            deadline = setTimeout(() => {
             this.unavailable = true;
             this.client.dispose();
             reject(new VerificationPlanError(`Tool ${name} exceeded its ${timeoutMs}ms verification deadline.`, 'capability'));
@@ -91,6 +102,7 @@ export class VerificationSession {
         this.emit('stream/tool', { id, name, status: receipt.passed ? 'ok' : 'error', output: observed.output,
           meta: { ...result.meta, toolIsError: result.isError, expectedExitCode: step.expectExitCode, assertionProblem: receipt.problem } });
         if (!receipt.passed) failedInvocations.add(fingerprint);
+        if (isMandatoryPlaywrightStep(step)) this.mandatoryReceipt = receipt;
         receipts.push(receipt);
       } catch (error: any) {
         this.checkActive();
@@ -102,6 +114,12 @@ export class VerificationSession {
       } finally { clearInterval(timer); if (deadline) clearTimeout(deadline); }
     }
     return receipts;
+  }
+
+  requiredPlan(plan: VerificationPlan): VerificationPlan {
+    return enforcePlaywright(plan, this.testing ? {
+      testingUrl: this.testing.url, testingCredentialNames: Object.keys(this.testing.credentials),
+    } : undefined);
   }
 
   stop(): void { this.cancelled = true; this.client.dispose(); }

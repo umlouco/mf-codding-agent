@@ -200,6 +200,7 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 
 	system := agent.BuildSystemPrompt(agent.PromptInput{
 		QueueRole:             cfg.QueueRole,
+		VerificationStage:     cfg.VerificationStage,
 		WorkspaceRoot:         cfg.WorkspaceRoot,
 		Languages:             cfg.Languages,
 		MemoryEnabled:         s.mem != nil,

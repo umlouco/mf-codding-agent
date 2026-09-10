@@ -78,7 +78,7 @@ test('a delayed progress decision cannot act on superseded worker evidence', asy
     assert.equal(queue.get(current.id).description, current.description);
     assert.equal(queue.countEvents(current.id, 'review-outdated'), 1);
     assert.equal(queue.countEvents(current.id, `action:${action}`), 0);
-    assert.equal(runner.reviewed.has(current.id), false, 'new evidence can receive a fresh review');
+    assert.equal(runner.shouldReview(current, queue.latestWorkerToolEventId(current.id)), false, 'new evidence waits for the normal review interval');
   }
 });
 
@@ -400,7 +400,7 @@ test('review evidence survives thousands of heartbeats and excludes superseded e
 });
 
 
-test('live split fences the old worker, preserves evidence, and retains the full acceptance gate', async t => {
+test('explicit owner split fences the old worker, preserves evidence, and retains the full acceptance gate', async t => {
   const queue = fixture(t);
   queue.addAll([{title:'Later task',description:'Existing later work'}]);
   const current = queue.claimNext();
@@ -411,7 +411,7 @@ test('live split fences the old worker, preserves evidence, and retains the full
   let aborted = false;
   runner.executionAbort = () => { aborted = true; };
   const parts = Array.from({length:8},(_,i)=>({title:`Small check ${i+1}`,description:`Implement check ${i+1}`,solutionVerifyPrompt:`Only check ${i+1}`,status:'VERIFIED'}));
-  await runner.applyProgressDecision(queue.get(current.id),{action:'SPLIT_TASK',reason:'Eight independent checks are being conflated',splitInto:parts,usage},{gen:0});
+  runner.splitTask(current.id, parts);
   assert.equal(aborted,true);
   assert.equal(queue.get(current.id),undefined);
   assert.equal(queue.finishExecution(current.id,current.attempts,{status:'VERIFIED'}),false);

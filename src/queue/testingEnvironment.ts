@@ -90,3 +90,37 @@ export function testingPrompt(text: string, testing: TestingEnvironment): string
   }
   return text;
 }
+
+/** Extract explicit owner input before logs, planning, or durable goal storage. */
+export async function preparePlanningGoal(
+  context: Pick<vscode.ExtensionContext, 'secrets'>, queue: TaskQueue, prompt: string,
+): Promise<string> {
+  const text = prompt.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$2');
+  const urls = [...new Set((text.match(/https?:\/\/[^\s<>"'`\])]+/g) ?? [])
+    .map(value => value.replace(/[.,;]+$/, '')))];
+  const targeted = urls.filter(url => {
+    const before = text.slice(Math.max(0, text.indexOf(url) - 100), text.indexOf(url));
+    return /(?:\btest(?:ing)?\b|\bplaywright\b)[^\n.!?]*$/i.test(before);
+  });
+  const detectedURL = targeted.length === 1 ? targeted[0] : urls.length === 1 ? urls[0] : '';
+  const detected: Record<string, string> = {};
+  const value = '(?:"([^"\\n]+)"|\'([^\'\\n]+)\'|`([^`\\n]+)`|([^\\s,;]+))';
+  const unquote = (match: RegExpMatchArray, start = 1) => match.slice(start, start + 4).find(part => part !== undefined) || '';
+  const pair = text.match(new RegExp('\\bcredentials?\\s*(?::|=)?\\s*' + value + '\\s*/\\s*' + value, 'i'));
+  if (pair) { detected.username = unquote(pair); detected.password = unquote(pair, 5); }
+  for (const [name, label] of [['username', '(?:username|user|login)'], ['password', '(?:password|passwd)']]) {
+    const found = text.match(new RegExp('\\b' + label + '\\s*[:=]\\s*' + value, 'i'));
+    if (found) detected[name] = unquote(found);
+  }
+  const current = await loadTestingEnvironment(context, queue, true);
+  const additions = Object.entries(detected).filter(([name]) => !current.credentials[name]);
+  // An existing target is a manual/previously confirmed selection. Do not attach
+  // credentials from a different URL to that account.
+  const differentTarget = !!current.url && !!detectedURL && testingURL(detectedURL) !== current.url;
+  if ((!current.url && detectedURL) || (additions.length && !differentTarget)) {
+    await saveTestingEnvironment(context, queue, { url: current.url || detectedURL,
+      credentials: differentTarget ? [] : additions.map(([name, value]) => ({ name, value })), remove: [] });
+  }
+  const safe = testingPrompt(prompt, { url: detectedURL, credentials: detected });
+  return testingPrompt(safe, await loadTestingEnvironment(context, queue, true));
+}

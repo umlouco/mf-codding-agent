@@ -8,6 +8,7 @@ import { hasOutstandingRecovery, recoveryJobKey } from './recoverySchedule';
 import { requiresDecomposition } from './recoveryDecomposition';
 
 export abstract class OrchestratorControl extends OrchestratorState {
+  private ownedWork?: Set<Promise<void>>;
 
   // ---- configuration ---------------------------------------------------
 
@@ -86,13 +87,19 @@ export abstract class OrchestratorControl extends OrchestratorState {
     try {
       const result = work();
       if (result && typeof (result as Promise<void>).catch === 'function') {
-        void (result as Promise<void>).catch((error: any) => {
+        const pending = (result as Promise<void>).catch((error: any) => {
           this.log(`${label} failed: ${error?.message ?? error}`);
-        });
+        }).finally(() => this.ownedWork?.delete(pending));
+        (this.ownedWork ??= new Set()).add(pending);
       }
     } catch (error: any) {
       this.log(`${label} failed: ${error?.message ?? error}`);
     }
+  }
+
+  /** Call after dispose to keep storage alive until cancelled turns settle. */
+  async drain(): Promise<void> {
+    while (this.ownedWork?.size) await Promise.allSettled([...this.ownedWork]);
   }
 
   // ---- controls --------------------------------------------------------

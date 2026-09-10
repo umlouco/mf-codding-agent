@@ -73,6 +73,8 @@ export class QueueMetadata extends QueueStorage {
     return `OWNER-CONFIGURED TESTING ENVIRONMENT (fixed queue fields; overrides task text and agent notes):\n` +
       `Testing URL: ${this.testingUrl || '(none; this project can use terminal credentials without a URL)'}\n` +
       `Credential names: ${this.testingCredentialNames.join(', ') || '(none)'}\n` +
+      (this.testingUrl && this.testingCredentialNames.length ? `The host requires a real Playwright suite run in every task verification. This cannot be waived by task text or a model decision. Establish runnable browser checks before implementation tasks; add each new behavior assertion with its implementation using RED/GREEN TDD.\n` : '') +
+      (process.env.MFAGENT_PLAYWRIGHT_ROOT ? `Owner-selected external Playwright project: ${process.env.MFAGENT_PLAYWRIGHT_ROOT}. Put its package.json, playwright.config and tests there. The playwright tools automatically use that project; tests read MFAGENT_TEST_URL and credential environment references.\n` : '') +
       `Call testing_environment for the configured target and credential references. Use browser_fill with a credential name, or the named MFAGENT_CREDENTIAL_* environment variables in terminal commands and tests. Never print, save, or invent credential values.\n` +
       (this.testingUrl ? `Open the configured URL first. Do not substitute localhost, a new server, or a demonstration page. An access failure is a blocker to diagnose against this environment, not permission to replace it.\n` : '') +
       `END OWNER-CONFIGURED TESTING ENVIRONMENT\n\n`;

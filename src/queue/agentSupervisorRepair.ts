@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { Task, NewTask, Usage } from './db';
 import { ReviewOptions, NO_USAGE, AgentRunError } from './agentTypes';
 import { attemptHistory } from './agentHistory';
-import { originalGoalContext, projectNotesContext, recoveryRules } from './prompts';
+import { originalGoalContext, projectNotesContext, recoveryRules, verificationCommandRuntime } from './prompts';
 import { SupervisorDecision, isReview } from './agentReviewSupport';
 import { parseSupervisorSplit } from './agentSplit';
 import { runOnce, supervisorRounds } from './agentRuntime';
@@ -138,6 +138,8 @@ export async function reformatVerdict(
 could not be read as a verdict. Here is exactly what you wrote:
 
 ${rawReply.slice(0, 4000)}
+
+${verificationCommandRuntime}
 
 ${originalGoalContext(goal)}
 

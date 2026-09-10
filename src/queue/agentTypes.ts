@@ -50,10 +50,14 @@ export const NO_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 
 export type ReviewOptions = Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> & { projectNotes?: string; failedRepairs?: number; recoveryContext?: string };
 
 export interface RunOptions {
+  /** Resolve planning work through the planner provider, retaining queue ownership. */
+  planningOnly?: boolean;
   /** Only the dedicated supervisor test-repair turn may edit while supervising. */
   allowTestEdits?: boolean;
   /** Validators may inspect and execute checks but cannot rewrite workspace files. */
   verificationOnly?: boolean;
+  /** Planning proposes typed checks; reporting judges host receipts. */
+  verificationStage?: 'plan' | 'report';
   /** Repair a response using supplied evidence without starting another tool investigation. */
   formatOnly?: boolean;
   /** Durable work identity; independent from this disposable process and conversation. */

@@ -183,7 +183,7 @@ func resolveExisting(p string) string {
 }
 
 // Resolve turns a model-supplied path into an absolute path confined to the
-// workspace root. Model output is untrusted: reject anything that escapes,
+// workspace root or an owner-configured external Playwright project. Model output is untrusted: reject anything that escapes,
 // including via `..` or a symlink pointing out of the tree.
 func (e *Env) Resolve(p string) (string, error) {
 	if p == "" {
@@ -206,6 +206,14 @@ func (e *Env) Resolve(p string) (string, error) {
 	// platform's own semantics.
 	rel, err := filepath.Rel(root, abs)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		// This value comes from the host environment, never from model tool input.
+		// Resolve both ancestors so aliases and symlinks cannot widen the grant.
+		if external := os.Getenv("MFAGENT_PLAYWRIGHT_ROOT"); filepath.IsAbs(external) {
+			allowed := resolveExisting(filepath.Clean(external))
+			if relative, problem := filepath.Rel(allowed, abs); problem == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return abs, nil
+			}
+		}
 		return "", fmt.Errorf("path %q is outside the workspace root %s", p, root)
 	}
 	return abs, nil

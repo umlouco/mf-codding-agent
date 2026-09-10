@@ -85,6 +85,9 @@ export function parseVerificationPlan(text: string, sourceCommand: string, capab
       if (shellCommandWords(raw.command).some(name => /^(?:cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)$/i.test(name))) {
         throw new VerificationPlanError('A typed shell step already uses the portable shell; remove host-shell wrappers.', 'capability');
       }
+      if (shellCommandWords(raw.command).some(name => /^(?:Get-Command|Test-Path|Get-Content|ConvertFrom-Json|Push-Location|Pop-Location|Write-Output)$/i.test(name))) {
+        throw new VerificationPlanError('PowerShell cmdlets cannot run in kind shell: verification uses the portable POSIX shell. Translate the check while preserving its assertions; executor shell feedback does not change this runtime.', 'capability');
+      }
       step.command = raw.command; step.expectExitCode = raw.expectExitCode;
     } else {
       if (!nonempty(raw.name) || !names.has(raw.name)) throw new VerificationPlanError(`Unregistered verification tool: ${raw.name}.`, 'capability');

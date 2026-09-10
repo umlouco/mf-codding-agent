@@ -142,7 +142,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 			system = supervisorResponsePolicy
 		}
 		if a.cfg.QueueRole == "validator" {
-			system = validatorPolicy + "\nTools are unavailable in this response turn. Use only the supplied requirements and host evidence."
+			system = validatorSystemPolicy(a.cfg.VerificationStage) + "\nTools are unavailable in this response turn. Use only the supplied requirements and host evidence."
 		}
 	}
 	a.mu.Unlock()
@@ -159,6 +159,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	var accumulated strings.Builder
 	var failures toolFailureLoop
 	var unchanged unchangedToolLoop
+	commandProtocolRepaired := false
 
 	for iter := 1; maxIterations == 0 || iter <= maxIterations; iter++ {
 		select {
@@ -230,6 +231,17 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 			return nil, fmt.Errorf("the response-only reviewer requested tools instead of returning the requested decision")
 		}
 		if len(calls) == 0 {
+			if a.cfg.QueueRole == "executor" && !a.cfg.ResponseOnly && unnamedCommandProposal(turnText, defs) {
+				if !commandProtocolRepaired && (maxIterations == 0 || iter < maxIterations) {
+					commandProtocolRepaired = true
+					a.mu.Lock()
+					sess.Messages = append(sess.Messages, llm.UserText(unnamedCommandCorrection))
+					a.mu.Unlock()
+					a.activity(req.SessionID, PhaseError, "Unnamed command was not executed; requesting one tool-protocol correction")
+					continue
+				}
+				turn.StopReason = "tool_protocol_error"
+			}
 			result.Text = accumulated.String()
 			result.StopReason = turn.StopReason
 			a.activity(req.SessionID, PhaseDone, fmt.Sprintf(

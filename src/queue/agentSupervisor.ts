@@ -94,8 +94,7 @@ Reply with ONE JSON object and nothing else:
 {
   "verdict": "RETRY",
   "feedback": "why the stored validation is or is not sufficient",
-  "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
-                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
+  "splitInto": [],
   "taskEdits": [{ "seq": ${task.seq}, "description": "...", "implVerifyPrompt": "...",
                   "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
 }
@@ -103,7 +102,8 @@ Reply with ONE JSON object and nothing else:
 Set verdict to VERIFIED, REVERIFY, RETRY, SPLIT, or REPAIR_TESTS. Choose REPAIR_TESTS when an existing
 test or validation script needs rewriting: the extension stops execution and gives YOU a test-editing
 turn, then independently runs the repaired checks. Do not delegate test rewrites to the executor.
-Use empty splitInto unless splitting; use empty taskEdits
+For SPLIT give the concrete scope problem in feedback and leave splitInto empty: the configured
+planner authors and validates the replacement tasks. Use empty taskEdits
 unless making edits. Replace example strings with concrete instructions, not placeholders.
 In feedback, state the original requirement this task covers and why the actual evidence satisfies
 it or what remains missing. Never accept report formatting or a demonstration as a replacement for
@@ -164,7 +164,8 @@ Do not duplicate the parent, repeat a rejected approach, weaken acceptance, or m
   const evidenceProblem = verdict === 'VERIFIED' ? storedValidationProblem(task.validationReport) : '';
   if (evidenceProblem) verdict = 'REVERIFY';
 
-  const splitInto = verdict === 'SPLIT' ? parseSupervisorSplit(d.splitInto) : [];
+  const hasSplitProposal = d.splitInto !== undefined && !(Array.isArray(d.splitInto) && !d.splitInto.length);
+  const splitInto = verdict === 'SPLIT' && hasSplitProposal ? parseSupervisorSplit(d.splitInto) : [];
   const settled = verdict;
   const feedback = evidenceProblem || String(d.feedback ?? '').trim();
   const taskEdits = (Array.isArray(d.taskEdits) ? d.taskEdits : []).filter(

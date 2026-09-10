@@ -5,7 +5,7 @@ import { parseExecutorValidation, serializeValidation, ToolObservation } from '.
 import { verificationExample, reportContract, originalGoalContext, projectNotesContext } from './prompts';
 import { taskCognition } from './cognition';
 import { VerificationSession } from './verificationPlanRunner';
-import { parseVerificationPlan, VerificationPlanError, VerificationReceipt } from './verificationPlan';
+import { parseVerificationPlan, VerificationPlan, VerificationPlanError, VerificationReceipt } from './verificationPlan';
 import type { VerificationAuthority } from './verificationAuthority';
 
 export { VerificationPlanError } from './verificationPlan';
@@ -16,28 +16,33 @@ export interface VerificationOutcome {
   usage: Usage;
 }
 
-/** A check has a finite lifetime even if the model keeps emitting reasoning. */
+const verificationPlanShape = `{
+  "version": 1,
+  "commandDisposition": "none",
+  "reason": "No saved shell command exists; inspect current files and exercise required behavior.",
+  "preservedAssertions": ["The assigned behavior and all acceptance conditions remain unchanged."],
+  "steps": [{"id": "inspect", "requirement": "Inspect the implementation", "kind": "tool",
+    "name": "read_file", "input": {"path": "confirmed/path"}, "dependsOn": []}],
+  "remaining": []
+}
+Shell step shape: {"id":"check","requirement":"required behavior","kind":"shell",
+"command":"existing check command","expectExitCode":0,"dependsOn":[]}
+Tool assertion shape: {"id":"state","requirement":"required state","kind":"tool",
+"name":"registered_tool","input":{},"expect":{"jsonEquals":true},"dependsOn":["inspect"]}`;
+
+const verificationShellRuntime = `Use kind shell for portable POSIX command text, on Windows as well as other platforms.
+Earlier executor feedback about PowerShell does not change this verification runtime.
+Translate host-shell checks into POSIX syntax while preserving their assertions. For example,
+use test -f for a required file; do not send Test-Path, Get-Content, or Get-Command as shell commands.
+The portable shell is already selected: do not wrap it in cmd /c or PowerShell.`;
+
+/** Model reasoning has no elapsed-time limit; individual tool checks retain their own bounds. */
 export async function runVerification(
   context: vscode.ExtensionContext, output: vscode.OutputChannel, task: Task, goal: string,
   onActivity?: (activity: ActivityRecord) => void, onEvent?: (method: string, params: any) => void,
   onAbort?: (abort: () => void) => void, projectNotes = '', authority?: VerificationAuthority,
 ): Promise<VerificationOutcome> {
-  let abort: (() => void) | undefined;
-  let ended = false;
-  let deadline: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      verificationPass(context, output, task, goal,
-        a => { if (!ended) onActivity?.(a); },
-        (method, params) => { if (!ended) onEvent?.(method, params); },
-        stop => { abort = stop; onAbort?.(stop); if (ended) stop(); }, projectNotes, authority),
-      new Promise<never>((_, reject) => { deadline = setTimeout(() => {
-        ended = true;
-        abort?.();
-        reject(new VerificationPlanError('Verification exceeded its ten-minute pass limit. Review the captured checks and exact remaining work.', 'capability'));
-      }, 600_000); }),
-    ]);
-  } finally { ended = true; if (deadline) clearTimeout(deadline); }
+  return verificationPass(context, output, task, goal, onActivity, onEvent, onAbort, projectNotes, authority);
 }
 
 /** Reason about requirements, execute typed checks in the host, then judge receipts. */
@@ -80,7 +85,7 @@ async function verificationPass(
   onAbort?.(() => { aborted = true; stopModel?.(); session.stop(); });
   const checkActive = () => { if (aborted) throw new VerificationPlanError('Verification cancelled.', 'cancelled'); };
   const options: RunOptions = {
-    verificationOnly: true, cognition: taskCognition(task, goal, 'verifier'), formatOnly: true, maxIterations: 1,
+    verificationOnly: true, verificationStage: 'plan', cognition: taskCognition(task, goal, 'verifier'), formatOnly: true, maxIterations: 1,
     onActivity, onEvent: observe,
     onAbort: abort => { stopModel = abort; if (aborted) abort(); },
   };
@@ -111,6 +116,15 @@ files since those receipts, recheck the affected behavior; historical PASS is no
   try {
     await session.start(context);
     checkActive();
+    const initial: VerificationPlan = { version: 1, commandDisposition: 'none', reason: '',
+      preservedAssertions: [], steps: [], remaining: [] };
+    const mandatory = session.requiredPlan?.(initial) ?? initial;
+    if (mandatory.steps.length) {
+      checkpoint = { ...mandatory, sourceCommand: task.solutionVerifyCommand, effectiveCommand,
+        commandAuthority: admittedAuthority, prerequisiteCheck: true };
+      receipts = await session.execute(mandatory);
+      checkActive();
+    }
     let planning = await runOnce(context, output, 'executor', `You are the independent verification planner.
 Produce an executable plan, not claims that checks already passed. The HOST executes every step;
 you cannot create observations by describing them. Do not edit production files, fixtures, tests,
@@ -122,13 +136,21 @@ ambiguity or missing evidence instead of silently narrowing the owner's requirem
 
 ${requirements}
 
+Mandatory Playwright evidence already captured by the host in this session:
+${JSON.stringify(receipts)}
+A failed mandatory gate prevents PASS but does not block independent implementation inspection.
+Plan explicit assertions for the assigned implementation even when the test harness is missing.
+For example, assert that a required manifest exists using an executable check with an expected
+result. Distinguish a missing assigned deliverable from an unavailable inspection tool. The host
+retains its mandatory receipt; do not repeat the unchanged failed suite invocation in your plan.
+
 Actual registered tool capabilities and their exact JSON input schemas:
 ${JSON.stringify(session.capabilities)}
 
-Use kind shell for portable POSIX command text. Tool names are RPC capabilities, NOT shell
+${verificationShellRuntime}
+Tool names are RPC capabilities, NOT shell
 executables. Use kind tool with its registered name and JSON input for browser, inspection, and
 other tools. Keep browser calls separate from shell text. Preserve valid saved shell commands intact.
-The portable shell is already selected: do not wrap it in cmd /c or PowerShell.
 Use registered background-process tools for persistent services, never a foreground dev server or
 an unowned '&' shell job. Use an HTTP readiness tool rather than arbitrary sleep durations.
 If a saved adapter has wrong quoting, conflates capabilities with shell executables, or encodes the
@@ -152,19 +174,7 @@ Return ONE JSON object. At most 24 steps per round; remaining explicitly names e
 commandDisposition is retained (saved command intact), adapted (diagnosed harness correction), or
 none (no saved command exists). Each step maps to a substantive assigned requirement.
 For THIS task an authoritative saved command is ${effectiveCommand?.trim() ? 'PRESENT: none is INVALID; use retained or adapted.' : 'ABSENT: use none.'}
-{
-  "version": 1,
-  "commandDisposition": "none",
-  "reason": "No saved shell command exists; inspect current files and exercise required behavior.",
-  "preservedAssertions": ["The assigned behavior and all acceptance conditions remain unchanged."],
-  "steps": [{"id": "inspect", "requirement": "Inspect the implementation", "kind": "tool",
-    "name": "read_file", "input": {"path": "confirmed/path"}, "dependsOn": []}],
-  "remaining": []
-}
-Shell step shape: {"id":"check","requirement":"required behavior","kind":"shell",
-"command":"existing check command","expectExitCode":0,"dependsOn":[]}
-Tool assertion shape: {"id":"state","requirement":"required state","kind":"tool",
-"name":"registered_tool","input":{},"expect":{"jsonEquals":true},"dependsOn":["inspect"]}`, options);
+${verificationPlanShape}`, options);
     recordUsage(planning.usage);
     stopModel = undefined;
     checkActive();
@@ -179,19 +189,24 @@ Tool assertion shape: {"id":"state","requirement":"required state","kind":"tool"
 The host rejected the complete plan BEFORE any step executed. No observations were produced.
 Exact validation error: ${String(error?.message ?? error)}
 ${requirements}
+${verificationShellRuntime}
 Registered capabilities and input schemas: ${JSON.stringify(session.capabilities)}
 Rejected plan: ${planning.text}
-Return a complete corrected version-1 plan in the SAME JSON shape, with all original checks retained.
+Return a complete corrected version-1 plan using the schema BELOW, with all original checks retained.
+This is a verification-plan turn. Do not return a supervisor verdict, task edits, or a PASS/FAIL report.
 For a nonempty saved command use retained with its intact shell invocation, or adapted with a
 concrete defect diagnosis and all preservedAssertions. Use none ONLY when no saved command exists.
 Separate RPC tools from shell commands; use actual tool schemas. Correct unsupported fields and
 exit expectations; do not waive checks, edit requirements, or fabricate observations. At most 24
-steps; list all deferred work in remaining. Do not return commentary or a second unchanged plan.`, options);
+steps; list all deferred work in remaining. Do not return commentary or a second unchanged plan.
+Required plan and step schemas (replace examples with the actual assigned checks):
+${verificationPlanShape}`, options);
       recordUsage(planning.usage);
       checkActive();
       if (coreHalted(planning.stopReason)) throw new VerificationPlanError('Plan correction did not finish.', 'planning');
       plan = parseVerificationPlan(planning.text, effectiveCommand, session.capabilities);
     }
+    plan = session.requiredPlan?.(plan) ?? plan;
     observe('verification/plan', { taskId: task.id, sourceCommand: task.solutionVerifyCommand, plan });
     checkpoint = { ...plan, sourceCommand: task.solutionVerifyCommand, effectiveCommand, commandAuthority: admittedAuthority };
     receipts = await session.execute(plan);
@@ -232,7 +247,7 @@ and add every check not independently established. Never claim this local task d
 The queue report schema below controls the final response.
 ${reportContract}
 Return ONE JSON object.
-${verificationExample.replace(/"kind":/g, '"stepId": "receipt-id", "kind":')}`, options);
+${verificationExample.replace(/"kind":/g, '"stepId": "receipt-id", "kind":')}`, { ...options, verificationStage: 'report' });
     recordUsage(result.usage);
     stopModel = undefined;
     checkActive();

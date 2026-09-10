@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { editTasks, planGoal } from './agents';
 import { TaskQueue, taskEditSummary } from './db';
 import { LiveLog } from './liveLog';
+import { preparePlanningGoal } from './testingEnvironment';
 
 export interface PlanningHost {
   context: vscode.ExtensionContext;
@@ -34,8 +35,9 @@ export async function generatePlan(host: PlanningHost, goal: string, append: boo
   // Planning has no task yet, so its stream is the queue's own — the
   // Planner terminal on the Plan tab.
   const live = new LiveLog(queue, null, 'planner');
-  live.note('plan', `planning: ${goal.trim()}`);
   try {
+    goal = await preparePlanningGoal(host.context, queue, goal);
+    live.note('plan', `planning: ${goal.trim()}`);
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: 'Scanning the workspace and scoping a plan…' },
       async (progress) => {

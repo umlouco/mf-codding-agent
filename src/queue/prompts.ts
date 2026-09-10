@@ -44,7 +44,20 @@ An INCOMPLETE result is unverified. After any relevant edit, reload and capture 
 Run separate viewports for responsive requirements. Each worker's browser session is isolated;
 authenticate as needed. With Remote SSH, URLs and browser processes run on the remote host.`;
 
-export const recoveryRules = `Diagnose the failure before rewriting:
+export const playwrightTestRegistration = `A spec run by Playwright must register test() cases using test imported or required from @playwright/test (or an existing fixture extending it).
+Node fs/path assertions may run inside these cases without a browser page. Do not confuse avoiding
+browser fixtures with forbidding the test-runner import. Top-level Node assertions alone do not
+register Playwright tests; a no-tests-found result is a setup failure, never RED or GREEN.`;
+
+export const verificationCommandRuntime = `Saved solutionVerifyCommand values run in the portable POSIX unix tool on every host, including Windows.
+PowerShell guidance applies to executor development commands, not saved verification commands.
+Use POSIX checks such as test -f and test -d, or an existing cross-platform test runner. Do not
+put Test-Path, Get-Content, Select-String, or host-shell wrappers in solutionVerifyCommand.
+Preserve the substantive assertions when correcting a command's shell syntax.`;
+
+export const recoveryRules = `${verificationCommandRuntime}
+
+Diagnose the failure before rewriting:
 - Saved verification commands execute in the extension's portable POSIX shell (unix) on every
   host, including Windows. Keep a working POSIX script intact; do not translate it to PowerShell
   just because workspace paths contain spaces. Quote paths or use workspace-relative paths.

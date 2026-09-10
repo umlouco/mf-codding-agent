@@ -269,19 +269,3 @@ test('fabricated PASS with zero receipts, failed receipt, or unobserved browser 
     assert.equal(JSON.parse(result.validationReport).conclusion, 'INCOMPLETE');
   }
 });
-
-
-
-test('verification deadline stops an endlessly reasoning model and disposes the host session', async () => {
-  let expire;
-  const f = fixture({hangModel:true,setTimeout:(callback,ms)=>{
-    assert.equal(ms,600000);expire=callback;return 1;
-  }});
-  const pending=f.load('verification').runVerification({}, {}, {id:1,createdAt:1,solutionVerifyCommand:''}, 'Goal');
-  for(let i=0;i<12;i++) await Promise.resolve();
-  assert.equal(f.prompts.length,1);
-  expire();
-  await assert.rejects(pending,/ten-minute pass limit/);
-  assert.ok(f.clients.every(client=>client.disposed));
-  assert.equal(f.calls.length,0);
-});

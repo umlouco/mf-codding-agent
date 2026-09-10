@@ -15,6 +15,11 @@ The TypeScript extension host integrates with VS Code and owns the durable task
 queue and worker orchestration. A compiled Go core runs individual agent turns,
 tools, graph memory, MCP clients, and browser work.
 
+The same queue can also [run directly from source](docs/source-runner.md) using
+Claude CLI, without installing the VS Code extension. Prompt-detected testing
+settings feed a mandatory Playwright verification gate when both a URL and
+credentials are configured.
+
 The architectural direction is to keep identity, behavioral rules, and automatic
 recovery in the program, with LLMs supplying knowledge and reasoning. See
 [Runtime identity and model reasoning](docs/runtime-identity.md) for the principles,

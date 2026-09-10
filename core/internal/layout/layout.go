@@ -169,9 +169,8 @@ Return one JSON object without markdown: {"checks":[{"id":"supplied ID","status"
 Include every supplied ID exactly once. Do not supply code, tool calls, or an overall verdict.
 Evidence packet:
 ` + string(data)
-	visionCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-	defer cancel()
-	turn, err := provider.Stream(visionCtx, llm.Request{System: "You are a visual layout inspector. Report only observable evidence for the supplied criteria. You have no tools.", Messages: []llm.Message{{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: prompt}, {Type: llm.BlockImage, MediaType: "image/png", Data: base64.StdEncoding.EncodeToString(capture.PNG)}}}}}, nil)
+	// Model latency is not a failed visual check. Preserve caller cancellation.
+	turn, err := provider.Stream(ctx, llm.Request{System: "You are a visual layout inspector. Report only observable evidence for the supplied criteria. You have no tools.", Messages: []llm.Message{{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: prompt}, {Type: llm.BlockImage, MediaType: "image/png", Data: base64.StdEncoding.EncodeToString(capture.PNG)}}}}}, nil)
 	if err != nil {
 		report.Problem = "Vision request failed; layout remains unverified: " + err.Error()
 		return report, nil

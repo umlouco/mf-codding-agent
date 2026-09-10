@@ -26,14 +26,14 @@ function setup(t, status, dependencies = {}) {
   return { queue, runner, task: queue.get(claimed.id), beforeIds: Array.from(queue.list(), row => row.id) };
 }
 
-function assertRefusalIsScheduled(f) {
+function assertRefusalIsScheduled(f, reason = /verified family outcome/) {
   const current = f.queue.get(f.task.id);
   assert.ok(current, 'the failed split transaction must retain its original row');
   assert.deepEqual(Array.from(f.queue.list(), row => row.id), f.beforeIds, 'no replacement child may escape rollback');
   assert.equal(current.status, 'VERIFYING', 'a failed split must not leave its parent PENDING or EXECUTING');
   assert.equal(current.activityPhase, 'decomposition_required');
   assert.equal(requiresDecomposition(current), true);
-  assert.match(readDecomposition(f.queue, current).reason, /verified family outcome/);
+  assert.match(readDecomposition(f.queue, current).reason, reason);
   assert.equal(f.queue.runState, 'RUNNING');
   assert.equal(JSON.parse(f.queue.getMeta(familyKey)).splits, 32, 'failed admission cannot reset or increment the budget');
   for (const field of ['title', 'description', 'implVerifyPrompt', 'solutionVerifyPrompt',
@@ -42,15 +42,14 @@ function assertRefusalIsScheduled(f) {
   }
 }
 
-test('normal progress SPLIT_TASK family-budget refusal schedules mandatory decomposition instead of leaving a pending parent', async t => {
+test('normal progress SPLIT_TASK schedules the planner without spending or resetting the family budget', async t => {
   const f = setup(t, 'EXECUTING');
-  await assert.rejects(() => f.runner.applyProgressDecision(f.task,
-    { action: 'SPLIT_TASK', reason: 'Partition the remaining work.', splitInto: parts(), usage }, { gen: 0 }),
-  error => error.invalidDecomposition === true && /verified family outcome/.test(error.message));
-  assertRefusalIsScheduled(f);
+  await f.runner.applyProgressDecision(f.task,
+    { action: 'SPLIT_TASK', reason: 'Partition the remaining work.', splitInto: parts(), usage }, { gen: 0 });
+  assertRefusalIsScheduled(f, /Partition the remaining work/);
 });
 
-test('normal supervisor SPLIT verdict family-budget refusal cannot leave the unchanged task in ordinary review', async t => {
+test('normal supervisor SPLIT verdict preserves the family budget while requesting the planner', async t => {
   let decisions = 0;
   const f = setup(t, 'VERIFYING', { './agents': { superviseTask: async () => {
     decisions++;
@@ -59,7 +58,7 @@ test('normal supervisor SPLIT verdict family-budget refusal cannot leave the unc
   } } });
   await f.runner.supervise(f.task);
   assert.equal(decisions, 1, 'the normal verifier-supervisor path produced this replacement decision');
-  assertRefusalIsScheduled(f);
+  assertRefusalIsScheduled(f, /need separate tasks/);
 });
 
 test('normal scope SPLIT family-budget refusal stops the parent without losing work or creating children', t => {

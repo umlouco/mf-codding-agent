@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import { statSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join, resolve } from 'path';
 import type { Task, TaskQueue } from './db';
 import { indexRepository } from './workInventory';
 
@@ -54,11 +54,20 @@ export function scheduleDecomposition(queue: TaskQueue, task: Task, reason: stri
 
 /** No clock, heartbeat, sequence number, or model-generated explanation counts as changed evidence. */
 export function decompositionWorkspaceRevision(root: string): string {
-  const index = indexRepository(root);
-  return decompositionDigest([index.fingerprint, index.problems, index.files.map(file => {
-    try { const stat = statSync(join(root, file)); return [file, stat.size, stat.mtimeMs]; }
-    catch { return [file, 'unavailable']; }
-  })]);
+  const snapshot = (directory: string): unknown[] => {
+    const index = indexRepository(directory);
+    return [index.fingerprint, index.problems, index.files.map(file => {
+      try { const stat = statSync(join(directory, file)); return [file, stat.size, stat.mtimeMs]; }
+      catch { return [file, 'unavailable']; }
+    })];
+  };
+  const current = snapshot(root);
+  const external = process.env.MFAGENT_PLAYWRIGHT_ROOT;
+  if (external && isAbsolute(external) && resolve(external) !== resolve(root)) {
+    try { current.push({ externalRoot: resolve(external), revision: snapshot(external) }); }
+    catch (error: any) { current.push({ externalRoot: resolve(external), unavailable: error?.code || 'unavailable' }); }
+  }
+  return decompositionDigest(current);
 }
 
 /** Persist before the provider starts; reloads and A -> B -> A input changes cannot renew a spent allowance. */

@@ -16,10 +16,20 @@ function setup(t, parts, overrides = {}) {
     validationReport: 'The shared implementation is sound; independent checks remain.',
     errorLog: 'Retained earlier attempt evidence.' });
   f.queue.log(original.id, 'executor', 'tool', 'Saved a useful completed observation.');
-  return { ...f, original: f.queue.get(original.id), reply };
+  const plannerCalls = [];
+  f.load('src/queue/failureDecomposition.ts').decideFailureDecomposition = async (...args) => {
+    plannerCalls.push(args); return reply;
+  };
+  f.runner.decompositionWorkspaceRevision = () => 'unchanged-fixture';
+  const completeSplit = async snapshot => {
+    await f.runner.supervise(snapshot);
+    const current = f.queue.get(snapshot.id);
+    if (current?.activityPhase === 'decomposition_required') await f.runner.serviceFailureDecomposition(current);
+  };
+  return { ...f, original: f.queue.get(original.id), reply, completeSplit, plannerCalls };
 }
 
-test('real supervisor SPLIT commits supplied children and retires the parent without another planning turn', async t => {
+test('supervisor SPLIT commits the planner replacement and retires the parent after planning', async t => {
   const executed = [];
   const f = setup(t, [child('First outcome'), child('Second outcome')], {
     executeTask: async (_, __, task) => {
@@ -30,13 +40,13 @@ test('real supervisor SPLIT commits supplied children and retires the parent wit
   });
   const originalUsage = { input: 9, output: 5, cacheRead: 3, cacheWrite: 2 };
   f.queue.addUsage(f.original.id, originalUsage);
-  await f.runner.supervise(f.original);
+  await f.completeSplit(f.original);
   const rows = f.queue.list();
   assert.equal(f.queue.get(f.original.id), undefined);
   assert.deepEqual(rows.map(row => row.title), ['First outcome', 'Second outcome', 'Later work']);
   assert.ok(rows.every(row => row.status === 'PENDING'));
   assert.equal(f.queue.runState, 'RUNNING');
-  assert.equal(f.calls.length, 0, 'the accepted decision must not be reconsidered by another paid planner');
+  assert.equal(f.plannerCalls.length, 1, 'the configured planner authors the required replacement');
   const archive = JSON.parse(f.queue.getMeta(JSON.parse(rows[0].region).scopeSplit.archiveKey));
   assert.equal(archive.ownerContext, JSON.stringify([f.queue.getMeta('goal'), f.queue.testingContext + f.queue.instructions]));
   const assigned = JSON.parse(rows[0].region).scopeSplit.contract;
@@ -49,7 +59,7 @@ test('real supervisor SPLIT commits supplied children and retires the parent wit
   assert.equal(archive.task.errorLog, f.original.errorLog);
   assert.deepEqual(archive.decision.splitInto, plain(f.reply.splitInto));
   assert.ok(archive.events.some(event => event.kind === 'tool'));
-  assert.deepEqual(plain(f.queue.stats().usage), { input: 10, output: 6, cacheRead: 3, cacheWrite: 2 });
+  assert.deepEqual(plain(f.queue.stats().usage), { input: 11, output: 7, cacheRead: 3, cacheWrite: 2 });
   await f.runner.pump();
   assert.deepEqual(executed, ['First outcome']);
   assert.equal(f.queue.get(rows[0].id).status, 'VERIFYING');
@@ -62,7 +72,7 @@ test('SPLIT ignores accompanying task edits instead of rewriting the retired tas
   const later = f.queue.list()[1];
   f.reply.taskEdits = [{ seq: f.original.seq, description: 'Unwanted original rewrite' },
     { seq: later.seq, description: 'Unwanted later rewrite' }];
-  await f.runner.supervise(f.original);
+  await f.completeSplit(f.original);
   assert.equal(f.queue.get(f.original.id), undefined);
   assert.equal(f.queue.get(later.id).description, later.description);
   assert.ok(f.queue.list().every(row => !row.description.includes('Unwanted')));
@@ -70,7 +80,7 @@ test('SPLIT ignores accompanying task edits instead of rewriting the retired tas
 
 test('a child retry changes approach feedback without re-authoring its persisted local contract', async t => {
   const f = setup(t, [child('First'), child('Second')]);
-  await f.runner.supervise(f.original);
+  await f.completeSplit(f.original);
   const claimed = f.queue.claimNext();
   f.queue.update(claimed.id, { status: 'VERIFYING', validationReport: 'A local implementation defect remains.' });
   f.reply.verdict = 'RETRY';
@@ -78,7 +88,7 @@ test('a child retry changes approach feedback without re-authoring its persisted
   f.reply.taskEdits = [{ seq: claimed.seq, description: 'Rebuild the entire original objective',
     implVerifyPrompt: 'Inspect everything again', solutionVerifyPrompt: 'Test every sibling again',
     solutionVerifyCommand: 'different command' }];
-  await f.runner.supervise(f.queue.get(claimed.id));
+  await f.completeSplit(f.queue.get(claimed.id));
   const retried = f.queue.get(claimed.id);
   assert.equal(retried.status, 'PENDING');
   for (const field of ['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand']) {
@@ -95,49 +105,44 @@ test('a failed replacement insert rolls back deletion, children, ordering and ac
   connection.exec(`CREATE TRIGGER reject_replacement BEFORE INSERT ON tasks
     WHEN NEW.title = 'Reject child' BEGIN SELECT RAISE(ABORT, 'test replacement failure'); END;`);
   connection.close();
-  await f.runner.supervise(f.original);
+  await f.completeSplit(f.original);
   const after = f.queue.list();
   assert.deepEqual(after.map(row => [row.id, row.seq, row.title]), before.map(row => [row.id, row.seq, row.title]));
   for (const field of ['description', 'output', 'validationReport', 'errorLog', 'attempts']) {
     assert.equal(f.queue.get(f.original.id)[field], f.original[field]);
   }
-  assert.equal(f.queue.stats().usage.input, 1, 'the attempted supervisor turn still cost tokens');
+  assert.equal(f.queue.stats().usage.input, 2, 'supervisor and planner usage survives a failed commit');
   assert.equal(f.queue.runState, 'RUNNING');
-  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_required');
-  assert.match(f.load('src/queue/recoveryDecomposition.ts').readDecomposition(f.queue, f.original).reason, /test replacement failure/);
+  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_waiting');
+  assert.match(f.load('src/queue/recoveryDecomposition.ts').readDecomposition(f.queue, f.original).lastError, /test replacement failure/);
   assert.equal(f.calls.length, 0);
 });
 
 test('incomplete supplied plans are rejected whole without deleting the task or inventing completion', async t => {
   for (const parts of [[child('Only one')], [child('First'), { title: 'Missing checks', description: 'Incomplete' }]]) {
     const f = setup(t, parts);
-    await f.runner.supervise(f.original);
+    await f.completeSplit(f.original);
     assert.equal(f.queue.list().length, 2);
     assert.equal(f.queue.get(f.original.id).status, 'VERIFYING');
     assert.equal(f.queue.get(f.original.id).validationReport, f.original.validationReport);
     assert.equal(f.queue.runState, 'RUNNING');
-  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_required');
+  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_waiting');
     assert.equal(f.calls.length, 0);
   }
 });
 
-test('an omitted replacement plan retains the bounded-planner fallback', async t => {
+test('an omitted supervisor replacement still requests the configured planner', async t => {
   const f = setup(t, undefined);
-  let replans = 0;
-  f.runner.replanOrPause = async (task, reason) => {
-    replans++;
-    assert.equal(task.id, f.original.id);
-    assert.equal(reason, f.reply.feedback);
-  };
   await f.runner.supervise(f.original);
-  assert.equal(replans, 1);
+  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_required');
+  assert.equal(f.load('src/queue/recoveryDecomposition.ts').readDecomposition(f.queue, f.original).reason, f.reply.feedback);
   assert.ok(f.queue.get(f.original.id));
 });
 
 test('retirement survives database reopening and cannot be overwritten by a stale verdict', async t => {
   const f = setup(t, [child('First'), child('Second')]);
-  await f.runner.supervise(f.original);
-  await f.runner.supervise(f.original);
+  await f.completeSplit(f.original);
+  await f.completeSplit(f.original);
   const { TaskQueue } = f.load('src/queue/db.ts');
   const reopened = TaskQueue.open(f.queue.path);
   try {
@@ -156,7 +161,7 @@ test('a later active worker is cancelled and fenced when replacement children pr
   let stopped = 0;
   f.runner.executionAbort = () => { stopped++; };
   const generation = f.runner.executionGen;
-  await f.runner.supervise(f.original);
+  await f.completeSplit(f.original);
   assert.equal(stopped, 1);
   assert.ok(f.runner.executionGen > generation);
   assert.equal(f.queue.get(later.id).status, 'PENDING');
@@ -172,23 +177,23 @@ test('a pending older supervisor response cannot rewrite the committed replaceme
     if (++calls === 1) return new Promise(resolve => { finishOlder = resolve; });
     return decision(parts);
   } });
-  const older = f.runner.supervise(f.original);
-  await f.runner.supervise(f.original);
+  const older = f.completeSplit(f.original);
+  await f.completeSplit(f.original);
   finishOlder({ verdict: 'RETRY', feedback: 'Obsolete verdict', usage,
     taskEdits: [{ seq: f.original.seq, description: 'Must never reach a replacement' }] });
   await older;
   assert.equal(f.queue.get(f.original.id), undefined);
   assert.deepEqual(f.queue.list().map(row => row.title), ['First', 'Second', 'Later work']);
   assert.ok(f.queue.list().every(row => !row.description.includes('Must never reach')));
-  assert.equal(f.queue.stats().usage.input, 1, 'the abandoned response cannot mutate replacement rows');
+  assert.equal(f.queue.stats().usage.input, 2, 'only current supervisor and planner usage reaches the replacement');
 });
 
 test('required acceptance command cannot disappear from the replacement plan', async t => {
   const f = setup(t, [child('First'), child('Second')]);
   f.queue.update(f.original.id, { solutionVerifyCommand: 'npm test' });
-  await f.runner.supervise(f.queue.get(f.original.id));
+  await f.completeSplit(f.queue.get(f.original.id));
   assert.equal(f.queue.runState, 'RUNNING');
-  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_required');
+  assert.equal(f.queue.get(f.original.id).activityPhase, 'decomposition_waiting');
   assert.equal(f.queue.get(f.original.id).solutionVerifyCommand, 'npm test');
-  assert.match(f.load('src/queue/recoveryDecomposition.ts').readDecomposition(f.queue, f.original).reason, /retain the original required verification command/);
+  assert.match(f.load('src/queue/recoveryDecomposition.ts').readDecomposition(f.queue, f.original).lastError, /retain the original required verification command/);
 });

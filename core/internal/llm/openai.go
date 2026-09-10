@@ -501,6 +501,21 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 			Type: BlockToolUse, ID: id, Name: c.Function.Name, Input: json.RawMessage(args),
 		})
 	}
+	if len(turn.ToolCalls()) == 0 && turn.StopReason == "stop" {
+		if recovered, preface := recoverTextToolCalls(text.String(), req.Tools); len(recovered) > 0 {
+			for i := range turn.Blocks {
+				if turn.Blocks[i].Type == BlockText {
+					turn.Blocks[i].Text = preface
+				}
+			}
+			turn.Blocks = append(turn.Blocks, recovered...)
+			if sink != nil {
+				for _, call := range recovered {
+					sink(Event{Kind: EventToolStart, ToolName: call.Name, ToolID: call.ID})
+				}
+			}
+		}
+	}
 	// Normalise the stop reason so the agent loop has one vocabulary.
 	if len(turn.ToolCalls()) > 0 {
 		turn.StopReason = "tool_use"

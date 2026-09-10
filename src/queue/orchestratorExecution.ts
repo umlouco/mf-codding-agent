@@ -6,6 +6,7 @@ import { scopeBlocked } from './scopePlan';
 import { recoveryState } from './recovery';
 import { boundedTask } from './scopeBoundary';
 import { hasRecoveryJob } from './recoverySchedule';
+import { promptOverloadReason } from './scopeEvidence';
 
 export abstract class OrchestratorExecution extends OrchestratorVerification {
 
@@ -37,6 +38,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
 
     const next = this.queue.list().find(task => task.status === 'PENDING');
     if (next && scopeBlocked(next, this.queue.list())) return;
+    if (next && this.requireBootstrapRepair(next)) return;
     if (next) {
       const blocked = recoveryState(this.queue, next).blocked;
       if (blocked || hasRecoveryJob(this.queue, next)) {
@@ -143,6 +145,11 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       if (!applied) {
         this.log(`task ${task.seq} — result arrived after the run moved past this attempt; discarding it`);
       } else {
+        const overload = promptOverloadReason(res.text);
+        if (overload) {
+          this.requestFailureDecomposition(this.queue.get(task.id)!, overload);
+          return;
+        }
         this.queue.log(
           task.id,
           'executor',

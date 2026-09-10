@@ -2,16 +2,35 @@ import { cognitionRecord } from './cognition';
 import { LiveLog } from './liveLog';
 import { OrchestratorProgress } from './orchestratorProgress';
 import { formatToolEvent } from './orchestratorState';
+import { ScopeEvidence } from './scopeEvidence';
+import { requiresDecomposition } from './recoveryDecomposition';
 
 export abstract class OrchestratorJournal extends OrchestratorProgress {
 
+  private observePromptOverload(taskId: number, actor: string, evidence: ScopeEvidence,
+    method: string, params: any, flush: () => void): boolean {
+    if (method !== 'stream/text' && method !== 'stream/thinking') return false;
+    evidence.observe(method, params);
+    const reason = evidence.promptOverload;
+    const task = this.queue.get(taskId);
+    // The planner is already fulfilling this request; do not cancel its own
+    // decomposition because it acknowledges the parent's confusing prompt.
+    if (!reason || !task || requiresDecomposition(task)) return false;
+    flush();
+    this.queue.log(taskId, actor, 'prompt-overload', reason);
+    this.requestFailureDecomposition(task, reason);
+    return true;
+  }
+
   /** Runtime observations are durable evidence of execution, never liveness heartbeats. */
   protected observerEvents(taskId: number, actor: string, live: LiveLog, accepts = () => true) {
+    const scopeEvidence = new ScopeEvidence();
     let lastCognition = '';
     const pendingTools = new Map<string, { name: string; input: unknown }>();
     return (method: string, params: any): void => {
       if (!accepts()) return;
       live.onEvent(method, params);
+      if (this.observePromptOverload(taskId, actor, scopeEvidence, method, params, () => live.flush())) return;
       if (method === 'stream/tool' && params?.id && params.status !== 'start') {
         if (params.status === 'running') {
           pendingTools.set(params.id, { name: String(params.name ?? 'tool'), input: params.input });
@@ -50,6 +69,7 @@ export abstract class OrchestratorJournal extends OrchestratorProgress {
    * one is not optional, or the tail of every reply is lost.
    */
   protected streamJournal(taskId: number, actor: 'executor' | 'validator', accepts = () => true) {
+    const scopeEvidence = new ScopeEvidence();
     const pendingTools = new Map<string, { name: string; input: unknown }>();
     let kind = '';
     let buffer = '';
@@ -87,6 +107,7 @@ export abstract class OrchestratorJournal extends OrchestratorProgress {
         }
         kind = next;
         buffer += String(params?.delta ?? '');
+        if (this.observePromptOverload(taskId, actor, scopeEvidence, method, params, flush)) return;
         if (buffer.length >= 1200) {
           flush();
         }

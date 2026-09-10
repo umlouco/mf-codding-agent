@@ -2,10 +2,12 @@ import type { Task } from './db';
 import type { SupervisorDecision } from './agents';
 import type { Review } from './orchestratorState';
 import { OrchestratorRecovery } from './orchestratorRecovery';
-import { decideFailureDecomposition } from './failureDecomposition';
+import { bootstrapTddProblem, decideFailureDecomposition } from './failureDecomposition';
 import { LiveLog } from './liveLog';
 import { completeRecoveryJob } from './recoverySchedule';
 import { decisionEvidence } from './recovery';
+import { plannerIdentity } from './agents';
+import { requiresPlaywright } from './playwrightPolicy';
 import { admitDecomposition, decompositionAncestry, decompositionDigest,
   decompositionWorkspaceRevision, readDecomposition, requiresDecomposition,
   saveDecomposition, scheduleDecomposition } from './recoveryDecomposition';
@@ -19,9 +21,22 @@ import { admitDecomposition, decompositionAncestry, decompositionDigest,
 // rejected.  Let the repaired, current contract receive one bounded plan.
 const DECOMPOSITION_STRATEGY = 'failure-decomposition-v5';
 
+/** A different planner can repair a rejected proposal; credentials and clock time cannot. */
+export function decompositionPlannerIdentity(): string {
+  return decompositionDigest(plannerIdentity?.() || []);
+}
+
 /** A rejected/exhausted task has only one exit: commit its complete replacement and retire its row. */
 export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
   protected abstract applyVerdictSplit(task: Task, decision: SupervisorDecision, current: () => boolean): boolean;
+
+  protected requireBootstrapRepair(task: Task): boolean {
+    if (task.seq !== 1 || task.kind === 'phase' || !requiresPlaywright(this.queue)) return false;
+    const problem = bootstrapTddProblem(task.description);
+    if (!problem) return false;
+    this.requestFailureDecomposition(task, problem);
+    return true;
+  }
 
   protected requestFailureDecomposition(snapshot: Task, reason: string): void {
     const task = this.queue.get(snapshot.id);
@@ -63,7 +78,8 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
       row.description, row.implVerifyPrompt, row.solutionVerifyPrompt, row.solutionVerifyCommand,
       row.region, row.splitScope, row.output, row.validationReport]);
     const contractAtStart = contract(task);
-    const fingerprint = decompositionDigest([DECOMPOSITION_STRATEGY, ownerAtStart, contractAtStart, workspace, evidence]);
+    const planner = decompositionPlannerIdentity();
+    const fingerprint = decompositionDigest([DECOMPOSITION_STRATEGY, planner, ownerAtStart, contractAtStart, workspace, evidence]);
     if (!admitDecomposition(this.queue, task, job, fingerprint)) {
       // A crash on the last admitted call must not leave a row claiming to be planning forever.
       if ((job.inputs[fingerprint] ?? 0) >= 3 && task.activityPhase !== 'decomposition_waiting') {
@@ -80,6 +96,7 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
       return !this.disposed && this.queue.runState === 'RUNNING' && this.reviewGen === review.gen &&
         !!current && current.status === 'VERIFYING' && requiresDecomposition(current) &&
         contract(current) === contractAtStart && owner() === ownerAtStart &&
+        decompositionPlannerIdentity() === planner &&
         decisionEvidence(this.queue, current) <= evidence;
     };
     this.queue.recordActivity(task.id, 'decomposition_planning',
@@ -89,6 +106,7 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     try {
       const decision = await decideFailureDecomposition(this.context, this.output, task, {
         goal: this.queue.getMeta('goal'),
+        requireRunnableSuite: task.seq === 1 && requiresPlaywright(this.queue),
         ownerInstructions: this.queue.contextInstructions + '\n' + this.queue.testingContext + this.queue.instructions,
         evidence: JSON.stringify({ reason: job.reason, errorLog: task.errorLog, report: task.validationReport.slice(0, 16000),
           events: this.queue.events(task.id, 16, true).map(event => ({ actor: event.actor, kind: event.kind, message: event.message.slice(0, 1500) })),

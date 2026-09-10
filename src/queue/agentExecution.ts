@@ -2,7 +2,7 @@ import { CompletionClaim, parseCompletionClaim, extractExecutorNotes } from './v
 import { Usage, Task } from './db';
 import * as vscode from 'vscode';
 import { ActivityRecord, RunOptions } from './agentTypes';
-import { retryBriefing } from './agentHistory';
+import { retryBriefing, replacementHandoff, decisionOnlyReport } from './agentHistory';
 import { projectNotesContext, originalGoalContext, codingWorkflow, browserEvidence, reportContract, executorExample } from './prompts';
 import { runOnce, workerRounds } from './agentRuntime';
 import { taskCognition } from './cognition';
@@ -43,7 +43,7 @@ export interface ExecutionOutcome {
  * or is ready to validate.
  */
 export function coreHalted(stopReason: string): boolean {
-  return stopReason === 'supervisor_repair_required' || stopReason === 'testing_target_blocked' || stopReason === 'repeated_tool_error' || stopReason === 'unchanged_tool_loop' || stopReason === 'context_limit' || stopReason === 'max_iterations';
+  return stopReason === 'supervisor_repair_required' || stopReason === 'testing_target_blocked' || stopReason === 'tool_protocol_error' || stopReason === 'repeated_tool_error' || stopReason === 'unchanged_tool_loop' || stopReason === 'context_limit' || stopReason === 'max_iterations';
 }
 
 export async function executeTask(
@@ -77,6 +77,7 @@ ${notes}TASK ${task.seq}: ${task.title}
 ${task.description}
 
 ${task.splitScope || ''}
+${replacementHandoff(task)}
 ${retry}
 Own the implementation. Run ordinary development checks while you work, but do
 not make the final verification decision. A supervisor watches your database
@@ -113,7 +114,7 @@ ${reportContract}
   Use an empty notes string when there is no new durable fact. Replace this example's values:
 ${executorExample}`;
 
-  const { text, stopReason, usage } = await runOnce(context, output, 'executor', prompt, {
+  const options: RunOptions = {
     cognition: taskCognition(task, goal, 'executor'),
     memoryQuery: `${task.title || ''}\n${task.description}`,
     maxIterations: workerRounds(),
@@ -121,7 +122,29 @@ ${executorExample}`;
     onEvent,
     onAbort,
     onSteerable,
-  });
+  };
+  let result = await runOnce(context, output, 'executor', prompt, options);
+  if (!coreHalted(result.stopReason) && decisionOnlyReport(result.text)) {
+    output.appendLine('[queue:executor] supervisor/verifier-only report received; requesting one execution-role correction');
+    const spent = result.usage;
+    try {
+      result = await runOnce(context, output, 'executor', `${prompt}\n\nROLE CORRECTION:
+Your previous response returned a supervisor-only verdict, verification plan, or verifier-only report instead of an execution report.
+You are the EXECUTOR. Perform the assigned implementation yourself using the available tools,
+inspect existing work first, follow the owner's TDD instructions, and report the actual result
+using the completion schema above. Do not tell a future worker to do your task or return a verdict.
+If a concrete blocker prevents implementation, report NEEDS_MORE_WORK with observed evidence.`, options);
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      const partial = (failure as any).usage || {};
+      (failure as any).usage = Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite']
+        .map(key => [key, (spent as any)[key] + (partial[key] || 0)]));
+      throw failure;
+    }
+    result.usage = { ...result.usage };
+    for (const key of ['input', 'output', 'cacheRead', 'cacheWrite'] as const) result.usage[key] += spent[key];
+  }
+  const { text, stopReason, usage } = result;
   return {
     text,
     completion: parseCompletionClaim(text),

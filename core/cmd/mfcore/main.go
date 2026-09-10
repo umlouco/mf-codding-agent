@@ -114,13 +114,14 @@ func (s *server) log(level, msg string) {
 func (s *server) register() {
 	s.conn.Register("initialize", s.onInitialize)
 	// A chat turn runs for minutes; it must not block cancels or the
-	// permission round-trip, so it is the one async handler.
+	// permission round-trip, so it needs asynchronous dispatch.
 	s.conn.RegisterAsync("chat/send", s.onSend)
 	s.conn.Register("chat/cancel", s.onCancel)
 	s.conn.Register("chat/steer", s.onSteer)
 	s.conn.Register("chat/reset", s.onReset)
 	s.conn.Register("tools/list", s.onToolsList)
-	s.conn.Register("tools/invoke", s.onToolsInvoke)
+	// File and editor tools call back into the host; keep reading their replies.
+	s.conn.RegisterAsync("tools/invoke", s.onToolsInvoke)
 	s.conn.Register("memory/stats", s.onMemoryStats)
 	s.conn.Register("memory/graph", s.onMemoryGraph)
 	s.conn.Register("memory/search", s.onMemorySearch)

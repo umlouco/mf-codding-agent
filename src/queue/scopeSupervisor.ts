@@ -101,6 +101,7 @@ export class ScopeSupervisor {
           inventory = await discoverWork(snapshot, queue.getMeta('goal'), queue.contextInstructions, repository,
             async prompt => {
               const result = await runOnce(this.host.context, this.host.output, 'supervisor', prompt, {
+                planningOnly: true,
                 cognition: taskCognition(task, queue.getMeta('goal'), 'supervisor'),
                 onAbort: abort => { if (!this.current()) abort(); else this.abort = abort; },
                 onEvent: (method, params) => { if (this.current()) live.onEvent(method, params); },
@@ -137,6 +138,7 @@ export class ScopeSupervisor {
       let repair = '';
       for (let attempt = 0; attempt < 2; attempt++) {
         const result = await runOnce(this.host.context, this.host.output, 'supervisor', prompt + repair, {
+          planningOnly: true,
           cognition: taskCognition(task, queue.getMeta('goal'), 'supervisor'),
           onAbort: abort => { if (!this.current()) abort(); else this.abort = abort; },
           onEvent: (method, params) => { if (this.current()) live.onEvent(method, params); },

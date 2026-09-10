@@ -49,7 +49,7 @@ test('attempt-ceiling escalation also preserves the complete 27-part replacement
 });
 
 for (const [label, splitInto] of [
-  ['missing array', undefined], ['empty array', []], ['one child', [part(0)]],
+  ['one child', [part(0)]],
   ['not an array', {}], ['invalid late branch', [...Array.from({ length: 25 }, (_, i) => part(i)), null]],
   ['empty late title', [...Array.from({ length: 25 }, (_, i) => part(i)), { ...part(25), title: '' }]],
   ['missing description', [part(0), { ...part(1), description: undefined }]],

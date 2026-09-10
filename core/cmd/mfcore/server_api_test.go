@@ -48,7 +48,7 @@ func TestServerRPCRegistrationContract(t *testing.T) {
 		"chat/steer":          "Register:onSteer",
 		"chat/reset":          "Register:onReset",
 		"tools/list":          "Register:onToolsList",
-		"tools/invoke":        "Register:onToolsInvoke",
+		"tools/invoke":        "RegisterAsync:onToolsInvoke",
 		"memory/stats":        "Register:onMemoryStats",
 		"memory/graph":        "Register:onMemoryGraph",
 		"memory/search":       "Register:onMemorySearch",

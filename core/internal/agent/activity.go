@@ -24,10 +24,9 @@ That inverts how a stuck worker is detected. Instead of asking "has this run
 longer than it was allowed", which punishes slow models, the question becomes
 "has this written anything lately", which only ever punishes dead ones.
 
-One condition does end a call: silence on the wire. Bytes arriving mean the far
-end is alive however slowly it is working, so every read resets the window;
-bytes having stopped for the whole window means the connection is gone, and
-saying so is more useful than waiting on it forever.
+An optional transport idle window can end a call that delivers no bytes. A
+silent local model may still be loading or doing prefill, so callers can disable
+this window and wait until completion, a transport error, or explicit cancellation.
 */
 
 // Phases an observer can act on. They go into the journal verbatim.
@@ -51,6 +50,9 @@ const (
 )
 
 func (a *Agent) llmIdle() time.Duration {
+	if a.cfg.LLMIdleSeconds < 0 {
+		return 0 // Explicitly disabled: slow prefill may deliver no bytes for hours.
+	}
 	if n := a.cfg.LLMIdleSeconds; n > 0 {
 		return time.Duration(n) * time.Second
 	}
@@ -113,8 +115,8 @@ stream runs one provider call under an activity watch.
 
 The watch does two things and nothing else. It keeps writing for as long as the
 call is in flight, so silence in the journal means a dead worker rather than a
-busy one. And it cancels the call when the connection has delivered nothing for
-the whole idle window — the one condition that is never a slow model.
+busy one. If explicitly enabled, the idle guard cancels a connection that has
+delivered nothing for its configured window.
 */
 func (a *Agent) stream(
 	ctx context.Context,
@@ -172,7 +174,7 @@ func (a *Agent) stream(
 				return
 			case now := <-tick.C:
 				idle := now.Sub(time.Unix(0, lastByte.Load()))
-				if idle >= a.llmIdle() {
+				if limit := a.llmIdle(); limit > 0 && idle >= limit {
 					stalled.Store(true)
 					a.activity(sessionID, PhaseStalled, fmt.Sprintf(
 						"%s has delivered nothing for %s — dropping the connection",

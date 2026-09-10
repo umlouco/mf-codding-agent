@@ -17,7 +17,7 @@ async function local(t) {
   } });
   const parent = f.queue.claimNext();
   f.queue.update(parent.id, { status: 'VERIFYING', validationReport: 'Independent findings.' });
-  await f.runner.supervise(f.queue.get(parent.id));
+  f.runner.applyVerdictSplit(f.queue.get(parent.id), reply, () => true);
   const claimed = f.queue.claimNext();
   f.queue.update(claimed.id, { status: 'VERIFYING', validationReport: 'The command has an unsupported flag.' });
   return { ...f, task: f.queue.get(claimed.id), validated, setReply: value => { reply = value; } };

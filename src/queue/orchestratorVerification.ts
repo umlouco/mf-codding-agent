@@ -31,6 +31,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
   protected async verifyWithExecutor(task: Task, review: Review): Promise<void> {
     if (!sameVerificationSnapshot(this.queue.get(task.id), task) || review.gen !== this.reviewGen) return;
     if (requiresDecomposition(task)) return;
+    if (this.requireBootstrapRepair(task)) return;
     if (scopeBlocked(task, this.queue.list())) return;
     if (this.correctTestingTarget(task)) return;
     if (this.queue.countEvents(task.id, 'verification-pass', true) >= 2) {
@@ -278,18 +279,10 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         !await this.allowRecovery(task, decision.verdict)) return;
     if (!accepts()) return;
     if (decision.verdict === 'SPLIT') {
-      // A supplied plan has already been decided. Asking another planner whether
-      // to split discards that decision and can leave the original runnable forever.
-      // Edits accompanying SPLIT are deliberately ignored: this transition only
-      // replaces the reviewed row, and sequence numbers move when it commits.
-      if (!decision.splitInto?.length) {
-        await this.replanOrPause(task, decision.feedback || 'Supervisor requested decomposition');
-      } else {
-        try { this.applyVerdictSplit(task, decision, accepts); }
-        catch (error: any) {
-          if (accepts()) this.requestFailureDecomposition(task, `Replacement plan could not be committed: ${error?.message ?? error}`);
-        }
-      }
+      // The supervisor decides that a split is needed; the configured planner
+      // authors its replacement. Fence the parent now so it cannot run again
+      // while the planner preserves outcomes and validates the smaller tasks.
+      this.requestFailureDecomposition(task, decision.feedback || 'Supervisor requested decomposition.');
       this.changed();
       return;
     }

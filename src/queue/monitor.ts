@@ -132,7 +132,8 @@ function normalize(raw: any, usage: Usage, task: Task, testingUrl = "", needsRec
   if (needsRecovery && raw?.action === 'CONTINUE_EXECUTION') {
     throw new Error('The current worker was halted for a wrong testing target or repeated tool failures. CONTINUE_EXECUTION would repeat the rejected approach. Supply a concrete task/validation correction or SPLIT_TASK with smaller steps.');
   }
-  if (raw?.action === 'SPLIT_TASK' && (!Array.isArray(raw.splitInto) || raw.splitInto.length < 2 ||
+  const hasSplitProposal = raw?.splitInto !== undefined && !(Array.isArray(raw.splitInto) && !raw.splitInto.length);
+  if (raw?.action === 'SPLIT_TASK' && hasSplitProposal && (!Array.isArray(raw.splitInto) || raw.splitInto.length < 2 ||
       raw.splitInto.some((p: any) => !p || typeof p.title !== 'string' || !p.title.trim() ||
         typeof p.description !== 'string' || !p.description.trim() ||
         !(typeof p.solutionVerifyPrompt === 'string' && p.solutionVerifyPrompt.trim() ||
@@ -163,7 +164,7 @@ function normalize(raw: any, usage: Usage, task: Task, testingUrl = "", needsRec
     : 'CONTINUE_EXECUTION';
   const decision: ProgressDecision = {
     action,
-    splitInto: action === 'SPLIT_TASK' ? raw.splitInto.map((p: NewTask) => ({
+    splitInto: action === 'SPLIT_TASK' && hasSplitProposal ? raw.splitInto.map((p: NewTask) => ({
       title: p.title, description: p.description, implVerifyPrompt: p.implVerifyPrompt,
       solutionVerifyPrompt: p.solutionVerifyPrompt, solutionVerifyCommand: p.solutionVerifyCommand,
     })) : undefined,
@@ -321,14 +322,11 @@ are valid when they serve this task's scope and do not replace a required applic
   YOU rewrite the test in a dedicated supervisor turn with editing tools. Preserve owner acceptance
   criteria, repair syntax/selectors/target assumptions from evidence, and never weaken a valid test
   to hide an application defect. Independent validation follows your repair.
-- SPLIT_TASK: stop the current executor and replace this task with smaller sequential steps.
+- SPLIT_TASK: stop the current executor and ask the configured planner for smaller sequential steps.
   Use this when failures show it is juggling independent requirements or repeatedly rewriting
   a large test instead of completing one check. Do not wait for formal validation to split.
-  Supply splitInto with at least two parts in dependency order, each with title, complete
-  description, and its own solutionVerifyPrompt or solutionVerifyCommand. Each part must be
-  smaller than the parent and independently checkable. Preserve working files and all owner
-  requirements. The extension appends a final acceptance check using the parent's full contract;
-  do not duplicate that final check in splitInto. Use the configured testing URL in every part.
+  Give the concrete scope problem in reason; omit splitInto. The planner authors and validates
+  the replacement tasks while preserving working files, owner requirements and acceptance checks.
 - START_VALIDATION: implementation evidence is sufficient to stop/resume no further work and
   delegate formal verification to a fresh execution LLM.
 - STOP_AND_DECOMPOSE_TASK: repeated discovery or multiple independently checkable outcomes
@@ -345,8 +343,7 @@ Reply with one JSON object. This protocol is fixed:
   "rewrittenDescription": "required only for STOP_AND_REWRITE_TASK",
   "implVerifyPrompt": "replacement when rewriting validation",
   "solutionVerifyPrompt": "replacement when rewriting validation",
-  "solutionVerifyCommand": "replacement when rewriting validation; empty only to remove an invalid command while preserving the required check",
-  "splitInto": [{"title": "one small step", "description": "complete requirements for this step", "solutionVerifyPrompt": "the specific check for this step"}]
+  "solutionVerifyCommand": "replacement when rewriting validation; empty only to remove an invalid command while preserving the required check"
 }
 Use one action from the list above and replace example values. Omit replacement fields unless
 that action needs them. The final response must be valid JSON, with no code fence or prose.`;
@@ -380,7 +377,7 @@ Return ONE JSON object: {"action":"CONTINUE_EXECUTION","reason":"concrete reason
 Allowed action values: ${SUPERVISOR_ACTIONS.join(', ')}.
 For STOP_AND_REWRITE_TASK include complete rewrittenDescription and any changed verification fields.
 For STOP_AND_REWRITE_VALIDATION include changed implVerifyPrompt, solutionVerifyPrompt or solutionVerifyCommand.
-For SPLIT_TASK include splitInto with at least two complete title, description and solutionVerifyPrompt objects.
+For SPLIT_TASK give the concrete scope problem in reason; the configured planner generates replacement tasks.
 For test repair include guidance identifying the defect. Preserve requirements. Do not return a bare action.`;
     try {
       const localRepair = isLocalScope(task) ? `\nThis is a committed local ticket. The proposed contract rewrite

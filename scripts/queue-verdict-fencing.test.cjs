@@ -136,7 +136,7 @@ test('a stale task snapshot cannot launch validation or consume its retry budget
   assert.equal(queue.countEvents(task.id, 'verification-pass'), 0);
 });
 
-test('a split verdict uses bounded recovery instead of an unbounded legacy preflight', async t => {
+test('a split verdict requests planner decomposition instead of a legacy preflight', async t => {
   const queue = fixture(t);
   const task = verifying(queue);
   let replans = 0;
@@ -144,7 +144,7 @@ test('a split verdict uses bounded recovery instead of an unbounded legacy prefl
     superviseTask: async () => ({ verdict: 'SPLIT', feedback: 'Investigate independent work', usage }),
   } });
   runner.scopeWatch = () => assert.fail('The legacy split path must not start its own preflight');
-  runner.replanOrPause = async (snapshot, reason) => {
+  runner.requestFailureDecomposition = (snapshot, reason) => {
     replans++;
     assert.equal(snapshot.id, task.id);
     assert.equal(reason, 'Investigate independent work');

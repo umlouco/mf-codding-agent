@@ -18,7 +18,7 @@ function load(file, dependencies = {}, extra = '') {
   vm.runInNewContext(outputText, {
     exports, setTimeout, clearTimeout,
     Buffer,
-    require: (name) => dependencies[name] ?? (/^\.\/(orchestrator|scope|recovery|workInventory|verificationAuthority|verificationRecovery)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : name === './cognition' ? cognition : name === 'crypto' ? require('node:crypto') : {}),
+    require: (name) => dependencies[name] ?? (/^\.\/(orchestrator|scope|recovery|workInventory|verificationAuthority|verificationRecovery|playwrightPolicy)/.test(name) ? load('src/queue/' + name.slice(2) + '.ts', dependencies) : name === './cognition' ? cognition : name === 'crypto' ? require('node:crypto') : {}),
   }, { filename: file });
   return exports;
 }
@@ -422,7 +422,9 @@ test('execution and independent verification retain client intent across task re
     seen.push(prompt);
     assert.equal(typeof opts.onActivity, 'function', 'goal must not shift activity callback');
     assert.equal(typeof opts.onAbort, 'function', 'cancellation callback preserved');
-    return { text: JSON.stringify(prompt.startsWith('You are the independent verification planner.')
+    return { text: JSON.stringify(prompt.startsWith('You are an execution agent.')
+      ? { completion: { status: 'NEEDS_MORE_WORK', summary: 'Owner requirements need implementation', filesChanged: [], developmentChecks: [] } }
+      : prompt.startsWith('You are the independent verification planner.')
       ? verificationPlanReply() : { validation: passingValidation() }), stopReason: '',
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
   };

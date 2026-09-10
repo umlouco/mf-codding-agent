@@ -1,5 +1,7 @@
 import { Task } from './db';
 import { parseCompletionClaim, completionForSupervisor, parseExecutorValidation } from './validation';
+import { getActiveQueue } from './registry';
+import { extractJson } from './agentJson';
 
 export const MAX_LOG_ENTRIES = 4;
 
@@ -11,6 +13,62 @@ export const squash = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
 export function clip(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}\n… (truncated)`;
+}
+
+/** A decision from another role cannot describe the executor's completed work. */
+export function decisionOnlyReport(text: string): boolean {
+  if (parseCompletionClaim(text).status !== 'UNSTATED') return false;
+  try {
+    return !!extractJson(text, value => {
+      if (!value || typeof value !== 'object') return false;
+      const report = value as any;
+      return typeof report.verdict === 'string' ||
+        typeof report.validation?.conclusion === 'string' ||
+        (typeof report.commandDisposition === 'string' && Array.isArray(report.steps) &&
+          (report.version === 1 || (Array.isArray(report.preservedAssertions) && Array.isArray(report.remaining)))) ||
+        (typeof report.conclusion === 'string' && Array.isArray(report.checks));
+    });
+  } catch { return false; }
+}
+
+function rejectedHandoff(text: string): string {
+  const notice = 'The previous worker returned a supervisor/verifier-only decision, not an execution handoff. Inspect current files to establish completed work; no implementation claim was supplied.';
+  // Older workers used the validation schema. Keep their concrete observations
+  // and unfinished checks without copying decision schemas or role-setting prose.
+  try {
+    const envelope = extractJson<any>(text, value => !!value && typeof value === 'object' &&
+      (typeof (value as any).validation?.conclusion === 'string' ||
+        (typeof (value as any).conclusion === 'string' && Array.isArray((value as any).checks))));
+    const report = envelope.validation || envelope;
+    const evidence: Record<string, unknown> = Object.fromEntries(['implementationEvidence', 'behaviorEvidence', 'remaining']
+      .filter(key => typeof report[key] === 'string' || Array.isArray(report[key]))
+      .map(key => [key, clip(Array.isArray(report[key])
+        ? report[key].filter((value: unknown) => typeof value === 'string').join('\n') : report[key], 800)]));
+    if (Array.isArray(report.checks)) {
+      evidence.checks = report.checks.slice(0, 4).map((check: any) =>
+        ({ name: clip(String(check?.name || ''), 120), evidence: clip(String(check?.evidence || ''), 300) }));
+      if (report.checks.length > 4) evidence.additionalChecks = report.checks.length - 4;
+    }
+    return `${notice}\nReported observations and unfinished checks (unverified):\n${JSON.stringify(evidence)}`;
+  } catch { return notice; }
+}
+
+/** Supply the retired worker's report directly; workers need no SQLite access. */
+export function replacementHandoff(task: Task): string {
+  if (!task.region) return '';
+  let key: unknown;
+  try { key = JSON.parse(task.region).scopeSplit?.archiveKey; } catch { return ''; }
+  if (typeof key !== 'string' || !key.startsWith('scopeSplit:')) return '';
+  let parent: any;
+  try { parent = JSON.parse(getActiveQueue?.()?.getMeta(key) || '{}').task; } catch { /* Missing archive is explicit below. */ }
+  return `\nARCHIVED PARENT HANDOFF (reports are claims, not proof):
+${parent ? JSON.stringify({ title: parent.title,
+    output: decisionOnlyReport(String(parent.output || '')) ? rejectedHandoff(String(parent.output))
+      : clip(String(parent.output || '(no prior work reported)'), 8000),
+    validationReport: clip(String(parent.validationReport || '(none)'), 4000),
+    errorLog: clip(String(parent.errorLog || '(none)'), 2000) }) : '(archive unavailable; inspect current files and report any material uncertainty)'}
+The host supplied the handoff above; do not query or modify the queue database.
+Inspect current files to establish what exists, then complete this task's remaining work.\n`;
 }
 
 /** Splits an accumulated error log back into its per-attempt entries. */
@@ -61,6 +119,7 @@ export function retryBriefing(task: Task): string {
   }
   const claim = parseCompletionClaim(previous);
   const handoff = !previous ? '(no prior report recorded)'
+    : decisionOnlyReport(previous) ? rejectedHandoff(previous)
     : claim.status !== 'UNSTATED' ? completionForSupervisor(claim)
     : JSON.stringify(parseExecutorValidation(previous, false));
   return `

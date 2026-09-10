@@ -1,3 +1,13 @@
+/** An explicit model report of prompt overload, not a latency or token-count limit. */
+export function promptOverloadReason(text: string): string | undefined {
+  const sentences = text.match(/[^.!?\n]+[.!?]?/g) || [];
+  const report = sentences.find(sentence =>
+    /\b(?:very long|too long|overwhelming)\s+prompt\b/i.test(sentence) &&
+    /\bnested instructions\b/i.test(sentence) &&
+    /\b(?:corrupted|concatenated fragments)\b/i.test(sentence));
+  return report ? `Agent reports prompt overload; planner must split the task into clearer, smaller work. Observed response: ${report.trim().slice(0, 1200)}` : undefined;
+}
+
 /** Tool footprints are evidence for a supervisor, never an edit allowance. */
 export class ScopeEvidence {
   private pending = new Map<string, { name: string; input: any }>();
@@ -65,6 +75,7 @@ export class ScopeEvidence {
   }
 
   get revision(): number { return this.activityRevision; }
+  get promptOverload(): string | undefined { return promptOverloadReason(this.focus); }
   get breadthSignal(): boolean { return this.edits.size > 3 || this.reads.size >= 12; }
   snapshot() {
     return { completedTools: this.completed, distinctReadTargets: this.reads.size,
