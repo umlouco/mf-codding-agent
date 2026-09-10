@@ -11,6 +11,12 @@ export interface RecoveryJob {
   failedStrategies: string[];
   lastError: string;
   updatedAt: number;
+  /** The most recently proposed strategy fingerprint and how many consecutive
+   * attempts — accepted or rejected — have now proposed that same one. See
+   * strategyStreak: an unbroken run means the supervisor's decision has
+   * stopped changing, which backoff alone cannot fix. */
+  lastStrategy: string;
+  lastStrategyStreak: number;
 }
 
 export type RecoveryOutcome = { status: 'applied' } |
@@ -29,11 +35,16 @@ export function readRecoveryJob(queue: TaskQueue, task: Task): RecoveryJob | und
         !Number.isSafeInteger(job.attempts) || job.attempts < 0 ||
         !Number.isSafeInteger(job.dueAt) || job.dueAt < 0 || !Array.isArray(job.failedStrategies) ||
         !job.failedStrategies.every((s: unknown) => typeof s === 'string')) throw Error('Invalid recovery job');
+    // Older persisted jobs predate this streak tracking; default them in rather
+    // than treating an otherwise-valid in-flight job as corrupt.
+    if (typeof job.lastStrategy !== 'string') job.lastStrategy = '';
+    if (!Number.isSafeInteger(job.lastStrategyStreak) || job.lastStrategyStreak < 0) job.lastStrategyStreak = 0;
     return job;
   } catch {
     // Corrupt scheduling data cannot authorize an unchanged worker launch.
     return { version: 1, active: true, reason: 'Repair unreadable recovery scheduling metadata.',
-      dueAt: 0, attempts: 0, failedStrategies: [], lastError: raw.slice(0, 1000), updatedAt: 0 };
+      dueAt: 0, attempts: 0, failedStrategies: [], lastError: raw.slice(0, 1000), updatedAt: 0,
+      lastStrategy: '', lastStrategyStreak: 0 };
   }
 }
 
@@ -48,7 +59,8 @@ export function scheduleRecoveryJob(queue: TaskQueue, task: Task, reason: string
   if (previous?.active) return previous; // A tick or reload must not postpone or renew a budget.
   const job: RecoveryJob = { version: 1, active: true, reason, dueAt: Date.now(),
     attempts: previous?.attempts ?? 0, failedStrategies: previous?.failedStrategies ?? [],
-    lastError: '', updatedAt: Date.now() };
+    lastError: '', updatedAt: Date.now(),
+    lastStrategy: previous?.lastStrategy ?? '', lastStrategyStreak: previous?.lastStrategyStreak ?? 0 };
   queue.log(task.id, 'supervisor', 'recovery-scheduled', JSON.stringify(job));
   return save(queue, task, job);
 }
@@ -74,6 +86,26 @@ export function rememberRecoveryStrategy(queue: TaskQueue, task: Task, strategy:
   job.failedStrategies.push(strategy);
   save(queue, task, job);
   return true;
+}
+
+/**
+ * How many consecutive attempts — accepted or rejected — have now proposed this
+ * exact strategy fingerprint. Resets the moment a different one is proposed.
+ *
+ * Backoff alone bounds how OFTEN autonomous recovery retries, not whether each
+ * retry is capable of reaching a different outcome. Once rememberRecoveryStrategy
+ * starts rejecting a strategy as already-tried, nothing about waiting five more
+ * minutes and asking again changes the evidence the supervisor sees, so it keeps
+ * proposing the identical operation and getting the identical rejection — an
+ * unbroken streak this counts. The caller escalates once that streak is long
+ * enough that continuing to defer cannot plausibly help.
+ */
+export function strategyStreak(queue: TaskQueue, task: Task, strategy: string): number {
+  const job = readRecoveryJob(queue, task);
+  if (!job) return 1;
+  const streak = job.lastStrategy === strategy ? job.lastStrategyStreak + 1 : 1;
+  save(queue, task, { ...job, lastStrategy: strategy, lastStrategyStreak: streak });
+  return streak;
 }
 
 export function deferRecoveryJob(queue: TaskQueue, task: Task, reason: string,

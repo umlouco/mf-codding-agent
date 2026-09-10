@@ -82,6 +82,27 @@ function outcomeIds(value: unknown, known: Set<string>, label: string): string[]
 }
 
 /**
+ * A concrete, host-enforced ceiling, not a judgment call left to the planner: a
+ * replacement whose own edits would touch more than 3 files is itself too large
+ * and must be split further by file/directory population. This is what actually
+ * catches an oversized "fix every occurrence across the codebase" task at plan
+ * time, instead of only discovering it many failed attempts later.
+ */
+const TARGET_FILE_LIMIT = 3;
+function targetFiles(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some(f => !nonempty(f)) || new Set(value).size !== value.length) {
+    throw Error(`${label} needs targets: a list of distinct file paths it will edit (an empty list ` +
+      'only for a replacement that edits no files).');
+  }
+  const files = (value as string[]).map(f => f.trim());
+  if (files.length > TARGET_FILE_LIMIT) {
+    throw Error(`${label} lists ${files.length} target files, over the ${TARGET_FILE_LIMIT}-file limit ` +
+      'per replacement; partition it further by file or directory population instead of widening one task.');
+  }
+  return files;
+}
+
+/**
  * Structural acceptance is deterministic. Semantic entailment remains the supervisor's
  * responsibility: the host never treats a coverage declaration as verified behavior.
  */
@@ -98,9 +119,10 @@ export function parseFailureDecomposition(text: string, task: Task,
 
   // Use the exact atomic replacement validator; do not quietly drop incomplete children.
   verdictReplacementTasks(value.splitInto, task, 'failure-decomposition-validation');
-  const parts: Array<NewTask & { outcomeIds: string[] }> = value.splitInto;
+  const parts: Array<NewTask & { outcomeIds: string[]; targets: string[] }> = value.splitInto;
   const forbidden = new Set([task, ...ancestry].map(failureScopeFingerprint));
   const titles = new Set<string>();
+  const targets: string[][] = [];
   for (const [index, part] of parts.entries()) {
     const identity = failureScopeFingerprint(part);
     if (forbidden.has(identity)) throw Error(`Replacement ${index + 1} repeats the parent, an ancestor, or another child.`);
@@ -108,6 +130,7 @@ export function parseFailureDecomposition(text: string, task: Task,
     const title = canonical(part.title);
     if (!title || titles.has(title)) throw Error('Replacement tasks require distinct descriptive titles.');
     titles.add(title);
+    targets.push(targetFiles(part.targets, `Replacement ${index + 1}`));
   }
 
   if (!Array.isArray(value.remainingOutcomes) || value.remainingOutcomes.length < 2) {
@@ -162,7 +185,10 @@ export function parseFailureDecomposition(text: string, task: Task,
   if (justified.size !== known.size) throw Error('Every unfinished outcome must serve an original requirement.');
 
   return { verdict: 'SPLIT', feedback: value.feedback.trim(), taskEdits: [], usage: { ...usage },
-    splitInto: parts.map(part => ({ title: part.title.trim(), description: part.description.trim(),
+    splitInto: parts.map((part, index) => ({ title: part.title.trim(),
+      description: part.description.trim() + (targets[index].length
+        ? `\n\nAssigned files for this replacement (host-enforced limit: ${TARGET_FILE_LIMIT}): ${targets[index].join(', ')}`
+        : ''),
       implVerifyPrompt: part.implVerifyPrompt!.trim(), solutionVerifyPrompt: part.solutionVerifyPrompt!.trim(),
       // An empty parent command deliberately quarantines a malformed legacy
       // command.  Do not let a planner revive it in a replacement child.
@@ -243,6 +269,15 @@ absence assertion, do NOT rewrite it here and do NOT make "repair the command" a
 Copy it byte-for-byte into the appropriate final child. The independent verifier may diagnose and
 adapt an adapter invocation while retaining every assertion; this decomposition only partitions work.
 
+State each replacement's targets: the exact repository-relative files it will edit (an empty list for
+a child that only inspects, verifies, or integrates without editing). A CONCRETE FILE-COUNT LIMIT, not
+a judgment call: a replacement whose targets would exceed 3 files is itself too large and must be
+partitioned further, by file or directory population, into more/narrower replacements until every
+one lists 3 or fewer. This is the actual reason a "replace every occurrence across many files" task
+keeps failing to land as one unit; do not reproduce that mistake here. Splitting by file population
+does not excuse dropping the coverage/outcome rules above — every replacement still needs its own
+concrete outcome and contract coverage.
+
 Return ONE JSON object with verdict SPLIT, concrete feedback, remainingOutcomes, coverage, splitInto:
 {"verdict":"SPLIT","feedback":"observed cause and changed division of work",
  "remainingOutcomes":[{"id":"a","description":"first concrete unfinished outcome"},
@@ -250,10 +285,10 @@ Return ONE JSON object with verdict SPLIT, concrete feedback, remainingOutcomes,
  "coverage":[{"field":"description","requirement":"EXACT current task description","outcomeIds":["a","b"]}],
  "splitInto":[{"title":"first narrow task","description":"complete first scope and dependencies",
    "implVerifyPrompt":"inspect first outcome","solutionVerifyPrompt":"exercise first outcome",
-   "solutionVerifyCommand":"","outcomeIds":["a"]},
+   "solutionVerifyCommand":"","outcomeIds":["a"],"targets":["path/to/file-one.ext","path/to/file-two.ext"]},
   {"title":"second narrow task","description":"complete remaining scope using first handoff",
    "implVerifyPrompt":"inspect second outcome","solutionVerifyPrompt":"exercise second outcome",
-   "solutionVerifyCommand":"","outcomeIds":["b"]}],"taskEdits":[]}
+   "solutionVerifyCommand":"","outcomeIds":["b"],"targets":["path/to/file-three.ext"]}],"taskEdits":[]}
 Include exactly one coverage entry for EACH nonempty original description, implVerifyPrompt,
 solutionVerifyPrompt, and solutionVerifyCommand field. Each entry needs only field and outcomeIds:
 the host binds those names to the exact durable values, so do NOT echo long requirements. Map each
@@ -261,7 +296,8 @@ to the outcomes that preserve it. Every outcome must serve at least one original
 The coverage map is a traceable plan, not fabricated evidence that the behavior is already correct.
 Replace every example with concrete task-specific content. Do not investigate or edit files here.
 Before answering, verify these host rules yourself: every remainingOutcomes description is distinct;
-every outcome is assigned exactly once; and at least one child preserves the saved command exactly.`;
+every outcome is assigned exactly once; at least one child preserves the saved command exactly; and
+no replacement's targets lists more than 3 files.`;
 }
 
 /** Two bounded decisions at most; invalid output is returned to the durable scheduler, never retried here forever. */

@@ -26,7 +26,12 @@ import { admitDecomposition, decompositionAncestry, decompositionDigest,
 // spent allowance every time. A task already parked as awaitingChange under
 // an older fingerprint is unblocked once by this bump and re-enters under the
 // now-correctly-enforced 3-attempt cap; see decompositionRetryRevision.
-const DECOMPOSITION_STRATEGY = 'failure-decomposition-v6';
+// v7 is a prompt/parser repair: replacements must now state targets (the
+// files each one edits) and the host rejects any replacement over 3 files,
+// forcing an oversized "fix every occurrence across the codebase" task to be
+// partitioned by file population at plan time instead of only being
+// discovered as too large after it has already failed for hours.
+const DECOMPOSITION_STRATEGY = 'failure-decomposition-v7';
 
 /** A different planner can repair a rejected proposal; credentials and clock time cannot. */
 export function decompositionPlannerIdentity(): string {

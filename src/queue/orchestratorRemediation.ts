@@ -5,7 +5,8 @@ import type { Review } from './orchestratorState';
 import { LiveLog } from './liveLog';
 import { decideRecovery, recoveryOperation } from './recoveryDecision';
 import { decisionEvidence, recoveryContext, recoveryEvidence } from './recovery';
-import { readRecoveryJob, RecoveryOutcome, recoveryStrategyFingerprint, rememberRecoveryStrategy } from './recoverySchedule';
+import { readRecoveryJob, RecoveryOutcome, recoveryStrategyFingerprint, rememberRecoveryStrategy,
+  strategyStreak } from './recoverySchedule';
 import { boundedTask } from './scopeBoundary';
 import { verificationAuthority } from './verificationAuthority';
 import { implementationRetryProblem } from './verificationRecovery';
@@ -57,8 +58,28 @@ export abstract class OrchestratorRemediation extends OrchestratorDecomposition 
       // repair. Attempts, waiting, new prose, and reloads cannot change this key.
       const strategy = recoveryStrategyFingerprint({ operation: recoveryOperation(decision),
         evidenceRevision: recoveryEvidence(this.queue, task).revision });
-      if (!rememberRecoveryStrategy(this.queue, task, strategy)) return { status: 'deferred',
-        reason: 'The proposed operation already failed or was admitted. Obtain a different observation or approach.', strategy };
+      const streak = strategyStreak(this.queue, task, strategy);
+      if (!rememberRecoveryStrategy(this.queue, task, strategy)) {
+        // Backing off and asking again cannot reach a different answer without
+        // new evidence, and nothing here produces any while stuck on this branch
+        // (VERIFY never runs below; EXECUTE is already rejected by
+        // implementationRetryProblem on a genuine repeat). Three consecutive
+        // identical proposals is this file's own threshold elsewhere for "stop
+        // asking, do something structurally different" — reuse it here instead
+        // of deferring the identical question forever on a five-minute timer.
+        if (streak >= 3) {
+          this.requestFailureDecomposition(task, `Autonomous recovery proposed the identical ` +
+            `operation ${streak} times running with no new evidence between attempts (latest ` +
+            `diagnosis: ${decision.reason}). Replace this task with smaller, independently ` +
+            `verifiable work instead of repeating the same recovery decision.`);
+          // requestFailureDecomposition already fenced this review (nulled it and
+          // bumped reviewGen), so serviceRecovery's post-await gen check discards
+          // whatever is returned here; the value only satisfies the return type.
+          return { status: 'applied' };
+        }
+        return { status: 'deferred',
+          reason: 'The proposed operation already failed or was admitted. Obtain a different observation or approach.', strategy };
+      }
       if (decision.action === 'SPLIT') {
         if (!this.applyVerdictSplit(task, { verdict: 'SPLIT', feedback: decision.reason,
           splitInto: decision.splitInto, usage: result.usage }, accepts)) throw Error('Replacement was superseded before commit.');
