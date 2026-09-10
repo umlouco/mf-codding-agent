@@ -350,6 +350,7 @@
     }
   },
   "scripts": {
+    "build:headless": "node scripts/build-headless.mjs",
     "build:core": "node scripts/build-core.mjs",
     "build:ext": "node esbuild.mjs",
     "build": "npm run build:core && npm run build:ext",

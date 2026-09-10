@@ -82,6 +82,10 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	if cfg.EditorTerminal {
 		s.env.EditorTerminal = s.editorTerminal
 	}
+	if cfg.NativeFS {
+		s.env.EditorWrite = nil
+		s.env.EditorEdit = nil
+	}
 
 	tools.RegisterFS(s.registry)
 	tools.RegisterSearch(s.registry)

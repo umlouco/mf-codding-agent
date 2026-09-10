@@ -61,6 +61,8 @@ type EditorToolDef struct {
 }
 
 type Config struct {
+	// NativeFS opts standalone hosts into native writes; editors keep buffer-aware RPC.
+	NativeFS          bool   `json:"nativeFS"`
 	QueueRole         string `json:"queueRole"`
 	VerificationStage string `json:"verificationStage"`
 	ResponseOnly      bool   `json:"responseOnly"`
