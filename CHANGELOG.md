@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fix the failure-decomposition retry budget being silently renewed forever: its admission fingerprint included the same fine-grained per-file workspace revision that the post-plan staleness check compares against, so a file touched anywhere in an active workspace during a long planning call both discarded the finished plan and looked like a brand-new input, defeating the 3-attempt cap and replanning the same stuck task over and over. The retry fingerprint now uses a coarser, file-existence-only revision (`decompositionRetryRevision`); the staleness check keeps its original byte/mtime sensitivity.
 - Fix Claude CLI planning on root/sudo extension hosts: use non-interactive `dontAsk` with explicit built-in and bundled MCP tool approvals, preserving Claude deny rules and testing hooks. Response-only turns no longer request bypass mode. Non-root tool-enabled turns retain their existing permission mode.
 - Retain OpenAI-compatible streamed reasoning in the provider's observed field during the current tool-call sequence, while removing it after a new user turn and keeping it out of visible answer content. Project runtime observations into existing request/result messages instead of introducing conversational turns that strict local templates reject.
 - Merge adjacent OpenAI-compatible user context messages without crossing tool-call/result boundaries. A real Devstral Small 2 trial exposed a strict chat-template failure after the first tool invocation.

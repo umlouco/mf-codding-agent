@@ -9,8 +9,8 @@ import { decisionEvidence } from './recovery';
 import { plannerIdentity } from './agents';
 import { requiresPlaywright } from './playwrightPolicy';
 import { admitDecomposition, decompositionAncestry, decompositionDigest,
-  decompositionWorkspaceRevision, deferDecomposition, readDecomposition, requiresDecomposition,
-  scheduleDecomposition } from './recoveryDecomposition';
+  decompositionRetryRevision, decompositionWorkspaceRevision, deferDecomposition, readDecomposition,
+  requiresDecomposition, scheduleDecomposition } from './recoveryDecomposition';
 
 // Changing this is a host-strategy change, not new workspace evidence. It
 // grants one newly bounded replacement-planning lane after a deployed parser
@@ -19,7 +19,14 @@ import { admitDecomposition, decompositionAncestry, decompositionDigest,
 // planners could be in flight while an operator removed a malformed saved
 // command; their reply then echoed the superseded command and was correctly
 // rejected.  Let the repaired, current contract receive one bounded plan.
-const DECOMPOSITION_STRATEGY = 'failure-decomposition-v5';
+// v6 fixes the fingerprint itself: it used to include the same fine-grained
+// workspace revision that the post-call staleness check compares against, so
+// any incidental file touch during a long planning call both discarded the
+// finished plan AND looked like a brand-new input, silently renewing the
+// spent allowance every time. A task already parked as awaitingChange under
+// an older fingerprint is unblocked once by this bump and re-enters under the
+// now-correctly-enforced 3-attempt cap; see decompositionRetryRevision.
+const DECOMPOSITION_STRATEGY = 'failure-decomposition-v6';
 
 /** A different planner can repair a rejected proposal; credentials and clock time cannot. */
 export function decompositionPlannerIdentity(): string {
@@ -61,6 +68,11 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     return decompositionWorkspaceRevision(this.workspaceRoot);
   }
 
+  /** See decompositionRetryRevision: deliberately coarser than the check above. */
+  protected decompositionRetryRevision(): string {
+    return decompositionRetryRevision(this.workspaceRoot);
+  }
+
   protected async serviceFailureDecomposition(snapshot: Task): Promise<boolean> {
     let task = this.queue.get(snapshot.id);
     if (!task || !requiresDecomposition(task)) return false;
@@ -72,14 +84,17 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     const owner = () => JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
       this.queue.testingContext, this.queue.instructions]);
     const ownerAtStart = owner();
+    // workspace guards staleness (below, after the provider call); retryRevision seeds the
+    // admission fingerprint. They must stay different signals — see decompositionRetryRevision.
     const workspace = this.decompositionWorkspaceRevision();
+    const retryRevision = this.decompositionRetryRevision();
     const evidence = decisionEvidence(this.queue, task);
     const contract = (row: Task) => JSON.stringify([row.createdAt, row.startedAt, row.attempts, row.title,
       row.description, row.implVerifyPrompt, row.solutionVerifyPrompt, row.solutionVerifyCommand,
       row.region, row.splitScope, row.output, row.validationReport]);
     const contractAtStart = contract(task);
     const planner = decompositionPlannerIdentity();
-    const fingerprint = decompositionDigest([DECOMPOSITION_STRATEGY, planner, ownerAtStart, contractAtStart, workspace, evidence]);
+    const fingerprint = decompositionDigest([DECOMPOSITION_STRATEGY, planner, ownerAtStart, contractAtStart, retryRevision, evidence]);
     if (!admitDecomposition(this.queue, task, job, fingerprint)) {
       // A crash on the last admitted call must not leave a row claiming to be planning forever.
       if ((job.inputs[fingerprint] ?? 0) >= 3 && task.activityPhase !== 'decomposition_waiting') {

@@ -121,4 +121,32 @@ export function decompositionAncestry(queue: TaskQueue, task: Task): Task[] {
   return ancestors;
 }
 
+/**
+ * The coarse sibling of decompositionWorkspaceRevision, used only to seed the
+ * per-input retry budget in admitDecomposition. A completed plan is still
+ * discarded by the full mtime/size revision above when anything at all moved
+ * underneath it while it was being planned — and planning a replacement for a
+ * stuck task can run many minutes, more than enough for something unrelated
+ * elsewhere in an active workspace to be touched. But that same noisy signal
+ * must not ALSO seed the fingerprint admitDecomposition uses to recognize
+ * "the same input already tried": doing so lets every such discard silently
+ * renew the spent allowance, so the 3-attempt cap never engages and the same
+ * stuck task is replanned forever — the "over and over" loop this budget
+ * exists to stop. Only a file actually appearing or disappearing counts as a
+ * new situation here; edits to existing file contents or timestamps do not.
+ */
+export function decompositionRetryRevision(root: string): string {
+  const scope = (directory: string): unknown => {
+    const index = indexRepository(directory);
+    return [index.fingerprint, index.problems];
+  };
+  const current: unknown[] = [scope(root)];
+  const external = process.env.MFAGENT_PLAYWRIGHT_ROOT;
+  if (external && isAbsolute(external) && resolve(external) !== resolve(root)) {
+    try { current.push({ externalRoot: resolve(external), revision: scope(external) }); }
+    catch (error: any) { current.push({ externalRoot: resolve(external), unavailable: error?.code || 'unavailable' }); }
+  }
+  return decompositionDigest(current);
+}
+
 export { decompositionFamily, admitDecompositionFamily } from './dbFailureLineage';
