@@ -138,11 +138,14 @@ export class QueuePlans extends QueueWrites {
       }
       const replacements = family ? parts.map(part => ({ ...part,
         region: JSON.stringify({ ...JSON.parse(part.region || '{}'), failureFamily: family }) })) : parts;
-      // Preserve the complete acceptance contract and journal before removing
-      // the parent. Splitting is recovery, never a way to erase failed evidence.
+      // Preserve the complete acceptance contract before removing the parent
+      // row. Splitting is recovery, never a way to erase failed evidence — its
+      // own task_events are the evidence, and (task_events no longer cascades
+      // on delete) stay directly queryable by this id rather than needing to
+      // be duplicated into this snapshot.
       this.db.prepare(`INSERT INTO task_events (task_id, actor, kind, message, at)
         VALUES (NULL, 'supervisor', 'split-archive', ?, ?)`).run(
-        JSON.stringify({ task, events: this.events(id, -1) }), Date.now());
+        JSON.stringify({ task }), Date.now());
       const shift = parts.length - 1;
       this.db
         .prepare('UPDATE tasks SET seq = seq + ?, updated_at = ? WHERE seq > ?')

@@ -23,6 +23,23 @@ export interface RecoveryState {
 
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export const recoveryKey = (task: Task) => `recovery:v1:${task.id}:${task.createdAt}`;
+
+/**
+ * A transport/provider outage is not evidence about the task — it says nothing
+ * about whether the work is right, and it resolves itself once the provider
+ * answers again. Matches the Go core's dial-failure wrapper ("cannot reach
+ * <url>: <net error>", see core/internal/llm/openai.go), the OS/DNS failure
+ * text it wraps (Windows and POSIX spellings), and a provider-side quota or
+ * rate-limit refusal. Callers that would otherwise count a failed attempt as
+ * grounds to retry-with-judgment, spend a decomposition attempt, or replace a
+ * task must check this first and back off instead — see supervise() and
+ * verifyWithExecutor() in orchestratorVerification.ts, and
+ * serviceFailureDecomposition() in orchestratorDecomposition.ts.
+ */
+export function providerUnavailable(message: string): boolean {
+  return /^cannot reach |dial tcp|lookup [\w.-]+:|no such host|connectex:|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|network is unreachable|fetch failed|socket hang up|spend limit|rate.?limit|\btoo many requests\b|\b429\b|\b529\b|\boverloaded\b/i
+    .test(message);
+}
 const contract = (task: Task) => digest(JSON.stringify([task.description, task.implVerifyPrompt,
   task.solutionVerifyPrompt, task.solutionVerifyCommand]));
 const fresh = (): RecoveryState => ({ version: 1, cursor: 0, revision: 0, seen: [], repeats: 0,

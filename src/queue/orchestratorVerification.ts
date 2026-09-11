@@ -6,7 +6,7 @@ import { OrchestratorScope } from './orchestratorScope';
 import { scopeBlocked } from './scopePlan';
 import { appendAttempt, Review } from './orchestratorState';
 import { runVerification } from './verification';
-import { recoveryFailure, recoverySucceeded, recoveryContext } from './recovery';
+import { recoveryFailure, recoverySucceeded, recoveryContext, providerUnavailable } from './recovery';
 import { completeRecoveryJob } from './recoverySchedule';
 import { storedValidationProblem } from './validation';
 import { boundedTask } from './scopeBoundary';
@@ -134,7 +134,16 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         summary: message, implementationEvidence: '', behaviorEvidence: '', checks: [], remaining: message }) });
       this.queue.setMeta(`verificationAccepted:${task.id}`,
         JSON.stringify([this.verificationIdentity(task), this.queue.get(task.id)!.validationReport]));
-      if (error?.code === 'interaction_budget' || budget.exhausted) {
+      // A verifier that never reached the provider spent an interaction (the
+      // budget is reserved before dispatch, on purpose — see VerificationBudget)
+      // but produced no evidence about the task. Exhausting the budget this way
+      // must not read as "verification tried and failed"; it isn't evidence at
+      // all, and it must not spend the family's bounded replacement budget on
+      // pure connectivity noise. Back off and let the same task verify again
+      // once the provider answers.
+      if (providerUnavailable(message)) {
+        this.pauseForRecovery(this.queue.get(task.id)!, message);
+      } else if (error?.code === 'interaction_budget' || budget.exhausted) {
         this.requestFailureDecomposition(this.queue.get(task.id)!, budget.reason);
       }
 
@@ -200,7 +209,6 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         (task.supervisorFeedback || task.validationReport));
       return;
     }
-    this.queue.log(task.id, 'supervisor', 'verification-decision', 'Review only the unresolved verification result.');
     this.log(`supervising task ${task.seq} — ${task.title}`);
 
     // From here until the verdict lands there is a turn running that only this
@@ -247,6 +255,11 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
           },
         },
       );
+      // Counted toward the two-decisions cap below only once a decision was
+      // actually reached — a call that never got there (see the catch branch)
+      // is not a decision the supervisor made about this task, and must not
+      // spend this budget on transport noise. See providerUnavailable.
+      this.queue.log(task.id, 'supervisor', 'verification-decision', 'Review only the unresolved verification result.');
     } catch (e: any) {
       if (!accepts()) return;
       const message = String(e?.message ?? e);
@@ -256,6 +269,13 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       this.queue.recordActivity(task.id, 'error', `supervisor: ${message}`, 'supervisor');
       live.note('error', `supervisor failed: ${message}`);
       this.changed();
+      if (providerUnavailable(message)) {
+        // The provider was unreachable, not unhelpful. Back off and retry
+        // this same unresolved verification later instead of counting it as
+        // one of the two decisions that would otherwise force a replacement.
+        this.pauseForRecovery(task, message);
+        return;
+      }
       const limit = recoveryFailure(this.queue, task, 'verification-review');
       if (limit) await this.replanOrPause(task, limit);
       // Leave it in VERIFYING; the next tick tries again.
@@ -399,10 +419,13 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       part.region = JSON.stringify({ ...JSON.parse(part.region || '{}'), failureFamily: decompositionFamily(task) });
     }
     // A rolled-back replacement may leave an unused archive, never a missing
-    // original handoff. splitTask inserts every child and deletes the parent in one transaction.
+    // original handoff. splitTask inserts every child and deletes the parent in
+    // one transaction. Its task_events no longer cascade away with it (see
+    // dbStorage's task_events schema) and stay queryable by this id, so this
+    // snapshot only needs the contract and verdict, not a duplicate journal.
     this.queue.setMeta(archiveKey, JSON.stringify({ task, decision,
       ownerContext: JSON.stringify([this.queue.getMeta('goal'), this.queue.testingContext + this.queue.instructions]),
-      events: this.queue.events(task.id, -1), archivedAt: Date.now() }));
+      archivedAt: Date.now() }));
     if (this.queue.splitTask(task.id, parts) !== parts.length) throw Error('The original task no longer accepts this replacement.');
     const active = this.queue.activeTask();
     if (active && active.seq > task.seq) this.abandonExecution();

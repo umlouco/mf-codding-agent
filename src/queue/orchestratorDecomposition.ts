@@ -4,13 +4,13 @@ import type { Review } from './orchestratorState';
 import { OrchestratorRecovery } from './orchestratorRecovery';
 import { bootstrapTddProblem, decideFailureDecomposition } from './failureDecomposition';
 import { LiveLog } from './liveLog';
-import { completeRecoveryJob } from './recoverySchedule';
-import { decisionEvidence } from './recovery';
+import { completeRecoveryJob, scheduleRecoveryJob } from './recoverySchedule';
+import { decisionEvidence, providerUnavailable } from './recovery';
 import { plannerIdentity } from './agents';
 import { requiresPlaywright } from './playwrightPolicy';
-import { admitDecomposition, decompositionAncestry, decompositionDigest,
+import { admitDecomposition, decompositionAncestry, decompositionDigest, decompositionKey,
   decompositionRetryRevision, decompositionWorkspaceRevision, deferDecomposition, readDecomposition,
-  requiresDecomposition, scheduleDecomposition } from './recoveryDecomposition';
+  requiresDecomposition, saveDecomposition, scheduleDecomposition } from './recoveryDecomposition';
 
 // Changing this is a host-strategy change, not new workspace evidence. It
 // grants one newly bounded replacement-planning lane after a deployed parser
@@ -31,7 +31,17 @@ import { admitDecomposition, decompositionAncestry, decompositionDigest,
 // forcing an oversized "fix every occurrence across the codebase" task to be
 // partitioned by file population at plan time instead of only being
 // discovered as too large after it has already failed for hours.
-const DECOMPOSITION_STRATEGY = 'failure-decomposition-v7';
+// v8 fixes decomposition being requested at all over a transport/provider
+// outage: a verifier or supervisor call that never reached the model (a DNS
+// failure, a dead connection, a provider quota refusal) used to count
+// identically to the model actually looking at the task and failing to
+// verify it — see providerUnavailable. Two such outages 13 seconds apart were
+// enough to retire a perfectly reasonable task and start narrowing it into
+// smaller and smaller replacements, entirely because the network, not the
+// task, was the problem. Bumping the strategy also gives any task already
+// parked under the old blind fingerprint one bounded fresh look under the
+// fixed logic.
+const DECOMPOSITION_STRATEGY = 'failure-decomposition-v8';
 
 /** A different planner can repair a rejected proposal; credentials and clock time cannot. */
 export function decompositionPlannerIdentity(): string {
@@ -69,6 +79,63 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     if (!existing) this.wakeAfterHandoff();
   }
 
+  /**
+   * A bounded replan allowance exists to stop narrowing from running forever,
+   * not to hand the run to a person. This queue never stops for one — see
+   * requestFailureDecomposition and splitTask — so exhausting that allowance
+   * without a verified outcome has to lead somewhere autonomous too: undo the
+   * narrowing and try the complete original job again, exactly as if a person
+   * had rewritten the run back to it. That is a structurally different move
+   * from "split narrower once more," so it earns its own fresh lineage rather
+   * than reusing the exhausted one.
+   *
+   * A second full rebuild-and-resplit cycle failing the same way means no
+   * phrasing this host can produce converges on this job; a third rebuild
+   * would only repeat that cycle, so it hands off to ordinary autonomous
+   * recovery instead (bounded backoff, retried indefinitely, still no human
+   * step) rather than rebuilding again.
+   */
+  protected rebuildFromRoot(task: Task, reason: string): void {
+    const ancestry = decompositionAncestry(this.queue, task);
+    const root = ancestry.length ? ancestry[ancestry.length - 1] : task;
+    // Keyed by the restored content, not root.id/createdAt: once this rebuild
+    // commits, the row carrying that content is this task's own id, so a
+    // second exhaustion would walk its ancestry back only to itself and read
+    // as a brand-new root under an id-keyed counter — never reaching the cap.
+    // The content is what actually stays invariant across rebuild cycles.
+    const rebuildKey = `decompositionRebuilds:v1:${decompositionDigest([root.title, root.description,
+      root.implVerifyPrompt, root.solutionVerifyPrompt, root.solutionVerifyCommand])}`;
+    let rebuilds = 0;
+    try { rebuilds = Math.max(0, Math.floor(JSON.parse(this.queue.getMeta(rebuildKey) || '0'))); } catch { rebuilds = 0; }
+    this.queue.setMeta(decompositionKey(task), '');
+    if (rebuilds >= 2) {
+      if (!this.stopForDecision(task, { activityPhase: 'recovery_execution', activityDetail: reason.slice(0, 4000) })) return;
+      const job = scheduleRecoveryJob(this.queue, task, `${reason} Two full rebuilds of the original task did not ` +
+        'converge either; continuing as ordinary autonomous recovery instead of narrowing further.');
+      this.queue.recordActivity(task.id, 'recovery_waiting',
+        `${job.reason} Autonomous recovery is scheduled for ${new Date(job.dueAt).toISOString()}.`, 'supervisor');
+      this.queue.log(task.id, 'supervisor', 'decomposition-rebuild-exhausted', reason);
+      this.log(`task ${task.seq}: repeated narrowing and two full rebuilds did not converge; handed to ordinary recovery`);
+      this.changed();
+      this.wakeAfterHandoff();
+      return;
+    }
+    this.queue.setMeta(rebuildKey, JSON.stringify(rebuilds + 1));
+    if (!this.stopForDecision(task, {
+      title: root.title, description: root.description, implVerifyPrompt: root.implVerifyPrompt,
+      solutionVerifyPrompt: root.solutionVerifyPrompt, solutionVerifyCommand: root.solutionVerifyCommand,
+      status: 'PENDING', attempts: 0, finishedAt: null, output: '', errorLog: '', validationReport: '',
+      splitScope: '', activityPhase: '', activityDetail: '', region: '',
+      supervisorFeedback: `${reason} Repeated narrowing produced no verified outcome; restored the original ` +
+        `task (rebuild ${rebuilds + 1} of 2) instead of splitting it again.`,
+    })) return;
+    this.queue.log(task.id, 'supervisor', 'decomposition-rebuilt',
+      JSON.stringify({ restoredFrom: root.id, rebuilds: rebuilds + 1, reason }));
+    this.log(`task ${task.seq}: repeated narrowing did not converge; restored the original task (rebuild ${rebuilds + 1} of 2)`);
+    this.changed();
+    this.wakeAfterHandoff();
+  }
+
   protected decompositionWorkspaceRevision(): string {
     return decompositionWorkspaceRevision(this.workspaceRoot);
   }
@@ -103,9 +170,7 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     if (!admitDecomposition(this.queue, task, job, fingerprint)) {
       // A crash on the last admitted call must not leave a row claiming to be planning forever.
       if ((job.inputs[fingerprint] ?? 0) >= 3 && task.activityPhase !== 'decomposition_waiting') {
-        this.queue.recordActivity(task.id, 'decomposition_waiting',
-          'Decomposition allowance exhausted for unchanged input. Waiting for a changed workspace, owner requirement, or observed evidence.', 'supervisor');
-        this.changed();
+        this.rebuildFromRoot(task, 'Decomposition allowance exhausted for unchanged input.');
       }
       return true;
     }
@@ -167,10 +232,27 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     } catch (error: any) {
       if (!accepts()) return true;
       if (error?.usage) this.queue.addUsage(task.id, error.usage);
+      const message = String(error?.message ?? error);
+      const wasInvalid = error?.invalidDecomposition === true || typeof error?.invalidPlan === 'string';
+      if (providerUnavailable(message) && !wasInvalid) {
+        // The replacement planner was never reached — this attempt proves
+        // nothing about the task or the input, so it must not spend the
+        // bounded per-input replan allowance admitDecomposition already
+        // reserved for it before dispatch (see admitDecomposition's own
+        // comment on why that reservation happens early). Refund it and let
+        // the existing backoff (already set on the job's dueAt) retry later.
+        job.inputs[fingerprint] = Math.max(0, (job.inputs[fingerprint] ?? 1) - 1);
+        saveDecomposition(this.queue, task, job);
+        this.queue.recordActivity(task.id, 'decomposition_planning',
+          `Replacement planner could not reach the provider: ${message}. Retrying automatically once it answers; this is not evidence about the task.`, 'supervisor');
+        this.log(`task ${task.seq}: replacement planner unreachable, not counted against it: ${message}`);
+        this.changed();
+        return true;
+      }
       job.invalidPlan = typeof error?.invalidPlan === 'string' ? error.invalidPlan : job.invalidPlan;
-      const next = deferDecomposition(this.queue, task, job, String(error?.message ?? error),
-        error?.invalidDecomposition === true || typeof error?.invalidPlan === 'string');
-      this.log(`task ${task.seq}: replacement not committed; original evidence retained. ${next}`);
+      const next = deferDecomposition(this.queue, task, job, message, wasInvalid);
+      if (next.newlyBlocked) this.rebuildFromRoot(task, next.detail);
+      this.log(`task ${task.seq}: replacement not committed; original evidence retained. ${next.detail}`);
     } finally {
       live.close();
       if (this.review === review) this.review = null;

@@ -47,7 +47,8 @@ export function saveDecomposition(queue: TaskQueue, task: Task, job: Decompositi
 
 /** Failure and watchdog recovery share durable backoff; neither renews spend. */
 export function deferDecomposition(queue: TaskQueue, task: Task, job: DecompositionJob,
-  error: string, invalidPlan = false): string {
+  error: string, invalidPlan = false): { detail: string; newlyBlocked: boolean } {
+  const wasWaiting = job.awaitingChange;
   const attempts = job.inputs[job.fingerprint] ?? 0;
   job.lastError = error;
   job.awaitingChange = invalidPlan || attempts >= 3;
@@ -59,7 +60,7 @@ export function deferDecomposition(queue: TaskQueue, task: Task, job: Decomposit
   const detail = `${error} ${next}`;
   queue.recordActivity(task.id, 'decomposition_waiting', detail, 'supervisor');
   queue.log(task.id, 'supervisor', 'decomposition-deferred', detail);
-  return detail;
+  return { detail, newlyBlocked: job.awaitingChange && !wasWaiting };
 }
 
 export function scheduleDecomposition(queue: TaskQueue, task: Task, reason: string): DecompositionJob {

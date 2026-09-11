@@ -47,10 +47,13 @@ export class QueueStorage {
       CREATE INDEX IF NOT EXISTS idx_tasks_seq        ON tasks(seq);
 
       -- Append-only audit trail. The supervisor reads this to understand how a
-      -- task got into its current state, not just what that state is.
+      -- task got into its current state, not just what that state is. No FK
+      -- to tasks(id): task_id names the task an event happened to, including
+      -- one since replaced or deleted, on purpose — a row's whole iteration
+      -- history is exactly the record a real "append-only" trail keeps.
       CREATE TABLE IF NOT EXISTS task_events (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+        task_id INTEGER,
         actor   TEXT NOT NULL,
         kind    TEXT NOT NULL,
         message TEXT NOT NULL DEFAULT '',
@@ -112,6 +115,7 @@ export class QueueStorage {
     // Where the independent verification agent's findings land — see the
     // Task.validationReport doc comment.
     this.addColumn('validation_report', "TEXT NOT NULL DEFAULT ''");
+    this.dropTaskEventsCascade();
     installDecompositionInvariant(this.db);
   }
 
@@ -123,6 +127,41 @@ export class QueueStorage {
     if (!has) {
       this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${decl}`);
     }
+  }
+
+  /**
+   * A database written before this build still cascade-deletes task_events
+   * when its task is replaced or removed, silently erasing exactly the
+   * "how did it get into this state" trail the table exists to keep. SQLite
+   * cannot drop a foreign key in place, so a still-cascading table is rebuilt
+   * without one; every existing row is preserved, tagged with whatever
+   * task_id it always had, findable by that id even after the task it names
+   * is long gone. A no-op once already rebuilt.
+   */
+  private dropTaskEventsCascade(): void {
+    const row = this.db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_events'`)
+      .get() as { sql?: string } | undefined;
+    if (!row?.sql || !/ON DELETE CASCADE/.test(row.sql)) {
+      return;
+    }
+    this.tx(() => {
+      this.db.exec(`
+        CREATE TABLE task_events_norefs (
+          id      INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id INTEGER,
+          actor   TEXT NOT NULL,
+          kind    TEXT NOT NULL,
+          message TEXT NOT NULL DEFAULT '',
+          at      INTEGER NOT NULL
+        );
+        INSERT INTO task_events_norefs (id, task_id, actor, kind, message, at)
+          SELECT id, task_id, actor, kind, message, at FROM task_events;
+        DROP TABLE task_events;
+        ALTER TABLE task_events_norefs RENAME TO task_events;
+        CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id);
+      `);
+    });
   }
 
   close(): void {

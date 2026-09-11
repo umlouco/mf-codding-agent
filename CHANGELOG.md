@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+- Fix `task_events` — documented as an "append-only audit trail" — actually
+  cascade-deleting a task's entire history the moment that task was replaced
+  or removed. Every prior iteration's evidence (tool calls, model turns,
+  decomposition activity) vanished with it; the only trace left was a
+  best-effort JSON snapshot a split happens to take of the row on its way
+  out, undiscoverable without knowing to go look for it and unqueryable
+  without manually parsing it. `task_events.task_id` is no longer a foreign
+  key: a database written under the old schema is rebuilt once, losslessly,
+  on next open. A task's full lineage — including a task since split or
+  deleted — now stays directly queryable by its original id, which is what
+  actually made this incident's `providerUnavailable`/`rebuildFromRoot` fixes
+  possible to verify tonight instead of having to reconstruct them from those
+  snapshots. The two archive snapshots (`split-archive`, and the
+  `scopeSplit:*` metadata `applyVerdictSplit` writes) drop their own embedded
+  copy of the same events for the same reason: duplicating a permanent
+  journal into a one-off blob no longer buys anything.
+- Fix decomposition being requested over a transport or provider outage instead
+  of an actual task problem. A verifier or supervisor call that never reached
+  the model — a DNS failure, a dead connection, a Claude CLI spend-limit
+  refusal — used to be logged and counted exactly like the model reviewing the
+  task and failing to verify it: two such outages back to back (`supervise`'s
+  two-decisions cap) or a verification budget burned entirely on failed
+  connection attempts (`verifyWithExecutor`) were enough to retire the task and
+  start replacing it with narrower ones, and a replanning call that itself hit
+  the same outage spent part of the bounded per-input replan allowance for
+  nothing. Confirmed live in two separate workspaces during the same overnight
+  internal-LLM outage: one task was silently re-split about 30 times over
+  several days into meaningless "hold this value, pass it through unedited"
+  fragments before the family's 32-split budget ran out. `providerUnavailable`
+  (`recovery.ts`) now recognizes this class of failure and every one of these
+  call sites backs off and retries automatically instead of treating it as
+  evidence about the task; `DECOMPOSITION_STRATEGY` moves to v8 so a task
+  already parked under the old blind fingerprint gets one bounded fresh look.
+- Fix a family that has run out of its bounded replan allowance stopping the
+  run instead of continuing on its own. Repeated narrowing that never reaches
+  a verified outcome used to park the task waiting on a person to change the
+  planner, the workspace, or the owner's requirements — and because the queue
+  runs lockstep, every task behind it sat at zero progress until someone
+  did. This queue never stops for a human elsewhere (no task is terminally
+  failed; see the "bounded supervisor decomposition" entry below), so it
+  should not start here either: `rebuildFromRoot` now undoes the narrowing
+  instead, restoring the task to the original, complete job an ancestor
+  archive still has on record and trying that directly, on a fresh lineage, in
+  place of another split. Two such rebuild-and-resplit cycles failing the same
+  way hands the task to ordinary autonomous recovery (bounded backoff, retried
+  indefinitely) rather than rebuilding a third time — still no human step, no
+  terminal failure, just a different autonomous move once narrowing has
+  demonstrably stopped helping.
 - Fix autonomous recovery retrying an unwinnable diagnosis forever: `rememberRecoveryStrategy` correctly recognized the supervisor proposing the identical operation again with no new evidence, but the surrounding loop treated that rejection as just another reason to back off and ask again on a 5-minute timer — capped only by transport-level backoff, never by whether repeating the question could possibly produce a different answer. Confirmed live: 158 consecutive identical `VERIFY` cycles over ~16 hours on one task. A new `strategyStreak` now counts consecutive identical proposals; three in a row escalates to failure-decomposition (replace the task) instead of deferring indefinitely.
 - Failure-decomposition replacements must now state `targets`: the files each one will edit. The host rejects any replacement listing more than 3, forcing an oversized "fix every occurrence across the codebase" task to be partitioned by file/directory population at plan time — instead of only being discovered as too large after it has already failed for hours across several splits.
 - Fix the failure-decomposition retry budget being silently renewed forever: its admission fingerprint included the same fine-grained per-file workspace revision that the post-plan staleness check compares against, so a file touched anywhere in an active workspace during a long planning call both discarded the finished plan and looked like a brand-new input, defeating the 3-attempt cap and replanning the same stuck task over and over. The retry fingerprint now uses a coarser, file-existence-only revision (`decompositionRetryRevision`); the staleness check keeps its original byte/mtime sensitivity.
