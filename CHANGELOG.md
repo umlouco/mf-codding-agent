@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Fix `stopForDecision` letting a stale decision overwrite a fresher one that
+  had already committed. Its `EXECUTING` branch was already guarded — `finishExecution`
+  writes only if the row is still on the same `attempts` the caller last saw — but
+  every other status fell through to a plain, unconditional `queue.update`, with
+  no check that the row was still what the caller's snapshot said it was. A decision
+  is computed from a snapshot fetched earlier, sometimes across a genuinely slow
+  gap (hashing the workspace, a model round-trip), so a second, independently-triggered
+  decision that read the same earlier snapshot could still land after a first one
+  already committed something else — silently clobbering it with a conclusion drawn
+  from information that was no longer true. Confirmed live within the SAC queue
+  the same night `verificationStallStreak` (above) first fired: a task rebuilt back
+  to its full original scope was punched straight back into "needs decomposition"
+  52ms later, using a verification-cap reason string computed *before* the rebuild —
+  the rebuild had already happened, but nothing had told that other, slower decision
+  its premise no longer held. `updateIfUnchanged` (`dbWrites.ts`) gives every status
+  the same `updated_at`-fenced compare-and-swap `finishExecution` already used for
+  `EXECUTING`; `stopForDecision` now goes through it uniformly.
 - Fix independent verification's own inability to converge reading as a scope
   problem and being split forever instead of ever being fixed. `admitDecompositionFamily`'s
   32-split family budget counts every split alike, so a task whose only real

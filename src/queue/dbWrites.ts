@@ -177,6 +177,43 @@ export class QueueWrites extends QueueJournal {
   }
 
   /**
+   * Writes a patch, but only if the row is still exactly as the caller last
+   * observed it — the general-purpose counterpart to `finishExecution`'s
+   * `attempts`-fenced write, for every other status a decision can be made
+   * against (VERIFYING, PENDING, mid-decomposition).
+   *
+   * A decision to rebuild, split, or otherwise stop a task is computed from a
+   * snapshot fetched earlier — sometimes much earlier, across an I/O-bound
+   * gap like hashing the workspace or a model round-trip. Without this check,
+   * a second, slower decision that started against the same earlier snapshot
+   * can still land after a first one already committed something else,
+   * silently overwriting it with a conclusion drawn from information that is
+   * no longer true — observed live as a freshly rebuilt task's full scope
+   * being clobbered straight back into "needs decomposition" by a stale
+   * verification-cap reason computed before the rebuild, milliseconds after
+   * it landed. `updated_at` is bumped by every write already, so it is
+   * already the fencing token every writer needs; this just enforces it.
+   *
+   * Returns whether the write actually landed.
+   */
+  updateIfUnchanged(
+    id: number,
+    expectedUpdatedAt: number,
+    patch: Partial<Omit<Task, 'id' | 'createdAt'>>,
+  ): boolean {
+    const { sets, args } = this.buildSet(patch);
+    if (sets.length === 0) {
+      return false;
+    }
+    sets.push('updated_at = ?');
+    args.push(Date.now());
+    const info = this.db
+      .prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ? AND updated_at = ?`)
+      .run(...args, id, expectedUpdatedAt);
+    return info.changes > 0;
+  }
+
+  /**
    * Deletes a task and closes the gap it leaves.
    *
    * Renumbering matters more than it looks: `seq` is what the supervisor names

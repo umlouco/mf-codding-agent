@@ -463,7 +463,16 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     }
   }
 
-  /** Fences a running executor before killing it, so its late result cannot land. */
+  /**
+   * Fences a running executor before killing it, so its late result cannot land.
+   *
+   * Every branch here writes a decision computed from `task`, a snapshot the
+   * caller fetched earlier — sometimes much earlier, across an I/O-bound gap
+   * like hashing the workspace or a model round-trip. Both branches must
+   * therefore only land if the row is still exactly as that snapshot found
+   * it; see `updateIfUnchanged` for why a plain unconditional write let a
+   * stale decision clobber a fresher one that had already committed.
+   */
   protected stopForDecision(task: Task, patch: Partial<Task>): boolean {
     if (task.status === 'EXECUTING') {
       if (!this.queue.finishExecution(task.id, task.attempts, patch)) {
@@ -481,7 +490,6 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       }
       return true;
     }
-    this.queue.update(task.id, patch);
-    return true;
+    return this.queue.updateIfUnchanged(task.id, task.updatedAt, patch);
   }
 }
