@@ -30,8 +30,11 @@ func CaptureLayout(ctx context.Context, setup *Setup, spec layout.Spec, target, 
 	if err := spec.Validate(); err != nil {
 		return layout.Capture{}, err
 	}
-	if setup.NodePath == "" || !setup.Installed {
-		return layout.Capture{}, fmt.Errorf("Playwright capture requires node and the project's installed @playwright/test; call playwright_status")
+	if err := setup.Ready(); err != nil {
+		return layout.Capture{}, err
+	}
+	if err := setup.prepare(); err != nil {
+		return layout.Capture{}, err
 	}
 	u, err := url.Parse(target)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "file") {
@@ -59,7 +62,7 @@ func CaptureLayout(ctx context.Context, setup *Setup, spec layout.Spec, target, 
 	if err = os.WriteFile(runner, []byte(layoutRunner), 0600); err != nil {
 		return layout.Capture{}, err
 	}
-	request := map[string]any{"root": setup.Root, "spec": spec, "url": target, "executable": executable, "storageState": storageState, "steps": steps, "selectors": spec.Selectors(), "measure": layout.MeasureJS, "output": temp}
+	request := map[string]any{"root": setup.Root, "pkg": setup.PkgDir(), "spec": spec, "url": target, "executable": executable, "storageState": storageState, "steps": steps, "selectors": spec.Selectors(), "measure": layout.MeasureJS, "output": temp}
 	if steps == nil {
 		request["steps"] = []LayoutStep{}
 	}
@@ -69,6 +72,7 @@ func CaptureLayout(ctx context.Context, setup *Setup, spec layout.Spec, target, 
 	cmd := exec.CommandContext(runCtx, setup.NodePath, runner)
 	configureCommand(cmd)
 	cmd.Dir = setup.Root
+	cmd.Env = setup.env()
 	cmd.Stdin = bytes.NewReader(data)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

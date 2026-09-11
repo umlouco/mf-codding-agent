@@ -2,7 +2,7 @@
   "name": "mf-agent",
   "displayName": "MF Agent",
   "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
-  "version": "0.1.40",
+  "version": "0.1.42",
   "publisher": "mflores",
   "license": "MIT",
   "pricing": "Free",
@@ -359,11 +359,12 @@
     "build:headless": "node scripts/build-headless.mjs",
     "build:core": "node scripts/build-core.mjs",
     "build:ext": "node esbuild.mjs",
+    "build:playwright": "node scripts/bundle-playwright.mjs",
     "build": "npm run build:core && npm run build:ext",
     "build:all": "node scripts/build-core.mjs --all && npm run build:ext",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
-    "package": "npm run build:all && npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository"
+    "package": "npm run build:all && npm run build:playwright && npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository"
   },
   "optionalDependencies": {
     "better-sqlite3": "^11.3.0"

@@ -335,6 +335,55 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 			return Ok("Browser closed.")
 		},
 	})
+
+	r.Add(&Tool{
+		Name: "browser_show",
+		Description: "Display a URL in the editor's integrated browser. DISPLAY ONLY: it shows " +
+			"the page to the person watching and returns no evidence — no DOM, no screenshot, " +
+			"no console. It cannot verify anything and its result is never a passing check. " +
+			"Use it only when browser_open has failed on every available browser, alongside " +
+			"reporting the blocker.",
+		Mutating: true,
+		Schema: obj(map[string]any{
+			"url":    str("Absolute URL, reachable from the editor."),
+			"reason": str("Why automated checking was not possible. Recorded with the result."),
+		}, "url"),
+		Summarize: func(in json.RawMessage) string {
+			var a struct {
+				URL string `json:"url"`
+			}
+			_ = json.Unmarshal(in, &a)
+			return "Show " + a.URL + " in the editor's browser"
+		},
+		Run: func(ctx context.Context, env *Env, in json.RawMessage) Result {
+			var a struct {
+				URL    string `json:"url"`
+				Reason string `json:"reason"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return Errf("bad input: %v", err)
+			}
+			if strings.TrimSpace(a.URL) == "" {
+				return Errf("url is required")
+			}
+			if env.EditorBrowser == nil {
+				return Errf("no editor is connected, so there is no integrated browser to show %s in. "+
+					"This host can only verify through browser_open or playwright_test; report the blocker.", a.URL)
+			}
+			if err := env.EditorBrowser(ctx, a.URL); err != nil {
+				return Errf("could not open %s in the editor's browser: %v", a.URL, err)
+			}
+			out := "DISPLAY_ONLY: " + a.URL + " is now showing in the editor's integrated browser.\n\n" +
+				"This produced no evidence. The Simple Browser is a sandboxed webview — its DOM, " +
+				"console and pixels are unreachable from here, so nothing about the page has been " +
+				"observed or asserted. Do not record this as a check, a PASS, or behaviour confirmed. " +
+				"Report the browser failure that led here as the blocker it is."
+			if strings.TrimSpace(a.Reason) != "" {
+				out += "\n\nStated reason: " + strings.TrimSpace(a.Reason)
+			}
+			return Ok(out)
+		},
+	})
 	// Page reads must also preserve ordering against navigation and interaction.
 	// Otherwise a batched capture can run before the click it was meant to check.
 	for _, tool := range r.List() {

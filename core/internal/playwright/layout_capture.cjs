@@ -3,7 +3,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 (async () => {
   const request = JSON.parse(fs.readFileSync(0, 'utf8'));
-  const { chromium } = require(path.join(request.root, 'node_modules', '@playwright', 'test'));
+  // The core resolves the runtime and passes its absolute package directory.
+  // This script lives in a temp directory, so resolving '@playwright/test' by
+  // name here would search upward from /tmp and find nothing.
+  const pkg = request.pkg || path.join(request.root, 'node_modules', '@playwright', 'test');
+  const { chromium } = require(pkg);
   const browser = await chromium.launch({
     headless: true,
     ...(request.executable ? { executablePath: request.executable } : {}),

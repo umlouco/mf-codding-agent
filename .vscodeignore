@@ -38,3 +38,11 @@ bin/**
 
 # Kilocode's agent-manager folder, with its own node_modules — never part of the extension.
 .kilo/**
+
+# The Playwright runtime shipped with the extension, built by
+# scripts/bundle-playwright.mjs. It is what makes browser testing work against
+# a project that owns no test dependencies, so it must survive the
+# node_modules/** rule above.
+!runtime/**
+runtime/**/*.md
+runtime/**/.bin/**

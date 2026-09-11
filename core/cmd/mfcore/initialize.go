@@ -15,6 +15,7 @@ import (
 	"github.com/mflores/mfagent/core/internal/llm"
 	"github.com/mflores/mfagent/core/internal/mcp"
 	"github.com/mflores/mfagent/core/internal/memory"
+	"github.com/mflores/mfagent/core/internal/playwright"
 	"github.com/mflores/mfagent/core/internal/tools"
 )
 
@@ -76,8 +77,9 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		FileChanged: func(path string) {
 			_ = s.conn.Notify("file/changed", map[string]any{"path": path})
 		},
-		EditorWrite: s.editorWrite,
-		EditorEdit:  s.editorEdit,
+		EditorWrite:   s.editorWrite,
+		EditorEdit:    s.editorEdit,
+		EditorBrowser: s.editorShowURL,
 	}
 	if cfg.EditorTerminal {
 		s.env.EditorTerminal = s.editorTerminal
@@ -139,6 +141,12 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	// they must never remove one another's profile locks or change each other's page.
 	shotDir := filepath.Join(cfg.WorkspaceRoot, ".mfagent", "screenshots")
 	s.brw = browser.New(cfg.BrowserExecutable, cfg.BrowserHeadless, shotDir, "")
+	// Playwright's own downloaded Chromium is the fallback that actually
+	// exists on a server: no system browser is installed, but the browsers
+	// Playwright needs have been, and it is the same build the project's specs
+	// run against. Discovered on the workspace host, which over SSH is the
+	// remote — the one place the answer is true.
+	s.brw.SetFallbacks(playwright.ChromiumPaths())
 	tools.RegisterBrowser(s.registry, s.brw)
 
 	// MCP servers, connected in parallel so one slow server does not stall

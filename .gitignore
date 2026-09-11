@@ -12,3 +12,6 @@ core/mfagent-mcp.exe
 *.db-shm
 .env
 .mfagent/replay/
+
+# Built by scripts/bundle-playwright.mjs and shipped in the VSIX, never committed.
+runtime/

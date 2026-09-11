@@ -13,21 +13,17 @@ import (
 func RegisterPlaywright(r *Registry) {
 	r.Add(&Tool{
 		Name: "playwright_status",
-		Description: "Report whether this project can run Playwright: config file, " +
-			"@playwright/test version, installed CLI, and Node availability on the workspace host. " +
-			"Call this first when a Playwright run fails for an unclear reason.",
+		Description: "Report the Playwright runtime available here: where it came from, its " +
+			"version, the config file in use, Node, and the browser builds present on the " +
+			"workspace host. The extension ships its own runtime, so this is normally ready " +
+			"with no project setup. Call it first when a Playwright run fails unclearly.",
 		Schema: obj(map[string]any{}),
 		Run: func(ctx context.Context, env *Env, in json.RawMessage) Result {
 			s := playwright.Detect(env.Root)
 			var sb strings.Builder
+			fmt.Fprintf(&sb, "runtime: %s\n", s.Describe())
 			fmt.Fprintf(&sb, "node:    %s\n", orNone(s.NodePath))
 			fmt.Fprintf(&sb, "CLI:     %s\n", orNone(s.CLIPath))
-			sb.WriteString("Execution host: workspace host (remote server when using SSH). Tests launch via node, without a shell or implicit package downloads.\n")
-			if s.ConfigPath != "" {
-				fmt.Fprintf(&sb, "config:  %s\n", env.Rel(s.ConfigPath))
-			} else {
-				sb.WriteString("config:  (none found; Playwright defaults apply, or select an explicit spec)\n")
-			}
 			if s.Installed {
 				v := s.Version
 				if v == "" {
@@ -35,16 +31,29 @@ func RegisterPlaywright(r *Registry) {
 				}
 				fmt.Fprintf(&sb, "package: @playwright/test %s\n", v)
 			} else {
-				sb.WriteString("package: not installed\n")
+				sb.WriteString("package: none resolved\n")
 			}
+			fmt.Fprintf(&sb, "specs:   %s\n", s.Root)
+			if s.ConfigPath != "" {
+				fmt.Fprintf(&sb, "config:  %s\n", env.Rel(s.ConfigPath))
+			} else {
+				sb.WriteString("config:  (none found; Playwright defaults apply, or select an explicit spec)\n")
+			}
+			if browsers := playwright.ChromiumPaths(); len(browsers) > 0 {
+				fmt.Fprintf(&sb, "browsers: %d Chromium build(s) present, newest %s\n", len(browsers), browsers[0])
+			} else {
+				sb.WriteString("browsers: none downloaded yet — playwright_install fetches them\n")
+			}
+			sb.WriteString("Execution host: workspace host (the remote server when using SSH). Tests launch via node, without a shell.\n")
+
 			if err := s.Ready(); err != nil {
 				fmt.Fprintf(&sb, "\nNot ready: %v", err)
-			} else {
-				sb.WriteString("\nReady to run tests.")
+				return Ok(sb.String())
 			}
-			if s.NodePath != "" && s.Installed {
-				sb.WriteString("\nDeclarative layout replay is available without a test config; browser installation is checked at launch.")
-			}
+			sb.WriteString("\nReady to run tests. The runtime is provided for you: do not add " +
+				"@playwright/test to the project, run npm install, or scaffold a package.json for it. " +
+				"Write specs and run them.")
+			sb.WriteString("\nDeclarative layout replay is available without a test config; browser installation is checked at launch.")
 			return Ok(sb.String())
 		},
 	})
@@ -139,8 +148,8 @@ func RegisterPlaywright(r *Registry) {
 			withDeps := a.WithDeps == nil || *a.WithDeps
 
 			s := playwright.Detect(env.Root)
-			if s.NpxPath == "" {
-				return Errf("npx is not on PATH — install Node.js on this machine first")
+			if err := s.Ready(); err != nil {
+				return Errf("%v", err)
 			}
 			if env.Emit != nil {
 				env.Emit("status", map[string]any{"text": "installing Playwright browsers…"})

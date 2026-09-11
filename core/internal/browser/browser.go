@@ -7,6 +7,7 @@ package browser
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,9 +38,37 @@ type Browser struct {
 	started bool
 
 	execPath   string
+	fallbacks  []string
+	resolved   string
 	headless   bool
 	shotDir    string
 	profileDir string
+}
+
+// Resolved reports which executable actually started, for status output. Empty
+// means chromedp found one on its own, or nothing has started yet.
+func (b *Browser) Resolved() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.resolved
+}
+
+func describePath(p string) string {
+	if p == "" {
+		return "chromedp's own search"
+	}
+	return p
+}
+
+// condense keeps a launch failure to one line. Chromium writes a paragraph of
+// sandbox advice on every failed start, and one per candidate would bury the
+// list the reader actually needs.
+func condense(err error) string {
+	line := strings.TrimSpace(strings.SplitN(err.Error(), "\n", 2)[0])
+	if len(line) > 200 {
+		line = line[:200] + "…"
+	}
+	return line
 }
 
 // New builds a Browser. profileDir, when non-empty, is a persistent Chromium
@@ -50,6 +79,39 @@ func New(execPath string, headless bool, shotDir, profileDir string) *Browser {
 	return &Browser{execPath: execPath, headless: headless, shotDir: shotDir, profileDir: profileDir}
 }
 
+// SetFallbacks supplies further browser executables to try when the primary
+// one will not start. The usual source is Playwright's own downloaded
+// Chromium: on a server with no system browser that is normally the only build
+// present, and it is the same one the project's specs run against.
+//
+// The list is supplied by the caller rather than discovered here so this
+// package keeps knowing nothing about Playwright.
+func (b *Browser) SetFallbacks(paths []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.fallbacks = paths
+}
+
+// Candidates is the launch order: the configured executable first, then each
+// fallback, then an empty path that lets chromedp search for itself.
+func (b *Browser) Candidates() []string {
+	out := make([]string, 0, len(b.fallbacks)+2)
+	seen := map[string]bool{}
+	for _, p := range append([]string{b.execPath}, append(b.fallbacks, "")...) {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// ensure starts a browser, trying each candidate in turn.
+//
+// A missing system Chrome used to end the turn here. It no longer should: the
+// machine nearly always has a browser somewhere, and which one it is matters
+// far less than whether the check runs at all.
 func (b *Browser) ensure(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -57,6 +119,25 @@ func (b *Browser) ensure(ctx context.Context) error {
 		return nil
 	}
 
+	var attempts []string
+	for _, candidate := range b.Candidates() {
+		err := b.launch(ctx, candidate)
+		if err == nil {
+			b.resolved = candidate
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		attempts = append(attempts, fmt.Sprintf("  %s: %v", describePath(candidate), condense(err)))
+	}
+	return fmt.Errorf("no browser could be started. Tried:\n%s\n\n"+
+		"Every candidate failed, so browser_* tools cannot produce evidence here. "+
+		"Use browser_show to display the page to the user (display only, not evidence), "+
+		"or report a blocked environment.", strings.Join(attempts, "\n"))
+}
+
+func (b *Browser) launch(ctx context.Context, execPath string) error {
 	// A previous browser died (closed by hand, or crashed). Release its
 	// contexts before allocating a replacement so the process and its
 	// user-data dir do not leak.
@@ -80,8 +161,8 @@ func (b *Browser) ensure(ctx context.Context) error {
 		chromedp.Flag("mute-audio", true),
 		chromedp.WindowSize(1440, 900),
 	)
-	if b.execPath != "" {
-		opts = append(opts, chromedp.ExecPath(b.execPath))
+	if execPath != "" {
+		opts = append(opts, chromedp.ExecPath(execPath))
 	}
 	if b.profileDir != "" {
 		// Never remove Chromium's lock: another process may own this profile.
@@ -148,12 +229,12 @@ func (b *Browser) ensure(ctx context.Context) error {
 		if err != nil {
 			bcancel()
 			allocCancel()
-			return fmt.Errorf("could not start Chromium at %q (set MFAGENT_CHROME_PATH to a Chrome or Edge executable): %w", b.execPath, err)
+			return err
 		}
 	case <-time.After(45 * time.Second):
 		bcancel()
 		allocCancel()
-		return fmt.Errorf("timed out after 45s starting Chromium at %q (set MFAGENT_CHROME_PATH to a Chrome or Edge executable)", b.execPath)
+		return errors.New("timed out after 45s")
 	}
 
 	b.allocCancel = allocCancel

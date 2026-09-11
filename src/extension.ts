@@ -18,6 +18,7 @@ import { discoverInstalledSkills, SKILL_INSTALL_AGENTS } from './skills';
 import { runSkillInstall } from './skillInstall';
 import { notifySkillsChanged } from './queue/registry';
 import { resolveChromium } from './chromium';
+import { activatePlaywrightRuntime, registerBrowserShowHandler } from './playwrightRuntime';
 import { getContext, getModelRegistry, getStore, initProviders } from './providers/instance';
 import { ProfileStore } from './providers/store';
 import { SettingsPanel } from './settings/panel';
@@ -39,6 +40,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   output = vscode.window.createOutputChannel('MF Agent');
   context.subscriptions.push(output);
 
+  // Before anything is spawned: the core, the queue workers and the headless
+  // host all inherit this process's environment, and that is how they are told
+  // where the bundled Playwright runtime lives.
+  activatePlaywrightRuntime(context, output);
+
   store = initProviders(context, output).store;
   await migrateLegacySettings(store);
 
@@ -54,6 +60,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(core);
   registerEditorFsHandlers(core);
   registerEditorTerminalHandlers(core);
+  registerBrowserShowHandler(core);
   bridge.attach(core);
   // The agent's terminal belongs to this activation, not to the workspace: a
   // stale one left behind on deactivate would still be sitting there, detached

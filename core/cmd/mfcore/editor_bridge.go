@@ -69,3 +69,14 @@ func (s *server) editorEdit(ctx context.Context, path string, edits []tools.Edit
 	}
 	return reply.Replacements, nil
 }
+
+// editorShowURL asks the extension to open a URL in VS Code's own Simple
+// Browser — see Env.EditorBrowser and src/extension.ts.
+//
+// This is display only. The Simple Browser is a sandboxed webview iframe: the
+// extension can point it at a URL and nothing more. It cannot read the DOM,
+// click anything, or take a screenshot. The tool that uses it says so, because
+// a page a human can see is not the same as a check that ran.
+func (s *server) editorShowURL(ctx context.Context, url string) error {
+	return s.conn.Call(ctx, "browser/show", map[string]any{"url": url}, nil)
+}

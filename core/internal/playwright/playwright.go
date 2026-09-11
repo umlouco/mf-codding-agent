@@ -35,57 +35,94 @@ var configNames = []string{
 // Setup describes what is and is not present, so a failure can say which
 // piece is missing instead of dumping a raw npx error.
 type Setup struct {
-	Root       string
+	// Root is where the specs and config live: the workspace, or an
+	// owner-selected external suite.
+	Root string
+	// Home is the directory whose node_modules provides the runtime. It equals
+	// Root for a project that owns its dependencies, and points at the
+	// extension's bundled runtime otherwise.
+	Home       string
+	Origin     Origin
 	ConfigPath string // absolute path, "" when not found
 	NodePath   string
 	NpxPath    string
-	CLIPath    string // installed JS entry point, invoked with node (never npx.cmd)
-	Installed  bool   // @playwright/test resolvable from Root
+	CLIPath    string // resolved JS entry point, invoked with node (never npx.cmd)
+	Installed  bool   // @playwright/test resolvable for Root
 	Version    string // best-effort, "" when unknown
 }
 
 func (s *Setup) Ready() error {
 	if s.NodePath == "" {
-		return errors.New("node is not on PATH — Playwright needs Node.js installed on this machine")
+		return errors.New("node is not on PATH — Playwright needs Node.js on the workspace host")
 	}
 	if !s.Installed {
-		return errors.New("@playwright/test is not installed in this project — run `npm install -D @playwright/test`")
+		// Reaching this means the extension's own bundled runtime is missing
+		// too, so it is an installation fault to report rather than a project
+		// setup step for an agent to perform. Telling a worker to run npm
+		// install here is what sends it off to scaffold dependencies it was
+		// never meant to own.
+		return errors.New("no Playwright runtime is available: the extension's bundled runtime was " +
+			"not found and this project has none of its own. Report this as a blocked environment; " +
+			"do not install Playwright into the project")
 	}
 	if s.CLIPath == "" {
-		return errors.New("installed Playwright CLI is missing; restore the project's dependencies")
+		return errors.New("the resolved Playwright package has no cli.js; the runtime is incomplete")
 	}
 	return nil
 }
 
 // Detect inspects the workspace without running anything.
 func Detect(root string) *Setup {
+	s := &Setup{Root: root, Origin: OriginNone}
+
 	// Owner-selected suite location keeps test dependencies and artifacts out of
 	// application repositories. The target URL/credentials still come from the
 	// fixed testing environment inherited by this process.
-	if external := strings.TrimSpace(os.Getenv("MFAGENT_PLAYWRIGHT_ROOT")); external != "" {
-		root = external
+	external := strings.TrimSpace(os.Getenv("MFAGENT_PLAYWRIGHT_ROOT"))
+	if external != "" {
+		s.Root = external
 	}
-	s := &Setup{Root: root}
+
 	s.NodePath, _ = exec.LookPath("node")
 	s.NpxPath, _ = exec.LookPath("npx")
 
 	for _, n := range configNames {
-		p := filepath.Join(root, n)
+		p := filepath.Join(s.Root, n)
 		if _, err := os.Stat(p); err == nil {
 			s.ConfigPath = p
 			break
 		}
 	}
 
+	// Resolution order: a project that already owns @playwright/test keeps
+	// running against its own pinned version, and everything else falls
+	// through to the runtime the extension ships. That fall-through is what
+	// makes these tools work against a project with no test setup at all.
+	//
 	// Resolving the package directory is a more honest check than reading
-	// package.json, which lists intent rather than what is on disk.
-	pkgDir := filepath.Join(root, "node_modules", "@playwright", "test")
-	if fi, err := os.Stat(pkgDir); err == nil && fi.IsDir() {
-		s.Installed = true
-		if info, err := os.Stat(filepath.Join(pkgDir, "cli.js")); err == nil && !info.IsDir() {
-			s.CLIPath = filepath.Join(pkgDir, "cli.js")
+	// package.json, which lists intent rather than what is on disk — the
+	// distinction that turned a scaffolded `devDependencies: {}` into a night
+	// of retries.
+	sources := []struct {
+		home   string
+		origin Origin
+	}{
+		{s.Root, OriginProject},
+		{bundledHome(), OriginBundled},
+	}
+	if external != "" {
+		sources[0].origin = OriginExternal
+	}
+	for _, src := range sources {
+		dir := pkgDir(src.home)
+		if dir == "" {
+			continue
 		}
-		if b, err := os.ReadFile(filepath.Join(pkgDir, "package.json")); err == nil {
+		s.Home, s.Origin, s.Installed = src.home, src.origin, true
+		if info, err := os.Stat(filepath.Join(dir, "cli.js")); err == nil && !info.IsDir() {
+			s.CLIPath = filepath.Join(dir, "cli.js")
+		}
+		if b, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil {
 			var pj struct {
 				Version string `json:"version"`
 			}
@@ -93,8 +130,20 @@ func Detect(root string) *Setup {
 				s.Version = pj.Version
 			}
 		}
+		break
 	}
 	return s
+}
+
+// prepare links the bundled runtime into the project so the project's own
+// specs and config can resolve `@playwright/test` by name. Running the bundled
+// CLI is not enough on its own: a spec's import resolves by walking up from the
+// spec file, which never reaches the extension's directory.
+func (s *Setup) prepare() error {
+	if s.Origin != OriginBundled {
+		return nil
+	}
+	return EnsureResolvable(s.Root, s.Home)
 }
 
 // RunOptions selects which part of the suite to run.
@@ -189,6 +238,9 @@ func Run(ctx context.Context, s *Setup, opt RunOptions) (*Report, error) {
 	if err := s.Ready(); err != nil {
 		return nil, err
 	}
+	if err := s.prepare(); err != nil {
+		return nil, err
+	}
 
 	// The JSON reporter shares stdout with anything the tests print, so send
 	// it to a file instead of trying to find it in the noise.
@@ -234,7 +286,7 @@ func Run(ctx context.Context, s *Setup, opt RunOptions) (*Report, error) {
 	cmd := exec.CommandContext(runCtx, s.NodePath, args...)
 	configureCommand(cmd)
 	cmd.Dir = s.Root
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(s.env(),
 		"PLAYWRIGHT_JSON_OUTPUT_NAME="+reportPath,
 		// Colour codes would end up in the model's context as escape noise.
 		"FORCE_COLOR=0",
@@ -360,11 +412,32 @@ func collect(s jsonSuite, file string, rep *Report) {
 	}
 }
 
+// env is the base environment for every node process this package starts.
+//
+// NODE_PATH is the belt to prepare's braces: the link makes resolution work
+// the ordinary way, and this covers a project whose node_modules could not be
+// written to at all — a read-only checkout, or a root-owned document root the
+// core is not running as.
+func (s *Setup) env() []string {
+	env := os.Environ()
+	if s.Origin == OriginBundled && s.Home != "" {
+		modules := filepath.Join(s.Home, "node_modules")
+		if existing := os.Getenv("NODE_PATH"); existing != "" {
+			modules += string(os.PathListSeparator) + existing
+		}
+		env = append(env, "NODE_PATH="+modules)
+	}
+	return env
+}
+
 // InstallBrowsers runs `playwright install`, which is the step people forget
 // on a fresh server and which produces a famously opaque failure when missed.
 func InstallBrowsers(ctx context.Context, s *Setup, withDeps bool) (string, error) {
 	if s.NodePath == "" || s.CLIPath == "" {
-		return "", errors.New("node and the project's installed @playwright/test CLI are required; no implicit package download is performed")
+		return "", errors.New("node and a resolved @playwright/test CLI are required; no implicit package download is performed")
+	}
+	if err := s.prepare(); err != nil {
+		return "", err
 	}
 	args := []string{s.CLIPath, "install", "chromium"}
 	if withDeps && runtime.GOOS == "linux" {
@@ -376,7 +449,7 @@ func InstallBrowsers(ctx context.Context, s *Setup, withDeps bool) (string, erro
 	cmd := exec.CommandContext(runCtx, s.NodePath, args...)
 	configureCommand(cmd)
 	cmd.Dir = s.Root
-	cmd.Env = append(os.Environ(), "NO_COLOR=1", "CI=1")
+	cmd.Env = append(s.env(), "NO_COLOR=1", "CI=1")
 	out, err := cmd.CombinedOutput()
 	if runCtx.Err() == context.DeadlineExceeded {
 		return tail(string(out), 3000), errors.New("playwright install timed out after 15m")

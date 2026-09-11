@@ -116,6 +116,21 @@ type Env struct {
 	// falls back to spawning the shell itself.
 	EditorTerminal func(ctx context.Context, cwd, command string, timeoutMS int) (TerminalRun, error)
 
+	// EditorBrowser, when set, asks the editor to open a URL in its own
+	// integrated browser — see browser_show in browser_tools.go and
+	// src/extension.ts.
+	//
+	// It is the last rung of the browser fallback ladder and the only one that
+	// produces no evidence. VS Code's Simple Browser is a sandboxed webview:
+	// the extension can point it at a URL, and that is the whole of the API.
+	// There is no DOM access, no input, no screenshot. It exists so a check
+	// that cannot be automated can at least be put in front of the person
+	// watching, clearly labelled as something they looked at rather than
+	// something that passed.
+	//
+	// Nil when there is no live editor connection (`mfcore sh`, unit tests).
+	EditorBrowser func(ctx context.Context, url string) error
+
 	rootOnce sync.Once
 	rootReal string
 }

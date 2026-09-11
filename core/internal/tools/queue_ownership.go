@@ -132,14 +132,101 @@ func (e *Env) CheckQueueCommand(command string) error {
 			return fmt.Errorf("queue ownership: this %s shell may run checks, but file rewrites require the supervisor's scoped editing tools", e.QueueRole)
 		}
 	}
-	if e.QueueRole == "executor" && testPath(strings.ReplaceAll(lower, " ", "/")) {
-		for _, write := range []string{">", "sed ", "perl ", "writefile", "write-file", "set-content", "add-content", "out-file", "apply_patch", "python ", "python3 ", "node -e", "remove-item", "move-item", "rm ", "mv ", "cp ", "tee "} {
-			if strings.Contains(lower, write) {
-				return fmt.Errorf("queue ownership: the supervisor owns test rewrites. Run the assigned check without modifying its test, or request supervisor test repair")
-			}
+	if e.QueueRole == "executor" {
+		if target := testWriteTarget(lower); target != "" {
+			return fmt.Errorf("queue ownership: the supervisor owns test rewrites, and this command writes to %s. "+
+				"Run the assigned check without modifying its test, or request supervisor test repair", target)
 		}
 	}
 	return nil
+}
+
+// packageManagers never rewrite a test, whatever their arguments look like.
+// Installing a dependency is dependency management; the fact that a package is
+// *named* `@playwright/test` says nothing about which files are being written.
+var packageManagers = map[string]bool{
+	"npm": true, "npx": true, "pnpm": true, "pnpx": true,
+	"yarn": true, "bun": true, "bunx": true, "corepack": true,
+}
+
+// testWriteTarget returns the test file a command would write to, or "" when
+// it writes to none.
+//
+// The precision matters more than it looks. The previous version pasted the
+// whole command together with "/" for every space and asked whether the result
+// contained "/test/", which made `npm install -D @playwright/test > log` read
+// as a test rewrite: the package name became a directory segment and the
+// redirect became a write verb. An executor that could never install its own
+// dependencies had no way to make progress and no way to say why.
+func testWriteTarget(command string) string {
+	fields := strings.Fields(command)
+	// Skip leading `VAR=value` assignments to find the real program.
+	for len(fields) > 0 && strings.Contains(fields[0], "=") && !strings.ContainsAny(fields[0], "/\\") {
+		fields = fields[1:]
+	}
+	if len(fields) > 0 {
+		program := fields[0]
+		if slash := strings.LastIndexAny(program, "/\\"); slash >= 0 {
+			program = program[slash+1:]
+		}
+		if packageManagers[strings.TrimSuffix(program, ".cmd")] {
+			return ""
+		}
+	}
+	if !queueShellWrite.MatchString(command) && !strings.Contains(command, ">") {
+		return ""
+	}
+	for _, token := range splitArgs(command) {
+		if token == "" || strings.HasPrefix(token, "-") || packageSpecifier(token) {
+			continue
+		}
+		// A path inside node_modules is a dependency, not one of the project's
+		// tests — `node node_modules/@playwright/test/cli.js` is how the runner
+		// is invoked, not an edit to a spec.
+		if strings.Contains(token, "node_modules/") || strings.Contains(token, `node_modules\`) {
+			continue
+		}
+		if testPath(token) {
+			return token
+		}
+	}
+	return ""
+}
+
+// splitArgs breaks a command into candidate path arguments, cutting on shell
+// metacharacters and stripping quotes and redirect operators.
+func splitArgs(command string) []string {
+	raw := strings.FieldsFunc(command, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\n', '\r', '|', ';', '&', '(', ')', '<', '>', '\'', '"', '`':
+			return true
+		}
+		return false
+	})
+	out := make([]string, 0, len(raw))
+	for _, token := range raw {
+		out = append(out, strings.Trim(token, ",="))
+	}
+	return out
+}
+
+// packageSpecifier reports whether a token names an npm package rather than a
+// path — `@playwright/test`, `@playwright/test@1.55.0`, `mocha@^10`. A real
+// path to a test carries more structure than a single scope segment, or is
+// anchored with `./`, `/` or a drive letter.
+func packageSpecifier(token string) bool {
+	if strings.HasPrefix(token, "./") || strings.HasPrefix(token, "../") ||
+		strings.HasPrefix(token, "/") || strings.HasPrefix(token, ".\\") {
+		return false
+	}
+	if len(token) > 1 && token[1] == ':' {
+		return false // C:\… on Windows
+	}
+	if !strings.HasPrefix(token, "@") {
+		return false
+	}
+	// A scoped package is exactly `@scope/name`, optionally `@version`.
+	return strings.Count(token, "/") == 1
 }
 
 var queueShellWrite = regexp.MustCompile(`(?i)(?:\b(?:sed\s+-i|perl\s+-(?:\w*i|e)|(?:python\S*|node|ruby)\s+(?:-c|-e|--eval)|(?:set-content|add-content|out-file|remove-item|move-item|copy-item|rm|mv|cp|tee|touch|truncate|apply_patch)\s)|\b(?:writefile|write_text|write_bytes)\b|\bgit\s+(?:checkout|restore|reset|clean|apply)\b)`)
