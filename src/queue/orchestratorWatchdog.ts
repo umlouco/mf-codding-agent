@@ -24,6 +24,12 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     if (this.disposed || this.queue.runState !== 'RUNNING') {
       return;
     }
+    // The run-wide backstop runs before anything else: if the run has spent too
+    // much, produced too many rows, or run too long, stop it now rather than
+    // start another review or worker.
+    if (this.runBreakerTripped()) {
+      return;
+    }
     // Before the busy check, never after: a review that has gone silent is the
     // reason the busy check would be true, so testing it second means never
     // testing it at all.
@@ -157,6 +163,12 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       return;
     }
     const quiet = Date.now() - r.lastActivityAt;
+    // Hard wall-clock ceiling on one review. A validator that keeps streaming
+    // without concluding is not making progress, and without this bound a task
+    // could sit in VERIFYING indefinitely, so the queue would never reach its
+    // end. On expiry the task is blocked for a person and the run moves on.
+    const ceilingMs = Math.max(30, this.cfg<number>('queue.verificationMaxSeconds', 180)) * 1000;
+    const overTime = r.startedAt !== undefined && Date.now() - r.startedAt >= ceilingMs;
     const stalledPlanner = r.lastModelOutputAt !== undefined &&
       Date.now() - r.lastModelOutputAt >= Math.min(this.silentMs, DECOMPOSITION_OUTPUT_IDLE_MS);
     // A planner that never goes idle never trips the check above no matter how
@@ -167,23 +179,32 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     // every other tick from looking at anything else in the queue at all.
     const ramblingPlanner = r.lastModelOutputAt !== undefined && r.startedAt !== undefined &&
       Date.now() - r.startedAt >= DECOMPOSITION_TOTAL_CEILING_MS;
-    if (quiet < this.silentMs && !stalledPlanner && !ramblingPlanner) {
+    if (quiet < this.silentMs && !stalledPlanner && !ramblingPlanner && !overTime) {
       return;
     }
 
-    const note = ramblingPlanner
+    const note = overTime
+      ? `Verification/review exceeded its ${Math.round(ceilingMs / 1000)}s wall-clock budget without concluding`
+      : ramblingPlanner
       ? `Replacement planner has been streaming a single response for ${Math.round((Date.now() - r.startedAt!) / 60_000)} minute(s) without concluding; still producing tokens is not the same as making progress`
       : stalledPlanner
       ? `Replacement planner produced no model output for ${Math.round((Date.now() - r.lastModelOutputAt!) / 1000)} seconds; transport heartbeats are not progress`
       : `the supervisor went silent for ${Math.round(quiet / 60_000)} minute(s)`;
     this.queue.log(r.taskId, 'supervisor', 'silent', `${note}; abandoning the review`);
-    this.log(`task ${r.seq} — ${note}; abandoning the review and retrying next tick`);
-    // The task stays in VERIFYING on purpose: nothing was judged, so the next
-    // tick reviews it again from scratch.
+    this.log(`task ${r.seq} — ${note}; abandoning the review`);
     this.abandonReview();
     this.changed();
     const task = this.queue.get(r.taskId);
     if (task) {
+      if (overTime) {
+        // Terminal, so the queue keeps moving: a bounded, honest "a person
+        // must look at this" instead of an unbounded review that never ends.
+        this.blockForHuman(task, note);
+        return;
+      }
+      // Anything else stays in VERIFYING on purpose: nothing was judged, so the
+      // next tick reviews it again from scratch.
+      this.log(`task ${r.seq} — retrying next tick`);
       if (requiresDecomposition(task)) {
         const job = readDecomposition(this.queue, task);
         if (job) deferDecomposition(this.queue, task, job, note);

@@ -9,7 +9,6 @@ import { parseScopeAssessment, ScopeAssessment, ScopeRole } from './scopePlan';
 import { scopePrompt } from './scopePrompt';
 import { discoverWork, indexRepository, WorkInventory } from './workInventory';
 import { inventoryScopePlan, scopeBoundary } from './scopeBoundary';
-import { hasAdmittedScope } from './scopeContract';
 
 export interface ScopeHost {
   context: vscode.ExtensionContext;
@@ -39,19 +38,18 @@ export class ScopeSupervisor {
     return !this.closed && this.host.current() && this.host.queue.runState === 'RUNNING';
   }
 
-  async preflight(forcePlanning = false): Promise<boolean> {
-    // A persisted replacement was already admitted by the planner. Re-running
-    // static scope planning on each child (or on its full acceptance gate)
-    // can regenerate the same parent population before any child gets to work.
-    // Fresh live evidence and explicit recovery may still justify a new plan.
-    const admitted = !forcePlanning && hasAdmittedScope(this.host.queue, this.host.task);
-    if (admitted) this.lastReview = Date.now();
-    const keep = admitted ? this.current() : await this.assess('preflight');
-    if (keep && this.current()) {
-      this.timer = setInterval(() => { void this.check(); }, 5000);
-      this.timer.unref?.();
-    }
-    return keep && this.current();
+  /**
+   * Scope planning is disabled.
+   *
+   * This lane used to ask a model, mid-execution, whether a task was "broad"
+   * and split it into dependency-ordered children. In the ten-hour run that
+   * prompted this change it produced 50 splits of a single read-only inspect
+   * task. A task is now executed as written; deciding scope is a plan-time
+   * decision (orchestratorExpansion), never a mid-run multiplication. The
+   * session starts no timer, so check()/assess() are unreachable.
+   */
+  async preflight(_forcePlanning = false): Promise<boolean> {
+    return this.current();
   }
 
   observe(method: string, params: any): void {

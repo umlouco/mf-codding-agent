@@ -61,7 +61,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (supervisor_repair_required)`) &&
         /queue ownership: the supervisor (?:must rewrite existing test|owns test rewrites)/.test(task.output)) {
       if (this.queue.countEvents(task.id, 'test-repair-started') > 0) {
-        this.requestFailureDecomposition(task, `The executor encountered the same test-ownership blocker after a supervisor repair. Split the application and test work instead of repeating that repair.\n${task.output}`);
+        this.blockForHuman(task, `The executor encountered the same test-ownership blocker after a supervisor repair. Splitting is disabled; a person must resolve the application/test ownership conflict.\n${task.output}`);
         return;
       }
       await this.repairTests(task, `The executor was blocked from rewriting a supervisor-owned test. Complete the assigned test correction yourself.\n${task.output}`);
@@ -204,7 +204,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
   protected async repairTests(task: Task, reason: string): Promise<void> {
     if (this.queue.countEvents(task.id, 'test-repair-halted') > 0) {
-      this.requestFailureDecomposition(task, `A previous supervisor test repair halted. Replace this task rather than restarting the exhausted repair.\n${reason}`);
+      this.blockForHuman(task, `A previous supervisor test repair halted. Splitting is disabled; a person must take over the exhausted repair.\n${reason}`);
       return;
     }
     // Replace the completed decision's worker without releasing the current
@@ -231,7 +231,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         errorLog:appendAttempt(current.errorLog,
         `[attempt ${task.attempts}] supervisor test repair halted: ${failure}`)});
       this.queue.log(task.id,'supervisor','test-repair-halted',failure);
-      this.requestFailureDecomposition(this.queue.get(task.id)!, failure);
+      this.blockForHuman(this.queue.get(task.id)!, failure);
     };
     try {
       const observe=this.observerEvents(task.id,'supervisor',live,()=>review.gen===this.reviewGen);
@@ -318,7 +318,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     try { count = this.queue.splitTask(id, [...parts, acceptance], true); }
     catch (error) {
       const current = this.queue.get(id);
-      if (current) this.requestFailureDecomposition(current, `Replacement could not be committed: ${String(error)}`);
+      if (current) this.blockForHuman(current, `Replacement could not be committed: ${String(error)}`);
       throw error;
     }
     this.reviewed.delete(id);
@@ -360,7 +360,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     }
 
     if (decision.action === 'STOP_AND_DECOMPOSE_TASK') {
-      await this.replanOrPause(task, decision.reason);
+      this.blockForHuman(task, `Supervisor asked to decompose this task; decomposition on failure is disabled. ${decision.reason}`);
       return;
     }
     if (isLocalScope(task) && ['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION'].includes(decision.action)) {
@@ -376,7 +376,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         await this.repairTests(task, decision.guidance || decision.reason);
         return;
       case 'SPLIT_TASK':
-        this.requestFailureDecomposition(task, decision.reason || 'Supervisor requested decomposition.');
+        this.blockForHuman(task, decision.reason || 'Supervisor requested a split, which is disabled.');
         return;
       case 'CONTINUE_EXECUTION':
         if (task.status === 'VERIFYING' && !task.validationReport.trim()) {

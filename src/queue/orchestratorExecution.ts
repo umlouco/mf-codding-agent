@@ -147,7 +147,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       } else {
         const overload = promptOverloadReason(res.text);
         if (overload) {
-          this.requestFailureDecomposition(this.queue.get(task.id)!, overload);
+          this.blockForHuman(this.queue.get(task.id)!, overload);
           return;
         }
         this.queue.log(

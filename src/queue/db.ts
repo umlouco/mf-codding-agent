@@ -89,7 +89,12 @@ export class TaskQueue extends QueuePlans {
   /** Legacy compatibility; failed attempts are represented as decomposition work. */
   anyFailed(): boolean { return false; }
 
-  /** Unresolved failures and required decompositions never count as complete. */
+  /**
+   * A run is complete when no row still has work to do. BLOCKED is terminal:
+   * a task the queue could not verify is handed to a person, but it does not
+   * stop the rest of the list from finishing, and it never re-enters the queue
+   * on its own. `finish()` reports the blocked count alongside verified.
+   */
   isComplete(): boolean {
     const row = this.db.prepare(`SELECT COUNT(*) AS n FROM tasks
       WHERE status IN ('PENDING','EXECUTING','VERIFYING','FAILED')

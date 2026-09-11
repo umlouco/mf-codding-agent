@@ -1,7 +1,7 @@
 import * as cp from 'child_process';
 import * as vscode from 'vscode';
-import { QueueStats } from './db';
-import { OrchestratorState, OrchestratorStatus, RunMode, WATCHDOG_MS } from './orchestratorState';
+import { QueueStats, Task } from './db';
+import { appendAttempt, OrchestratorState, OrchestratorStatus, RunMode, WATCHDOG_MS } from './orchestratorState';
 import { recoveryKey, resumeRecovery } from './recovery';
 import { restoreScopedContracts } from './scopeContract';
 import { hasOutstandingRecovery, recoveryJobKey } from './recoverySchedule';
@@ -146,6 +146,12 @@ export abstract class OrchestratorControl extends OrchestratorState {
     } else {
       this.queue.setRunState('RUNNING');
     }
+    // Wall-clock origin for the run circuit breaker. Set on every transition
+    // into RUNNING so a breaker configured in minutes measures this run, not
+    // the age of the database.
+    if (!Number(this.queue.getMeta('runStartedAt') || 0)) {
+      this.queue.setMeta('runStartedAt', String(Date.now()));
+    }
 
     this.arm();
     // Deliberately not cleared by stop or pause: those set the run state, and
@@ -186,8 +192,99 @@ export abstract class OrchestratorControl extends OrchestratorState {
     this.abandonReview();
     this.abandonExecution();
     this.queue.setRunState('STOPPED');
+    this.queue.setMeta('runStartedAt', '');
     this.changed();
     this.log('stopped');
+  }
+
+  /**
+   * The terminal exit for a task the queue cannot complete.
+   *
+   * Marks the row BLOCKED and moves on to the rest of the list. It deliberately
+   * does not split, retry or replan: a verification that will not converge is a
+   * fact about the task or the check, and multiplying it into smaller tasks is
+   * what made one inspect task run for ten hours without finishing. A person
+   * resets, edits or deletes the row from the Task Queue view, and the run still
+   * reaches its end once every row is terminal.
+   */
+  protected blockTask(snapshot: Task, reason: string): void {
+    let task = this.queue.get(snapshot.id);
+    if (!task || task.status === 'VERIFIED' || task.status === 'BLOCKED') {
+      return;
+    }
+    const patch: Partial<Task> = {
+      status: 'BLOCKED',
+      finishedAt: Date.now(),
+      activityPhase: 'blocked',
+      activityDetail: reason.slice(0, 2000),
+      errorLog: appendAttempt(task.errorLog, `[blocked] ${reason}`),
+    };
+    // `stopForDecision` is guarded by updated_at so it cannot clobber a fresher
+    // write. A task that is being reviewed usually has a heartbeat landing, so
+    // retry once against a fresh row, and as a last resort force the terminal
+    // state: the one thing that must never happen is a run that decided to stop
+    // and then kept looping because the row moved.
+    let applied = this.stopForDecision(task, patch);
+    if (!applied) {
+      task = this.queue.get(task.id);
+      if (!task || task.status === 'VERIFIED' || task.status === 'BLOCKED') {
+        return;
+      }
+      applied = this.stopForDecision(task, patch);
+    }
+    if (!applied) {
+      this.abandonExecution();
+      this.queue.update(task.id, patch);
+    }
+    // Drop this task's recovery bookkeeping: a blocked row must not keep
+    // hasOutstandingRecovery() true and so hold finish() open forever.
+    this.queue.setMeta(recoveryKey(task), '');
+    this.queue.setMeta(recoveryJobKey(task), '');
+    this.queue.log(task.id, 'supervisor', 'verdict:BLOCKED', reason.slice(0, 8000));
+    this.log(`task ${task.seq} BLOCKED for human review — continuing with the remaining list: ${reason}`);
+    this.changed();
+    this.notify('blocked', this.queue.stats());
+  }
+
+  /**
+   * Run-wide circuit breaker.
+   *
+   * The per-task policy above stops a task that cannot be verified. This is the
+   * backstop for a run that is not converging across tasks: too many rows, too
+   * many tokens, or too much wall-clock. Any of the three trips the run and
+   * blocks whatever is active. Each limit is configurable; 0 disables it.
+   */
+  protected runBreakerTripped(): boolean {
+    const maxTasks = this.cfg<number>('queue.maxRunTasks', 200);
+    const maxTokens = this.cfg<number>('queue.maxRunTokens', 50_000_000);
+    const maxMinutes = this.cfg<number>('queue.maxRunMinutes', 480);
+    const stats = this.queue.stats();
+
+    if (maxTasks > 0 && stats.total > maxTasks) {
+      return this.tripBreaker(`run holds ${stats.total} tasks, over the ${maxTasks} limit`);
+    }
+    const tokens = (stats.usage.input || 0) + (stats.usage.output || 0);
+    if (maxTokens > 0 && tokens > maxTokens) {
+      return this.tripBreaker(`run spent ${tokens} tokens, over the ${maxTokens} limit`);
+    }
+    const startedAt = Number(this.queue.getMeta('runStartedAt') || 0);
+    if (maxMinutes > 0 && startedAt > 0 && Date.now() - startedAt > maxMinutes * 60_000) {
+      return this.tripBreaker(`run has been RUNNING for over ${maxMinutes} minute(s)`);
+    }
+    return false;
+  }
+
+  private tripBreaker(reason: string): boolean {
+    const active = this.queue.activeTask();
+    if (active) this.blockTask(active, `Run circuit breaker: ${reason}.`);
+    // Unlike a single blocked task, a tripped breaker stops the whole run.
+    this.disarm();
+    this.queue.setRunState('STOPPED');
+    this.queue.setMeta('runStartedAt', '');
+    this.log(`run circuit breaker tripped: ${reason}`);
+    this.changed();
+    this.notify('breaker', this.queue.stats());
+    return true;
   }
 
   pause(): void {
@@ -211,6 +308,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
     // resetAll zeroes `attempts`, so a stale entry here would read as a review
     // of the attempt about to start rather than of the run just thrown away.
     this.reviewed.clear();
+    this.queue.setMeta('runStartedAt', '');
     this.changed();
     this.log('reset — every task back to PENDING');
   }
@@ -247,12 +345,14 @@ export abstract class OrchestratorControl extends OrchestratorState {
     if (!this.queue.isComplete() || hasOutstandingRecovery(this.queue)) return;
     this.disarm();
     this.queue.setRunState('IDLE');
+    this.queue.setMeta('runStartedAt', '');
     this.changed();
 
     const s = this.queue.stats();
-    this.log(`run complete — ${s.byStatus.VERIFIED} verified`);
+    const blocked = s.byStatus.BLOCKED ?? 0;
+    this.log(`run complete — ${s.byStatus.VERIFIED} verified, ${blocked} blocked, ${s.total} total`);
     void vscode.window.showInformationMessage(
-      `MF Agent queue finished: ${s.byStatus.VERIFIED} tasks verified.`,
+      `MF Agent queue finished: ${s.byStatus.VERIFIED} verified, ${blocked} blocked.`,
     );
     this.notify('finished', s);
   }

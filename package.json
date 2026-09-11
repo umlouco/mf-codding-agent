@@ -2,7 +2,7 @@
   "name": "mf-agent",
   "displayName": "MF Agent",
   "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
-  "version": "0.1.44",
+  "version": "0.1.47",
   "publisher": "mflores",
   "license": "MIT",
   "pricing": "Free",
@@ -315,7 +315,31 @@
           "type": "number",
           "default": 4,
           "minimum": 1,
-          "description": "Maximum LLM request/response interactions for verifying one task, shared across verification passes and reloads. Planning, plan correction, reporting and vision-backed checks each consume an interaction; ordinary tools, streamed chunks and elapsed time do not. If the budget is exhausted without a passing host-backed report, preserve evidence and require smaller replacement tasks."
+          "description": "Maximum LLM request/response interactions for verifying one task, shared across verification passes and reloads. Planning, plan correction, reporting and vision-backed checks each consume an interaction; ordinary tools, streamed chunks and elapsed time do not. If the budget is exhausted without a passing host-backed report, the task is BLOCKED for human review. It is never split into smaller tasks."
+        },
+        "mfagent.queue.maxRunTasks": {
+          "type": "number",
+          "default": 200,
+          "minimum": 0,
+          "markdownDescription": "Run circuit breaker: stop the run when the queue holds more than this many task rows. Splitting on failure is disabled, so this only ever trips on runaway phase expansion or repeated planner edits. Set to 0 to disable."
+        },
+        "mfagent.queue.maxRunTokens": {
+          "type": "number",
+          "default": 50000000,
+          "minimum": 0,
+          "markdownDescription": "Run circuit breaker: stop the run when its tasks have spent more than this many input+output tokens in total. The token totals are the durable per-task counters in the queue, so they survive reloads. Set to 0 to disable."
+        },
+        "mfagent.queue.verificationMaxSeconds": {
+          "type": "number",
+          "default": 180,
+          "minimum": 30,
+          "markdownDescription": "Hard wall-clock ceiling on a single verification or supervisor review. A validator that keeps streaming without concluding is cut off, the task is BLOCKED for a person, and the run continues. This is what guarantees the queue reaches its end instead of parking on one task."
+        },
+        "mfagent.queue.maxRunMinutes": {
+          "type": "number",
+          "default": 480,
+          "minimum": 0,
+          "markdownDescription": "Run circuit breaker: stop the run after it has been continuously RUNNING for this many minutes. The clock resets on start, stop, reset and finish, and is preserved across a window reload. Set to 0 to disable."
         },
         "mfagent.queue.maxContextTokens": {
           "type": "number",

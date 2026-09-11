@@ -28,7 +28,7 @@ export abstract class OrchestratorScope extends OrchestratorJournal {
     let count: number;
     try { count = this.queue.splitTask(task.id, parts); }
     catch (error) {
-      if (current()) this.requestFailureDecomposition(task, `Replacement could not be committed: ${String(error)}`);
+      if (current()) this.blockForHuman(task, `Replacement could not be committed: ${String(error)}`);
       return false;
     }
     if (!count) return false;

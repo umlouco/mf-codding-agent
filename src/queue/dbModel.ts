@@ -4,9 +4,12 @@ export const TASK_STATUSES = [
   'VERIFYING',
   'VERIFIED',
   'PAUSED',
+  'BLOCKED',
 ] as const;
 
 // FAILED is accepted only as legacy input; storage converts it to required decomposition.
+// BLOCKED is terminal for the run: a task the queue could not verify is handed to a
+// person, never split into smaller tasks. See blockTask in orchestratorControl.
 export type TaskStatus = (typeof TASK_STATUSES)[number] | 'FAILED';
 
 /**

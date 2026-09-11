@@ -1,5 +1,4 @@
 import type { Task } from './db';
-import type { SupervisorDecision } from './agents';
 import { OrchestratorDecomposition } from './orchestratorDecomposition';
 import type { Review } from './orchestratorState';
 import { LiveLog } from './liveLog';
@@ -14,7 +13,6 @@ import { implementationRetryProblem } from './verificationRecovery';
 /** Recovery changes the next operation, not the owner's task or its acceptance criteria. */
 export abstract class OrchestratorRemediation extends OrchestratorDecomposition {
   protected abstract verifyWithExecutor(task: Task, review: Review): Promise<void>;
-  protected abstract applyVerdictSplit(task: Task, decision: SupervisorDecision, current: () => boolean): boolean;
 
   protected async performRecovery(task: Task, reason: string): Promise<RecoveryOutcome> {
     const review = this.review;
@@ -68,11 +66,11 @@ export abstract class OrchestratorRemediation extends OrchestratorDecomposition 
         // asking, do something structurally different" — reuse it here instead
         // of deferring the identical question forever on a five-minute timer.
         if (streak >= 3) {
-          this.requestFailureDecomposition(task, `Autonomous recovery proposed the identical ` +
+          this.blockForHuman(task, `Autonomous recovery proposed the identical ` +
             `operation ${streak} times running with no new evidence between attempts (latest ` +
             `diagnosis: ${decision.reason}). Replace this task with smaller, independently ` +
             `verifiable work instead of repeating the same recovery decision.`);
-          // requestFailureDecomposition already fenced this review (nulled it and
+          // blockForHuman already fenced this review (nulled it and
           // bumped reviewGen), so serviceRecovery's post-await gen check discards
           // whatever is returned here; the value only satisfies the return type.
           return { status: 'applied' };
@@ -81,8 +79,7 @@ export abstract class OrchestratorRemediation extends OrchestratorDecomposition 
           reason: 'The proposed operation already failed or was admitted. Obtain a different observation or approach.', strategy };
       }
       if (decision.action === 'SPLIT') {
-        if (!this.applyVerdictSplit(task, { verdict: 'SPLIT', feedback: decision.reason,
-          splitInto: decision.splitInto, usage: result.usage }, accepts)) throw Error('Replacement was superseded before commit.');
+        this.blockForHuman(task, decision.reason || 'Recovery requested a split, which is disabled.');
         return { status: 'applied' };
       }
       const feedback = `Recovery diagnosis: ${decision.reason}\nNext approach: ${decision.guidance}\n` +

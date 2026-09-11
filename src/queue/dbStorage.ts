@@ -40,7 +40,7 @@ export class QueueStorage {
         updated_at              INTEGER NOT NULL,
         started_at              INTEGER,
         finished_at             INTEGER,
-        CHECK (status IN ('PENDING','EXECUTING','VERIFYING','VERIFIED','FAILED','PAUSED'))
+        CHECK (status IN ('PENDING','EXECUTING','VERIFYING','VERIFIED','FAILED','PAUSED','BLOCKED'))
       );
 
       CREATE INDEX IF NOT EXISTS idx_tasks_status_seq ON tasks(status, seq);
@@ -115,8 +115,88 @@ export class QueueStorage {
     // Where the independent verification agent's findings land — see the
     // Task.validationReport doc comment.
     this.addColumn('validation_report', "TEXT NOT NULL DEFAULT ''");
+    this.allowBlockedStatus();
     this.dropTaskEventsCascade();
     installDecompositionInvariant(this.db);
+  }
+
+  /**
+   * A database written before BLOCKED existed carries a CHECK constraint that
+   * rejects it, so the terminal block would throw at the one moment it must
+   * commit. SQLite cannot widen a CHECK in place, so the table is rebuilt once
+   * with the same columns and a constraint that allows BLOCKED; existing rows
+   * are copied across unchanged. No-op on a database that already allows it.
+   *
+   * Foreign keys are disabled for the rebuild and re-enabled after, so
+   * agent_logs' cascade reference to tasks(id) survives the drop/rename. The
+   * decomposition triggers are dropped with the old table and recreated by
+   * installDecompositionInvariant at the end of migrate().
+   */
+  private allowBlockedStatus(): void {
+    const row = this.db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'`)
+      .get() as { sql?: string } | undefined;
+    if (!row?.sql || row.sql.includes("'BLOCKED'")) {
+      return;
+    }
+    // PRAGMA foreign_keys is a no-op inside a transaction, so it brackets it.
+    this.db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      this.tx(() => {
+        this.db.exec(`
+          CREATE TABLE tasks_rebuild (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            title                   TEXT    NOT NULL,
+            description             TEXT    NOT NULL DEFAULT '',
+            impl_verify_prompt      TEXT    NOT NULL DEFAULT '',
+            solution_verify_prompt  TEXT    NOT NULL DEFAULT '',
+            solution_verify_command TEXT    NOT NULL DEFAULT '',
+            status                  TEXT    NOT NULL DEFAULT 'PENDING',
+            seq                     INTEGER NOT NULL,
+            output                  TEXT    NOT NULL DEFAULT '',
+            validation_report       TEXT    NOT NULL DEFAULT '',
+            error_log               TEXT    NOT NULL DEFAULT '',
+            supervisor_feedback     TEXT    NOT NULL DEFAULT '',
+            attempts                INTEGER NOT NULL DEFAULT 0,
+            max_attempts            INTEGER NOT NULL DEFAULT 3,
+            created_at              INTEGER NOT NULL,
+            updated_at              INTEGER NOT NULL,
+            started_at              INTEGER,
+            finished_at             INTEGER,
+            last_activity_at        INTEGER,
+            activity_phase          TEXT NOT NULL DEFAULT '',
+            activity_detail         TEXT NOT NULL DEFAULT '',
+            tokens_in               INTEGER NOT NULL DEFAULT 0,
+            tokens_out              INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_read       INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_write      INTEGER NOT NULL DEFAULT 0,
+            kind                    TEXT NOT NULL DEFAULT 'task',
+            region                  TEXT NOT NULL DEFAULT '',
+            split_scope             TEXT NOT NULL DEFAULT '',
+            CHECK (status IN ('PENDING','EXECUTING','VERIFYING','VERIFIED','FAILED','PAUSED','BLOCKED'))
+          );
+          INSERT INTO tasks_rebuild (
+            id, title, description, impl_verify_prompt, solution_verify_prompt,
+            solution_verify_command, status, seq, output, validation_report, error_log,
+            supervisor_feedback, attempts, max_attempts, created_at, updated_at, started_at,
+            finished_at, last_activity_at, activity_phase, activity_detail, tokens_in,
+            tokens_out, tokens_cache_read, tokens_cache_write, kind, region, split_scope)
+          SELECT
+            id, title, description, impl_verify_prompt, solution_verify_prompt,
+            solution_verify_command, status, seq, output, validation_report, error_log,
+            supervisor_feedback, attempts, max_attempts, created_at, updated_at, started_at,
+            finished_at, last_activity_at, activity_phase, activity_detail, tokens_in,
+            tokens_out, tokens_cache_read, tokens_cache_write, kind, region, split_scope
+          FROM tasks;
+          DROP TABLE tasks;
+          ALTER TABLE tasks_rebuild RENAME TO tasks;
+          CREATE INDEX IF NOT EXISTS idx_tasks_status_seq ON tasks(status, seq);
+          CREATE INDEX IF NOT EXISTS idx_tasks_seq ON tasks(seq);
+        `);
+      });
+    } finally {
+      this.db.exec('PRAGMA foreign_keys = ON');
+    }
   }
 
   /** Adds a column to `tasks` if this database predates it. */

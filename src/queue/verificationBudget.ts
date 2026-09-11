@@ -17,8 +17,9 @@ export class VerificationBudget {
 
   get exhausted(): boolean { return this.used >= this.limit; }
   get reason(): string {
-    return `Verification LLM interaction budget exhausted (${this.used}/${this.limit}). ` +
-      'Preserve recorded checks and completed implementation; split only the remaining verification work into smaller tasks.';
+    return `Verification did not reach a passing host-backed report within its ` +
+      `${this.used}/${this.limit} interaction budget. The task is handed to a person; ` +
+      'splitting a verification failure into smaller tasks is disabled because it never converges.';
   }
 
   consume(stage: string): void {

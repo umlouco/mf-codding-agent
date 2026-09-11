@@ -136,9 +136,31 @@ async function createHost(options) {
         [role, { profileId: 'headless-worker', model: options.workerModel, effort: options.workerEffort || '' }])) } });
     await store.setApiKey('headless-worker', options.workerApiKey || process.env.MFAGENT_WORKER_API_KEY || '');
   }
+  if (options.provider) {
+    // Bind planner/supervisor/executor to a real HTTP provider, mirroring the
+    // roles the extension has stored. Configured before initRouter so the
+    // router reads these bindings, not the default claude-cli profile.
+    const p = options.provider;
+    const id = p.id || 'headless-provider';
+    const providerId = p.providerId || 'openai-compatible';
+    await store.update({
+      profiles: [...store.profiles.filter(x => x.id !== id),
+        { id, name: p.name || 'Headless provider', providerId, baseURL: p.baseURL }],
+      roles: { ...store.settings.roles,
+        coding:     { profileId: id, model: p.codingModel || p.executorModel || p.plannerModel, effort: p.effort || '' },
+        planner:    { profileId: id, model: p.plannerModel, effort: p.effort || '' },
+        supervisor: { profileId: id, model: p.supervisorModel || p.plannerModel, effort: p.effort || '' },
+        executor:   { profileId: id, model: p.executorModel || p.plannerModel, effort: p.effort || '' },
+      },
+    });
+    await store.setApiKey(id, p.apiKey || '');
+  }
   const router = load('src/llm/router.ts').initRouter(context, output);
   const bridge = load('src/mcpBridge.ts').initBridge(context, store, output);
-  const queue = load('src/queue/db.ts').TaskQueue.open(path.join(workspace, '.mfagent', 'queue.db'));
+  // queuePath lets a run use a snapshot of a live queue while the workspace
+  // still points at the real files. Default is the workspace's own queue.
+  const queuePath = options.queuePath ? path.resolve(options.queuePath) : path.join(workspace, '.mfagent', 'queue.db');
+  const queue = load('src/queue/db.ts').TaskQueue.open(queuePath);
   load('src/queue/registry.ts').setActiveQueue(queue);
   const testing = load('src/queue/testingEnvironment.ts');
   const credentials = options.credentials || Object.fromEntries(Object.entries(process.env)
