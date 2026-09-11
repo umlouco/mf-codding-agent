@@ -10,7 +10,7 @@ import { plannerIdentity } from './agents';
 import { requiresPlaywright } from './playwrightPolicy';
 import { admitDecomposition, decompositionAncestry, decompositionDigest, decompositionKey,
   decompositionRetryRevision, decompositionWorkspaceRevision, deferDecomposition, readDecomposition,
-  requiresDecomposition, saveDecomposition, scheduleDecomposition } from './recoveryDecomposition';
+  requiresDecomposition, saveDecomposition, scheduleDecomposition, verificationStallStreak } from './recoveryDecomposition';
 
 // Changing this is a host-strategy change, not new workspace evidence. It
 // grants one newly bounded replacement-planning lane after a deployed parser
@@ -174,6 +174,18 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
       }
       return true;
     }
+    // Splitting narrower cannot fix a verifier that cannot converge on the current
+    // shape of the task — see verificationStallStreak. Three such splits in a row
+    // in this family, with no defect and no verified proof ever produced, means
+    // narrowing itself is the failure mode; stop feeding it and rebuild instead,
+    // the same escalation the general split/attempt ceilings use elsewhere.
+    const stallStreak = verificationStallStreak(this.queue, task, job.reason);
+    if (stallStreak >= 3) {
+      this.rebuildFromRoot(task, 'Verification failed to converge for three consecutive replacements in ' +
+        'this family with no implementation defect ever observed and no verified proof produced; narrowing ' +
+        `the verification further will not help. ${job.reason}`);
+      return true;
+    }
     const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen,
       lastActivityAt: Date.now(), lastModelOutputAt: Date.now() };
     this.review = review;
@@ -203,6 +215,7 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
           title: parent.title, description: parent.description, implVerifyPrompt: parent.implVerifyPrompt,
           solutionVerifyPrompt: parent.solutionVerifyPrompt, solutionVerifyCommand: parent.solutionVerifyCommand })),
         previousInvalidPlan: job.invalidPlan, previousError: job.lastError,
+        verificationStallStreak: stallStreak,
       }, {
         onAbort: abort => { if (!accepts()) abort(); else review.abort = abort; },
         onEvent: (method, params) => {

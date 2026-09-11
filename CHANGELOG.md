@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Fix independent verification's own inability to converge reading as a scope
+  problem and being split forever instead of ever being fixed. `admitDecompositionFamily`'s
+  32-split family budget counts every split alike, so a task whose only real
+  obstacle was that verification itself never reached a verdict — `verifyWithExecutor`'s
+  interaction budget or two-pass cap, `supervise`'s two-decisions cap — kept being
+  replaced with narrower "verify/reconcile/inventory a prior verification attempt"
+  children: the identical wall, one layer down, every time. Confirmed live on a SAC
+  workspace queue: one analysis task ran through 30+ such generations over several
+  days with no implementation defect ever found and no verified proof ever produced,
+  while every other task behind it sat at zero attempts the whole time (the queue
+  runs lockstep). `verificationStallStreak` (`dbFailureLineage.ts`) now counts
+  consecutive splits in a family forced only by these three host-generated reasons;
+  from the second one, the decomposition prompt is told explicitly to stop narrowing
+  what is being checked and point back at the original deliverable with one concrete,
+  mechanical check instead, and a third in a row skips the split entirely and rebuilds
+  the task from its root instead — the same escalation `rebuildFromRoot` already uses
+  when other bounded allowances run out.
 - Fix `task_events` — documented as an "append-only audit trail" — actually
   cascade-deleting a task's entire history the moment that task was replaced
   or removed. Every prior iteration's evidence (tool calls, model turns,

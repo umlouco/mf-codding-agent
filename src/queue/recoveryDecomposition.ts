@@ -150,4 +150,4 @@ export function decompositionRetryRevision(root: string): string {
   return decompositionDigest(current);
 }
 
-export { decompositionFamily, admitDecompositionFamily } from './dbFailureLineage';
+export { decompositionFamily, admitDecompositionFamily, verificationStallStreak } from './dbFailureLineage';
