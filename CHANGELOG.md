@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Fix a replacement planner that never goes idle running unmonitored for as
+  long as it keeps streaming, however long that is. `sweepSilentReview` already
+  abandoned one that stalled — no new model output for two minutes straight —
+  but a planner that keeps producing tokens continuously never trips that
+  check no matter how long it runs, and it is a single response-only turn
+  producing one bounded JSON plan, not open-ended work: nothing legitimate
+  needs more than a few minutes. While it runs, `tick()`'s own busy-check skips
+  every cron tick meanwhile, so the supervisor was not just failing to notice
+  this one call rambling — it could not look at anything else in the queue
+  until the call finally stopped on its own. `DECOMPOSITION_TOTAL_CEILING_MS`
+  (8 minutes) now bounds the total duration of one such turn regardless of
+  whether it is still actively streaming; `Review.startedAt` (set once, never
+  overwritten, unlike `lastActivityAt`) is what the check reads.
+- Fix a rebuilt task's abandoned split lineage never being cleaned up.
+  `rebuildFromRoot` restores the task being rebuilt to its full original scope,
+  which subsumes the entire collective scope every sibling produced by that
+  narrowing strategy was each covering a slice of — but it left every one of
+  those siblings sitting in the list at zero attempts, real per the split
+  contract but now duplicating work the restored task will redo wholesale, with
+  no way to ever get a "real" answer of its own beyond waiting for a lockstep
+  queue to reach it. `pruneAbandonedLineage` now deletes every task whose own
+  `region.scopeSplit.archiveKey` names a split anywhere between the task being
+  restored and the root, at every generation, skipping anything already
+  `VERIFIED` — the same set `decompositionAncestry` already walks to find the
+  root, just used to find what that lineage produced rather than only where it
+  came from.
 - Fix `stopForDecision` letting a stale decision overwrite a fresher one that
   had already committed. Its `EXECUTING` branch was already guarded — `finishExecution`
   writes only if the row is still on the same `attempts` the caller last saw — but

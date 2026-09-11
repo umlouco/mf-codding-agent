@@ -172,7 +172,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
 
   /** Runs the full verification pass for one task and applies the verdict. */
   protected async startIndependentVerification(task: Task): Promise<void> {
-    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now() };
+    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now(), startedAt: Date.now() };
     this.review = review;
     try {
       await this.verifyWithExecutor(task, review);
@@ -220,7 +220,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       ownerContext === JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
         this.queue.testingContext, this.queue.instructions]) &&
       sameVerificationSnapshot(this.queue.get(task.id), task);
-    const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now() };
+    const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now(), startedAt: Date.now() };
     this.review = review;
 
     // See reviewWork: the verdict is watchable while it is being reached.
@@ -328,7 +328,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
           finishedAt: null, supervisorFeedback: decision.feedback,
         });
         const verification: Review = {
-          taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now(),
+          taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now(), startedAt: Date.now(),
         };
         this.review = verification;
         try {

@@ -65,7 +65,7 @@ export abstract class OrchestratorRecovery extends OrchestratorWatchdog {
         ownerContext === JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
           this.queue.testingContext, this.queue.instructions]);
     };
-    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now() };
+    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen, lastActivityAt: Date.now(), startedAt: Date.now() };
     this.review = review;
     this.supervising = true;
     this.queue.recordActivity(task.id, 'recovery_diagnosing', `Bounded recovery attempt ${job.attempts}: ${job.reason}`, 'supervisor');

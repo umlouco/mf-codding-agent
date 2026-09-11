@@ -132,8 +132,48 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     this.queue.log(task.id, 'supervisor', 'decomposition-rebuilt',
       JSON.stringify({ restoredFrom: root.id, rebuilds: rebuilds + 1, reason }));
     this.log(`task ${task.seq}: repeated narrowing did not converge; restored the original task (rebuild ${rebuilds + 1} of 2)`);
+    this.pruneAbandonedLineage(task, [task, ...ancestry]);
     this.changed();
     this.wakeAfterHandoff();
+  }
+
+  /**
+   * Deletes every task still in the list that this abandoned lineage produced
+   * along the way — every sibling from every split point between the task
+   * being restored and the root, at every generation. rebuildFromRoot's whole
+   * premise is that this narrowing strategy failed and the *entire* original
+   * scope is being redone from the goal; every task those splits produced
+   * belongs to a plan just declared a dead end, and now duplicates whatever
+   * the restored task will cover again from scratch, so it never gets a
+   * "real" answer of its own — it only ever sat at zero attempts waiting for
+   * a lockstep queue to reach it, and no rebuild before this one ever swept it
+   * away. `applyVerdictSplit` stamps every child's `region.scopeSplit.archiveKey`
+   * with the exact archive record its own split produced, so every task the
+   * whole abandoned lineage generated is exactly the set of live rows whose
+   * own archiveKey names one of those splits — never a task any OTHER split
+   * produced, and never one already VERIFIED.
+   */
+  protected pruneAbandonedLineage(kept: Task, lineage: Task[]): void {
+    const archiveKeys = new Set<string>();
+    for (const node of lineage) {
+      try {
+        const key = JSON.parse(node.region || '{}').scopeSplit?.archiveKey;
+        if (key) archiveKeys.add(key);
+      } catch { /* no split archive to trace */ }
+    }
+    if (!archiveKeys.size) return;
+    let pruned = 0;
+    for (const row of this.queue.list()) {
+      if (row.id === kept.id || row.status === 'VERIFIED') continue;
+      let key: unknown;
+      try { key = JSON.parse(row.region || '{}').scopeSplit?.archiveKey; } catch { continue; }
+      if (typeof key !== 'string' || !archiveKeys.has(key)) continue;
+      this.queue.log(row.id, 'supervisor', 'decomposition-lineage-pruned',
+        `Superseded by rebuilding task ${kept.seq} from its original scope; this task's own split strategy was abandoned.`);
+      this.queue.remove(row.id);
+      pruned++;
+    }
+    if (pruned) this.log(`task ${kept.seq}: removed ${pruned} leftover task(s) from the abandoned split lineage`);
   }
 
   protected decompositionWorkspaceRevision(): string {
@@ -187,7 +227,7 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
       return true;
     }
     const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen,
-      lastActivityAt: Date.now(), lastModelOutputAt: Date.now() };
+      lastActivityAt: Date.now(), startedAt: Date.now(), lastModelOutputAt: Date.now() };
     this.review = review;
     const accepts = () => {
       const current = this.queue.get(task!.id);

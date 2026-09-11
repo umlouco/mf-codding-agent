@@ -4,7 +4,7 @@ import { appendAttempt } from './orchestratorState';
 import { scopeBlocked } from './scopePlan';
 import { recoveryFailure } from './recovery';
 import { deferRecoveryJob, hasOutstandingRecovery, hasRecoveryJob, completeRecoveryJob } from './recoverySchedule';
-import { DECOMPOSITION_OUTPUT_IDLE_MS, deferDecomposition, readDecomposition, requiresDecomposition } from './recoveryDecomposition';
+import { DECOMPOSITION_OUTPUT_IDLE_MS, DECOMPOSITION_TOTAL_CEILING_MS, deferDecomposition, readDecomposition, requiresDecomposition } from './recoveryDecomposition';
 
 export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
@@ -159,11 +159,21 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     const quiet = Date.now() - r.lastActivityAt;
     const stalledPlanner = r.lastModelOutputAt !== undefined &&
       Date.now() - r.lastModelOutputAt >= Math.min(this.silentMs, DECOMPOSITION_OUTPUT_IDLE_MS);
-    if (quiet < this.silentMs && !stalledPlanner) {
+    // A planner that never goes idle never trips the check above no matter how
+    // long it runs — "still producing tokens" is not the same claim as
+    // "producing tokens worth waiting for". This is one response-only turn
+    // producing a single bounded JSON plan; nothing legitimate needs longer
+    // than the ceiling below, and while it runs the busy-check in tick() keeps
+    // every other tick from looking at anything else in the queue at all.
+    const ramblingPlanner = r.lastModelOutputAt !== undefined && r.startedAt !== undefined &&
+      Date.now() - r.startedAt >= DECOMPOSITION_TOTAL_CEILING_MS;
+    if (quiet < this.silentMs && !stalledPlanner && !ramblingPlanner) {
       return;
     }
 
-    const note = stalledPlanner
+    const note = ramblingPlanner
+      ? `Replacement planner has been streaming a single response for ${Math.round((Date.now() - r.startedAt!) / 60_000)} minute(s) without concluding; still producing tokens is not the same as making progress`
+      : stalledPlanner
       ? `Replacement planner produced no model output for ${Math.round((Date.now() - r.lastModelOutputAt!) / 1000)} seconds; transport heartbeats are not progress`
       : `the supervisor went silent for ${Math.round(quiet / 60_000)} minute(s)`;
     this.queue.log(r.taskId, 'supervisor', 'silent', `${note}; abandoning the review`);

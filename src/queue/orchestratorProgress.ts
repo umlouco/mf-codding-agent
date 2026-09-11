@@ -85,7 +85,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
     this.log(`reviewing live work on task ${task.seq} — ${task.title}`);
     const gen = ++this.reviewGen;
-    const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now(), evidenceEventId };
+    const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now(), startedAt: Date.now(), evidenceEventId };
     this.review = review;
     // The supervisor's reasoning streams to the view like everyone else's —
     // into the live table only, never into the journal it will read next time.
@@ -217,7 +217,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     }
     if (!this.stopForDecision(task, {status:'VERIFYING',validationReport:'',finishedAt:null,
       supervisorFeedback:`[SUPERVISOR_TEST_REPAIR] ${reason.replace('[SUPERVISOR_TEST_REPAIR]', '').trim()}`})) return;
-    const review: Review = {taskId:task.id,seq:task.seq,gen:++this.reviewGen,lastActivityAt:Date.now()};
+    const review: Review = {taskId:task.id,seq:task.seq,gen:++this.reviewGen,lastActivityAt:Date.now(),startedAt:Date.now()};
     this.review = review;
     const live = new LiveLog(this.queue, task.id, 'supervisor');
     this.queue.log(task.id,'supervisor','test-repair-started',reason);

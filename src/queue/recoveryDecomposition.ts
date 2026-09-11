@@ -19,6 +19,17 @@ export const decompositionKey = (task: Task) => `failureDecomposition:v1:${task.
 // A response-only replacement planner must produce output, not just keep a
 // transport alive. This is an idle bound, not a cap on a streaming plan's runtime.
 export const DECOMPOSITION_OUTPUT_IDLE_MS = 120_000;
+// The complementary total-duration bound: a planner that never goes idle for
+// two minutes straight — it keeps streaming — never trips the idle bound above
+// no matter how long it runs, because "still producing tokens" and "producing
+// tokens worth waiting for" are different things. This is a single response-only
+// turn producing one bounded JSON plan, not open-ended work; there is no
+// legitimate reason it needs more than a few minutes. Confirmed live: a local
+// model kept a single such turn streaming for 20+ minutes on one task, and
+// separately, 3+ minutes was routine on the same workspace — long enough that
+// the entire supervisor sat blocked on it (tick()'s own busy-check skips every
+// cron tick meanwhile), unable to look at anything else in the queue.
+export const DECOMPOSITION_TOTAL_CEILING_MS = 480_000;
 export const requiresDecomposition = (task: Task) => task.status === 'FAILED' ||
   task.activityPhase?.startsWith('decomposition_') === true;
 export const decompositionDigest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');

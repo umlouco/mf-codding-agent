@@ -53,6 +53,8 @@ export interface Review {
   gen: number;
   /** Last time this review's core said anything — its liveness, as above. */
   lastActivityAt: number;
+  /** When this review began; unlike lastActivityAt, never overwritten — see DECOMPOSITION_TOTAL_CEILING_MS. */
+  startedAt?: number;
   /** Replacement planning: transport heartbeats do not count as model output. */
   lastModelOutputAt?: number;
   /** Worker evidence available when this review's prompt was assembled. */
