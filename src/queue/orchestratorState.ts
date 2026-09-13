@@ -120,6 +120,31 @@ export function appendAttempt(log: string, entry: string): string {
     .filter(Boolean);
   return all.slice(-KEEP_ATTEMPTS).join('\n');
 }
+
+/**
+ * The core's own sentence about why it stopped a turn.
+ *
+ * A stop reason alone ('supervisor_repair_required') names a category, not a
+ * cause, and a person reading the row cannot act on a category. The core writes
+ * the actionable line as the report's opening sentence, so the error log keeps
+ * it verbatim instead of only the reason code.
+ */
+export function stopDetail(text: string): string {
+  const first = text.replace(/^Execution stopped:\s*/i, '').split('\n')[0].trim();
+  return first.length > 600 ? `${first.slice(0, 600)}…` : first;
+}
+
+/** Legacy guard text, retained to recognize evidence from older installed cores. */
+export const TEST_OWNERSHIP_STOP = /queue ownership:\s*the supervisor (?:must rewrite existing test|owns test rewrites)/i;
+
+/**
+ * Identifies a current-attempt stop from the retired source/test ownership split.
+ * ownershipRecovery supplies a bounded migration retry without discarding evidence.
+ */
+export function testOwnershipStop(task: Task): boolean {
+  return task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (supervisor_repair_required)`) &&
+    TEST_OWNERSHIP_STOP.test(task.output);
+}
 export abstract class OrchestratorState {
 
   protected timer: NodeJS.Timeout | undefined;
@@ -198,7 +223,6 @@ export abstract class OrchestratorState {
   protected abstract disarm(): void;
   protected abstract tick(): Promise<void>;
   protected abstract get silentMs(): number;
-  protected abstract sweepSilentReview(): void;
   protected abstract abandonReview(): void;
   protected abstract abandonExecution(): void;
   protected abstract sweepSilentWorkers(): void;

@@ -2,8 +2,16 @@ package tools
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// numberedGutter matches the `<number>\t` prefix read_file prints on every
+// line. A model that copies a block straight out of read_file output often
+// leaves it in, and the resulting "not found" is otherwise baffling because
+// the visible text looks right. Naming it in the error turns a retry loop into
+// one correction. Kept in sync with src/textEdits.ts.
+var numberedGutter = regexp.MustCompile(`(?m)^\s*\d+\t`)
 
 func normalizeEOL(text string) string {
 	return strings.ReplaceAll(text, "\r\n", "\n")
@@ -34,7 +42,10 @@ func replaceIn(text, oldStr, newStr string, all bool) (string, int, error) {
 	normalized := normalizeEOL(text)
 	count := strings.Count(normalized, oldStr)
 	if count == 0 {
-		return "", 0, fmt.Errorf("old_string not found; read_file the current file, then copy a smaller unique exact block without line numbers. For a deliberate full-file replacement, use write_file after reading it. No change was applied")
+		if numberedGutter.MatchString(oldStr) {
+			return "", 0, fmt.Errorf("old_string not found: it still contains read_file's line-number gutter (lines like \"   12\\ttext\"). Copy the block again without the leading line number and tab, then retry. No change was applied")
+		}
+		return "", 0, fmt.Errorf("old_string not found; read the file again, then copy a smaller unique exact block without line numbers. For a deliberate full-file replacement, use write_file after reading it. No change was applied")
 	}
 	if count > 1 && !all {
 		return "", 0, fmt.Errorf("old_string appears %d times; add surrounding context or set replace_all", count)

@@ -44,7 +44,7 @@ const (
 	// How long a reply may deliver nothing at all before the connection counts
 	// as dropped. Generous on purpose: a local model loading a large set of
 	// weights can take a long time to produce its first token.
-	defaultLLMIdle = 30 * time.Minute
+	defaultLLMIdle = 60 * time.Minute
 	// How often a waiting turn writes that it is still waiting.
 	defaultActivityInterval = 30 * time.Second
 )

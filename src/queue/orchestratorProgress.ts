@@ -6,6 +6,7 @@ import { appendAttempt, Review } from './orchestratorState';
 import { OrchestratorRemediation } from './orchestratorRemediation';
 import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, recoverySucceeded, recoveryReplayLimit } from './recovery';
 import { isLocalScope } from './scopeContract';
+import { recoverOwnershipStop } from './ownershipRecovery';
 
 export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
@@ -51,19 +52,10 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
   /** Lets the supervisor judge live work and choose one fixed control action. */
   protected async reviewWork(task: Task): Promise<void> {
+    if (recoverOwnershipStop(this.queue, task)) { this.changed(); return; }
     if (this.correctTestingTarget(task)) return;
     if (task.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
       await this.repairTests(task, task.supervisorFeedback);
-      return;
-    }
-    if (task.status !== 'EXECUTING' &&
-        task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (supervisor_repair_required)`) &&
-        /queue ownership: the supervisor (?:must rewrite existing test|owns test rewrites)/.test(task.output)) {
-      if (this.queue.countEvents(task.id, 'test-repair-started') > 0) {
-        this.requestFailureDecomposition(task, `The executor encountered the same test-ownership blocker after a supervisor repair. Split the application and test work instead of repeating that repair.\n${task.output}`);
-        return;
-      }
-      await this.repairTests(task, `The executor was blocked from rewriting a supervisor-owned test. Complete the assigned test correction yourself.\n${task.output}`);
       return;
     }
     const state = recoveryEvidence(this.queue, task);
@@ -201,6 +193,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
   }
 
   protected async repairTests(task: Task, reason: string): Promise<void> {
+    if (recoverOwnershipStop(this.queue, task)) { this.changed(); return; }
     if (this.queue.countEvents(task.id, 'test-repair-halted') > 0) {
       this.requestFailureDecomposition(task, `A previous supervisor test repair halted. Replace this task rather than restarting the exhausted repair.\n${reason}`);
       return;
@@ -229,6 +222,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         errorLog:appendAttempt(current.errorLog,
         `[attempt ${task.attempts}] supervisor test repair halted: ${failure}`)});
       this.queue.log(task.id,'supervisor','test-repair-halted',failure);
+      if (recoverOwnershipStop(this.queue, this.queue.get(task.id)!)) return;
       this.requestFailureDecomposition(this.queue.get(task.id)!, failure);
     };
     try {
@@ -238,9 +232,9 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       if(review.gen!==this.reviewGen)return;
       const result = await runOnce(this.context,this.output,'supervisor',
         `You are the SUPERVISOR and own test repairs. The executor has been stopped.\n` +
-        `Read and rewrite the defective test, fixture or validation script yourself using editing tools.\n` +
+        `Read the failure and repair the relevant source, tests, fixtures or configuration using editing tools. All project file types are editable.\n` +
         `Preserve acceptance criteria; do not hide application defects by weakening assertions.\n` +
-        `Do not change application implementation or the task database. Task-list changes use your decision protocol.\n` +
+        `Stay within the assigned task. Do not change the task database; task-list changes use your decision protocol.\n` +
         `Use the configured testing environment and credential references. Run a focused check of your repair.\n` +
         `Return a factual handoff listing changed files and observed checks. Independent verification follows; you cannot approve your own repair.\n\n` +
         `${this.queue.contextInstructions}\nOriginal goal: ${this.queue.getMeta('goal')}\n` +

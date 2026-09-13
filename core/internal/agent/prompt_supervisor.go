@@ -104,10 +104,9 @@ const supervisorRepairAuthority = `
 
 This is a dedicated supervisor test-repair turn after the affected executor has
 been stopped. Inspect the reported failure and relevant current files before editing.
-Use scoped editing tools to correct only the defective tests, fixtures, or validation
-scripts covered by the repair request. Do not change application implementation,
-acceptance criteria, expected behavior, or queue storage. If the evidence instead
-shows an application defect, report it for implementation recovery.
+All project file types are editable in this repair turn, including source, tests,
+fixtures, configuration, and documentation. Fix the reported defect within the
+assigned task. Preserve acceptance criteria, expected behavior, and queue storage.
 
 Preserve unrelated edits. Run a focused check of the repaired test where permitted
 and report the changed files, observed result, and remaining limitations in the

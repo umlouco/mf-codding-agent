@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { getRouter } from '../llm/router';
+import { withDeepSeekModels } from './deepseekModels';
 import {
   ListStyle,
   ProviderDef,
@@ -13,9 +14,8 @@ import {
 /**
  * Live model discovery.
  *
- * Every model list in this extension is fetched from the provider, never
- * hard-coded — a checked-in list is stale the week after it ships, and a stale
- * list is exactly the kind of thing you end up editing JSON to work around.
+ * Prefer live provider listings. Documented release hints supplement stale or
+ * unavailable hosted listings without changing saved model selections.
  * Results are cached per profile so opening the settings page is instant, with
  * an explicit refresh for when you have just pulled a new local model.
  */
@@ -63,7 +63,8 @@ export class ModelRegistry {
   /** Cached list without touching the network. */
   peek(providerId: string, baseURLOverride: string | undefined): ModelList | undefined {
     const base = effectiveBaseURL(providerId, baseURLOverride);
-    return this.context.globalState.get<ModelList>(cacheKey(providerId, base));
+    return withDeepSeekModels(providerId, base,
+      this.context.globalState.get<ModelList>(cacheKey(providerId, base)));
   }
 
   /**
@@ -87,7 +88,7 @@ export class ModelRegistry {
 
     const cached = this.context.globalState.get<ModelList>(key);
     if (!force && cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS && cached.models.length) {
-      return cached;
+      return withDeepSeekModels(providerId, base, cached)!;
     }
 
     // Collapse concurrent requests — the settings page asks for several roles
@@ -101,7 +102,7 @@ export class ModelRegistry {
       .then(async (models) => {
         const result: ModelList = { models, fetchedAt: Date.now() };
         await this.context.globalState.update(key, result);
-        return result;
+        return withDeepSeekModels(providerId, base, result)!;
       })
       .catch(async (e: unknown) => {
         const message = describeError(e);
@@ -112,7 +113,7 @@ export class ModelRegistry {
           error: message,
           fallback: !cached?.models?.length,
         };
-        return result;
+        return withDeepSeekModels(providerId, base, result)!;
       })
       .finally(() => this.inflight.delete(key));
 

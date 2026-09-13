@@ -72,11 +72,11 @@ export async function executeTask(
   };
   let result = await runOnce(context, output, 'executor', prompt, options);
   if (!coreHalted(result.stopReason) && decisionOnlyReport(result.text)) {
-    output.appendLine('[queue:executor] supervisor/verifier-only report received; requesting one execution-role correction');
+    output.appendLine('[queue:executor] verdict-only report received; requesting one execution-role correction');
     const spent = result.usage;
     try {
       result = await runOnce(context, output, 'executor', `${prompt}\n\nROLE CORRECTION:
-Your previous response returned a supervisor-only verdict, verification plan, or verifier-only report instead of an execution report.
+Your previous response returned a plan or verdict instead of an execution report.
 You are the EXECUTOR. Perform the assigned implementation yourself using the available tools,
 inspect existing work first, follow the owner's TDD instructions, and report the actual result
 using the completion schema above. Do not tell a future worker to do your task or return a verdict.

@@ -2,31 +2,42 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 	"unicode/utf8"
 )
 
 // readState guards against the classic agent failure of overwriting a file the
 // model has not actually looked at, or that changed underneath it.
+//
+// The identity it compares is the file's content, not its timestamp. An earlier
+// version stored mtime and refused any write whose mtime was newer, which
+// rejected edits the native editor would have applied correctly: another
+// worker saving identical bytes, a formatter no-op, an editor touching the file
+// on focus, or a filesystem with coarse mtime resolution all read as "changed"
+// even though the text the model saw was still current. A content hash says
+// what the check actually means — the text moved on — and says it the same on
+// Windows, Linux and macOS.
 type readState struct {
 	mu   sync.Mutex
-	seen map[string]time.Time
+	seen map[string][32]byte
 }
 
-var reads = &readState{seen: map[string]time.Time{}}
+var reads = &readState{seen: map[string][32]byte{}}
 
 func (r *readState) mark(path string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if fi, err := os.Stat(path); err == nil {
-		r.seen[path] = fi.ModTime()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
 	}
+	r.mu.Lock()
+	r.seen[path] = sha256.Sum256(data)
+	r.mu.Unlock()
 }
 
 // check reports whether path is safe to modify. display is the same file as
@@ -39,7 +50,7 @@ func (r *readState) mark(path string) {
 // succeeds, and it concludes the file tools were the broken ones. Saying "call
 // read_file, then retry" ends that in one round.
 func (r *readState) check(path, display string) error {
-	fi, err := os.Stat(path)
+	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil // new file: nothing to clobber
 	}
@@ -47,7 +58,7 @@ func (r *readState) check(path, display string) error {
 		return err
 	}
 	r.mu.Lock()
-	seenAt, ok := r.seen[path]
+	seen, ok := r.seen[path]
 	r.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("refusing to modify %s without reading it first: "+
@@ -56,8 +67,8 @@ func (r *readState) check(path, display string) error {
 			"workspace root, so writing the change through a shell instead is not a "+
 			"way around this check", display, display)
 	}
-	if fi.ModTime().After(seenAt) {
-		return fmt.Errorf("%s changed on disk since it was last read: "+
+	if sha256.Sum256(data) != seen {
+		return fmt.Errorf("%s changed since it was last read: "+
 			"call read_file with path %q again and rebase the edit on what is there now",
 			display, display)
 	}
@@ -103,8 +114,10 @@ func numberLines(text string, offset int) string {
 func RegisterFS(r *Registry) {
 	r.Add(&Tool{
 		Name: "read_file",
-		Description: "Read a UTF-8 text file from the workspace. Returns content with 1-based " +
-			"line numbers. Use offset/limit for large files. Always read a file before editing it.",
+		Description: "Read a UTF-8 text file from the workspace. Each line is returned as " +
+			"`<line-number>\\t<text>`; the number and the tab after it are a display gutter, " +
+			"not file content. Call this immediately before editing, and copy old_string from " +
+			"the current output without the line-number gutter. Use offset/limit for large files.",
 		Schema: obj(map[string]any{
 			"path":   str("Workspace-relative path to the file."),
 			"offset": num("1-based line to start from. Optional."),
@@ -181,8 +194,11 @@ func RegisterFS(r *Registry) {
 
 	r.Add(&Tool{
 		Name: "write_file",
-		Description: "Create a new file or fully replace an existing one. For partial changes use " +
-			"edit_file instead. Overwriting a file you have not read is rejected.",
+		Description: "Create a new file, or replace an existing file's entire content. An existing " +
+			"path must have been read first: this replaces everything, so an unread file is refused " +
+			"rather than clobbered. For any change to existing code prefer edit_file or multi_edit, " +
+			"which replace only the exact text you name and stay reviewable. `content` becomes the " +
+			"whole file, so it must not include read_file's line-number gutter.",
 		Mutating: true,
 		Schema: obj(map[string]any{
 			"path":    str("Workspace-relative path."),
@@ -238,15 +254,18 @@ func RegisterFS(r *Registry) {
 
 	r.Add(&Tool{
 		Name: "edit_file",
-		Description: "Replace an exact string in a file. old_string must appear exactly once " +
-			"unless replace_all is true. Include surrounding context to disambiguate. " +
-			"CRLF and LF line endings are equivalent; replacements preserve the file's line-ending style. " +
-			"Preferred over write_file for changes to existing code.",
+		Description: "Replace exact text in an existing file. Read the file first and copy " +
+			"`old_string` verbatim from what is there now — exact indentation, no read_file " +
+			"line-number gutter. `old_string` must occur exactly once unless `replace_all` is " +
+			"true; include enough surrounding lines to make it unique. CRLF and LF are equivalent, " +
+			"and replacements preserve the file's line-ending style. If it returns 'old_string " +
+			"not found', re-read the file and copy the current block again; do not repeat the " +
+			"same string. Preferred over write_file for changes to existing code.",
 		Mutating: true,
 		Schema: obj(map[string]any{
 			"path":        str("Workspace-relative path."),
-			"old_string":  str("Exact text to find, including indentation."),
-			"new_string":  str("Replacement text."),
+			"old_string":  str("Exact current text to replace, copied from read_file output with the line-number gutter removed. Include surrounding lines so it is unique."),
+			"new_string":  str("Replacement text. May be empty to delete the matched block."),
 			"replace_all": boolp("Replace every occurrence instead of requiring uniqueness."),
 		}, "path", "old_string", "new_string"),
 		Summarize: func(in json.RawMessage) string {
@@ -275,9 +294,14 @@ func RegisterFS(r *Registry) {
 			if err != nil {
 				return Errf("%v", err)
 			}
-			if err := reads.check(abs, env.Rel(abs)); err != nil {
-				return Errf("%v", err)
-			}
+			// No stale-read gate here. A find/replace edit names the exact
+			// current text, so the match itself is the safety check — and when
+			// an editor is connected the match is computed against the live
+			// document (see Env.EditorEdit). Refusing on file mtime instead
+			// rejected edits the native editor would have applied correctly,
+			// for example when another worker had touched the file since this
+			// one read it. A file that truly moved on simply no longer contains
+			// old_string, and the error says to re-read.
 			var n int
 			if env.EditorEdit != nil {
 				// The match itself is recomputed in the editor against whatever
@@ -304,8 +328,11 @@ func RegisterFS(r *Registry) {
 
 	r.Add(&Tool{
 		Name: "multi_edit",
-		Description: "Apply several edit_file operations to one file atomically, in order. " +
-			"If any edit fails, none are written.",
+		Description: "Apply several edit_file operations to one file in the order given, atomically. " +
+			"Each edit sees the result of the one before it; if any edit fails, nothing is written. " +
+			"Use it for multiple non-contiguous changes to the same file instead of several edit_file " +
+			"calls. Same old_string rules as edit_file: copied verbatim from a fresh read, no " +
+			"line-number gutter, unique unless replace_all.",
 		Mutating: true,
 		Schema: obj(map[string]any{
 			"path": str("Workspace-relative path."),
@@ -313,8 +340,8 @@ func RegisterFS(r *Registry) {
 				"type":        "array",
 				"description": "Ordered list of replacements.",
 				"items": obj(map[string]any{
-					"old_string":  str("Exact text to find."),
-					"new_string":  str("Replacement text."),
+					"old_string":  str("Exact current text to find (no line-number gutter)."),
+					"new_string":  str("Replacement text; empty deletes the block."),
 					"replace_all": boolp("Replace every occurrence."),
 				}, "old_string", "new_string"),
 			},
@@ -346,10 +373,9 @@ func RegisterFS(r *Registry) {
 			if err != nil {
 				return Errf("%v", err)
 			}
-			if err := reads.check(abs, env.Rel(abs)); err != nil {
-				return Errf("%v", err)
-			}
-
+			// Same as edit_file: exact-match replacement is its own safety check,
+			// and the gate is skipped so the native editor's live-buffer match
+			// decides. See the note in edit_file.
 			var total int
 			if env.EditorEdit != nil {
 				// The whole ordered batch goes over in one call so the editor can
@@ -437,7 +463,8 @@ func RegisterFS(r *Registry) {
 
 // applyEditRaw is the fallback used when no editor is connected to apply the
 // edit natively (see Env.EditorEdit) — a plain in-process read/replace/write.
-// The caller has already checked reads.check.
+// It reads the file here, so the exact-match rules in replaceIn are the only
+// gate; edit_file no longer requires a prior read_file.
 func applyEditRaw(abs, oldStr, newStr string, all bool) (string, int, error) {
 	raw, err := os.ReadFile(abs)
 	if err != nil {

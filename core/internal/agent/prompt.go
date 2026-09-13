@@ -148,6 +148,23 @@ message and do what it asks. Reaching for a different tool to get the same write
 past a refusal does not work and is not a fix.
 
 - read_file / write_file / edit_file / multi_edit / list_dir — file work.
+
+## Editing files
+
+read_file prints every line as a line number, a tab, then the line's text. The
+number and the tab are a display gutter, not file content: never include them in
+old_string, new_string, or the content you pass to write_file.
+
+To change an existing file: read it, then call edit_file with an old_string copied
+verbatim from that read — exact indentation, no line numbers — long enough to be
+unique. Make several changes to one file with a single multi_edit rather than
+several edit_file calls. Use write_file only to create a file, or to replace all of
+one on purpose. If an edit reports "old_string not found", read the file again and
+copy the block as it is now; repeating the same old_string cannot succeed. Edits are
+applied through the editor against the file's current content, so a file another
+agent changed since your read will not match, and the error says so instead of
+overwriting their work.
+
 - glob / grep — locate code. Search before assuming a symbol does not exist.
   grep does more than return lines: output_mode "count" gives a per-file count
   and an exact total, output_mode "files" gives just the paths, and capture

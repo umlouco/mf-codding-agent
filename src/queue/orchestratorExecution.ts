@@ -1,11 +1,11 @@
-import { executeTask } from './agents';
-import { appendAttempt } from './orchestratorState';
+import { executeTask, ExecutionOutcome } from './agents';
+import type { Task } from './db';
+import { appendAttempt, stopDetail, TEST_OWNERSHIP_STOP } from './orchestratorState';
 import { OrchestratorVerification } from './orchestratorVerification';
 import { completionForSupervisor } from './validation';
 import { scopeBlocked } from './scopePlan';
-import { providerConfigurationError, recoveryState } from './recovery';
+import { providerConfigurationError } from './recovery';
 import { boundedTask } from './scopeBoundary';
-import { hasRecoveryJob } from './recoverySchedule';
 import { promptOverloadReason } from './scopeEvidence';
 
 export abstract class OrchestratorExecution extends OrchestratorVerification {
@@ -31,21 +31,12 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     if (this.disposed || this.queue.runState !== 'RUNNING') {
       return;
     }
-    const awaiting = this.queue.awaitingVerification();
-    if ((this.mode === 'lockstep' && awaiting.length > 0) || awaiting.some(task => task.kind === 'phase')) {
-      return;
-    }
-
+    // One executor at a time: claimNext itself refuses to hand out a task while
+    // any row is EXECUTING, so this is safe to call from the cron and the
+    // watchdog at once. A task ends when its executor finishes; there is no
+    // separate verification stage for later work to wait behind.
     const next = this.queue.list().find(task => task.status === 'PENDING');
     if (next && scopeBlocked(next, this.queue.list())) return;
-    if (next && this.requireBootstrapRepair(next)) return;
-    if (next) {
-      const blocked = recoveryState(this.queue, next).blocked;
-      if (blocked || hasRecoveryJob(this.queue, next)) {
-        this.pauseForRecovery(next, blocked || 'Continue scheduled recovery before launching another unchanged worker.');
-        return;
-      }
-    }
     const task = this.queue.claimNext();
     if (!task) {
       if (this.queue.isComplete()) {
@@ -82,16 +73,9 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
 
     const journal = this.streamJournal(task.id, 'executor', current);
     journal.live.note('attempt', `attempt ${task.attempts} started`);
-    const scope = this.scopeWatch(task, 'executor', current, (phase, detail) => {
-      this.queue.recordActivity(task.id, phase, detail, 'supervisor');
-    });
-    this.executionScope = scope;
 
     try {
-      this.queue.recordActivity(task.id, 'scope_review', 'Assessing task and verification scope before execution', 'supervisor');
-      if (!await scope.preflight()) return;
-      if (!current()) return;
-      this.queue.recordActivity(task.id, 'starting', 'Scope reviewed; starting executor');
+      this.queue.recordActivity(task.id, 'starting', 'Starting executor');
       // Every record the worker writes lands in the database as it happens, so
       // the run is legible while it is still going and survives the process
       // that produced it. This is also the only thing keeping the task off the
@@ -109,7 +93,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
             this.changed();
           }
         },
-        (method, params) => { journal.onEvent(method, params); scope.observe(method, params); },
+        (method, params) => { journal.onEvent(method, params); },
         (abort) => {
           if (!current()) { abort(); return; }
           this.executionAbort = abort;
@@ -122,43 +106,57 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       // The core stopped this turn itself rather than the model finishing it —
       // see coreHalted. The report is partial progress, so say which limit it
       // ran into: the retry prompt feeds this back, and it is the difference
-      // between a task that needs splitting and one whose tool calls are broken.
+      // between a task that needs another attempt and one whose tool calls are
+      // broken.
       const cutOffNote = res.cutOff
         ? appendAttempt(
             task.errorLog,
-            `[attempt ${task.attempts}] the core stopped the turn (${res.stopReason}). ` +
-              'The report is partial progress. The supervisor must decide whether to ' +
-              'continue, rewrite, split, or validate.',
+            `[attempt ${task.attempts}] the core stopped the turn (${res.stopReason})` +
+              (stopDetail(res.text) ? `: ${stopDetail(res.text)}` : '') +
+              '. The report is partial progress. The task will be retried with this history.',
           )
         : undefined;
 
       this.queue.addUsage(task.id, res.usage);
-      const applied = this.queue.finishExecution(task.id, attempt, {
-        status: 'VERIFYING',
+      const overload = promptOverloadReason(res.text);
+      // An ownership stop is not retryable: the executor is fenced out of
+      // rewriting an existing test, so a retry reproduces the same stop until
+      // the attempt budget is spent and the row is blocked. Route it to the
+      // supervisor's editing turn instead of requeueing it.
+      const repairDetail = res.cutOff && res.stopReason === 'supervisor_repair_required' &&
+        TEST_OWNERSHIP_STOP.test(stopDetail(res.text)) ? stopDetail(res.text) : undefined;
+      // The executor is the only agent that decides a task is done: a closing
+      // READY_FOR_VALIDATION claim on a complete turn ends the task. Everything
+      // else is partial work and goes back for another attempt.
+      const done = !res.cutOff && res.ok && !overload &&
+        res.completion.status === 'READY_FOR_VALIDATION';
+      const outcome: Partial<Task> = {
         output: res.text,
-        // Empty means the supervisor has not delegated formal verification yet.
         validationReport: '',
-        activityPhase: !res.cutOff && res.completion.status === 'READY_FOR_VALIDATION'
-          ? 'ready_for_validation' : 'needs_review',
+        activityPhase: done ? 'done' : repairDetail ? 'needs_review' : 'needs_work',
+        finishedAt: done ? Date.now() : null,
         ...(cutOffNote ? { errorLog: cutOffNote } : {}),
-      });
+        ...(repairDetail ? { supervisorFeedback: `[SUPERVISOR_TEST_REPAIR] ${repairDetail}` } : {}),
+      };
+      const applied = this.queue.finishExecution(
+        task.id,
+        attempt,
+        done ? { ...outcome, status: 'VERIFIED' }
+          : repairDetail ? { ...outcome, status: 'VERIFYING' }
+          : this.retryPatch(task, outcome,
+              overload || res.stopReason || res.completion.status || 'executor reported unfinished work'),
+      );
       if (!applied) {
         this.log(`task ${task.seq} — result arrived after the run moved past this attempt; discarding it`);
       } else {
-        const overload = promptOverloadReason(res.text);
-        if (overload) {
-          this.requestFailureDecomposition(this.queue.get(task.id)!, overload);
-          return;
-        }
         this.queue.log(
           task.id,
           'executor',
-          res.cutOff ? 'cut-off' : 'completed',
+          done ? 'completed' : res.cutOff ? 'cut-off' : 'unfinished',
           res.text.slice(0, 4000),
         );
-        // Recorded separately from the raw reply, and normalised: this is the
-        // one thing in the reply the supervisor's next decision turns on, and
-        // it should not depend on the supervisor finding it inside prose.
+        // Recorded separately from the raw reply, and normalised: a durable,
+        // machine-readable statement of what the executor says it did.
         this.queue.log(
           task.id,
           'executor',
@@ -170,12 +168,19 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
           this.queue.appendInstruction(res.notes, `task ${task.seq}, attempt ${task.attempts}`);
           this.queue.log(task.id, 'executor', 'notes-added', res.notes);
         }
-        this.log(
-          res.cutOff
-            ? `task ${task.seq} — the core stopped the turn (${res.stopReason}); awaiting a supervisor action`
-            : `task ${task.seq} implementation agent stopped claiming ${res.completion.status}; ` +
-              'awaiting a supervisor action',
-        );
+        if (done) {
+          this.recordSharedMemory(task, res);
+          this.log(`task ${task.seq} complete — execution is the final step`);
+        } else if (repairDetail) {
+          this.queue.log(task.id, 'executor', 'test-repair-requested', repairDetail);
+          this.log(`task ${task.seq} — executor stopped on a supervisor-owned test; ` +
+            'a supervisor repair turn is queued');
+        } else {
+          this.log(
+            `task ${task.seq} did not complete (${overload || res.stopReason || res.completion.status}); ` +
+              'returned for another attempt',
+          );
+        }
       }
     } catch (e: any) {
       journal.flush();
@@ -184,19 +189,16 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       journal.live.note('error', `stopped: ${msg}`);
       // An unconfigured (or role-incompatible) provider is not a worker that
       // died mid-turn: there was never a turn. Every task would fail the same
-      // way, so stop the run with the actual fault instead of sending it to
-      // verification and letting the supervisor split it forever.
+      // way, so stop the run with the actual fault.
       if (providerConfigurationError(msg)) {
         this.stopForProviderConfiguration(msg);
         return;
       }
       // A worker that died mid-turn — a dropped connection, a crashed core, or
-      // abandonExecution killing it on purpose — still edited real files. Send
-      // it to the supervisor with an empty validation report. The supervisor
-      // uses the journal and any needed tools to decide recovery; completion
-      // still requires an independent verification report.
-      const applied = this.queue.finishExecution(task.id, attempt, {
-        status: 'VERIFYING',
+      // abandonExecution killing it on purpose — still edited real files, so
+      // the task is returned for another attempt with its history; the
+      // keep-alive supervisor exists to make sure it runs again.
+      const outcome: Partial<Task> = {
         output: task.output,
         errorLog: appendAttempt(
           task.errorLog,
@@ -204,16 +206,20 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
             "Whatever it changed is still on disk — read the files, and read this task's " +
             'activity log, rather than assuming nothing happened.',
         ),
-      });
+      };
+      const applied = this.queue.finishExecution(
+        task.id,
+        attempt,
+        this.retryPatch(task, outcome, 'worker stopped before reporting'),
+      );
       if (applied) {
         this.queue.recordActivity(task.id, 'stopped', msg);
         this.queue.log(task.id, 'executor', 'stopped', msg);
-        this.log(`task ${task.seq} stopped without reporting: ${msg}; awaiting supervision`);
+        this.log(`task ${task.seq} stopped without reporting: ${msg}; returned for another attempt`);
       } else {
         this.log(`task ${task.seq} — its worker stopped after the run moved past this attempt; ignoring it`);
       }
     } finally {
-      scope.close();
       journal.live.close();
       if (this.executionGen === gen) { this.executionAbort = null; this.executionScope = undefined; }
       this.changed();
@@ -225,5 +231,36 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     if (this.mode === 'continuous') {
       this.schedule('continuous execution pump', () => this.pump());
     }
+  }
+
+  /**
+   * A partial or unfinished executor result: retry it, or block it once its
+   * attempt budget is spent so a task that never completes cannot loop forever.
+   */
+  private retryPatch(task: Task, outcome: Partial<Task>, reason: string): Partial<Task> {
+    const errorLog = appendAttempt(
+      (outcome.errorLog as string | undefined) ?? task.errorLog,
+      `[attempt ${task.attempts}] ${reason}`,
+    );
+    if (task.kind === 'task' && task.attempts >= task.maxAttempts) {
+      return { ...outcome, status: 'BLOCKED', finishedAt: Date.now(), activityPhase: 'blocked',
+        activityDetail: reason.slice(0, 2000), errorLog };
+    }
+    return { ...outcome, status: 'PENDING', finishedAt: null, activityPhase: 'requeued', errorLog };
+  }
+
+  /**
+   * Records a compact, durable outcome in the queue's shared notes, so every
+   * later task session starts with what this one accomplished — the same
+   * cross-session memory as the workspace graph, kept where a fresh worker is
+   * guaranteed to read it.
+   */
+  private recordSharedMemory(task: Task, res: ExecutionOutcome): void {
+    const claim = res.completion;
+    const summary = (claim.summary || res.text).replace(/\s+/g, ' ').trim().slice(0, 800);
+    const files = claim.filesChanged.slice(0, 12).join(', ');
+    const line = `task ${task.seq} "${task.title}" complete${files ? ` — files: ${files}` : ''}: ${summary}`;
+    this.queue.appendInstruction(line, `task ${task.seq} outcome`);
+    this.queue.log(task.id, 'executor', 'shared-memory', line.slice(0, 8000));
   }
 }

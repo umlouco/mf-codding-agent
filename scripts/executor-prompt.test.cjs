@@ -100,7 +100,8 @@ test('executor renders concise task-specific instructions through the production
     await t.test('one consistent test ownership policy, with actionable recovery', async () => {
       const prompt = await render();
       assert.doesNotMatch(prompt, /script itself is wrong, correct it directly/);
-      assert.match(prompt, /existing test rewrites.*supervisor/i);
+      assert.match(prompt, /may update source, existing tests, and configuration/i);
+      assert.doesNotMatch(prompt, /existing test rewrites.*supervisor/i);
       assert.match(prompt, /NEEDS_MORE_WORK/);
       assert.match(prompt, /TDD/);
     });

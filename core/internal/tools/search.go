@@ -185,7 +185,9 @@ func RegisterSearch(r *Registry) {
 			"call, so there is no reason to pipe this into sort, uniq or wc in a shell, " +
 			"and no chance of two hand-built pipelines disagreeing about the count. " +
 			"Filter with the glob or lang parameter to keep results tight. Content output is a bounded preview; " +
-			"long lines and large results are explicitly shortened. Count mode always counts complete matches.",
+			"long lines and large results are explicitly shortened. Count mode always counts complete matches. " +
+			"UTF-8 and UTF-16 (BOM) text is decoded; other binary files are skipped, so a Windows log that " +
+			"looks empty to a byte search is still searched as text.",
 		Schema: obj(map[string]any{
 			"pattern":          str("Go regular expression (RE2 syntax)."),
 			"path":             str("Directory or single file to search. Defaults to workspace root."),
@@ -337,7 +339,7 @@ func RegisterSearch(r *Registry) {
 				}
 				defer f.Close()
 
-				sc := bufio.NewScanner(f)
+				sc := bufio.NewScanner(textReader(f))
 				sc.Buffer(make([]byte, 0, 64*1024), 4<<20)
 				var window []string
 				lineNo := 0

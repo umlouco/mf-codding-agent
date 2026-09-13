@@ -17,9 +17,9 @@ policies are unchanged.
 - Detailed browser guidance is included for browser/UI-related tasks or owner
   browser requirements, not merely because the wider goal mentions Playwright.
   This is guidance selection, not removal of tools or acceptance checks.
-- The executor owns its development checks. The runtime still reserves existing
-  test rewrites for supervisor repair; the prompt no longer simultaneously tells
-  the executor to repair those files itself. Queue enforcement is unchanged.
+- Execution and authorized repair turns can edit every project file type within
+  their task. Validators and inspection-only reviews remain read-only; queue
+  storage is protected.
 - Reports retain the existing JSON completion schema. No live queue or stored
   history is rewritten by prompt generation.
 

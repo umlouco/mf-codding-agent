@@ -23,8 +23,8 @@ export function buildExecutorPrompt(task: Task, instructions: string, goal: stri
 - Inspect current files and existing edits first. Implement only missing in-scope behavior,
   preserving unrelated work. Confirm APIs and commands in the repository.
 - Follow owner TDD requirements: observe the relevant test fail, implement, then rerun it.
-  Existing test rewrites belong to the supervisor under the runtime ownership guard;
-  report the exact required repair, rather than bypassing a refusal or weakening assertions.
+  You may update source, existing tests, and configuration within the assigned task.
+  Correct demonstrated test defects without weakening required assertions or bypassing refusals.
 - Run the required checks yourself and inspect the final diff. A skipped check, tool error,
   or empty test run is not a pass. No later verifier is assumed to finish your work.
 - Use the supplied environment for relevant application checks; never substitute a demo.

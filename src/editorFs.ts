@@ -39,7 +39,13 @@ export function registerEditorFsHandlers(client: CoreClient): void {
 }
 
 function samePath(a: string, b: string): boolean {
-  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  // Windows and macOS filesystems are case-insensitive by default; Linux is
+  // not. Comparing the live document's path to the requested path must match
+  // the platform's own semantics, or an open buffer is missed and the edit is
+  // computed against stale disk instead of what the user is looking at.
+  return process.platform === 'win32' || process.platform === 'darwin'
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b;
 }
 
 function findOpenDocument(absPath: string): vscode.TextDocument | undefined {
@@ -57,7 +63,9 @@ function fullRange(document: vscode.TextDocument): vscode.Range {
 async function commit(document: vscode.TextDocument, absPath: string, edit: vscode.WorkspaceEdit): Promise<void> {
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) {
-    throw new Error(`VS Code declined to apply the edit to ${absPath}`);
+    throw new Error(`the editor declined to apply the edit to ${absPath}: it may be ` +
+      'open read-only, outside the workspace, or the matched range is no longer valid. ' +
+      `Read ${absPath} again with read_file, then retry`);
   }
   await document.save();
 }

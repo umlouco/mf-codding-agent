@@ -84,6 +84,15 @@
     "error": "old_string not found"
   },
   {
+    "name": "line-number gutter in old_string is named",
+    "text": "package main\n\nfunc main() {}\n",
+    "edits": [{
+      "old_string": "     1\tpackage main\n     2\t\n     3\tfunc main() {}",
+      "new_string": "package main"
+    }],
+    "error": "line-number gutter"
+  },
+  {
     "name": "indentation must still match exactly",
     "text": "  a\r\n  b",
     "edits": [{"old_string": "a\n b", "new_string": "new"}],

@@ -3,7 +3,6 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -109,14 +108,8 @@ func (e *Env) CheckQueueWritePath(path string) error {
 	if e.QueueRole == "validator" || e.QueueRole == "supervisor" {
 		return fmt.Errorf("queue ownership: %s cannot rewrite workspace files; request supervisor test repair", e.QueueRole)
 	}
-	if e.QueueRole == "supervisor-repair" && !testPath(normalized) {
-		return fmt.Errorf("queue ownership: supervisor test repair cannot rewrite application file %s; stop this repair and request SPLIT into separate implementation and verification tasks while preserving the original owner goal", path)
-	}
-	if e.QueueRole == "executor" && testPath(normalized) {
-		if _, err := os.Stat(resolved); err == nil {
-			return fmt.Errorf("queue ownership: the supervisor must rewrite existing test %s. Report the defect and request STOP_AND_REWRITE_TESTS", path)
-		}
-	}
+	// Implementation includes its tests and configuration. File extensions do
+	// not transfer an executor's assigned work to a different agent.
 	return nil
 }
 
@@ -133,19 +126,13 @@ func (e *Env) CheckQueueCommand(command string) error {
 	if strings.Contains(lower, "queue.db") || strings.Contains(lower, "task_queue_") || strings.Contains(lower, "mfagent.queue.") {
 		return fmt.Errorf("queue ownership: shell access to task-list storage is disabled for autonomous workers; use read-only queue tools or return a supervisor decision")
 	}
-	if e.QueueRole == "validator" || e.QueueRole == "supervisor" || e.QueueRole == "supervisor-repair" {
+	if e.QueueRole == "validator" || e.QueueRole == "supervisor" {
 		// Editing roles use scoped file tools; a shell is for checks and reads.
 		// Reject commands that actually rewrite files, but allow read-only probes
 		// — including a plain `node -e "import(...)..."` inspection, which is not
 		// a rewrite just because it names an interpreter inline.
 		if validatorShellWrites(command) {
 			return fmt.Errorf("queue ownership: this %s shell may run checks, but file rewrites require the supervisor's scoped editing tools", e.QueueRole)
-		}
-	}
-	if e.QueueRole == "executor" {
-		if target := testWriteTarget(lower); target != "" {
-			return fmt.Errorf("queue ownership: the supervisor owns test rewrites, and this command writes to %s. "+
-				"Run the assigned check without modifying its test, or request supervisor test repair", target)
 		}
 	}
 	return nil

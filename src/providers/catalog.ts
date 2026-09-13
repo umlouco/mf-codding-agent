@@ -188,8 +188,10 @@ export const PROVIDERS: ProviderDef[] = [
     apiKey: 'required',
     apiKeyEnv: ['DEEPSEEK_API_KEY'],
     listStyle: 'openai',
-    serves: { chat: true, vision: false, embedding: false },
+    serves: { chat: true, vision: true, embedding: false },
     docsURL: 'https://platform.deepseek.com/api_keys',
+    notes: 'DeepSeek V4.1 Flash uses model ID deepseek-flash and supports image input. ' +
+      'Live discovery retains other available models; existing selections are not changed.',
   },
   {
     id: 'mistral',

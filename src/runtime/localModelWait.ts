@@ -19,7 +19,7 @@ export function localModelTiming(config: LocalModelWaitConfig) {
   };
   return {
     requestTimeoutMs: value(config.localTurnTimeoutMs, 0, true),
-    idleSeconds: value(config.localModelIdleSeconds, 35 * 60),
+    idleSeconds: value(config.localModelIdleSeconds, 60 * 60),
     availabilityWaitMs: value(config.localModelAvailabilityWaitMs, 35 * 60 * 1000),
     connectTimeoutMs: value(config.localModelConnectTimeoutMs, 10000),
     retryDelayMs: value(config.localModelRetryDelayMs, 30000),

@@ -488,7 +488,7 @@ VS Code settings editor is genuinely good at:
 | `mfagent.queue.maxFilesPerRegion` | `150` | Largest file count one region of the workspace may hold before the deterministic scan splits it further — bounds how much a phase's expansion agent explores in one sitting, regardless of project size |
 | `mfagent.queue.workerSilentMinutes` | `10` | How long a worker may write nothing before it counts as dead |
 | `mfagent.activityIntervalSeconds` | `30` | How often a working agent records what it is doing |
-| `mfagent.llm.idleMinutes` | `30` | How long a reply may deliver nothing before the connection counts as dropped |
+| `mfagent.llm.idleMinutes` | `60` | How long a reply may deliver nothing before the connection counts as dropped |
 | `mfagent.queue.notifyCommand` | `""` | Run with a JSON summary as its one argument when an autonomous run finishes — a script that pings your phone, Slack, or anything else, for the run that finished after you stopped watching |
 
 Changing any of them, or anything on the settings page, restarts the core

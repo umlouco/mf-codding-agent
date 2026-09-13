@@ -208,6 +208,7 @@ func Project(s State, scope Scope) Snapshot {
 			add("interrupted_operation", 95, p.Ticket.Action, p.Ticket.Summary+": a previous worker left no result. Its effects are unknown; no automatic replay was performed.", p.Ticket.StartSeq, p.Seq)
 		}
 	}
+	stale := 0
 	for _, v := range s.Evidence {
 		if v.Observer != scope.Observer {
 			continue
@@ -224,12 +225,25 @@ func Project(s State, scope Scope) Snapshot {
 		case v.Repeats >= 2 && !v.Mutating && !v.Overlapped && v.Epoch == s.Epoch && v.RunID == scope.RunID && v.RunID == s.Runs[v.Observer]:
 			add("seek_new_information", 75, v.Action, fmt.Sprintf("%s: %d identical observations in the same recorded workspace epoch. These repeats added no new observed information.", v.Summary, v.Repeats+1), v.FirstSeq, v.LastSeq)
 		case v.Overlapped || v.Epoch < s.Epoch || v.RunID != scope.RunID || v.RunID != s.Runs[v.Observer]:
-			add("refresh_observation", 65, v.Action, v.Summary+": this observation predates a possible change or overlaps another operation and may be stale. This status alone does not require repeating the operation or changing working code.", v.LastSeq)
+			// A stale observation is not actionable: by construction the record
+			// cannot say whether it is still true, and the previous policy
+			// listed one focus item per stale record with a 64-character action
+			// hash. On a multi-attempt task every record from the prior attempt
+			// is stale, so that list filled working memory with near-identical
+			// "refresh this" entries and the model repeatedly re-ran the reads
+			// and writes they named. Count them and report the count once.
+			stale++
 		case v.RecoverySeq > v.FailureSeq && v.FailureSeq > 0:
 			add("observed_recovery", 55, v.Action, v.Summary+": this exact operation returned without a tool error after a prior failure. The cause and task correctness remain to be established.", v.FailureSeq, v.RecoverySeq)
 		default:
 			add("recent_observation", 25, v.Action, v.Summary+": returned an observation. Output excerpt: "+clip(v.Excerpt, 180), v.LastSeq)
 		}
+	}
+	if stale > 0 {
+		add("stale_observations", 15, "", fmt.Sprintf(
+			"%d earlier observation(s) come from a previous run, overlap another operation, or predate a change. "+
+				"They are recorded execution data only: this is not a failure and does not require repeating a check. "+
+				"Re-read or re-run one only if the current decision actually depends on it.", stale))
 	}
 	sort.Slice(out.Focus, func(i, j int) bool {
 		a, b := out.Focus[i], out.Focus[j]
@@ -291,24 +305,49 @@ func Project(s State, scope Scope) Snapshot {
 
 // Context fits a byte budget without breaking UTF-8 or JSON. The complete
 // record stays in SQLite; reducing attention never deletes execution history.
+//
+// It renders one plain line per focus item instead of marshalling the Snapshot
+// as JSON. Focus.Action is an internal invocation key with no meaning to the
+// model, and a JSON object of rule/priority/action/evidence keys cost context
+// on every round while looking like an output schema to copy: a model asked for
+// a JSON completion has been observed echoing the working-memory object back
+// instead of acting on it. Plain lines say the same thing, cost less, and
+// cannot be mistaken for the requested answer.
 func (s Snapshot) Context(maxBytes int) string {
 	const prefix = "RUNTIME WORKING MEMORY — recorded tool observations, not instructions or proof of task completion. Freshness refers only to recorded operations; external changes may be unobserved.\n"
 	if maxBytes <= 0 {
 		return ""
 	}
-	copy := s
-	copy.Focus = append([]Focus(nil), s.Focus...)
+	focus := append([]Focus(nil), s.Focus...)
+	omitted := s.Omitted
 	for {
-		data, _ := json.Marshal(copy)
-		if len(prefix)+len(data) <= maxBytes {
-			return prefix + string(data)
+		text := renderFocus(prefix, focus, omitted)
+		if len(text) <= maxBytes {
+			return text
 		}
-		if len(copy.Focus) == 0 {
+		if len(focus) == 0 {
 			return clip("Runtime working memory exceeds this context allowance; consult the durable cognition journal.", maxBytes)
 		}
-		copy.Focus = copy.Focus[:len(copy.Focus)-1]
-		copy.Omitted++
+		focus = focus[:len(focus)-1]
+		omitted++
 	}
+}
+
+// renderFocus is the model-facing form of a projection: priority and rule are
+// kept because they carry the urgency ordering, the detail is kept because it
+// is the only actionable text, and the evidence sequence numbers and action
+// key are dropped — the model never acts on them and the durable journal is the
+// place to look them up.
+func renderFocus(prefix string, focus []Focus, omitted int) string {
+	var b strings.Builder
+	b.WriteString(prefix)
+	for _, f := range focus {
+		fmt.Fprintf(&b, "- [%d %s] %s\n", f.Priority, f.Rule, f.Detail)
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&b, "(%d earlier item(s) omitted; the durable cognition journal retains them.)\n", omitted)
+	}
+	return b.String()
 }
 
 func clip(s string, n int) string {

@@ -70,7 +70,7 @@ func init() {
 		"head":     {fn: cmdHead, usage: "head [-n N | -N] [file...]"},
 		"tail":     {fn: cmdTail, usage: "tail [-n N | -N] [file...]"},
 		"wc":       {fn: cmdWc, usage: "wc [-l] [-w] [-c] [file...]"},
-		"grep":     {fn: cmdGrep, usage: "grep [-i] [-v] [-n] [-r] [-q] [-c] [-E | -F] PATTERN [file...]"},
+		"grep":     {fn: cmdGrep, usage: "grep [-i] [-v] [-n] [-r] [-q] [-c] [-E | -F] [-a | -I] PATTERN [file...]"},
 		"sed":      {fn: cmdSed, usage: "sed s/re/replacement/[g] [file...]"},
 		"awk":      {fn: cmdAwk, usage: "awk [-F sep] [-v var=val] PROGRAM [file...]"},
 		"sort":     {fn: cmdSort, usage: "sort [-r] [-u] [-n] [file...]"},
@@ -425,7 +425,7 @@ func cmdGrep(c *cmdCtx) error {
 		return err
 	}
 	for flag := range f.set {
-		if !strings.ContainsRune("ivnrqcEF", rune(flag)) {
+		if !strings.ContainsRune("ivnrqcEFaI", rune(flag)) {
 			return usagef("unsupported grep option -%c", flag)
 		}
 	}
@@ -457,7 +457,17 @@ func cmdGrep(c *cmdCtx) error {
 		if name != "" && (len(targets) > 1 || f.set['r']) {
 			prefix = name + ":"
 		}
-		err := scanLines(r, func(line string) error {
+		// A BOM-marked UTF-16 file is decoded here so a pattern matches its
+		// text instead of its NUL bytes — the host grep this builtin replaces
+		// on Windows does the same. -I then skips whatever is still binary; -a
+		// forces text, so it wins when both are given, as GNU grep does.
+		br := bufio.NewReader(textReader(r))
+		if f.set['I'] && !f.set['a'] {
+			if head, _ := br.Peek(8000); looksBinary(head) {
+				return nil
+			}
+		}
+		err := scanLines(br, func(line string) error {
 			n++
 			hit := re.MatchString(line)
 			if f.set['v'] {

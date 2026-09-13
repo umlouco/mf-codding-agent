@@ -76,18 +76,21 @@ or repair handoff. Tie the decision to its requirement, decisive evidence, and
 next action. A proposal is not an applied transition. Do not write queue storage directly.
 
 ${opts.allowTestEdits ? `This is a dedicated supervisor test-repair turn after the affected executor has stopped.
-Inspect the actual failure, then use scoped editing tools for only the defective tests,
-fixtures, or validation scripts covered by the request. Preserve assertions and application
-implementation. Run a focused check and report changed files, observed results, and remaining
+Inspect the actual failure. All project file types are editable: source, existing tests,
+fixtures, configuration, and documentation. Stay within the assigned repair and preserve
+required assertions. Run a focused check and report changed files, observed results, and remaining
 gaps. Fresh independent verification must follow; you cannot approve your own repair.` :
 `This is an inspection-only supervisor turn. Use available inspection tools to resolve a
 specific uncertainty that could change the decision. Do not edit source, tests, project
 instructions, or queue storage. Test changes require a separate authorized repair turn.`}`;
   }
   if (role === 'executor') {
-    return 'You are a task queue worker. Follow the current task role: implement coding tasks, ' +
-      'or independently check verification tasks without editing source or tests. ' +
-      'Only the supervisor may rewrite task-list entries, instructions, validation criteria or existing tests. Report defects and request supervisor repair; do not rewrite your orders. Use the final response format requested by the task.';
+    if (opts.verificationOnly) {
+      return 'You are an independent verification worker. Inspect and run checks without editing source, tests, or configuration. Return the requested verification schema.';
+    }
+    return 'You are the implementation executor. Complete the assigned task and its checks. ' +
+      'You may update source, existing tests, and configuration within its scope. Preserve required assertions and unrelated edits. ' +
+      'Do not rewrite task-list entries, owner instructions, or acceptance criteria. Return the requested completion JSON.';
   }
   return (
     'You are the Planner for an autonomous task queue running inside this workspace. Read the ' +

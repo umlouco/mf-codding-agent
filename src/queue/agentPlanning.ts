@@ -87,7 +87,7 @@ Rules:
 - Honor the owner's development workflow, external test location, and fixed testing settings.
   Required test infrastructure is a dependency of application work. For TDD, plan runnable
   baseline checks first and pair each new failing behavior assertion with its implementation
-  in the same task; independent verification runs after that task reaches GREEN.
+  in the same task, which is not complete until those checks pass.
 - Scope phases by requested outcomes, not by every directory that happens to exist. Vendor code,
   generated assets, backups and duplicate applications are context unless the goal changes them.
 - Do not invent paths that are not in the REGIONS list.`;
@@ -105,10 +105,10 @@ Allowed region paths:\n${regionList}
 Draft:\n${draft.text}
 
 Check every phase against these execution facts:
-- The host verifies tasks before any later sibling runs. A phase whose deliverable is failing
-  tests alone cannot finish. For TDD, keep RED assertions AND their GREEN implementation within
-  the SAME phase and task. Rewrite any separate "write failing tests" phase together with the
-  behavior it tests. Never defer making its tests pass to a later phase.
+- A task ends when its executor reports it complete, and later siblings then run. A phase whose
+  deliverable is failing tests alone cannot finish. For TDD, keep RED assertions AND their GREEN
+  implementation within the SAME phase and task. Rewrite any separate "write failing tests" phase
+  together with the behavior it tests. Never defer making its tests pass to a later phase.
 - RED means a test asserts the DESIRED final behavior and fails before implementation. GREEN
   means that SAME assertion passes after implementation. Never assert the old/undesired state
   and call its success RED; never require opposite before/after assertions to both keep passing.
@@ -304,12 +304,13 @@ ${phase.description}
 ${scopeNote}
 ${retry}
 ${bootstrap ? `MANDATORY PLAYWRIGHT BOOTSTRAP
-The configured browser suite is not installed. The host runs playwright_test after EVERY task.
-Return exactly ONE task completing this entire bootstrap phase: dependencies, configuration,
-and real baseline assertions using the configured URL and credentials. Pair RED and GREEN inside
-that task. An empty suite or "no tests found" is a FAILURE, never a successful scaffold.
+The configured browser suite is not installed. Every executor must run playwright_test before
+reporting a task complete. Return exactly ONE task completing this entire bootstrap phase:
+dependencies, configuration, and real baseline assertions using the configured URL and
+credentials. Pair RED and GREEN inside that task. An empty suite or "no tests found" is a FAILURE,
+never a successful scaffold.
 ${playwrightTestRegistration}
-Do not split setup from the first passing tests. No sibling task can unblock this task's gate.\n` : ''}
+Do not split setup from the first passing tests.\n` : ''}
 First explore the region above enough to ground the plan in what is actually there. Then
 reply with ONE JSON array and nothing else, at most ${MAX_TASKS_PER_PHASE} elements.
 
@@ -317,8 +318,8 @@ Each element must be an object with exactly these keys:
   "title"                  short imperative summary, under 80 characters
   "description"            what to build, precise enough to act on with no other context:
                             name the files, functions and behaviour
-  "solutionVerifyPrompt"   how a verifier confirms the behaviour is correct against what
-                            the executor actually produced
+  "solutionVerifyPrompt"   the behaviour the executor must establish and check itself before
+                            reporting the task complete
   "kind"                   "task" (the default). Use "phase" instead, ONLY after exploring,
                             if part of this region turns out to be a distinct piece of work
                             that does not belong with the rest — in that case also set
@@ -336,13 +337,13 @@ Rules:
 - Keep implementation within this phase's region; owner-authorized external tests are allowed.
 - When the owner requires TDD, pair the failing assertion (RED) and its implementation (GREEN)
   in the same task. Establish a runnable baseline suite first. Never leave the shared suite failing
-  for a later sibling task to repair; independent verification runs after each completed task.
+  for a later sibling task to repair; each task must leave its own checks passing.
 - Each task must be completable by one agent in a single sitting, touching a handful of files.
 - Give each task one concrete outcome, relevant file paths, prerequisites, and observable acceptance
   criteria. Carry forward discovered commands and paths; later workers do not see this exploration.
-- Separate implementation from independent verification instructions. State expected outputs and
-  relevant failure or boundary cases. An unavailable runtime is a prerequisite to resolve, not a PASS.
-- Every task must be independently verifiable. Prefer real commands (test runners, builds,
+- State the expected behavior separately from the implementation steps, with relevant failure or
+  boundary cases. An unavailable runtime is a prerequisite to resolve, not a finished task.
+- Every task must have observable acceptance criteria. Prefer real commands (test runners, builds,
   linters) that already work in this repo — do not invent scripts that do not exist.
 - Do not include a task for the phase itself.`;
 

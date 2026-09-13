@@ -65,7 +65,7 @@ Connexall knowledge MCP servers are configured locally; unavailable domain sourc
 or live test environments must be reported rather than replaced with invented evidence.
 
 Local executor and supervisor turns have no whole-turn timeout by default. Each
-model response may be silent for 35 minutes before the stream idle guard fires.
+model response may be silent for 60 minutes before the stream idle guard fires.
 The old `turnTimeoutMs` applies to the Claude planner only; local-specific settings
 are `localTurnTimeoutMs` (0 = unlimited), `localModelIdleSeconds`, and
 `localModelAvailabilityWaitMs`. Connection startup is allowed 35 minutes too,

@@ -227,7 +227,7 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     // can say "continue". Queue workers override it per role in queue/agents.ts.
     maxIterations: 0,
     maxContextTokens: contextCeiling(),
-    llmIdleSeconds: cfg.get<number>('llm.idleMinutes', 30) === 0 ? -1 : Math.max(1, cfg.get<number>('llm.idleMinutes', 30)) * 60,
+    llmIdleSeconds: cfg.get<number>('llm.idleMinutes', 60) === 0 ? -1 : Math.max(1, cfg.get<number>('llm.idleMinutes', 60)) * 60,
     activitySeconds: Math.max(5, cfg.get<number>('activityIntervalSeconds', 30)),
     languages,
     mcpServers,

@@ -104,24 +104,16 @@ export class TaskQueue extends QueuePlans {
 
   /**
    * Recovers tasks orphaned by a crashed worker or a window reload. Anything
-   * still EXECUTING at startup has no live process behind it.
+   * still EXECUTING at startup has no live process behind it, so it goes back
+   * to PENDING and the keep-alive supervisor runs it again. Nothing is sent to
+   * a review lane: there is no review lane any more — see drainVerification.
    *
-   * `escalate` says what an orphan means. A crash during a deliberate stop or
-   * pause says nothing about the work — the extension killed the process — so
-   * that caller passes `false` and the task simply goes back to PENDING. A
-   * crash nobody asked for is different: it is the one thing the supervisor
-   * cannot see, because there is no report to read, so the task goes to
-   * VERIFYING instead — the same route it takes when it genuinely finishes —
-   * and the supervisor decides what to do from the journal.
-   *
-   * This is deliberately not counted. Requiring a task to die twice before
-   * anyone looks at it is an attempt limit wearing a different hat, and the one
-   * thing it reliably buys is a second identical crash.
-   *
-   * A phase (see TaskKind) is never escalated: it carries no report to judge
-   * and no verification contract to rewrite, so it just goes back in the queue.
+   * A task whose attempt budget is already spent is blocked rather than
+   * requeued, so a worker that crashes on every attempt cannot loop forever.
+   * A phase (see TaskKind) always goes back in the queue: it carries no result
+   * to judge, only a slice of the plan still to be expanded.
    */
-  requeueStale(olderThanMs: number, escalate = false): number {
+  requeueStale(olderThanMs: number, _escalate = false): number {
     const cutoff = Date.now() - olderThanMs;
     // `<=` rather than `<`: with olderThanMs of 0 the caller means "everything
     // currently EXECUTING", and a task claimed in the same millisecond as the
@@ -137,25 +129,77 @@ export class TaskQueue extends QueuePlans {
       // Attempts still count against the task the same as any other requeue —
       // see `attempts` on Task — so this only changes where it lands, not
       // whether it is retried at all.
-      if (escalate && t.kind === 'task') {
+      if (t.kind === 'task' && t.attempts >= t.maxAttempts) {
         this.update(t.id, {
-          status: 'VERIFYING',
-          finishedAt: null,
-          // Nothing verified anything: the worker died before it could. An
-          // empty report is what routes this to a progress review rather than
-          // to a verdict — see the orchestrator's tick.
-          validationReport: '',
-          errorLog:
-            `${note} No report was produced, so there is nothing to judge — the supervisor ` +
-            'must decide the next action from the journal.',
+          status: 'BLOCKED',
+          finishedAt: Date.now(),
+          activityPhase: 'blocked',
+          activityDetail: note,
+          errorLog: `${note}\n[blocked] attempt budget spent after repeated worker loss.`,
         });
-        this.log(t.id, 'system', 'escalated', 'worker died without reporting; sent to supervisor');
+        this.log(t.id, 'system', 'blocked', 'attempt budget spent after repeated worker loss');
       } else {
-        this.update(t.id, { status: 'PENDING', errorLog: note });
+        this.update(t.id, { status: 'PENDING', finishedAt: null, activityPhase: 'requeued', errorLog: note });
         this.log(t.id, 'system', 'recovered', 'requeued');
       }
     }
     return stale.length;
+  }
+
+  /**
+   * Keep-alive drain for rows an older build parked in the review lane.
+   *
+   * Verification is gone, so a VERIFYING row is not waiting for anyone. One
+   * that carries a non-empty executor result finished its work before the
+   * pipeline changed and is accepted as final; one with no result is a worker
+   * that died and is retried, or blocked once its attempt budget is spent.
+   *
+   * A legacy decomposition-parked row cannot simply be requeued: the schema's
+   * own decomposition trigger rewrites any such row back to VERIFYING unless it
+   * is BLOCKED (see installDecompositionInvariant). It is therefore blocked for
+   * a person, which is the only terminal exit that invariant allows.
+   */
+  drainVerification(): number {
+    const rows: Task[] = this.db
+      .prepare(`SELECT ${COLUMNS} FROM tasks WHERE status = 'VERIFYING' ORDER BY seq ASC`)
+      .all();
+    let settled = 0;
+    for (const t of rows) {
+      // A row awaiting a supervisor test repair is not abandoned legacy state:
+      // the repair turn runs in the same tick, after this drain. Settling it
+      // here would accept the executor result that triggered the ownership stop
+      // and skip the rewrite the row is waiting for.
+      if (t.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
+        continue;
+      }
+      settled++;
+      if (t.activityPhase.startsWith('decomposition_')) {
+        this.update(t.id, {
+          status: 'BLOCKED',
+          finishedAt: Date.now(),
+          activityPhase: 'blocked',
+          activityDetail: 'Legacy verification/decomposition state retired when verification was removed.',
+          errorLog: `${t.errorLog}\n[blocked] Legacy verification state retired; a person must review this row.`.trim(),
+        });
+        this.log(t.id, 'system', 'blocked', 'legacy verification state retired');
+      } else if (t.kind === 'task' && t.output.trim()) {
+        this.update(t.id, { status: 'VERIFIED', finishedAt: Date.now(), activityPhase: 'done' });
+        this.log(t.id, 'system', 'drained', 'executor result accepted as final; verification removed');
+      } else if (t.attempts >= t.maxAttempts) {
+        this.update(t.id, {
+          status: 'BLOCKED',
+          finishedAt: Date.now(),
+          activityPhase: 'blocked',
+          activityDetail: 'No executor result and the attempt budget is spent.',
+        });
+        this.log(t.id, 'system', 'blocked', 'no result after the attempt budget was spent');
+      } else {
+        this.update(t.id, { status: 'PENDING', finishedAt: null, activityPhase: 'requeued' });
+        this.log(t.id, 'system', 'recovered',
+          t.kind === 'phase' ? 'phase expansion requeued' : 'no result produced; requeued without verification');
+      }
+    }
+    return settled;
   }
 
   /** Compatibility hook for callers from older builds; never requeues a failed parent. */

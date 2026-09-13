@@ -218,9 +218,9 @@ they support the owner requirements; explain that relationship instead of claimi
   const prompt = `You supervise a coding agent by reading its durable database journal.
 Start with the supplied journal; registered tools remain callable when you need additional
 observations. This live review inspects evidence while an executor may still be running.
-You own test rewrites: choose STOP_AND_REWRITE_TESTS when a test file needs repair. The extension
-will stop the executor and give you a separate turn with editing tools, then independently run
-the repaired checks. Do not delegate test rewrites to the executor. Return a decision for the
+Executors own in-scope implementation, including existing tests and configuration. Choose
+STOP_AND_REWRITE_TESTS only for a concrete defect requiring a separate scoped repair, not
+merely because a filename is a test. The extension stops the executor before repair. Return a decision for the
 extension to apply. Judge direction and work quality, not elapsed time, token use, round count,
 or attempt count. A task may legitimately take hours. Intervene only when the evidence shows a
 rabbit hole, a wrong premise, invalid verification, or work ready for independent validation.

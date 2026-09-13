@@ -6,6 +6,13 @@ interface TextEdit {
 
 const normalizeEol = (text: string): string => text.replace(/\r\n/g, '\n');
 
+// The `<number>\t` prefix read_file prints on every line. A model that copies a
+// block straight from read_file output often leaves it in, and the resulting
+// "not found" is baffling because the visible text looks right. Naming it turns
+// a retry loop into one correction. Kept in sync with
+// core/internal/tools/fs_edit.go.
+const numberedGutter = /^\s*\d+\t/m;
+
 function firstEol(text: string): string | undefined {
   const i = text.indexOf('\n');
   return i < 0 ? undefined : i > 0 && text[i - 1] === '\r' ? '\r\n' : '\n';
@@ -32,7 +39,10 @@ export function matchEdits(text: string, oldStr: string, newStr: string, all: bo
     from = i + oldStr.length;
   }
   if (positions.length === 0) {
-    throw new Error('old_string not found; read_file the current file, then copy a smaller unique exact block without line numbers. For a deliberate full-file replacement, use write_file after reading it. No change was applied');
+    if (numberedGutter.test(oldStr)) {
+      throw new Error("old_string not found: it still contains read_file's line-number gutter (lines like \"   12\\ttext\"). Copy the block again without the leading line number and tab, then retry. No change was applied");
+    }
+    throw new Error('old_string not found; read the file again, then copy a smaller unique exact block without line numbers. For a deliberate full-file replacement, use write_file after reading it. No change was applied');
   }
   if (positions.length > 1 && !all) {
     throw new Error(`old_string appears ${positions.length} times; add surrounding context or set replace_all`);

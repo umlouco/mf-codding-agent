@@ -1,23 +1,17 @@
-import { JOURNAL_EVENTS, VALIDATION_FAILED } from './monitor';
 import { OrchestratorControl } from './orchestratorControl';
 import { appendAttempt } from './orchestratorState';
-import { scopeBlocked } from './scopePlan';
-import { recoveryFailure } from './recovery';
-import { deferRecoveryJob, hasOutstandingRecovery, hasRecoveryJob, completeRecoveryJob } from './recoverySchedule';
-import { DECOMPOSITION_OUTPUT_IDLE_MS, DECOMPOSITION_TOTAL_CEILING_MS, deferDecomposition, readDecomposition, requiresDecomposition } from './recoveryDecomposition';
+import { hasOutstandingRecovery } from './recoverySchedule';
+import { recoverOwnershipStop } from './ownershipRecovery';
 
 export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
   // ---- the cron tick ---------------------------------------------------
 
   /**
-   * One supervision cycle. Skips itself if the previous one is still running.
-   *
-   * A cycle can also be *superseded*: `sweepSilentReview` hands ownership to the
-   * next tick while this one is still parked on a turn that will never answer.
-   * Everything below therefore checks `this.cycle` before acting, so an
-   * abandoned cycle that finally wakes up cannot supervise a second task,
-   * declare the run finished, or take the flag back off its successor.
+   * One keep-alive cycle. There is no model turn and no review lane: the
+   * supervisor exists only to guarantee the run keeps moving. Everything below
+   * still checks `this.cycle` before acting, so a superseded cycle cannot
+   * declare the run finished or take the busy flag off its successor.
    */
   protected async tick(): Promise<void> {
     this.nextTickAt = Date.now() + this.intervalMs;
@@ -26,14 +20,10 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     }
     // The run-wide backstop runs before anything else: if the run has spent too
     // much, produced too many rows, or run too long, stop it now rather than
-    // start another review or worker.
+    // start another worker.
     if (this.runBreakerTripped()) {
       return;
     }
-    // Before the busy check, never after: a review that has gone silent is the
-    // reason the busy check would be true, so testing it second means never
-    // testing it at all.
-    this.sweepSilentReview();
     if (this.supervising) {
       this.log('supervisor still busy; skipping this tick');
       return;
@@ -43,49 +33,15 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     this.supervising = true;
     this.changed();
     try {
+      // Keep-alive, and nothing else. The supervisor's whole job is that the
+      // run never stops: a worker that has gone quiet goes back in the queue,
+      // and a row an older build parked in the review lane is settled. There is
+      // no quality review and no verification turn to take, so this cycle never
+      // calls a model.
       this.sweepSilentWorkers();
-
-      const active = this.queue.activeTask();
-      if (active?.kind === 'task' && active.activityPhase !== 'scope_review' && !await this.serviceRecovery(active)) {
-        // Startup and model transport heartbeats contain no completed work to
-        // assess. In particular, do not make a second local-model request while
-        // the fresh executor is still waiting for its first response. The journal
-        // filters prior claims and unfinished tool starts; overload has its own
-        // immediate stream handler and needs no scheduled supervisor review.
-        const hasOutcome = this.queue.events(active.id, JOURNAL_EVENTS, true)
-          .some(event => event.actor === 'executor' && event.kind === 'tool');
-        if (hasOutcome) await this.reviewWork(active);
-      }
-
-      const pending = this.queue.awaitingVerification();
-      for (const task of pending) {
-        if (this.disposed || this.queue.runState !== 'RUNNING' || this.cycle !== cycle) {
-          break;
-        }
-        let current = this.queue.get(task.id);
-        if (!current || current.status !== 'VERIFYING' || scopeBlocked(current, this.queue.list())) {
-          continue;
-        }
-        if (await this.serviceFailureDecomposition(current)) continue;
-        if (current.kind === 'phase') {
-          await this.serviceRecovery(current);
-          continue;
-        }
-        // Old scheduled recovery must not trap a stopped task in another planning loop.
-        completeRecoveryJob(this.queue, current);
-        if (!current.validationReport.trim() || !this.currentHostVerification(current)) {
-          if (current.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
-            await this.repairTests(current, current.supervisorFeedback);
-          } else {
-            await this.startIndependentVerification(current);
-          }
-          current = this.queue.get(task.id);
-        }
-        if (this.cycle !== cycle || this.queue.runState !== 'RUNNING') break;
-        if (current?.status === 'VERIFYING' && !requiresDecomposition(current) && current.validationReport.trim()) {
-          await this.supervise(current);
-        }
-      }
+      for (const task of this.queue.list()) recoverOwnershipStop(this.queue, task);
+      this.queue.drainVerification();
+      await this.serviceTestRepairs();
 
       if (this.cycle === cycle && this.queue.isComplete() && !hasOutstandingRecovery(this.queue)) {
         this.finish();
@@ -123,109 +79,6 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
    */
   protected get silentMs(): number {
     return Math.max(1, this.cfg<number>('queue.workerSilentMinutes', 10)) * 60_000;
-  }
-
-  /**
-   * The same test as sweepSilentWorkers, applied to the supervisor.
-   *
-   * A review is a turn against a model like any other and wedges the same way,
-   * but it is not a row in the queue — it is one in-flight promise plus the
-   * `supervising` flag guarding the tick. So when a review's core goes silent,
-   * nothing above notices: the flag stays set, every later tick skips itself,
-   * and the task sits in VERIFYING for as long as the window stays open. That
-   * is not a slow supervisor, it is a run that has stopped.
-   *
-   * Recovery is to kill the core, which rejects the request waiting on it and
-   * lets `supervise` finish and log. The flag is released here rather than
-   * waiting for that, because a process that ignores its stdin may well ignore
-   * its own death too, and the whole point is not to be held hostage by it. The
-   * generation counter is what keeps a late verdict from that turn out of the
-   * database.
-   */
-  protected sweepSilentReview(): void {
-    const r = this.review;
-    if (!this.supervising || !r) {
-      return;
-    }
-    if (r.validationToolViolation) {
-      const note = r.validationToolViolation;
-      this.queue.log(r.taskId, 'validator', VALIDATION_FAILED, note);
-      const current = this.queue.get(r.taskId);
-      if (current?.status === 'VERIFYING') {
-        this.queue.update(r.taskId, {
-          activityPhase: 'needs_review',
-          errorLog: appendAttempt(current.errorLog, `[attempt ${current.attempts}] independent validation did not complete: ${note}`),
-        });
-      }
-      this.log(`task ${r.seq} — recovering validator: ${note}`);
-      this.abandonReview();
-      this.changed();
-      return;
-    }
-    const quiet = Date.now() - r.lastActivityAt;
-    // Hard wall-clock ceiling on one review. A validator that keeps streaming
-    // without concluding is not making progress, and without this bound a task
-    // could sit in VERIFYING indefinitely, so the queue would never reach its
-    // end. On expiry the task is blocked for a person and the run moves on.
-    //
-    // It must outlast a legitimate verification: one shell step may run up to
-    // ten minutes (see verificationPlan's timeoutMs ceiling), and a plan plus
-    // its report is two model turns on top of that. A 180s default abandoned
-    // such reviews mid-step and blocked tasks that were about to pass, so the
-    // default now covers a slow step and the turns around it.
-    const ceilingMs = Math.max(30, this.cfg<number>('queue.verificationMaxSeconds', 900)) * 1000;
-    const overTime = r.startedAt !== undefined && Date.now() - r.startedAt >= ceilingMs;
-    const stalledPlanner = r.lastModelOutputAt !== undefined &&
-      Date.now() - r.lastModelOutputAt >= Math.min(this.silentMs, DECOMPOSITION_OUTPUT_IDLE_MS);
-    // A planner that never goes idle never trips the check above no matter how
-    // long it runs — "still producing tokens" is not the same claim as
-    // "producing tokens worth waiting for". This is one response-only turn
-    // producing a single bounded JSON plan; nothing legitimate needs longer
-    // than the ceiling below, and while it runs the busy-check in tick() keeps
-    // every other tick from looking at anything else in the queue at all.
-    const ramblingPlanner = r.lastModelOutputAt !== undefined && r.startedAt !== undefined &&
-      Date.now() - r.startedAt >= DECOMPOSITION_TOTAL_CEILING_MS;
-    if (quiet < this.silentMs && !stalledPlanner && !ramblingPlanner && !overTime) {
-      return;
-    }
-
-    const note = overTime
-      ? `Verification/review exceeded its ${Math.round(ceilingMs / 1000)}s wall-clock budget without concluding`
-      : ramblingPlanner
-      ? `Replacement planner has been streaming a single response for ${Math.round((Date.now() - r.startedAt!) / 60_000)} minute(s) without concluding; still producing tokens is not the same as making progress`
-      : stalledPlanner
-      ? `Replacement planner produced no model output for ${Math.round((Date.now() - r.lastModelOutputAt!) / 1000)} seconds; transport heartbeats are not progress`
-      : `the supervisor went silent for ${Math.round(quiet / 60_000)} minute(s)`;
-    this.queue.log(r.taskId, 'supervisor', 'silent', `${note}; abandoning the review`);
-    this.log(`task ${r.seq} — ${note}; abandoning the review`);
-    this.abandonReview();
-    this.changed();
-    const task = this.queue.get(r.taskId);
-    if (task) {
-      if (overTime) {
-        // Terminal, so the queue keeps moving: a bounded, honest "a person
-        // must look at this" instead of an unbounded review that never ends.
-        this.blockForHuman(task, note);
-        return;
-      }
-      // Anything else stays in VERIFYING on purpose: nothing was judged, so the
-      // next tick reviews it again from scratch.
-      this.log(`task ${r.seq} — retrying next tick`);
-      if (requiresDecomposition(task)) {
-        const job = readDecomposition(this.queue, task);
-        if (job) deferDecomposition(this.queue, task, job, note);
-        else this.queue.recordActivity(task.id, 'decomposition_waiting', note, 'supervisor');
-        this.changed();
-        return;
-      }
-      if (hasRecoveryJob(this.queue, task)) {
-        const job = deferRecoveryJob(this.queue, task, note);
-        this.queue.recordActivity(task.id, 'recovery_waiting', `${note}; next autonomous recovery: ${new Date(job.dueAt).toISOString()}.`, 'supervisor');
-        return;
-      }
-      const limit = recoveryFailure(this.queue, task, 'silent-review');
-      if (limit) this.pauseForRecovery(task, limit);
-    }
   }
 
   /**
@@ -288,31 +141,37 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       const note =
         `the worker went silent for ${quiet} minute(s) while ${task.activityPhase || 'starting up'}` +
         (task.activityDetail ? ` (${task.activityDetail})` : '');
-
-      if (task.kind === 'task') {
-        this.stopForDecision(task, {
-          status: 'VERIFYING',
-          finishedAt: null,
-          validationReport: '',
-          errorLog: appendAttempt(
-            task.errorLog,
-            `[attempt ${task.attempts}] ${note}. The supervisor must decide the next action from the journal.`,
-          ),
-        });
-        this.queue.log(task.id, 'system', 'silent', `${note}; sent to supervisor`);
-        this.log(`task ${task.seq} — ${note}; sent directly to the supervisor`);
-      } else {
-        this.stopForDecision(task, {
-          status: 'VERIFYING',
-          errorLog: appendAttempt(task.errorLog, `[attempt ${task.attempts}] ${note}.`),
-          finishedAt: null,
-        });
-        this.queue.log(task.id, 'system', 'silent', note);
-        this.pauseForRecovery(this.queue.get(task.id)!, `Phase expansion worker vanished: ${note}`);
-        this.log(`phase ${task.seq} — ${note}; scheduled a changed planning approach`);
-      }
+      const errorLog = appendAttempt(
+        task.errorLog,
+        `[attempt ${task.attempts}] ${note}. The keep-alive supervisor returned it to the queue.`,
+      );
+      const spent = task.kind === 'task' && task.attempts >= task.maxAttempts;
+      this.stopForDecision(task, spent
+        ? { status: 'BLOCKED', finishedAt: Date.now(), activityPhase: 'blocked',
+            activityDetail: note, errorLog }
+        : { status: 'PENDING', finishedAt: null, activityPhase: 'requeued', errorLog });
+      this.queue.log(task.id, 'system', spent ? 'blocked' : 'silent',
+        spent ? `${note}; attempt budget spent` : `${note}; requeued by the keep-alive supervisor`);
+      this.log(spent
+        ? `task ${task.seq} — ${note}; blocked after its attempt budget was spent`
+        : `task ${task.seq} — ${note}; requeued`);
       this.changed();
     }
+  }
+
+  /** Explicit scoped repairs remain ordered; obsolete ownership stops were recovered above. */
+  protected async serviceTestRepairs(): Promise<void> {
+    const rows = this.queue.list();
+    const task =
+      rows.find(t => t.status === 'VERIFYING' && t.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]'));
+    if (!task) {
+      return;
+    }
+    const reason = task.supervisorFeedback;
+    this.log(`task ${task.seq} — supervisor test repair requested; running the repair turn`);
+    this.queue.log(task.id, 'supervisor', 'test-repair-requested', reason);
+    await this.repairTests(task, reason);
+    this.changed();
   }
 
   /**
@@ -355,12 +214,11 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       return;
     }
     if (s.byStatus.VERIFYING > 0) {
-      // In lockstep pump() correctly refuses to claim later work while a
-      // verdict is outstanding. It cannot, however, make that verdict happen.
-      // A lost cron therefore used to leave VERIFYING rows untouched forever:
-      // the watchdog woke up faithfully and repeatedly called a no-op pump.
-      this.log(`${s.byStatus.VERIFYING} task(s) awaiting supervision; checking the supervisor`);
-      this.schedule('watchdog supervisor check', () => this.tick());
+      // A legacy row an older build parked in the review lane. The tick settles
+      // it (accepts its result, requeues it, or blocks it) and then pumps, so a
+      // lost cron cannot leave it untouched forever.
+      this.log(`${s.byStatus.VERIFYING} legacy review row(s); settling them`);
+      this.schedule('watchdog settle check', () => this.tick());
       return;
     }
     if (s.byStatus.EXECUTING === 0) {

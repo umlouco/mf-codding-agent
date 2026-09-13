@@ -13,8 +13,8 @@ export const codingWorkflow = `Work in this order:
 2. Choose the smallest change that satisfies the task. Reuse existing patterns. Preserve public
    interfaces and unrelated user edits. Do not add a dependency unless the task needs it.
 3. Implement the assigned application change, including relevant error paths and boundary cases.
-   Existing test rewrites and all task-list/acceptance changes belong to the supervisor. Report
-   the exact needed correction and hand off; do not rewrite your own orders or existing tests.
+   Update source, existing tests, and configuration within the assigned scope. Preserve required
+   assertions; task-list and acceptance changes still require a supervisor decision.
    Use file-writing/editing tools for source and configuration text. They preserve text without
    shell quoting or redirection encoding. Use the shell for builds, tests, and commands.
 4. Run the relevant checks and read their actual output. Inspect the final diff for unintended

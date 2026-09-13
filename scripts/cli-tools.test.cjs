@@ -52,6 +52,7 @@ for (const runtime of [
     ['planner', { formatOnly: true }],
     ['supervisor', { formatOnly: true }],
     ['executor', { formatOnly: true, verificationOnly: true }],
+    ['executor', { verificationOnly: true }],
   ]) {
     const root = runtime.getuid?.() === 0 || runtime.geteuid?.() === 0;
     test(`${role} starts with ${JSON.stringify(opts)} on ${runtime.platform}, uid=${runtime.getuid?.()}, euid=${runtime.geteuid?.()}`, async () => {
@@ -81,6 +82,11 @@ for (const runtime of [
       assert.equal(args[args.indexOf('--permission-mode') + 1], root || opts.formatOnly || role === 'planner' ? 'dontAsk' : 'bypassPermissions');
       assert.ok(!args.includes('--dangerously-skip-permissions'));
       assert.equal(invocation.options.env.MFAGENT_QUEUE_ROLE, opts.verificationOnly ? 'validator' : opts.allowTestEdits ? 'supervisor-repair' : role);
+      if (opts.verificationOnly && !opts.formatOnly) {
+        const suffix = args[args.indexOf('--append-system-prompt') + 1];
+        assert.match(suffix, /without editing source, tests, or configuration/);
+        assert.doesNotMatch(suffix, /may update source/);
+      }
       if (opts.formatOnly) {
         assert.equal(args[args.indexOf('--tools') + 1], '');
         assert.ok(!args.includes('--allowedTools'));
@@ -157,8 +163,9 @@ for (const role of ['supervisor', 'executor', 'planner']) {
       assert.match(suffix, /inspection-only supervisor turn/);
       assert.match(suffix, /does not replace independent verification/);
     } else if (role === 'executor') {
-      assert.match(suffix, /task queue worker/);
-      assert.match(suffix, /independently check verification tasks/);
+      assert.match(suffix, /implementation executor/);
+      assert.match(suffix, /may update source, existing tests, and configuration/);
+      assert.doesNotMatch(suffix, /Only the supervisor may.*existing tests/);
     } else {
       assert.match(suffix, /Planner/);
       assert.match(suffix, /read-only inspection tools/);
@@ -193,6 +200,8 @@ for (const formatOnly of [false, true]) {
       assert.equal(args[args.indexOf('--tools') + 1], '');
     } else {
       assert.match(system, /dedicated supervisor test-repair turn/);
+      assert.match(system, /All project file types are editable/);
+      assert.doesNotMatch(system, /only the defective tests/);
       assert.match(system, /Fresh independent verification must follow/);
       assert.doesNotMatch(system, /This is an inspection-only supervisor turn/);
     }

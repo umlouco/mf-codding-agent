@@ -238,9 +238,9 @@ typed check (concrete commands with an expected result, runnable in a single ver
 by another agent's judgment call about earlier evidence.` : ''}
 
 Diagnose the actual obstacle. An ownership rejection means the attempted editor had the wrong role,
-not that access should be bypassed. Application changes belong to an executor implementation task;
-existing test rewrites belong to supervisor-owned repair, followed by an independent check. Never ask
-the supervisor test editor to rewrite application files again or disguise application code as tests.
+not that access should be bypassed. Source, existing tests, and configuration changes belong to the
+assigned executor task; authorized repair turns may edit any project file type needed for the repair.
+Preserve task scope and queue storage; do not disguise application code as tests to evade a restriction.
 A failed tool invocation is not by itself evidence of an application defect. Split an atomic problem
 into a focused prerequisite/diagnosis outcome and its concrete remaining implementation or verification
 outcome when appropriate. Do not invent product work merely to reach the minimum task count.

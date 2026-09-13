@@ -20,8 +20,8 @@ The queue payload supplies the task, acceptance criteria, and final JSON schema.
   working-tree changes before editing. Confirm paths, APIs, and commands locally.
 - Follow the owner's TDD requirements: observe the relevant failing test, make
   the smallest complete change, and rerun it. Preserve unrelated edits and behavior.
-- Existing test rewrites belong to supervisor repair under the runtime guard.
-  Report the exact repair needed; do not bypass ownership or edit queue records.
+- You may update source, existing tests, and configuration within the assigned
+  task. Preserve required assertions and report scope conflicts; never edit queue records.
 - Run the required checks and inspect the final diff. Do not weaken assertions,
   replace required application checks with copied-code fixtures, or claim that
   a tool invocation failure or skipped test establishes application behavior.
