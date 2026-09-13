@@ -69,17 +69,15 @@ export class QueueWrites extends QueueJournal {
     const info = this.db
       .prepare(
         `INSERT INTO tasks (
-           title, description, impl_verify_prompt, solution_verify_prompt,
-           solution_verify_command, status, seq, max_attempts, created_at, updated_at,
+           title, description, solution_verify_prompt,
+           status, seq, max_attempts, created_at, updated_at,
            kind, region
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.title,
         t.description ?? '',
-        t.implVerifyPrompt ?? '',
         t.solutionVerifyPrompt ?? '',
-        t.solutionVerifyCommand ?? '',
         t.status ?? 'PENDING',
         seq,
         t.maxAttempts ?? 3,
@@ -94,9 +92,7 @@ export class QueueWrites extends QueueJournal {
   private static readonly COLUMN_MAP: Record<string, string> = {
     title: 'title',
     description: 'description',
-    implVerifyPrompt: 'impl_verify_prompt',
     solutionVerifyPrompt: 'solution_verify_prompt',
-    solutionVerifyCommand: 'solution_verify_command',
     splitScope: 'split_scope',
     status: 'status',
     seq: 'seq',

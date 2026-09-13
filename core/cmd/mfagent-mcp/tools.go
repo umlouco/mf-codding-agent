@@ -63,7 +63,7 @@ func (s *server) registerTools() {
 		{
 			Name: "task_queue_update",
 			Description: "Edit one or more fields of an existing task by id (title, description, " +
-				"implementationCheck, behaviorCheck, verificationCommand, maxAttempts, status, seq). " +
+				"behaviorCheck, maxAttempts, status, seq). " +
 				"Only the fields supplied are changed. Use task_queue_reorder to resequence more than one task.",
 			InputSchema:  updateInputSchema(),
 			OutputSchema: updateOutputSchema(),
@@ -91,19 +91,15 @@ func (s *server) registerTools() {
 }
 
 type taskArgs struct {
-	Title               string `json:"title"`
-	Description         string `json:"description"`
-	ImplementationCheck string `json:"implementationCheck"`
-	BehaviorCheck       string `json:"behaviorCheck"`
-	VerificationCommand string `json:"verificationCommand"`
-	MaxAttempts         int    `json:"maxAttempts"`
+	Title         string `json:"title"`
+	Description   string `json:"description"`
+	BehaviorCheck string `json:"behaviorCheck"`
+	MaxAttempts   int    `json:"maxAttempts"`
 }
 
 func (t taskArgs) queueTask() queue.NewTask {
 	return queue.NewTask{Title: strings.TrimSpace(t.Title), Description: strings.TrimSpace(t.Description),
-		ImplVerifyPrompt:      strings.TrimSpace(t.ImplementationCheck),
-		SolutionVerifyPrompt:  strings.TrimSpace(t.BehaviorCheck),
-		SolutionVerifyCommand: strings.TrimSpace(t.VerificationCommand), MaxAttempts: t.MaxAttempts}
+		SolutionVerifyPrompt: strings.TrimSpace(t.BehaviorCheck), MaxAttempts: t.MaxAttempts}
 }
 
 func validateTasks(tasks []taskArgs, strict bool) ([]queue.NewTask, []string) {
@@ -127,9 +123,6 @@ func validateTasks(tasks []taskArgs, strict bool) ([]queue.NewTask, []string) {
 			issues = append(issues, prefix+": duplicate title "+t.Title)
 		}
 		seen[key] = true
-		if strict && len(t.ImplVerifyPrompt) < 10 {
-			issues = append(issues, prefix+": implementationCheck is required")
-		}
 		if strict && len(t.SolutionVerifyPrompt) < 10 {
 			issues = append(issues, prefix+": behaviorCheck is required")
 		}
@@ -196,8 +189,8 @@ func (s *server) onCreate(_ context.Context, params json.RawMessage) (string, bo
 	if attempts <= 0 {
 		attempts = 3
 	}
-	id, err := queue.CreateTask(s.db, t.Title, t.Description, queue.WithImplVerifyPrompt(t.ImplVerifyPrompt),
-		queue.WithSolutionVerifyPrompt(t.SolutionVerifyPrompt), queue.WithSolutionVerifyCommand(t.SolutionVerifyCommand),
+	id, err := queue.CreateTask(s.db, t.Title, t.Description,
+		queue.WithSolutionVerifyPrompt(t.SolutionVerifyPrompt),
 		queue.WithMaxAttempts(attempts))
 	if err != nil {
 		return "", true, fmt.Errorf("create failed: %w", err)
@@ -226,15 +219,13 @@ func (s *server) onStats(_ context.Context, _ json.RawMessage) (string, bool, er
 
 func (s *server) onUpdate(_ context.Context, params json.RawMessage) (string, bool, error) {
 	var in struct {
-		ID                  int64   `json:"id"`
-		Title               *string `json:"title"`
-		Description         *string `json:"description"`
-		ImplementationCheck *string `json:"implementationCheck"`
-		BehaviorCheck       *string `json:"behaviorCheck"`
-		VerificationCommand *string `json:"verificationCommand"`
-		MaxAttempts         *int    `json:"maxAttempts"`
-		Status              *string `json:"status"`
-		Seq                 *int    `json:"seq"`
+		ID            int64   `json:"id"`
+		Title         *string `json:"title"`
+		Description   *string `json:"description"`
+		BehaviorCheck *string `json:"behaviorCheck"`
+		MaxAttempts   *int    `json:"maxAttempts"`
+		Status        *string `json:"status"`
+		Seq           *int    `json:"seq"`
 	}
 	if err := json.Unmarshal(params, &in); err != nil {
 		return "", true, fmt.Errorf("invalid arguments: %w", err)
@@ -245,11 +236,9 @@ func (s *server) onUpdate(_ context.Context, params json.RawMessage) (string, bo
 
 	var issues []string
 	patch := queue.TaskPatch{
-		Description:           in.Description,
-		ImplVerifyPrompt:      in.ImplementationCheck,
-		SolutionVerifyPrompt:  in.BehaviorCheck,
-		SolutionVerifyCommand: in.VerificationCommand,
-		Seq:                   in.Seq,
+		Description:          in.Description,
+		SolutionVerifyPrompt: in.BehaviorCheck,
+		Seq:                  in.Seq,
 	}
 	if in.Title != nil {
 		trimmed := strings.TrimSpace(*in.Title)

@@ -10,7 +10,7 @@ export class QueuePlans extends QueueWrites {
    */
   applyTaskEdits(snapshot: Task[], plan: TaskEditPlan): TaskEditReceipt {
     const fields: (keyof TaskEditFields)[] = [
-      'title', 'description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand',
+      'title', 'description', 'solutionVerifyPrompt',
     ];
     const identityFields: (keyof Task)[] = [
       'id', 'createdAt', ...fields, 'status', 'attempts', 'maxAttempts', 'kind', 'region',
@@ -124,7 +124,7 @@ export class QueuePlans extends QueueWrites {
         return 0;
       }
       if (parts.some(p => !p || !p.title?.trim() || !p.description?.trim() ||
-          (!p.solutionVerifyPrompt?.trim() && !p.solutionVerifyCommand?.trim()))) {
+          !p.solutionVerifyPrompt?.trim())) {
         throw new Error('Every split part needs a title, a complete description, and its own behavior check. No parts were changed.');
       }
       // All split entry points share the same lineage and atomic recursion bound.
@@ -163,8 +163,7 @@ export class QueuePlans extends QueueWrites {
             `Parent: ${task.title}. A separate final acceptance task retains the full parent requirements.\n` +
             `Complete and verify ONLY this step's assigned scope. Requirements assigned to sibling steps or final acceptance are not missing work in this step. Do not expand this step into the whole project or replace its focused check with full-site validation.\n` +
             `Assigned contract: ${JSON.stringify({title:p.title,description:p.description,
-              implVerifyPrompt:p.implVerifyPrompt,solutionVerifyPrompt:p.solutionVerifyPrompt,
-              solutionVerifyCommand:p.solutionVerifyCommand})}\nEND SPLIT STEP SCOPE`, newId);
+              solutionVerifyPrompt:p.solutionVerifyPrompt})}\nEND SPLIT STEP SCOPE`, newId);
         }
         // What the original cost was really spent, so it moves to the first
         // part rather than disappearing with the row. Attributing all of it to

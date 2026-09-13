@@ -12,14 +12,15 @@ export class VerificationBudget {
   }
 
   get used(): number {
-    return this.queue && this.task ? this.queue.countEvents(this.task.id, 'verification-interaction') : this.localUsed;
+    return this.queue && this.task
+      ? this.queue.verificationInteractionsUsed(this.task.id)
+      : this.localUsed;
   }
 
   get exhausted(): boolean { return this.used >= this.limit; }
   get reason(): string {
-    return `Verification did not reach a passing host-backed report within its ` +
-      `${this.used}/${this.limit} interaction budget. The task is handed to a person; ` +
-      'splitting a verification failure into smaller tasks is disabled because it never converges.';
+    return `Verification LLM interaction budget exhausted (${this.used}/${this.limit}). ` +
+      'Preserve recorded checks and completed implementation; split only the remaining verification work into smaller tasks.';
   }
 
   consume(stage: string): void {

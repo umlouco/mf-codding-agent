@@ -2,8 +2,7 @@ import type { Task, TaskEvent, TaskQueue } from './db';
 import { replacementTasks } from './scopePlan';
 import { verdictReplacementTasks } from './scopeVerdict';
 
-export const scopeContractFields = ['description', 'implVerifyPrompt',
-  'solutionVerifyPrompt', 'solutionVerifyCommand'] as const;
+export const scopeContractFields = ['description', 'solutionVerifyPrompt'] as const;
 export type LocalContract = Pick<Task, typeof scopeContractFields[number]>;
 
 function parse(text: string): any {

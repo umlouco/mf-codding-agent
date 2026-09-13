@@ -274,6 +274,23 @@ export abstract class OrchestratorControl extends OrchestratorState {
     return false;
   }
 
+  /**
+   * A role that resolves to no usable provider is an environment fault, not a
+   * failed task. Stop the whole run and name the fault, rather than sending
+   * every executor turn into verification and letting the supervisor rewrite
+   * the same impossible work into smaller and smaller copies of itself.
+   */
+  protected stopForProviderConfiguration(reason: string): void {
+    const active = this.queue.activeTask();
+    if (active) this.blockTask(active, reason);
+    this.disarm();
+    this.queue.setRunState('STOPPED');
+    this.queue.setMeta('runStartedAt', '');
+    this.queue.log(active?.id ?? null, 'supervisor', 'provider-configuration-error', reason.slice(0, 8000));
+    this.log(`run stopped — provider configuration error: ${reason}`);
+    this.changed();
+  }
+
   private tripBreaker(reason: string): boolean {
     const active = this.queue.activeTask();
     if (active) this.blockTask(active, `Run circuit breaker: ${reason}.`);

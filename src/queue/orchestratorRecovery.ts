@@ -22,7 +22,7 @@ export abstract class OrchestratorRecovery extends OrchestratorWatchdog {
   protected pauseForRecovery(snapshot: Task, reason: string): void {
     const task = this.queue.get(snapshot.id);
     if (!task || task.status === 'VERIFIED' || this.disposed || this.queue.runState !== 'RUNNING') return;
-    if (requiresDecomposition(task)) { this.blockForHuman(task, reason); return; }
+    if (requiresDecomposition(task)) { this.requestFailureDecomposition(task, reason); return; }
     const existed = hasRecoveryJob(this.queue, task);
     if (!this.stopForDecision(task, { status: 'VERIFYING', activityPhase: 'recovery_waiting' })) return;
     if (this.review?.taskId === task.id) this.abandonReview();
@@ -60,7 +60,7 @@ export abstract class OrchestratorRecovery extends OrchestratorWatchdog {
       this.queue.testingContext, this.queue.instructions]);
     const unchanged = () => {
       const current = this.queue.get(frozen.id);
-      return current && (['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand', 'region'] as const)
+      return current && (['description', 'solutionVerifyPrompt', 'region'] as const)
         .every(key => current[key] === frozen[key]) &&
         ownerContext === JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
           this.queue.testingContext, this.queue.instructions]);

@@ -9,7 +9,7 @@ import { extractJson, isPlan, unwrapArray } from './agentJson';
 import { AgentRunError, ActivityRecord } from './agentTypes';
 import { workspaceRoot } from '../detect';
 import { attemptHistory } from './agentHistory';
-import { projectNotesContext, verificationCommandRuntime, playwrightTestRegistration } from './prompts';
+import { projectNotesContext, playwrightTestRegistration } from './prompts';
 import { taskCognition } from './cognition';
 import { preparePlanningGoal } from './testingEnvironment';
 import { narrowPlanningRegions, targetApplicationRegions } from './planningScope';
@@ -68,7 +68,6 @@ REGIONS (path, file count, language mix — not file contents)
 ${regionList || '(none — the workspace appears to be empty)'}
 ${editorToolsNote}
 Break the goal into at most ${MAX_PHASES} phases. Reply with ONE JSON array and nothing else.
-${verificationCommandRuntime}
 
 Each element must be an object with exactly these keys:
   "title"        short imperative summary of this phase, under 80 characters
@@ -318,10 +317,8 @@ Each element must be an object with exactly these keys:
   "title"                  short imperative summary, under 80 characters
   "description"            what to build, precise enough to act on with no other context:
                             name the files, functions and behaviour
-  "implVerifyPrompt"       how a reviewer confirms the code and files exist as described
-  "solutionVerifyPrompt"   how a reviewer confirms the behaviour is correct
-  "solutionVerifyCommand"  a portable POSIX shell command (the unix tool on every host) that exits 0 on success and non-zero on
-                            failure, or "" if none applies
+  "solutionVerifyPrompt"   how a verifier confirms the behaviour is correct against what
+                            the executor actually produced
   "kind"                   "task" (the default). Use "phase" instead, ONLY after exploring,
                             if part of this region turns out to be a distinct piece of work
                             that does not belong with the rest — in that case also set
@@ -415,9 +412,7 @@ Previous expansion:\n${text}`, {
       title,
       description,
       kind: 'task',
-      implVerifyPrompt: String(t.implVerifyPrompt ?? '').trim(),
       solutionVerifyPrompt: String(t.solutionVerifyPrompt ?? '').trim(),
-      solutionVerifyCommand: String(t.solutionVerifyCommand ?? '').trim(),
     });
   }
 

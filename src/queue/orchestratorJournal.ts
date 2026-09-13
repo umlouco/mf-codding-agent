@@ -18,7 +18,7 @@ export abstract class OrchestratorJournal extends OrchestratorProgress {
     if (!reason || !task || requiresDecomposition(task)) return false;
     flush();
     this.queue.log(taskId, actor, 'prompt-overload', reason);
-    this.blockForHuman(task, reason);
+    this.requestFailureDecomposition(task, reason);
     return true;
   }
 

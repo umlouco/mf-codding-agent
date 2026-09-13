@@ -11,14 +11,10 @@ export function inventoryScopePlan(task: Task, inventory: WorkInventory): ScopeA
     key, title, description, targets, workUnit, dependsOn, integration: false, covers: ['original-work'],
     handoff: `Preserve existing changes and tests. Previous executor handoff (claim, not proof):\n${task.output?.slice(-4000) || '(none)'}\n` +
       'Determine what is already complete before editing; verify completed work instead of repeating it.',
-    implVerifyPrompt: 'Inspect this execution ticket against the unchanged parent contract. ' +
-      `Assigned targets: ${targets.join(', ') || 'shared prerequisites only'}. ` +
-      'Confirm the requested implementation and necessary supporting integration; preserve unrelated work.',
     solutionVerifyPrompt: 'Verify this execution ticket against every applicable behavior in the unchanged parent contract ' +
       'using the owner-supplied runtime and test requirements. Record concrete observations and commands. ' +
       'Prerequisites must be available; not-yet-executed independent tickets are not failures of this ticket. ' +
       'Do not claim the whole objective is complete from a local check.',
-    solutionVerifyCommand: '',
   });
   const setup = part('prerequisites', 'Establish shared prerequisites for discovered work',
     'Inspect the original contract and existing changes. Establish only shared prerequisites needed by the discovered ' +
@@ -32,20 +28,17 @@ export function inventoryScopePlan(task: Task, inventory: WorkInventory): ScopeA
     'Other independently inventoried units have separate tickets, not reduced acceptance criteria.', unit.targets, [setup.key], unit.key));
   const integration: ScopePart = {
     key: 'integration', title: `Final acceptance: ${task.title}`, integration: true, targets: [],
-    dependsOn: [setup.key, ...slices.map(p => p.key)], covers: ['original-work', 'original-implementation', 'original-behavior'],
+    dependsOn: [setup.key, ...slices.map(p => p.key)], covers: ['original-work', 'original-behavior'],
     description: task.description,
     handoff: 'Reconcile every ticket and its evidence, finish cross-unit integration and cleanup, then check the original contract. ' +
       'The original request and checks are unchanged. Do not repeat all local inspections if current verified evidence suffices.',
-    implVerifyPrompt: task.implVerifyPrompt || 'Verify the complete original implementation contract.',
     solutionVerifyPrompt: task.solutionVerifyPrompt || 'Verify the complete original behavior contract.',
-    solutionVerifyCommand: task.solutionVerifyCommand,
   };
   return { action: 'SPLIT', reason: inventory.reason,
     execution: { shape: 'broad', reason: 'Discovery identified independent work units with complete host-expanded membership.' },
     verification: { shape: 'broad', reason: 'Local evidence per unit precedes the unchanged final acceptance gate.' },
     requirements: [
       { key: 'original-work', criterion: task.description },
-      { key: 'original-implementation', criterion: task.implVerifyPrompt || 'Meet the original implementation requirements.' },
       { key: 'original-behavior', criterion: task.solutionVerifyPrompt || 'Meet the original behavior requirements.' },
     ], parts: [setup, ...slices, integration] };
 }

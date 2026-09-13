@@ -6,22 +6,21 @@ import { OrchestratorScope } from './orchestratorScope';
 import { scopeBlocked } from './scopePlan';
 import { appendAttempt, Review } from './orchestratorState';
 import { runVerification } from './verification';
-import { recoveryFailure, recoverySucceeded, recoveryContext, providerUnavailable } from './recovery';
+import { recoveryFailure, recoverySucceeded, recoveryContext, providerConfigurationError, providerUnavailable } from './recovery';
 import { completeRecoveryJob } from './recoverySchedule';
 import { storedValidationProblem } from './validation';
 import { boundedTask } from './scopeBoundary';
 import { isLocalScope } from './scopeContract';
-import { verificationAuthority } from './verificationAuthority';
+import { verdictReplacementTasks } from './scopeVerdict';
 import { implementationRetryProblem } from './verificationRecovery';
-import { requiresDecomposition } from './recoveryDecomposition';
+import { decompositionFamily, requiresDecomposition } from './recoveryDecomposition';
 import { verificationBudget } from './verificationBudget';
-import { runVerificationCommand } from './command';
 
 /** A verdict belongs to one claim, contract and report, not merely a row ID. */
 function sameVerificationSnapshot(current: Task | undefined, snapshot: Task): boolean {
   return !!current && current.status === 'VERIFYING' && current.status === snapshot.status &&
     (['createdAt', 'startedAt', 'attempts', 'seq', 'title', 'kind', 'region',
-      'description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand',
+      'description', 'solutionVerifyPrompt',
       'output', 'validationReport'] as const)
       .every(key => current[key] === snapshot[key]);
 }
@@ -35,14 +34,14 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
     if (this.requireBootstrapRepair(task)) return;
     if (scopeBlocked(task, this.queue.list())) return;
     if (this.correctTestingTarget(task)) return;
-    if (await this.verifyByRequiredCommand(task)) return;
     const budget = verificationBudget(this.queue, task);
     if (budget.exhausted) {
-      this.blockForHuman(task, budget.reason);
+      this.requestFailureDecomposition(task, budget.reason);
       return;
     }
-    if (this.queue.countEvents(task.id, 'verification-pass', true) >= 2) {
-      this.blockForHuman(task, 'Two verification passes did not establish completion. ' +
+    const passLimit = Math.max(1, this.cfg<number>('queue.verificationMaxPasses', 2));
+    if (this.queue.countEvents(task.id, 'verification-pass', true) >= passLimit) {
+      this.requestFailureDecomposition(task, `${passLimit} verification passes did not establish completion. ` +
         (task.supervisorFeedback || task.validationReport || 'See the validator journal for the missing check.'));
       return;
     }
@@ -81,7 +80,6 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
           review.abort = abort;
         },
         this.queue.testingContext + this.queue.instructions,
-        verificationAuthority(this.queue, task),
         budget,
       );
       journal.flush();
@@ -100,7 +98,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       this.queue.log(task.id, 'validator', 'validation', result.validationReport.slice(0, 8000));
       this.log(`task ${task.seq} — independent verification response stored`);
       if (budget.exhausted && storedValidationProblem(result.validationReport)) {
-        this.blockForHuman(this.queue.get(task.id)!, budget.reason);
+        this.requestFailureDecomposition(this.queue.get(task.id)!, budget.reason);
       }
     } catch (error: any) {
       journal.flush();
@@ -142,10 +140,12 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       // all, and it must not spend the family's bounded replacement budget on
       // pure connectivity noise. Back off and let the same task verify again
       // once the provider answers.
-      if (providerUnavailable(message)) {
+      if (providerConfigurationError(message)) {
+        this.stopForProviderConfiguration(message);
+      } else if (providerUnavailable(message)) {
         this.pauseForRecovery(this.queue.get(task.id)!, message);
       } else if (error?.code === 'interaction_budget' || budget.exhausted) {
-        this.blockForHuman(this.queue.get(task.id)!, budget.reason);
+        this.requestFailureDecomposition(this.queue.get(task.id)!, budget.reason);
       }
 
     } finally {
@@ -160,54 +160,9 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
     }
   }
 
-  /**
-   * Host-authoritative acceptance for a task that carries a required command.
-   *
-   * The command *is* the task's acceptance gate, and it is executed by the host
-   * through the core's portable shell — no model in the loop. This removes the
-   * failure mode that stalled the ten-hour run: a validator that authored its
-   * own auxiliary checks with an invalid precondition, aborted them, and
-   * reported INCOMPLETE even though the required command itself passed. Only a
-   * passing command short-circuits here; a failing one still goes to the
-   * independent validator.
-   */
-  private async verifyByRequiredCommand(task: Task): Promise<boolean> {
-    const command = task.solutionVerifyCommand.trim();
-    if (!command) return false;
-    const output = await runVerificationCommand(this.context, command, () => {}, () => {});
-    const passed = /^exit=0\b/.test(output.trim());
-    this.queue.log(task.id, 'host', 'required-command', output.slice(0, 8000));
-    if (!passed) {
-      this.log(`task ${task.seq} — required command did not pass on the host; falling back to independent verification`);
-      return false;
-    }
-    const report = JSON.stringify({
-      conclusion: 'PASS',
-      summary: 'The required verification command passed on the host (exit 0).',
-      implementationEvidence: '',
-      behaviorEvidence: output.slice(0, 4000),
-      checks: [{ command, result: 'exit=0' }],
-      remaining: '',
-    });
-    this.queue.update(task.id, {
-      status: 'VERIFIED',
-      validationReport: report,
-      finishedAt: Date.now(),
-      supervisorFeedback: 'Required verification command passed on the host (exit 0).',
-    });
-    this.queue.setMeta(`verificationAccepted:${task.id}`,
-      JSON.stringify([this.verificationIdentity(task), report]));
-    this.queue.log(task.id, 'supervisor', 'verdict:VERIFIED', 'Required command passed on the host.');
-    this.log(`task ${task.seq} VERIFIED by its required command (host-recorded exit 0)`);
-    completeRecoveryJob(this.queue, task);
-    this.changed();
-    this.wakeAfterHandoff();
-    return true;
-  }
-
   private verificationIdentity(task: Task): string {
     return JSON.stringify([task.createdAt, task.startedAt, task.attempts, task.title, task.kind, task.region, task.splitScope, task.description,
-      task.implVerifyPrompt, task.solutionVerifyPrompt, task.solutionVerifyCommand, task.output,
+      task.solutionVerifyPrompt, task.output,
       this.queue.getMeta('goal'), this.queue.contextInstructions, this.queue.testingContext, this.queue.instructions]);
   }
 
@@ -250,8 +205,9 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       this.wakeAfterHandoff();
       return;
     }
-    if (this.queue.countEvents(task.id, 'verification-decision', true) >= 2) {
-      this.blockForHuman(task, 'Verification recovery did not resolve the task after two decisions. ' +
+    const decisionLimit = Math.max(1, this.cfg<number>('queue.verificationMaxDecisions', 2));
+    if (this.queue.countEvents(task.id, 'verification-decision', true) >= decisionLimit) {
+      this.requestFailureDecomposition(task, `Verification recovery did not resolve the task after ${decisionLimit} decisions. ` +
         (task.supervisorFeedback || task.validationReport));
       return;
     }
@@ -361,7 +317,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       // The supervisor decides that a split is needed; the configured planner
       // authors its replacement. Fence the parent now so it cannot run again
       // while the planner preserves outcomes and validates the smaller tasks.
-      this.blockForHuman(task, decision.feedback || 'Supervisor requested a split, which is disabled.');
+      this.requestFailureDecomposition(task, decision.feedback || 'Supervisor requested decomposition.');
       this.changed();
       return;
     }
@@ -477,7 +433,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       }
       if (decision.verdict === 'REVERIFY') {
         this.queue.log(target.id, 'supervisor', isLocalScope(target) ? 'scope-edit-rejected' : 'verification-edit-rejected',
-          'Verification adapts a disposable host plan, never the stored task contract or required command.');
+          'Verification derives a disposable host plan from the executor output; the stored task contract is not rewritten here.');
         continue;
       }
       if (isLocalScope(target)) {
@@ -489,9 +445,7 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       const description = edit.description?.trim() || target.description;
       const patch = {
         description,
-        implVerifyPrompt: edit.implVerifyPrompt ?? target.implVerifyPrompt,
         solutionVerifyPrompt: edit.solutionVerifyPrompt ?? target.solutionVerifyPrompt,
-        solutionVerifyCommand: edit.solutionVerifyCommand ?? target.solutionVerifyCommand,
       };
       if (!Object.entries(patch).some(([key,value]) => target[key as keyof Task] !== value)) continue;
       this.stopForDecision(target, {...patch,validationReport:'',finishedAt:null,
@@ -500,15 +454,37 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         this.queue.log(target.id, 'supervisor', 'task-edited', description.slice(0, 8000));
         this.log(`supervisor rewrote task ${edit.seq}`);
       }
-      if (edit.solutionVerifyCommand && edit.solutionVerifyCommand !== target.solutionVerifyCommand) {
-        this.queue.log(
-          target.id,
-          'supervisor',
-          'check-fixed',
-          `${target.solutionVerifyCommand} → ${edit.solutionVerifyCommand}`,
-        );
-        this.log(`supervisor fixed the check for task ${edit.seq}`);
-      }
     }
+  }
+
+  /** Persist all replacements before retiring callbacks; SQL failure keeps the parent intact. */
+  protected applyVerdictSplit(snapshot: Task, decision: SupervisorDecision, current: () => boolean): boolean {
+    const task = this.queue.get(snapshot.id);
+    if (!task || !current() || this.disposed || this.queue.runState !== 'RUNNING' ||
+      !sameVerificationSnapshot(task, snapshot)) return false;
+    const archiveKey = `scopeSplit:${task.id}:${task.startedAt ?? task.createdAt}:verdict:` +
+      this.queue.countEvents(task.id, 'verdict:SPLIT');
+    const parts = verdictReplacementTasks(decision.splitInto!, task, archiveKey);
+    if (requiresDecomposition(task)) for (const part of parts) {
+      part.region = JSON.stringify({ ...JSON.parse(part.region || '{}'), failureFamily: decompositionFamily(task) });
+    }
+    // A rolled-back replacement may leave an unused archive, never a missing
+    // original handoff. splitTask inserts every child and deletes the parent in
+    // one transaction. Its task_events no longer cascade away with it (see
+    // dbStorage's task_events schema) and stay queryable by this id, so this
+    // snapshot only needs the contract and verdict, not a duplicate journal.
+    this.queue.setMeta(archiveKey, JSON.stringify({ task, decision,
+      ownerContext: JSON.stringify([this.queue.getMeta('goal'), this.queue.testingContext + this.queue.instructions]),
+      events: this.queue.events(task.id, -1), archivedAt: Date.now() }));
+    if (this.queue.splitTask(task.id, parts) !== parts.length) throw Error('The original task no longer accepts this replacement.');
+    const active = this.queue.activeTask();
+    if (active && active.seq > task.seq) this.abandonExecution();
+    this.abandonReview();
+    this.reviewed.delete(task.id);
+    this.queue.log(null, 'supervisor', 'scope-split', `${archiveKey}: committed ${parts.length} ordered replacement tasks`);
+    this.log(`task ${task.seq} retired and replaced by ${parts.length} tasks; existing work preserved`);
+    this.changed();
+    this.wakeAfterHandoff();
+    return true;
   }
 }

@@ -6,7 +6,6 @@ import { verificationExample, reportContract, originalGoalContext, projectNotesC
 import { taskCognition } from './cognition';
 import { VerificationSession } from './verificationPlanRunner';
 import { parseVerificationPlan, VerificationPlan, VerificationPlanError, VerificationReceipt } from './verificationPlan';
-import type { VerificationAuthority } from './verificationAuthority';
 import { VerificationBudget, verificationBudget } from './verificationBudget';
 
 export { VerificationPlanError } from './verificationPlan';
@@ -19,8 +18,7 @@ export interface VerificationOutcome {
 
 const verificationPlanShape = `{
   "version": 1,
-  "commandDisposition": "none",
-  "reason": "No saved shell command exists; inspect current files and exercise required behavior.",
+  "reason": "How the checks below test what the executor produced against the required behavior.",
   "preservedAssertions": ["The assigned behavior and all acceptance conditions remain unchanged."],
   "steps": [{"id": "inspect", "requirement": "Inspect the implementation", "kind": "tool",
     "name": "read_file", "input": {"path": "confirmed/path"}, "dependsOn": []}],
@@ -41,10 +39,10 @@ The portable shell is already selected: do not wrap it in cmd /c or PowerShell.`
 export async function runVerification(
   context: vscode.ExtensionContext, output: vscode.OutputChannel, task: Task, goal: string,
   onActivity?: (activity: ActivityRecord) => void, onEvent?: (method: string, params: any) => void,
-  onAbort?: (abort: () => void) => void, projectNotes = '', authority?: VerificationAuthority,
+  onAbort?: (abort: () => void) => void, projectNotes = '',
   budget = verificationBudget(),
 ): Promise<VerificationOutcome> {
-  return verificationPass(context, output, task, goal, onActivity, onEvent, onAbort, projectNotes, authority, budget);
+  return verificationPass(context, output, task, goal, onActivity, onEvent, onAbort, projectNotes, budget);
 }
 
 /** Reason about requirements, execute typed checks in the host, then judge receipts. */
@@ -57,12 +55,8 @@ async function verificationPass(
   onEvent?: (method: string, params: any) => void,
   onAbort?: (abort: () => void) => void,
   projectNotes = '',
-  authority?: VerificationAuthority,
   budget: VerificationBudget = verificationBudget(),
 ): Promise<VerificationOutcome> {
-  const admittedAuthority = authority?.source === 'extension-generated' && authority.adapter === task.solutionVerifyCommand
-    ? authority : undefined;
-  const effectiveCommand = admittedAuthority ? admittedAuthority.originalCommand : task.solutionVerifyCommand;
   const observations: ToolObservation[] = [];
   const started = new Map<string, { name: string; input: unknown }>();
   const observe = (method: string, params: any) => {
@@ -106,16 +100,8 @@ TASK ${task.seq}: ${task.title}
 Assigned requirements (this task's share, not unfinished sibling work):
 ${task.description}
 ${task.splitScope || ''}
-Required implementation inspection:
-${task.implVerifyPrompt || 'Inspect the actual implementation and diff.'}
-Required behavioral verification:
+Required behavioral verification (test what the execution agent actually produced):
 ${task.solutionVerifyPrompt || 'Exercise the assigned behavior.'}
-Saved check adapter (may itself be defective; never substitute its literal syntax for the requirements):
-${effectiveCommand || '(none)'}
-${admittedAuthority ? `HOST-PROVEN ADAPTER PROVENANCE (not additional acceptance requirements):\n${JSON.stringify(admittedAuthority)}\n` +
-  'This extension-generated adapter was added after the assignment. Its extra checks are not owner\n' +
-  'requirements. Diagnose its failure, but verify only the assigned description and acceptance checks.\n' +
-  'Do not copy parent or sibling work out of this obsolete adapter into the verification plan.' : ''}
 Supervisor follow-up:
 ${task.supervisorFeedback || '(none)'}
 Executor handoff, UNVERIFIED CLAIMS only:
@@ -128,12 +114,11 @@ files since those receipts, recheck the affected behavior; historical PASS is no
   try {
     await session.start(context);
     checkActive();
-    const initial: VerificationPlan = { version: 1, commandDisposition: 'none', reason: '',
+    const initial: VerificationPlan = { version: 1, reason: '',
       preservedAssertions: [], steps: [], remaining: [] };
     const mandatory = session.requiredPlan?.(initial) ?? initial;
     if (mandatory.steps.length) {
-      checkpoint = { ...mandatory, sourceCommand: task.solutionVerifyCommand, effectiveCommand,
-        commandAuthority: admittedAuthority, prerequisiteCheck: true };
+      checkpoint = { ...mandatory, prerequisiteCheck: true };
       receipts = await session.execute(mandatory);
       checkActive();
     }
@@ -143,18 +128,24 @@ you cannot create observations by describing them. Do not edit production files,
 expected output, requirements, or task rows. Normal build/test output is allowed.
 If a test file needs rewriting, report its concrete defect for supervisor-owned repair;
 the implementation executor must not rewrite the tests used to check its work.
+Verification is strictly read-only. Never plan a write_file, edit_file, multi_edit, apply_patch,
+or delete_file step, and never plan a shell command that copies, moves, deletes, or writes files —
+including into a scratch, sandbox, or mutation copy. Every such step is rejected before execution
+and the whole plan is thrown away. To establish that a test would catch a regression, inspect the
+test's assertions and the implementation read-only; do not mutate, copy, or restore source.
+If a required check genuinely cannot be performed read-only, list it in remaining instead of
+planning an edit.
 A passing script cannot override the client's requested behavior. Keep checks INCOMPLETE for material
 ambiguity or missing evidence instead of silently narrowing the owner's requirements.
 
 ${requirements}
 
-Mandatory Playwright evidence already captured by the host in this session:
-${JSON.stringify(receipts)}
-A failed mandatory gate prevents PASS but does not block independent implementation inspection.
+${receipts.length
+  ? `Mandatory evidence already captured by the host in this session:\n${JSON.stringify(receipts)}\nA failed mandatory gate prevents PASS but does not block independent implementation inspection. Do not repeat an invocation already represented by a receipt above.`
+  : 'No host evidence was captured for this task. Nothing is retained: every check you rely on must appear as an executable step below and be run by the host in this attempt. Do not claim a receipt, run, or prior result that is not shown here.'}
 Plan explicit assertions for the assigned implementation even when the test harness is missing.
 For example, assert that a required manifest exists using an executable check with an expected
-result. Distinguish a missing assigned deliverable from an unavailable inspection tool. The host
-retains its mandatory receipt; do not repeat the unchanged failed suite invocation in your plan.
+result. Distinguish a missing assigned deliverable from an unavailable inspection tool.
 
 Actual registered tool capabilities and their exact JSON input schemas:
 ${JSON.stringify(session.capabilities)}
@@ -162,13 +153,14 @@ ${JSON.stringify(session.capabilities)}
 ${verificationShellRuntime}
 Tool names are RPC capabilities, NOT shell
 executables. Use kind tool with its registered name and JSON input for browser, inspection, and
-other tools. Keep browser calls separate from shell text. Preserve valid saved shell commands intact.
+other tools. Keep browser calls separate from shell text.
 Use registered background-process tools for persistent services, never a foreground dev server or
 an unowned '&' shell job. Use an HTTP readiness tool rather than arbitrary sleep durations.
-If a saved adapter has wrong quoting, conflates capabilities with shell executables, or encodes the
-opposite success condition, adapt the invocation and explicitly explain every preserved assertion.
 An absence check must distinguish 'no match' from an actual execution error; state its expected exit
 code explicitly. Never turn an error into success using unconditional echo, true, or swallowed errors.
+Prefer exit-code assertions and simple substring checks over brittle exact filters: do not depend on
+invented PASS-name strings, on source literals the code builds dynamically, or on host grep options
+that may be unsupported (for example -x); use portable forms such as tr -d CR and grep -F.
 Express machine-checkable results with expect.jsonEquals, expect.includes, or expect.excludes.
 For shell commands record expectExitCode; for browser assertions prefer an actual JSON expected value.
 Every browser_eval used as a behavior assertion MUST supply expect.jsonEquals. Observation-only
@@ -176,6 +168,11 @@ evaluations are allowed for diagnosis, but tool success without an expectation c
 Steps default to 120000ms; set timeoutMs explicitly from 1000 through 600000 for legitimate longer
 tests. Deadlines bound a single invocation, not the autonomous queue's lifetime.
 Include actual implementation inspection AND runtime checks whenever behavior is required.
+When the assigned behavior means running something — a program, server, script, browser, or test
+suite — the plan MUST contain a step that actually runs it and asserts the result. A plan made only
+of read_file/glob/grep inspection steps cannot establish behavior and will be reported INCOMPLETE;
+do not conclude execution is impossible from a status probe alone. Try the executor's documented
+command and its fallbacks before deciding a check cannot run.
 Only use existing tools/scripts; do not invent executable names, input fields, paths, or data.
 Unknown prerequisites require inspection first; list dependent unplanned work in remaining rather
 than guessing or dropping it. A failed prerequisite blocks only its explicit dependants.
@@ -183,16 +180,15 @@ Do not re-run a failed exact invocation without a changed cause. No source edits
 evidence files, paid external operations unrelated to verification, or changes to user requirements.
 
 Return ONE JSON object. At most 24 steps per round; remaining explicitly names every deferred check.
-commandDisposition is retained (saved command intact), adapted (diagnosed harness correction), or
-none (no saved command exists). Each step maps to a substantive assigned requirement.
-For THIS task an authoritative saved command is ${effectiveCommand?.trim() ? 'PRESENT: none is INVALID; use retained or adapted.' : 'ABSENT: use none.'}
+Derive each step from the executor's actual handoff and the required behavior; each step maps to a
+substantive assigned requirement.
 ${verificationPlanShape}`, options);
     recordUsage(planning.usage);
     stopModel = undefined;
     checkActive();
     if (coreHalted(planning.stopReason)) throw new VerificationPlanError('Verification planner did not finish its plan.', 'planning');
     let plan;
-    try { plan = parseVerificationPlan(planning.text, effectiveCommand, session.capabilities); }
+    try { plan = parseVerificationPlan(planning.text, session.capabilities); }
     catch (error: any) {
       // Invalid plans have executed nothing. One bounded correction is cheaper
       // than launching another verifier with the same malformed instructions.
@@ -206,8 +202,6 @@ Registered capabilities and input schemas: ${JSON.stringify(session.capabilities
 Rejected plan: ${planning.text}
 Return a complete corrected version-1 plan using the schema BELOW, with all original checks retained.
 This is a verification-plan turn. Do not return a supervisor verdict, task edits, or a PASS/FAIL report.
-For a nonempty saved command use retained with its intact shell invocation, or adapted with a
-concrete defect diagnosis and all preservedAssertions. Use none ONLY when no saved command exists.
 Separate RPC tools from shell commands; use actual tool schemas. Correct unsupported fields and
 exit expectations; do not waive checks, edit requirements, or fabricate observations. At most 24
 steps; list all deferred work in remaining. Do not return commentary or a second unchanged plan.
@@ -216,18 +210,17 @@ ${verificationPlanShape}`, options);
       recordUsage(planning.usage);
       checkActive();
       if (coreHalted(planning.stopReason)) throw new VerificationPlanError('Plan correction did not finish.', 'planning');
-      plan = parseVerificationPlan(planning.text, effectiveCommand, session.capabilities);
+      plan = parseVerificationPlan(planning.text, session.capabilities);
     }
     plan = session.requiredPlan?.(plan) ?? plan;
-    observe('verification/plan', { taskId: task.id, sourceCommand: task.solutionVerifyCommand, plan });
-    checkpoint = { ...plan, sourceCommand: task.solutionVerifyCommand, effectiveCommand, commandAuthority: admittedAuthority };
+    observe('verification/plan', { taskId: task.id, plan });
+    checkpoint = { ...plan };
     receipts = await session.execute(plan);
     checkActive();
     const result = await ask(`You are the independent verification reporter.
 ${originalGoalContext(goal)}
 CURRENT TASK ${task.seq}: ${task.title}
 ${task.description}
-Implementation check: ${task.implVerifyPrompt || "Inspect the assigned deliverable."}
 Behavior check: ${task.solutionVerifyPrompt || "Check the assigned outcome."}
 ${task.splitScope || ''}
 ${projectNotesContext(projectNotes)}
@@ -246,9 +239,9 @@ ${JSON.stringify(plan)}
 HOST RECEIPTS:
 ${JSON.stringify(receipts)}
 
-Inspect the substantive requirements and adapter correctness as well as result statuses. A tool
-that ran successfully may still demonstrate a requirement failure. An adapted harness must preserve
-every acceptance condition. Report FAIL for an observed violation; INCOMPLETE for an invalid harness,
+Inspect the substantive requirements as well as result statuses. A tool
+that ran successfully may still demonstrate a requirement failure.
+Report FAIL for an observed violation; INCOMPLETE for an invalid plan,
 missing steps, truncated evidence that cannot establish the assertion, or any unverified requirement.
 PASS requires actual implementation AND relevant behavior evidence; no receipt means no evidence.
 Each check object MUST include stepId, exactly matching its corresponding host receipt stepId.

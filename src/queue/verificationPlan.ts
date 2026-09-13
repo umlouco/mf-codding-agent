@@ -25,7 +25,6 @@ export interface VerificationStep {
 }
 export interface VerificationPlan {
   version: 1;
-  commandDisposition: 'retained' | 'adapted' | 'none';
   reason: string;
   preservedAssertions: string[];
   steps: VerificationStep[];
@@ -50,11 +49,11 @@ function strings(value: unknown, field: string): string[] {
 }
 
 /** Reject a whole malformed plan before any step can have side effects. */
-export function parseVerificationPlan(text: string, sourceCommand: string, capabilities: VerificationCapability[]): VerificationPlan {
+export function parseVerificationPlan(text: string, capabilities: VerificationCapability[]): VerificationPlan {
   let value: any;
   try { value = extractJson(text); } catch { throw new VerificationPlanError('Verification planner returned no valid JSON plan.', 'planning'); }
-  if (!object(value) || value.version !== 1 || !['retained', 'adapted', 'none'].includes(value.commandDisposition)) {
-    throw new VerificationPlanError('Verification plan needs version 1 and an explicit commandDisposition.');
+  if (!object(value) || value.version !== 1) {
+    throw new VerificationPlanError('Verification plan needs version 1.');
   }
   if (!Array.isArray(value.steps) || value.steps.length > 24) {
     throw new VerificationPlanError('A verification round accepts at most 24 steps; put unfinished checks in remaining, never truncate them.');
@@ -112,16 +111,7 @@ export function parseVerificationPlan(text: string, sourceCommand: string, capab
   if (!steps.length && !remaining.length) throw new VerificationPlanError('An empty plan cannot establish verification.');
   const preservedAssertions = strings(value.preservedAssertions, 'preservedAssertions');
   const reason = typeof value.reason === 'string' ? value.reason.trim() : '';
-  if (sourceCommand.trim()) {
-    if (value.commandDisposition === 'none') throw new VerificationPlanError('A saved check cannot disappear from a plan.');
-    if (value.commandDisposition === 'retained' && !steps.some(step => step.command?.trim() === sourceCommand.trim())) {
-      throw new VerificationPlanError('A retained saved command must occur intact in a shell step.');
-    }
-    if (value.commandDisposition === 'adapted' && (!reason || !preservedAssertions.length)) {
-      throw new VerificationPlanError('Adapting a broken harness requires its concrete diagnosis and preserved assertions.');
-    }
-  } else if (value.commandDisposition !== 'none') throw new VerificationPlanError('There is no saved command to retain or adapt.');
-  return { version: 1, commandDisposition: value.commandDisposition, reason, preservedAssertions, steps, remaining };
+  return { version: 1, reason, preservedAssertions, steps, remaining };
 }
 
 /** Enforce the registry's structural schema before invoking any capability. */

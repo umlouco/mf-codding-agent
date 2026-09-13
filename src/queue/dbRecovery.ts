@@ -8,6 +8,16 @@ export const DECOMPOSITION_REQUIRED = 'decomposition_required';
  * and bulk resets cannot revive the same failed parent or silently accept it.
  * Decomposition phase changes are allowed; deleting/replacing the row discharges
  * the obligation. The schema keeps FAILED readable for old database writers.
+ *
+ * BLOCKED is exempt on purpose. It is the one sanctioned terminal exit for a row
+ * the queue cannot complete — including exactly the `decomposition_*` rows this
+ * invariant guards. Without the exemption the trigger rewrites the terminal
+ * `status = 'BLOCKED'` back to `VERIFYING` (and the old phase), so blockTask can
+ * never commit: the supervisor re-decides the same task every tick, logs a fresh
+ * verdict:BLOCKED forever, the row never leaves VERIFYING, and every later task
+ * is head-of-line blocked behind it. A human-blocked row is not an accepted
+ * failure, so allowing it through does not revive the failed parent the
+ * invariant exists to stop.
  */
 export function installDecompositionInvariant(db: Driver): void {
   db.exec('BEGIN IMMEDIATE');
@@ -17,20 +27,22 @@ export function installDecompositionInvariant(db: Driver): void {
       DROP TRIGGER IF EXISTS tasks_decomposition_update;
       CREATE TRIGGER tasks_decomposition_insert
       AFTER INSERT ON tasks
-      WHEN NEW.status = 'FAILED' OR
+      WHEN NEW.status <> 'BLOCKED' AND (
+        NEW.status = 'FAILED' OR
         (NEW.activity_phase GLOB 'decomposition_*' AND
-          (NEW.status <> 'VERIFYING' OR NEW.finished_at IS NOT NULL))
+          (NEW.status <> 'VERIFYING' OR NEW.finished_at IS NOT NULL)))
       BEGIN
         UPDATE tasks SET status = 'VERIFYING', activity_phase = 'decomposition_required',
           finished_at = NULL WHERE id = NEW.id;
       END;
       CREATE TRIGGER tasks_decomposition_update
       AFTER UPDATE ON tasks
-      WHEN NEW.status = 'FAILED' OR
+      WHEN NEW.status <> 'BLOCKED' AND (
+        NEW.status = 'FAILED' OR
         (NEW.activity_phase GLOB 'decomposition_*' AND
           (NEW.status <> 'VERIFYING' OR NEW.finished_at IS NOT NULL)) OR
         (OLD.activity_phase GLOB 'decomposition_*' AND
-          (NEW.status <> 'VERIFYING' OR NEW.activity_phase NOT GLOB 'decomposition_*'))
+          (NEW.status <> 'VERIFYING' OR NEW.activity_phase NOT GLOB 'decomposition_*')))
       BEGIN
         UPDATE tasks SET status = 'VERIFYING', finished_at = NULL,
           activity_phase = CASE WHEN OLD.activity_phase GLOB 'decomposition_*'

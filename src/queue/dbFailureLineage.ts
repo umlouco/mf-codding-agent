@@ -47,8 +47,8 @@ export function admitDecompositionFamily(queue: FamilyStore, task: Task): boolea
  */
 export function verificationStallReason(reason: string): boolean {
   return reason.includes('Verification LLM interaction budget exhausted') ||
-    reason.includes('Two verification passes did not establish completion') ||
-    reason.includes('Verification recovery did not resolve the task after two decisions');
+    reason.includes('verification passes did not establish completion') ||
+    reason.includes('Verification recovery did not resolve the task after');
 }
 
 /**

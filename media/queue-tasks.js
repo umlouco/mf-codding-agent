@@ -170,21 +170,8 @@ window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, termina
       body.appendChild(readonlyBlock('Region', regionSummary(t.region), false));
     } else {
       body.appendChild(
-        field('Implementation verification', t.implVerifyPrompt, (v) =>
-          patch(t.id, { implVerifyPrompt: v }),
-        ),
-      );
-      body.appendChild(
         field('Solution verification', t.solutionVerifyPrompt, (v) =>
           patch(t.id, { solutionVerifyPrompt: v }),
-        ),
-      );
-      body.appendChild(
-        field(
-          'Verification command',
-          t.solutionVerifyCommand,
-          (v) => patch(t.id, { solutionVerifyCommand: v }),
-          true,
         ),
       );
     }

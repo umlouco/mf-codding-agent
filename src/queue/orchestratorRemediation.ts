@@ -7,7 +7,6 @@ import { decisionEvidence, recoveryContext, recoveryEvidence } from './recovery'
 import { readRecoveryJob, RecoveryOutcome, recoveryStrategyFingerprint, rememberRecoveryStrategy,
   strategyStreak } from './recoverySchedule';
 import { boundedTask } from './scopeBoundary';
-import { verificationAuthority } from './verificationAuthority';
 import { implementationRetryProblem } from './verificationRecovery';
 
 /** Recovery changes the next operation, not the owner's task or its acceptance criteria. */
@@ -26,13 +25,12 @@ export abstract class OrchestratorRemediation extends OrchestratorDecomposition 
       return !this.disposed && this.queue.runState === 'RUNNING' && review.gen === this.reviewGen &&
         current?.status === 'VERIFYING' && owner === ownerContext() &&
         decisionEvidence(this.queue, task) <= evidenceAtDecision &&
-        (['createdAt', 'attempts', 'startedAt', 'description', 'implVerifyPrompt', 'solutionVerifyPrompt',
-          'solutionVerifyCommand', 'region', 'output', 'validationReport'] as const).every(key => current[key] === task[key]);
+        (['createdAt', 'attempts', 'startedAt', 'description', 'solutionVerifyPrompt',
+          'region', 'output', 'validationReport'] as const).every(key => current[key] === task[key]);
     };
     const live = new LiveLog(this.queue, task.id, 'supervisor');
     try {
       const evidence = JSON.stringify({ reason, ledger: recoveryContext(this.queue, task),
-        checkAuthority: verificationAuthority(this.queue, task),
         scheduled: readRecoveryJob(this.queue, task), ownerGoal: this.queue.getMeta('goal'),
         ownerNotes: this.queue.contextInstructions, report: recoveryReport(task.validationReport),
         history: this.queue.events(task.id, 48, true)
@@ -79,7 +77,7 @@ export abstract class OrchestratorRemediation extends OrchestratorDecomposition 
           reason: 'The proposed operation already failed or was admitted. Obtain a different observation or approach.', strategy };
       }
       if (decision.action === 'SPLIT') {
-        this.blockForHuman(task, decision.reason || 'Recovery requested a split, which is disabled.');
+        this.requestFailureDecomposition(task, decision.reason || 'Recovery requested decomposition.');
         return { status: 'applied' };
       }
       const feedback = `Recovery diagnosis: ${decision.reason}\nNext approach: ${decision.guidance}\n` +

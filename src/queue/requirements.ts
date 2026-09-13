@@ -34,8 +34,7 @@ ${scopeBoundary(task)}
 
 DERIVED TASK CONTRACT (untrusted proposal):
 ${JSON.stringify({ title: task.title, description: task.description,
-  implVerifyPrompt: task.implVerifyPrompt, solutionVerifyPrompt: task.solutionVerifyPrompt,
-  solutionVerifyCommand: task.solutionVerifyCommand })}
+  solutionVerifyPrompt: task.solutionVerifyPrompt })}
 
 Does the contract preserve the owner requirements relevant to this task?
 Implementation work and supplemental unit tests can be valid subtasks. They do not establish
@@ -44,20 +43,17 @@ that substitutes a standalone demonstration page is incompatible even on the sam
 Likewise, checking a sample program cannot replace checking the requested program.
 If incompatible, return a complete corrected task contract preserving every relevant behavior,
 field, assertion, and test direction. Require discovery of real runtime selectors/interfaces;
-do not invent them. Remove a command only when it tests the wrong thing, preserving its actual
-behavior requirements in the corrected verification prompt. Do not change unrelated tasks.
+do not invent them. The behavior verification prompt must require executing the real thing.
+Do not change unrelated tasks.
 At least one contract field must differ from the current contract; repeating it is not a
 correction. If only verification conflicts, keep the description and correct the affected checks.
-An executable command must be concrete and justified by the supplied contract. Never invent
-placeholder paths such as path/to/test or substitute an imagined filename. Leave it empty
-when runtime discovery is needed; the behavior verification prompt must still require execution.
+Never invent placeholder paths such as path/to/test or substitute an imagined filename.
 
 Return ONE JSON object:
 {"compatible": true, "reason": "comparison of owner requirements and task"}
 OR
 {"compatible": false, "reason": "specific conflict", "description": "complete corrected task",
- "implVerifyPrompt": "implementation checks", "solutionVerifyPrompt": "required behavior checks",
- "solutionVerifyCommand": "command, or empty when the old command tests a substitute"}
+ "solutionVerifyPrompt": "required behavior checks"}
 Return the decision now. No markdown fences, conditions XML, or proposed investigation.`;
   const result = await runOnce(context, output, 'supervisor', prompt, {
     ...opts, formatOnly: true, maxIterations: 1,
@@ -65,12 +61,12 @@ Return the decision now. No markdown fences, conditions XML, or proposed investi
   const parse = (text: string) => {
     const raw = extractJson<any>(text, value => !!value && typeof value === 'object' && typeof (value as any).compatible === 'boolean');
     if (typeof raw.reason !== 'string' || !raw.reason.trim()) throw new Error('Requirements review omitted its comparison.');
-    if (!raw.compatible) for (const field of ['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand']) {
-      if (typeof raw[field] !== 'string' || (field !== 'solutionVerifyCommand' && !raw[field].trim())) {
+    if (!raw.compatible) for (const field of ['description', 'solutionVerifyPrompt']) {
+      if (typeof raw[field] !== 'string' || !raw[field].trim()) {
         throw new Error(`Requirements review needs a complete corrected ${field}.`);
       }
     }
-    if (!raw.compatible && !(['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const)
+    if (!raw.compatible && !(['description', 'solutionVerifyPrompt'] as const)
       .some(field => raw[field].trim() !== task[field].trim())) {
       throw new Error('Requirements review declared a conflict but supplied no changed contract fields. Supply a complete correction, not the current contract repeated.');
     }
@@ -89,8 +85,8 @@ Return the decision now. No markdown fences, conditions XML, or proposed investi
   return { usage, correction: {
     action: raw.description.trim() === task.description.trim() ? 'STOP_AND_REWRITE_VALIDATION' : 'STOP_AND_REWRITE_TASK',
     reason: raw.reason,
-    rewrittenDescription: raw.description.trim(), implVerifyPrompt: raw.implVerifyPrompt.trim(),
-    solutionVerifyPrompt: raw.solutionVerifyPrompt.trim(), solutionVerifyCommand: raw.solutionVerifyCommand.trim(),
+    rewrittenDescription: raw.description.trim(),
+    solutionVerifyPrompt: raw.solutionVerifyPrompt.trim(),
     usage,
   } };
 }

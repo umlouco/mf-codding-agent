@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { Task, NewTask, Usage } from './db';
 import { ReviewOptions, NO_USAGE, AgentRunError } from './agentTypes';
 import { attemptHistory } from './agentHistory';
-import { originalGoalContext, projectNotesContext, recoveryRules, verificationCommandRuntime } from './prompts';
+import { originalGoalContext, projectNotesContext, recoveryRules } from './prompts';
 import { SupervisorDecision, isReview } from './agentReviewSupport';
 import { parseSupervisorSplit } from './agentSplit';
 import { runOnce, supervisorRounds } from './agentRuntime';
@@ -31,9 +31,7 @@ export async function escalate(
 ): Promise<{
   splitInto: NewTask[];
   description: string;
-  implVerifyPrompt: string;
   solutionVerifyPrompt: string;
-  solutionVerifyCommand: string;
   feedback: string;
   usage: Usage;
 }> {
@@ -62,8 +60,8 @@ Decide which of the two failures this is, and answer with ONE JSON object and no
 If the task is TOO BIG — the work is several distinct pieces and no single agent turn can carry
 all of it — split it:
 {
-  "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
-                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
+  "splitInto": [{ "title": "...", "description": "...",
+                  "solutionVerifyPrompt": "..." }],
   "feedback": "why the scope was the obstacle"
 }
 Give every required part, at least two, in execution order, each independently doable and
@@ -74,15 +72,12 @@ Otherwise rewrite the recovery instructions using the diagnosed failure:
 ${recoveryRules}
 {
   "description": "Full self-contained task: required behavior, confirmed files, completed work, and next concrete steps.",
-  "implVerifyPrompt": "a replacement implementation inspection that can actually be performed",
   "solutionVerifyPrompt": "a replacement behavioural success condition that can actually be met",
-  "solutionVerifyCommand": "",
   "feedback": "what was wrong with the premise, in one or two sentences"
 }
 
 Send one shape or the other, not both. Do not return a lightly edited version of the text above —
-change the failed approach while preserving the goal. An empty solutionVerifyCommand keeps the
-current command; otherwise provide the complete replacement command.`;
+change the failed approach while preserving the goal.`;
 
   const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
     maxIterations: supervisorRounds(),
@@ -97,9 +92,7 @@ current command; otherwise provide the complete replacement command.`;
   return {
     splitInto,
     description: String(d?.description ?? '').trim(),
-    implVerifyPrompt: String(d?.implVerifyPrompt ?? '').trim(),
     solutionVerifyPrompt: String(d?.solutionVerifyPrompt ?? '').trim(),
-    solutionVerifyCommand: String(d?.solutionVerifyCommand ?? '').trim(),
     feedback: String(d?.feedback ?? '').trim(),
     usage,
   };
@@ -139,8 +132,6 @@ could not be read as a verdict. Here is exactly what you wrote:
 
 ${rawReply.slice(0, 4000)}
 
-${verificationCommandRuntime}
-
 ${originalGoalContext(goal)}
 
 ${projectNotesContext(opts.projectNotes)}
@@ -150,10 +141,10 @@ required shape — as ONE JSON object and nothing else:
 {
   "verdict": "RETRY",
   "feedback": "what you found, and for a retry exactly what to do differently",
-  "splitInto": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
-                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
-  "taskEdits": [{ "seq": ${task.seq}, "description": "...", "implVerifyPrompt": "...",
-                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
+  "splitInto": [{ "title": "...", "description": "...",
+                  "solutionVerifyPrompt": "..." }],
+  "taskEdits": [{ "seq": ${task.seq}, "description": "...",
+                  "solutionVerifyPrompt": "..." }]
 }
 
 Set verdict to VERIFIED, REVERIFY, RETRY, SPLIT, or REPAIR_TESTS to match the original conclusion. Use empty arrays for
@@ -194,9 +185,7 @@ export async function demandRewrite(
   opts: ReviewOptions,
 ): Promise<{
   description: string;
-  implVerifyPrompt: string;
   solutionVerifyPrompt: string;
-  solutionVerifyCommand: string;
   feedback: string;
   usage: Usage;
 }> {
@@ -229,12 +218,9 @@ ${attemptHistory(task)}
 Reply with ONE JSON object and nothing else:
 {
   "description": "Full task with confirmed files, required behavior, completed work, and the next concrete correction.",
-  "implVerifyPrompt": "a precise replacement implementation inspection",
   "solutionVerifyPrompt": "a precise replacement behavioral success condition",
-  "solutionVerifyCommand": "",
   "feedback": "one or two sentences of standing instruction for the executor"
-}
-Use an empty solutionVerifyCommand to keep the current command, or supply the complete replacement.`;
+}`;
 
   try {
     const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
@@ -244,18 +230,14 @@ Use an empty solutionVerifyCommand to keep the current command, or supply the co
     const d = extractJson<any>(text);
     return {
       description: String(d?.description ?? '').trim(),
-      implVerifyPrompt: String(d?.implVerifyPrompt ?? '').trim(),
       solutionVerifyPrompt: String(d?.solutionVerifyPrompt ?? '').trim(),
-      solutionVerifyCommand: String(d?.solutionVerifyCommand ?? '').trim(),
       feedback: String(d?.feedback ?? '').trim(),
       usage,
     };
   } catch {
     return {
       description: '',
-      implVerifyPrompt: '',
       solutionVerifyPrompt: '',
-      solutionVerifyCommand: '',
       feedback: '',
       usage: { ...NO_USAGE },
     };

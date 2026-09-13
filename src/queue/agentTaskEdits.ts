@@ -11,9 +11,7 @@ export interface TaskEditResult {
     seq: number;
     title?: string;
     description?: string;
-    implVerifyPrompt?: string;
     solutionVerifyPrompt?: string;
-    solutionVerifyCommand?: string;
   }[];
   deletes: number[];
   adds: NewTask[];
@@ -53,11 +51,9 @@ itself change the queue. Include every affected sequence number, even for a larg
 Reply with ONE JSON object and nothing else:
 {
   "summary": "one sentence describing the proposed changes",
-  "edits": [{ "seq": 1, "title": "...", "description": "...", "implVerifyPrompt": "...",
-              "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }],
+  "edits": [{ "seq": 1, "title": "...", "description": "...", "solutionVerifyPrompt": "..." }],
   "deletes": [],
-  "adds": [{ "title": "...", "description": "...", "implVerifyPrompt": "...",
-             "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
+  "adds": [{ "title": "...", "description": "...", "solutionVerifyPrompt": "..." }]
 }
 
 Only include fields you are actually changing on an "edits" entry; omit a field to leave it as-is.
@@ -101,7 +97,7 @@ export function parseTaskEditResult(text: string, tasks: Task[], usage: Usage): 
     if (!known.has(value as number)) fail(`${label} refers to unknown task #${value}.`);
     return value as number;
   };
-  const fields = ['title', 'description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const;
+  const fields = ['title', 'description', 'solutionVerifyPrompt'] as const;
   // A discarded draft may precede the actual proposal in accumulated model
   // output. Accept one complete envelope, never an earlier parseable fragment.
   const source = text.trim();

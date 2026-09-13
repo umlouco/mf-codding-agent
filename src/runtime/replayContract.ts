@@ -4,7 +4,7 @@ import { openDriver } from '../queue/dbDriver';
 
 function contract(task: Task): string {
   return JSON.stringify([task.id, task.seq, task.title, task.description, task.kind,
-    task.region, task.implVerifyPrompt, task.solutionVerifyPrompt, task.solutionVerifyCommand]);
+    task.region, task.solutionVerifyPrompt]);
 }
 export function contractHash(task: Task): string {
   return createHash('sha256').update(contract(task)).digest('hex');

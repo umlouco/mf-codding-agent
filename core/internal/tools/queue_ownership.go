@@ -39,7 +39,7 @@ func (e *Env) CheckQueueOwnership(name string, input json.RawMessage, mutating b
 	if !mutating {
 		return nil
 	}
-	if (e.QueueRole == "validator" || e.QueueRole == "supervisor") && !testingBrowserTool(name) {
+	if (e.QueueRole == "validator" || e.QueueRole == "supervisor") && !testingBrowserTool(name) && !cleanupTool(name) {
 		return fmt.Errorf("queue ownership: %s may inspect files and run checks but cannot use a writing tool; request a supervisor test-repair decision for test changes", e.QueueRole)
 	}
 	var inspect func(any) error
@@ -79,6 +79,15 @@ func (e *Env) CheckQueueOwnership(name string, input json.RawMessage, mutating b
 }
 
 var patchTarget = regexp.MustCompile(`(?m)^\*\*\* (?:(?:Update|Add|Delete) File|Move to): (.+)$`)
+
+// cleanupTool reports whether a mutating tool only releases resources a run
+// owns — stopping or listing the background processes it started. Refusing
+// these left dev servers listening on a task's port and polluted later checks,
+// so verification may always clean up after itself.
+func cleanupTool(name string) bool {
+	n := strings.ToLower(name)
+	return strings.HasSuffix(n, "shell_kill_background") || strings.HasSuffix(n, "shell_list_background")
+}
 
 // Check the resolved path too: aliases and symlinks must not change ownership.
 func (e *Env) CheckQueueWritePath(path string) error {
@@ -126,9 +135,10 @@ func (e *Env) CheckQueueCommand(command string) error {
 	}
 	if e.QueueRole == "validator" || e.QueueRole == "supervisor" || e.QueueRole == "supervisor-repair" {
 		// Editing roles use scoped file tools; a shell is for checks and reads.
-		// Reject common inline writers rather than allowing an opaque script to
-		// rewrite the files whose independent evidence is being collected.
-		if queueShellWrite.MatchString(lower) {
+		// Reject commands that actually rewrite files, but allow read-only probes
+		// — including a plain `node -e "import(...)..."` inspection, which is not
+		// a rewrite just because it names an interpreter inline.
+		if validatorShellWrites(command) {
 			return fmt.Errorf("queue ownership: this %s shell may run checks, but file rewrites require the supervisor's scoped editing tools", e.QueueRole)
 		}
 	}
@@ -156,8 +166,18 @@ var packageManagers = map[string]bool{
 // whole command together with "/" for every space and asked whether the result
 // contained "/test/", which made `npm install -D @playwright/test > log` read
 // as a test rewrite: the package name became a directory segment and the
-// redirect became a write verb. An executor that could never install its own
-// dependencies had no way to make progress and no way to say why.
+// redirect became a write verb. A later version kept that shape and treated
+// every `test/...` token as a write target as soon as the command contained any
+// writing verb or redirect — so `node test/run.js; Remove-Item scratch/o.txt`
+// read as an edit to `test/run.js`, and an executor running the assigned suite
+// was cut off for a rewrite it never attempted.
+//
+// So the question is not "does this command contain a test path" but "is a test
+// path the thing this command writes". Only redirect destinations and the
+// argument tail of a real writing verb are candidates. Inline scripts
+// (`node -e`, `python -c`, `apply_patch`) and VCS restores can write anywhere
+// and are unreadable statically, so those stay pessimistic: any test path in
+// them counts as a target.
 func testWriteTarget(command string) string {
 	fields := strings.Fields(command)
 	// Skip leading `VAR=value` assignments to find the real program.
@@ -173,10 +193,25 @@ func testWriteTarget(command string) string {
 			return ""
 		}
 	}
-	if !queueShellWrite.MatchString(command) && !strings.Contains(command, ">") {
+
+	candidates, opaque := writeCandidates(command)
+	if opaque {
+		// An inline script can write to any path; keep the pessimistic scan so
+		// a one-liner cannot hide a test rewrite behind an unknown argument.
+		for _, token := range splitArgs(command) {
+			if token == "" || strings.HasPrefix(token, "-") || packageSpecifier(token) {
+				continue
+			}
+			if strings.Contains(token, "node_modules/") || strings.Contains(token, `node_modules\`) {
+				continue
+			}
+			if testPath(token) {
+				return token
+			}
+		}
 		return ""
 	}
-	for _, token := range splitArgs(command) {
+	for _, token := range candidates {
 		if token == "" || strings.HasPrefix(token, "-") || packageSpecifier(token) {
 			continue
 		}
@@ -191,6 +226,173 @@ func testWriteTarget(command string) string {
 		}
 	}
 	return ""
+}
+
+// writingVerbRe captures a writing verb together with its argument tail, up to
+// the next shell separator. The tail is tokenized to find the path operands.
+var writingVerbRe = regexp.MustCompile(`(?i)\b(set-content|add-content|out-file|new-item|remove-item|move-item|copy-item|rename-item|tee|touch|truncate|rmdir|rm|del|cp|mv)\b([^\n;|&<>]*)`)
+
+// sedRe captures sed's arguments; sed only writes with an in-place flag.
+var sedRe = regexp.MustCompile(`(?i)\bsed\b([^\n;|&<>]*)`)
+var sedInPlaceRe = regexp.MustCompile(`(?i)(?:^|\s)(?:-i|--in-place)(?:\s|$|\.)`)
+
+// opaqueWriterRe matches commands whose write targets cannot be read
+// statically: inline interpreters, patch tools and VCS restores.
+var opaqueWriterRe = regexp.MustCompile(`(?i)(?:\b(?:python\S*|node|ruby|perl)\s+(?:-c|-e|--eval)\b|\b(?:apply_patch|writefile|write_text|write_bytes)\b|\bgit\s+(?:checkout|restore|reset|clean|apply)\b|(?:^|[;&|]\s*)(?:powershell|pwsh)\b[^\n]*-command\b)`)
+
+// writeCandidates returns the paths a command plausibly writes to, plus
+// whether the command contains an opaque writer that defeats static reading.
+func writeCandidates(command string) (paths []string, opaque bool) {
+	paths = append(paths, verbWriteTargets(command)...)
+	paths = append(paths, redirectWriteTargets(command)...)
+	return paths, opaqueWriterRe.MatchString(command)
+}
+
+// writingVerbAtRe matches one writing verb at the start of a scan position.
+var writingVerbAtRe = regexp.MustCompile(`(?i)^(?:set-content|add-content|out-file|new-item|remove-item|move-item|copy-item|rename-item|tee|touch|truncate|rmdir|rm|del|cp|mv|sed)\b`)
+
+// verbWriteTargets returns the path operands of writing verbs that appear
+// outside quotes. Scanning quote-aware, rather than stripping quotes first,
+// keeps a quoted target (`Set-Content -Path "test/x"`) visible while a verb
+// merely mentioned inside a script string is ignored.
+func verbWriteTargets(s string) []string {
+	var paths []string
+	for i := 0; i < len(s); {
+		switch c := s[i]; c {
+		case '\'', '"':
+			quote := c
+			i++
+			for i < len(s) && s[i] != quote {
+				if quote == '"' && s[i] == '\\' && i+1 < len(s) {
+					i++
+				}
+				i++
+			}
+			i++
+			continue
+		}
+		boundary := i == 0 || !isWordChar(s[i-1])
+		if boundary {
+			if loc := writingVerbAtRe.FindStringIndex(s[i:]); loc != nil {
+				verb := strings.ToLower(s[i : i+loc[1]])
+				verbEnd := i + loc[1]
+				j := verbEnd
+				for j < len(s) && !strings.ContainsRune("\n;|&<>", rune(s[j])) {
+					j++
+				}
+				tail := s[verbEnd:j]
+				// sed only writes with an in-place flag.
+				if verb != "sed" || sedInPlaceRe.MatchString(tail) {
+					paths = append(paths, splitArgs(tail)...)
+				}
+				i = j
+				continue
+			}
+		}
+		i++
+	}
+	return paths
+}
+
+func isWordChar(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// redirectWriteTargets returns the destinations of unquoted `>`/`>>`/`>|`
+// redirections. A `>` inside quotes is script text, and `=>`/`>=`/`2>&1` name
+// no file, so a read-only probe that compares values does not look like a write.
+func redirectWriteTargets(s string) []string {
+	var targets []string
+	for i := 0; i < len(s); {
+		switch c := s[i]; c {
+		case '\'', '"':
+			quote := c
+			i++
+			for i < len(s) && s[i] != quote {
+				if quote == '"' && s[i] == '\\' && i+1 < len(s) {
+					i++
+				}
+				i++
+			}
+			i++
+		case '>':
+			if i > 0 && s[i-1] == '=' { // `=>`
+				i++
+				continue
+			}
+			j := i + 1
+			if j < len(s) && (s[j] == '>' || s[j] == '|') {
+				j++
+			}
+			for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+				j++
+			}
+			if j < len(s) && (s[j] == '\'' || s[j] == '"') {
+				quote := s[j]
+				k := j + 1
+				for k < len(s) && s[k] != quote {
+					if quote == '"' && s[k] == '\\' && k+1 < len(s) {
+						k++
+					}
+					k++
+				}
+				if target := s[j+1 : k]; target != "" && !isNullDevice(target) {
+					targets = append(targets, target)
+				}
+				i = k + 1
+				continue
+			}
+			k := j
+			for k < len(s) && !strings.ContainsRune(" \t\n;|&<>()", rune(s[k])) {
+				k++
+			}
+			target := s[j:k]
+			// `2>&1` duplicates a descriptor; `>=` compares.
+			if target != "" && !strings.HasPrefix(target, "&") && !strings.HasPrefix(target, "=") && !isNullDevice(target) {
+				targets = append(targets, target)
+			}
+			i = k
+		default:
+			i++
+		}
+	}
+	return targets
+}
+
+// isNullDevice reports whether a redirection discards output. Writing to the
+// null device cannot rewrite a workspace file, so a check like `... 2>/dev/null`
+// must not read as an edit.
+func isNullDevice(path string) bool {
+	switch strings.ToLower(strings.TrimSpace(path)) {
+	case "/dev/null", "nul", "nul:", "$null":
+		return true
+	}
+	return false
+}
+
+// gitRestoreRe matches history commands that can overwrite working files.
+var gitRestoreRe = regexp.MustCompile(`(?i)\bgit\s+(?:checkout|restore|reset|clean|apply)\b`)
+
+// inlineWriteRe matches the write operations an inline interpreter script can
+// perform. A validator probe that only reads — `node -e "import('x')"` — must
+// not be refused just because it names an interpreter inline.
+var inlineWriteRe = regexp.MustCompile(`(?i)(?:writefilesync|appendfilesync|createwritestream|fs\.write|writefile|write_text|write_bytes|truncate|rename|unlink|rmdir|mkdir)|open\([^)]*['"][wa]`)
+
+// validatorShellWrites reports whether a validator/supervisor shell command can
+// rewrite a file. It is deliberately narrower than queueShellWrite: the editing
+// roles may run read-only probes, so an inline interpreter is only refused when
+// its script actually writes, and a redirect only when it has a real target.
+func validatorShellWrites(command string) bool {
+	paths, opaque := writeCandidates(command)
+	if !opaque {
+		// A recognised writer with a real target, or sed -i, is a rewrite.
+		return len(paths) > 0
+	}
+	// Opaque inline script or VCS command: refuse when it writes.
+	if gitRestoreRe.MatchString(command) {
+		return true
+	}
+	return inlineWriteRe.MatchString(strings.ToLower(command))
 }
 
 // splitArgs breaks a command into candidate path arguments, cutting on shell
@@ -228,5 +430,3 @@ func packageSpecifier(token string) bool {
 	// A scoped package is exactly `@scope/name`, optionally `@version`.
 	return strings.Count(token, "/") == 1
 }
-
-var queueShellWrite = regexp.MustCompile(`(?i)(?:\b(?:sed\s+-i|perl\s+-(?:\w*i|e)|(?:python\S*|node|ruby)\s+(?:-c|-e|--eval)|(?:set-content|add-content|out-file|remove-item|move-item|copy-item|rm|mv|cp|tee|touch|truncate|apply_patch)\s)|\b(?:writefile|write_text|write_bytes)\b|\bgit\s+(?:checkout|restore|reset|clean|apply)\b)`)

@@ -167,7 +167,13 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     // without concluding is not making progress, and without this bound a task
     // could sit in VERIFYING indefinitely, so the queue would never reach its
     // end. On expiry the task is blocked for a person and the run moves on.
-    const ceilingMs = Math.max(30, this.cfg<number>('queue.verificationMaxSeconds', 180)) * 1000;
+    //
+    // It must outlast a legitimate verification: one shell step may run up to
+    // ten minutes (see verificationPlan's timeoutMs ceiling), and a plan plus
+    // its report is two model turns on top of that. A 180s default abandoned
+    // such reviews mid-step and blocked tasks that were about to pass, so the
+    // default now covers a slow step and the turns around it.
+    const ceilingMs = Math.max(30, this.cfg<number>('queue.verificationMaxSeconds', 900)) * 1000;
     const overTime = r.startedAt !== undefined && Date.now() - r.startedAt >= ceilingMs;
     const stalledPlanner = r.lastModelOutputAt !== undefined &&
       Date.now() - r.lastModelOutputAt >= Math.min(this.silentMs, DECOMPOSITION_OUTPUT_IDLE_MS);

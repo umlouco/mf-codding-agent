@@ -8,7 +8,7 @@ const { createHost } = require('./headless-host.cjs');
 const usage = { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 };
 const step = { id: 'scan', requirement: 'Check the assigned template tokens', kind: 'shell',
   command: 'grep -n legacy frontend.vue', expectExitCode: 0, dependsOn: [] };
-const plan = { version: 1, commandDisposition: 'none', reason: 'No saved adapter.',
+const plan = { version: 1, reason: 'No saved adapter.',
   preservedAssertions: ['Keep every assigned check.'], steps: [step], remaining: [] };
 const report = conclusion => JSON.stringify({ validation: { conclusion, summary: 'Checked scoped requirements.',
   implementationEvidence: 'scan: recorded source inspection', behaviorEvidence: 'scan: recorded output',
@@ -16,8 +16,7 @@ const report = conclusion => JSON.stringify({ validation: { conclusion, summary:
   remaining: conclusion === 'PASS' ? '' : 'Additional scoped evidence is required.' } });
 const parts = ['Scan layout tokens', 'Scan component tokens'].map(title => ({ title,
   description: `${title}; preserve existing implementation and record exact read-only evidence.`,
-  implVerifyPrompt: `Check scoped commands for ${title}.`, solutionVerifyPrompt: `Confirm outputs for ${title}.`,
-  solutionVerifyCommand: '' }));
+  solutionVerifyPrompt: `Confirm outputs for ${title}.` }));
 
 test('verification interaction budget', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mf-verification-budget-'));
@@ -62,8 +61,8 @@ test('verification interaction budget', async t => {
     calls = 0; tools = []; replies = []; provider = undefined;
     const queue = TaskQueue.open(file);
     queue.insert({ title: 'Task 45: read-only validation', description: 'Scan scoped Vue tokens.',
-      implVerifyPrompt: 'Inspect all assigned templates.', solutionVerifyPrompt: 'Record exact outputs.',
-      solutionVerifyCommand: '', status: 'VERIFYING', output: 'Existing implementation handoff.' }, 45);
+      solutionVerifyPrompt: 'Record exact outputs.',
+      status: 'VERIFYING', output: 'Existing implementation handoff.' }, 45);
     queue.setRunState('RUNNING');
     const logs = [];
     const runner = new Orchestrator(host.context, { appendLine: line => logs.push(line) }, queue);
@@ -74,7 +73,7 @@ test('verification interaction budget', async t => {
     return { queue, runner, task, logs, close() { runner.dispose(); queue.close(); } };
   }
   const verify = (f, budget) => runVerification(host.context, host.output, f.task, '',
-    undefined, undefined, undefined, '', undefined, budget);
+    undefined, undefined, undefined, '', budget);
 
   try {
     await t.test('normal plan/report costs two interactions, not one per host tool', async () => {

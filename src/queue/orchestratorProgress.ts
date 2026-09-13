@@ -6,7 +6,6 @@ import { appendAttempt, Review } from './orchestratorState';
 import { OrchestratorRemediation } from './orchestratorRemediation';
 import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, recoverySucceeded, recoveryReplayLimit } from './recovery';
 import { isLocalScope } from './scopeContract';
-import { runVerificationCommand } from './command';
 
 export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
@@ -61,7 +60,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (supervisor_repair_required)`) &&
         /queue ownership: the supervisor (?:must rewrite existing test|owns test rewrites)/.test(task.output)) {
       if (this.queue.countEvents(task.id, 'test-repair-started') > 0) {
-        this.blockForHuman(task, `The executor encountered the same test-ownership blocker after a supervisor repair. Splitting is disabled; a person must resolve the application/test ownership conflict.\n${task.output}`);
+        this.requestFailureDecomposition(task, `The executor encountered the same test-ownership blocker after a supervisor repair. Split the application and test work instead of repeating that repair.\n${task.output}`);
         return;
       }
       await this.repairTests(task, `The executor was blocked from rewriting a supervisor-owned test. Complete the assigned test correction yourself.\n${task.output}`);
@@ -109,8 +108,8 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
             const current = this.queue.get(task.id);
             if (!current || !['EXECUTING', 'VERIFYING'].includes(current.status) ||
                 current.attempts !== task.attempts || current.startedAt !== task.startedAt ||
-                current.description !== task.description || current.implVerifyPrompt !== task.implVerifyPrompt ||
-                current.solutionVerifyPrompt !== task.solutionVerifyPrompt || current.solutionVerifyCommand !== task.solutionVerifyCommand) {
+                current.description !== task.description ||
+                current.solutionVerifyPrompt !== task.solutionVerifyPrompt) {
               throw new Error('Task contract changed during requirements comparison; obtain a fresh review.');
             }
             task = current;
@@ -179,8 +178,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     if (!correction) return false;
     this.queue.log(task.id, 'supervisor', 'testing-target-corrected', JSON.stringify({
       configuredUrl: this.queue.testingUrl, previous: {
-        description: task.description, implVerifyPrompt: task.implVerifyPrompt,
-        solutionVerifyPrompt: task.solutionVerifyPrompt, solutionVerifyCommand: task.solutionVerifyCommand,
+        description: task.description, solutionVerifyPrompt: task.solutionVerifyPrompt,
       },
     }));
     this.stopForDecision(task, { ...correction, status: 'PENDING', validationReport: '', finishedAt: null,
@@ -204,7 +202,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
   protected async repairTests(task: Task, reason: string): Promise<void> {
     if (this.queue.countEvents(task.id, 'test-repair-halted') > 0) {
-      this.blockForHuman(task, `A previous supervisor test repair halted. Splitting is disabled; a person must take over the exhausted repair.\n${reason}`);
+      this.requestFailureDecomposition(task, `A previous supervisor test repair halted. Replace this task rather than restarting the exhausted repair.\n${reason}`);
       return;
     }
     // Replace the completed decision's worker without releasing the current
@@ -231,17 +229,12 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         errorLog:appendAttempt(current.errorLog,
         `[attempt ${task.attempts}] supervisor test repair halted: ${failure}`)});
       this.queue.log(task.id,'supervisor','test-repair-halted',failure);
-      this.blockForHuman(this.queue.get(task.id)!, failure);
+      this.requestFailureDecomposition(this.queue.get(task.id)!, failure);
     };
     try {
       const observe=this.observerEvents(task.id,'supervisor',live,()=>review.gen===this.reviewGen);
-      // Give the repair model the real failure first, rather than asking it
-      // to guess a syntax or selector defect from a truncated file preview.
-      const before=task.solutionVerifyCommand.trim() ? await runVerificationCommand(
-        this.context,task.solutionVerifyCommand,observe,
-        abort=>{if(review.gen!==this.reviewGen){abort();return;}review.abort=abort;},
-        a=>{if(review.gen!==this.reviewGen)return;review.lastActivityAt=a.at;live.activity(a);},
-      ) : '(No command supplied; inspect the reported failure before changing the test.)';
+      // No saved command exists to run; the repair model must read the reported
+      // failure itself before rewriting the defective test or harness.
       if(review.gen!==this.reviewGen)return;
       const result = await runOnce(this.context,this.output,'supervisor',
         `You are the SUPERVISOR and own test repairs. The executor has been stopped.\n` +
@@ -252,8 +245,8 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         `Return a factual handoff listing changed files and observed checks. Independent verification follows; you cannot approve your own repair.\n\n` +
         `${this.queue.contextInstructions}\nOriginal goal: ${this.queue.getMeta('goal')}\n` +
         `Task: ${task.title}\n${task.description}\n${task.splitScope || ''}\n` +
-        `Implementation check: ${task.implVerifyPrompt}\nBehavior check: ${task.solutionVerifyPrompt}\nCommand: ${task.solutionVerifyCommand}\n` +
-        `Observed check BEFORE repair (not validation of your changes):\n${before}\n` +
+        `Behavior check: ${task.solutionVerifyPrompt}\n` +
+        `Observed check BEFORE repair: (no saved command; read the reported failure and the current files before changing the test.)\n` +
         `Fix the concrete reported failure first. Do not make identical old/new edits or cosmetic selector changes.\n` +
         `Repair requested: ${reason}\nPrevious evidence: ${task.output.slice(0,8000)}`, {
           allowTestEdits:true,
@@ -299,7 +292,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     const task = this.queue.get(id);
     if (!task || task.status === 'VERIFIED') throw new Error('Select an unfinished task to split.');
     if (!Array.isArray(parts) || parts.length < 2 || parts.some(p => !p?.title?.trim() ||
-        !p.description?.trim() || (!p.solutionVerifyPrompt?.trim() && !p.solutionVerifyCommand?.trim()))) {
+        !p.description?.trim() || !p.solutionVerifyPrompt?.trim())) {
       throw new Error('Supply at least two complete smaller steps, each with its own behavior check.');
     }
     // Keep the original acceptance check after the smaller implementation steps.
@@ -307,9 +300,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     const acceptance: NewTask = {
       title: `Final acceptance: ${task.title}`,
       description: `Verify the assembled work from the preceding split steps against every requirement below. Preserve their implementation; repair only concrete remaining failures.\n\n${task.description}`,
-      implVerifyPrompt: task.implVerifyPrompt,
       solutionVerifyPrompt: task.solutionVerifyPrompt || task.description,
-      solutionVerifyCommand: task.solutionVerifyCommand,
     };
     if (this.review?.taskId === id) this.abandonReview();
     // Persist the replacement obligation before SQL: a crash must not requeue the old parent.
@@ -318,7 +309,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     try { count = this.queue.splitTask(id, [...parts, acceptance], true); }
     catch (error) {
       const current = this.queue.get(id);
-      if (current) this.blockForHuman(current, `Replacement could not be committed: ${String(error)}`);
+      if (current) this.requestFailureDecomposition(current, `Replacement could not be committed: ${String(error)}`);
       throw error;
     }
     this.reviewed.delete(id);
@@ -335,9 +326,8 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     const task = this.queue.get(snapshot.id);
     if (!task || !['EXECUTING', 'VERIFYING'].includes(task.status) ||
         task.status !== snapshot.status || task.startedAt !== snapshot.startedAt || task.attempts !== snapshot.attempts ||
-        task.description !== snapshot.description || task.implVerifyPrompt !== snapshot.implVerifyPrompt ||
-        task.solutionVerifyPrompt !== snapshot.solutionVerifyPrompt ||
-        task.solutionVerifyCommand !== snapshot.solutionVerifyCommand) {
+        task.description !== snapshot.description ||
+        task.solutionVerifyPrompt !== snapshot.solutionVerifyPrompt) {
       this.log(`task ${snapshot.seq} moved while its progress was reviewed; action ignored`);
       return;
     }
@@ -360,7 +350,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     }
 
     if (decision.action === 'STOP_AND_DECOMPOSE_TASK') {
-      this.blockForHuman(task, `Supervisor asked to decompose this task; decomposition on failure is disabled. ${decision.reason}`);
+      await this.replanOrPause(task, decision.reason);
       return;
     }
     if (isLocalScope(task) && ['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION'].includes(decision.action)) {
@@ -376,7 +366,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         await this.repairTests(task, decision.guidance || decision.reason);
         return;
       case 'SPLIT_TASK':
-        this.blockForHuman(task, decision.reason || 'Supervisor requested a split, which is disabled.');
+        this.requestFailureDecomposition(task, decision.reason || 'Supervisor requested decomposition.');
         return;
       case 'CONTINUE_EXECUTION':
         if (task.status === 'VERIFYING' && !task.validationReport.trim()) {
@@ -410,9 +400,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         if (!this.stopForDecision(task, {
           status: 'PENDING',
           description,
-          implVerifyPrompt: decision.implVerifyPrompt ?? task.implVerifyPrompt,
           solutionVerifyPrompt: decision.solutionVerifyPrompt ?? task.solutionVerifyPrompt,
-          solutionVerifyCommand: decision.solutionVerifyCommand ?? task.solutionVerifyCommand,
           validationReport: '',
           finishedAt: null,
           supervisorFeedback: decision.reason,
@@ -426,7 +414,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       }
 
       case 'STOP_AND_REWRITE_VALIDATION': {
-        const hasRewrite = (['implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const)
+        const hasRewrite = (['solutionVerifyPrompt'] as const)
           .some((field) => decision[field] !== undefined && decision[field]!.trim() !== task[field].trim());
         if (!hasRewrite) {
           throw new Error('The supervisor requested a validation rewrite without changed checks. Preserve the task and request a complete decision; do not run the rejected checks.');
@@ -434,9 +422,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
         if (!this.stopForDecision(task, {
           status: 'PENDING',
-          implVerifyPrompt: decision.implVerifyPrompt ?? task.implVerifyPrompt,
           solutionVerifyPrompt: decision.solutionVerifyPrompt ?? task.solutionVerifyPrompt,
-          solutionVerifyCommand: decision.solutionVerifyCommand ?? task.solutionVerifyCommand,
           validationReport: '',
           finishedAt: null,
           supervisorFeedback: decision.reason,

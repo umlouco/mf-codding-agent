@@ -83,10 +83,8 @@ Own the implementation. Run ordinary development checks while you work, but do
 not make the final verification decision. A supervisor watches your database
 journal and will start a separate execution LLM to perform formal verification.
 
-Verification requirements:
-- Implementation check: ${task.implVerifyPrompt || 'the described code exists and is coherent'}
-- Behaviour check: ${task.solutionVerifyPrompt || 'the described behaviour works'}
-${task.solutionVerifyCommand ? `- This command must exit 0: \`${task.solutionVerifyCommand}\`` : ''}
+Expected behaviour (the verifier will test this against what you actually produced):
+${task.solutionVerifyPrompt || 'the described behaviour works'}
 
 Rules:
 ${codingWorkflow}

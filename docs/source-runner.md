@@ -19,6 +19,34 @@ to the run command. Supply its API key through `MFAGENT_WORKER_API_KEY`.
 Phase exploration, scope plans and failure replacement plans use the planner profile; ordinary supervisor decisions and
 independent verification reasoning use the worker profile. CLI planning defaults
 to medium effort, configurable with `--effort`.
+
+`--worker-all` binds planner and supervisor to the same HTTP worker as execution,
+so a run does not depend on the Claude CLI account (its monthly spend limit
+otherwise stops planning and supervision mid-run). The worker endpoint, model and
+key are also auto-detected from `MFAGENT_WORKER_URL/MODEL/API_KEY`,
+`OPENROUTER_API_KEY` or `OPENAI_API_KEY`, and `repo/.env` is loaded for missing
+keys. `run` refuses to start when planner, supervisor or executor has no usable
+provider, and a configuration or authentication fault stops the run instead of
+being read as a failed task that earns endless decomposition.
+
+## Local WordPress on XAMPP
+
+`scripts/wp-xampp.cjs` takes the fragile local-setup work away from the model.
+It uses `C:\www\php\php.exe` and `C:\www\mysql\bin\mysql.exe` (root, no password):
+
+```powershell
+node scripts/wp-xampp.cjs bootstrap --site C:\www\htdocs\site --url http://localhost/site
+node scripts/wp-xampp.cjs probe     --site C:\www\htdocs\site --url http://localhost/site
+node scripts/wp-xampp.cjs activate  --site C:\www\htdocs\site --plugin mf-newsletter
+```
+
+`bootstrap` creates the database, writes a working `wp-config.php`, installs
+WordPress only when the tables are absent, ensures an administrator and sample
+posts, and fails unless the site serves a non-empty page. It is idempotent. When
+a run's workspace contains `wp-load.php`, the source host injects these exact
+facts and commands into the planning, supervision and execution prompts, and the
+generated admin password is available through `MFAGENT_CREDENTIAL_PASSWORD` and
+`<site>/.mfagent/wp-admin.json`.
 Model responses have no elapsed-time deadline. Planning, supervision and verification
 wait for completion or an explicit stop request. The source host also disables the
 transport idle timeout; activity heartbeats continue while the model is working.

@@ -13,6 +13,14 @@ export interface DecompositionJob {
   awaitingChange: boolean;
   lastError: string;
   invalidPlan: string;
+  /**
+   * Consecutive verification-stall decompositions in this family, computed once
+   * when the job is created. It must not advance per planning *attempt*: a
+   * single stuck decomposition that is retried a few times is still one
+   * decomposition, and counting each attempt tripped the rebuild escalation
+   * after three tries on what was really the first split.
+   */
+  streak?: number;
 }
 
 export const decompositionKey = (task: Task) => `failureDecomposition:v1:${task.id}:${task.createdAt}`;

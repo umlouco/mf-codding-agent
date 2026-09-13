@@ -1,4 +1,4 @@
-import * as vscode from 'vscode';
+﻿import * as vscode from 'vscode';
 import { createHash } from 'crypto';
 import { extractJson, runOnce } from './agents';
 import { taskCognition } from './cognition';
@@ -91,8 +91,8 @@ export class ScopeSupervisor {
       if (root && !scopeBoundary(snapshot)) {
         const repository = indexRepository(root);
         const key = 'workInventory:' + createHash('sha256').update(JSON.stringify([task.id, task.createdAt,
-          snapshot.description, snapshot.implVerifyPrompt, snapshot.solutionVerifyPrompt,
-          snapshot.solutionVerifyCommand, ownerContext, repository.fingerprint])).digest('hex');
+          snapshot.description, snapshot.solutionVerifyPrompt,
+          ownerContext, repository.fingerprint])).digest('hex');
         const cached = queue.getMeta(key);
         if (cached) inventory = JSON.parse(cached);
         else {
@@ -118,7 +118,7 @@ export class ScopeSupervisor {
         }
         if (!this.current()) return false;
         const latest = queue.get(task.id);
-        if (!latest || (['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const)
+        if (!latest || (['description', 'solutionVerifyPrompt'] as const)
           .some(field => latest[field] !== snapshot[field]) ||
           ownerContext !== JSON.stringify([queue.getMeta('goal'), queue.contextInstructions])) {
           throw Error('Contract changed during discovery; inventory cannot authorize work.');
@@ -163,7 +163,7 @@ export class ScopeSupervisor {
         throw new Error('Owner requirements changed during scope review; obtain a fresh assessment.');
       }
       const latest = queue.get(task.id);
-      if (!latest || (['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const)
+      if (!latest || (['description', 'solutionVerifyPrompt'] as const)
         .some(key => latest[key] !== snapshot[key])) {
         throw new Error('Task contract changed during scope review; obtain a fresh assessment.');
       }

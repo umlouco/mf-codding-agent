@@ -62,8 +62,8 @@ export function parseScopeAssessment(raw: any, task: Task, inventory?: WorkInven
     if (!Array.isArray(p.covers) || !p.covers.length || p.covers.some((c: unknown) => !requirements.has(c as string))) {
       throw new Error(`Part ${key} must cover known original requirements.`);
     }
-    if (typeof p.solutionVerifyCommand !== 'string' || typeof p.integration !== 'boolean') {
-      throw new Error(`Part ${key} requires a command (possibly empty) and integration boolean.`);
+    if (typeof p.integration !== 'boolean') {
+      throw new Error(`Part ${key} requires an integration boolean.`);
     }
     return {
       key, dependsOn: [...new Set<string>(p.dependsOn)], covers: p.covers,
@@ -71,9 +71,7 @@ export function parseScopeAssessment(raw: any, task: Task, inventory?: WorkInven
       workUnit: typeof p.workUnit === 'string' ? p.workUnit : '',
       integration: p.integration, handoff: required(p.handoff, `${key} progress handoff`),
       title: required(p.title, `${key} title`), description: required(p.description, `${key} description`),
-      implVerifyPrompt: required(p.implVerifyPrompt, `${key} implementation checks`),
       solutionVerifyPrompt: required(p.solutionVerifyPrompt, `${key} behavior checks`),
-      solutionVerifyCommand: p.solutionVerifyCommand.trim(),
     };
   });
   const keys = new Set(parts.map(p => p.key));
@@ -100,16 +98,13 @@ export function parseScopeAssessment(raw: any, task: Task, inventory?: WorkInven
   const integrations = parts.filter(p => p.integration);
   if (integrations.length !== 1) throw new Error('SPLIT requires exactly one final integration/check task.');
   const integration = integrations[0];
-  if (inventory?.strategy === 'enumerate') for (const field of ['description', 'implVerifyPrompt', 'solutionVerifyPrompt'] as const) {
+  if (inventory?.strategy === 'enumerate') for (const field of ['description', 'solutionVerifyPrompt'] as const) {
     if (task[field]?.trim() && integration[field] !== task[field]) {
       throw Error(`The final acceptance gate must preserve the original ${field} unchanged.`);
     }
   }
   // The final gate follows every slice, including independent branches.
   integration.dependsOn = parts.filter(p => p !== integration).map(p => p.key);
-  if (task.solutionVerifyCommand.trim() !== integration.solutionVerifyCommand) {
-    throw new Error('The final integration task must preserve the original required command intact.');
-  }
   const ordered: ScopePart[] = [];
   const done = new Set<string>();
   while (ordered.length < parts.length) {
@@ -134,14 +129,13 @@ export function replacementTasks(assessment: ScopeAssessment, task: Task, archiv
       'Retain completed changes and existing tests; implement only this slice\'s remaining work. ' +
       'Do not revert unrelated or partially finished work. A split is not proof of completion.\n' +
       `Prerequisite slices: ${part.dependsOn.join(', ') || '(none)'}.`,
-    implVerifyPrompt: part.implVerifyPrompt, solutionVerifyPrompt: part.solutionVerifyPrompt,
-    solutionVerifyCommand: part.solutionVerifyCommand, maxAttempts: task.maxAttempts,
+    solutionVerifyPrompt: part.solutionVerifyPrompt, maxAttempts: task.maxAttempts,
     kind: 'task' as const,
     };
     // Accepted requirements belong to this scheduled outcome. Recovery may change
     // the approach, not turn a child back into its retired parent's whole job.
-    const contract = { description: ticket.description, implVerifyPrompt: ticket.implVerifyPrompt,
-      solutionVerifyPrompt: ticket.solutionVerifyPrompt, solutionVerifyCommand: ticket.solutionVerifyCommand };
+    const contract = { description: ticket.description,
+      solutionVerifyPrompt: ticket.solutionVerifyPrompt };
     return { ...ticket, region: JSON.stringify({ scopeSplit: { archiveKey, key: part.key,
       targets: part.targets ?? [], workUnit: part.workUnit || '', integration: part.integration, contract } }) };
   });

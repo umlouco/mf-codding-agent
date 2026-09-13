@@ -207,8 +207,14 @@ export abstract class OrchestratorState {
   protected abstract correctTestingTarget(task: Task): boolean;
   protected abstract repairTests(task: Task, reason: string): Promise<void>;
   /**
-   * Terminal failure policy: a task the queue cannot complete is blocked for a
-   * person. It is never split into smaller tasks — see orchestratorDecomposition.
+   * A task the queue cannot complete is replaced by the configured planner: the
+   * supervisor requests its complete replacement, which is committed atomically
+   * and retires the original row — see orchestratorDecomposition.
+   */
+  protected abstract requestFailureDecomposition(task: Task, reason: string): void;
+  /**
+   * Terminal exit for a run-wide condition no replacement can fix: the row is
+   * marked BLOCKED and the run continues with the remaining list.
    */
   protected abstract blockForHuman(task: Task, reason: string): void;
   protected abstract serviceFailureDecomposition(task: Task): Promise<boolean>;

@@ -70,12 +70,8 @@ ${task.description}
 
 ${task.splitScope || ''}
 
-Required implementation check:
-${task.implVerifyPrompt || 'the described code exists and is coherent'}
-
 Required behaviour check:
 ${task.solutionVerifyPrompt || 'the described behaviour works'}
-${task.solutionVerifyCommand ? `Required command: ${task.solutionVerifyCommand}` : ''}
 
 INDEPENDENT VERIFICATION AGENT'S REPORT, READ FROM THE DATABASE:
 ${validationForSupervisor(task.validationReport)}
@@ -95,8 +91,8 @@ Reply with ONE JSON object and nothing else:
   "verdict": "RETRY",
   "feedback": "why the stored validation is or is not sufficient",
   "splitInto": [],
-  "taskEdits": [{ "seq": ${task.seq}, "description": "...", "implVerifyPrompt": "...",
-                  "solutionVerifyPrompt": "...", "solutionVerifyCommand": "..." }]
+  "taskEdits": [{ "seq": ${task.seq}, "description": "...",
+                  "solutionVerifyPrompt": "..." }]
 }
 
 Set verdict to VERIFIED, REVERIFY, RETRY, SPLIT, or REPAIR_TESTS. Choose REPAIR_TESTS when an existing
@@ -114,11 +110,11 @@ Choose VERIFIED only when the verification agent concluded PASS and its database
 concrete implementation and behaviour evidence plus successful required commands/tests. Do not
 independently repeat the checks. Choose REVERIFY when the verifier must finish checks, correct its invocation, authenticate at the
 supplied URL, or complete its report. Put the exact missing checks in feedback and leave splitInto
-empty. Always leave taskEdits empty for REVERIFY, including malformed saved commands. The independent
-verifier compiles a disposable host-executed plan and diagnoses adapters without editing task rows.
-Preserve the assigned acceptance criteria and genuine owner-required assertions. Tool names are RPC
-capabilities, not shell executables. Put the observed adapter problem in feedback, never replace the
-saved command or the admitted scope baseline. A report format problem
+empty. Always leave taskEdits empty for REVERIFY. The independent
+verifier derives its own host-executed checks from the executor's output and the behavior
+description without editing task rows. Preserve the assigned acceptance criteria and genuine
+owner-required assertions. Tool names are RPC capabilities, not shell executables. Put the
+observed checking problem in feedback. A report format problem
 must not be converted into new product requirements, a tool-call quota, or a requirement to
 produce a particular table. Choose RETRY when evidence identifies changes the executor must make;
 include a materially rewritten description for task ${task.seq}. Choose SPLIT when
@@ -256,9 +252,7 @@ Do not duplicate the parent, repeat a rejected approach, weaken acceptance, or m
         {
           seq: task.seq,
           description: repair.description,
-          implVerifyPrompt: repair.implVerifyPrompt || own?.implVerifyPrompt,
           solutionVerifyPrompt: repair.solutionVerifyPrompt || own?.solutionVerifyPrompt,
-          solutionVerifyCommand: repair.solutionVerifyCommand || own?.solutionVerifyCommand,
         },
       ],
       escalated: exhausted,
@@ -284,7 +278,6 @@ Do not duplicate the parent, repeat a rejected approach, weaken acceptance, or m
       {
         seq: task.seq,
         description: appendCorrection(task, feedback || repair.feedback),
-        solutionVerifyCommand: own?.solutionVerifyCommand,
       },
     ],
     escalated: exhausted,

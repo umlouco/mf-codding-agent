@@ -37,11 +37,24 @@ export const recoveryKey = (task: Task) => `recovery:v1:${task.id}:${task.create
  * serviceFailureDecomposition() in orchestratorDecomposition.ts.
  */
 export function providerUnavailable(message: string): boolean {
-  return /^cannot reach |dial tcp|lookup [\w.-]+:|no such host|connectex:|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|network is unreachable|fetch failed|socket hang up|spend limit|rate.?limit|\btoo many requests\b|\b429\b|\b529\b|\boverloaded\b/i
+  return /^cannot reach |dial tcp|lookup [\w.-]+:|no such host|connectex:|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|network is unreachable|fetch failed|socket hang up|spend limit|rate.?limit|\btoo many requests\b|\b429\b|\b529\b|\boverloaded\b|payment required|insufficient (?:credit|credits|funds|quota|balance)|requires more credits|\b402\b/i
     .test(message);
 }
-const contract = (task: Task) => digest(JSON.stringify([task.description, task.implVerifyPrompt,
-  task.solutionVerifyPrompt, task.solutionVerifyCommand]));
+
+/**
+ * A role bound to no usable provider (or one that cannot serve it) is an
+ * environment fault, not a transient outage and not evidence about the task.
+ * Retrying it just repeats the same error, and treating it as a failed
+ * verification earns a decomposition — which is how one misconfigured run
+ * rewrote the same task forever. Callers must stop the run and say what to
+ * configure instead.
+ */
+export function providerConfigurationError(message: string): boolean {
+  return /no supported provider is configured for the .* role|select a provider for this role|http 401\b|unauthori[sz]ed|invalid api key|no cookie auth credentials/i
+    .test(message);
+}
+const contract = (task: Task) => digest(JSON.stringify([task.description,
+  task.solutionVerifyPrompt]));
 const fresh = (): RecoveryState => ({ version: 1, cursor: 0, revision: 0, seen: [], repeats: 0,
   recoveries: 0, unchanged: 0, checkpoint: 0, failures: {} });
 

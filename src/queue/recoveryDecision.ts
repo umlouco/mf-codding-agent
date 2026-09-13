@@ -51,8 +51,8 @@ export function recoveryOperation(decision: RecoveryDecision): unknown {
   const canonical = (value: any): any => Array.isArray(value) ? value.map(canonical) :
     object(value) ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
   return canonical({ action: decision.action, operation: decision.nextOperation,
-    replacements: decision.splitInto?.map(part => [part.description, part.implVerifyPrompt,
-      part.solutionVerifyPrompt, part.solutionVerifyCommand]) });
+    replacements: decision.splitInto?.map(part => [part.description,
+      part.solutionVerifyPrompt]) });
 }
 
 /** One bounded, evidence-fed decision. Bad output is deferred by the scheduler, not retried here. */
@@ -67,8 +67,8 @@ If the host supplies checkAuthority provenance, its generated adapter is NOT own
 Do not require obsolete adapter-only assertions or unfinished sibling work to pass this task.
 
 ASSIGNED TASK (immutable acceptance; unfinished siblings are not this task):
-${JSON.stringify({ kind: task.kind, title: task.title, description: task.description, implementation: task.implVerifyPrompt,
-    behavior: task.solutionVerifyPrompt, savedCheckAdapter: task.solutionVerifyCommand })}
+${JSON.stringify({ kind: task.kind, title: task.title, description: task.description,
+    behavior: task.solutionVerifyPrompt })}
 
 HOST EVIDENCE AND RECOVERY HISTORY:
 ${evidence}
@@ -91,8 +91,8 @@ No taskEdits, acceptance rewrites, reset counters, rollback, or PASS action exis
 Reply ONE JSON object:
 {"action":"VERIFY","reason":"specific observed failure","guidance":"self-contained changed approach",
  "nextOperation":{"tool":"actual tool name","input":{}},"splitInto":[],"retryAfterSeconds":30}
-For SPLIT each entry needs title, description, implVerifyPrompt, solutionVerifyPrompt, solutionVerifyCommand
-(possibly empty). Preserve all substantive acceptance conditions and any owner-required command.`,
+For SPLIT each entry needs title, description and solutionVerifyPrompt.
+Preserve all substantive acceptance conditions.`,
   { ...opts, formatOnly: true, maxIterations: 1 });
   try { return { decision: parseRecoveryDecision(result.text, task), usage: result.usage }; }
   catch (error) {

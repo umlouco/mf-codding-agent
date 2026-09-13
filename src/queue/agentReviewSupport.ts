@@ -87,9 +87,7 @@ export interface SupervisorDecision {
   taskEdits?: {
     seq: number;
     description?: string;
-    implVerifyPrompt?: string;
     solutionVerifyPrompt?: string;
-    solutionVerifyCommand?: string;
   }[];
   /**
    * This decision was made at the attempt ceiling, so what it replaces the task

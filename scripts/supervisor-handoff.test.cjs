@@ -8,8 +8,7 @@ const { createHost } = require('./headless-host.cjs');
 const usage = { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 };
 const parts = ['Inspect headings', 'Inspect identifiers'].map(title => ({ title,
   description: `${title}; preserve the existing document and record exact evidence.`,
-  implVerifyPrompt: `Check ${title}.`, solutionVerifyPrompt: `Record ${title} evidence.`,
-  solutionVerifyCommand: '' }));
+  solutionVerifyPrompt: `Record ${title} evidence.` }));
 const decision = { verdict: 'SPLIT', feedback: 'Partition the remaining checks.', splitInto: parts, usage };
 
 test('supervisor recovery after verification handoff', async t => {
@@ -28,8 +27,8 @@ test('supervisor recovery after verification handoff', async t => {
     const file = path.join(root, '.mfagent', `handoff-${++number}.db`);
     const queue = TaskQueue.open(file);
     queue.insert({ title: 'Verify generated checklist', description: 'Inspect headings and identifiers.',
-      implVerifyPrompt: 'Inspect the existing file.', solutionVerifyPrompt: 'Record read-only evidence.',
-      solutionVerifyCommand: '', status: 'VERIFYING' }, 1);
+      solutionVerifyPrompt: 'Record read-only evidence.',
+      status: 'VERIFYING' }, 1);
     queue.setRunState('RUNNING');
     const task = queue.list()[0];
     queue.update(task.id, { output: 'Existing implementation must survive recovery.' });
@@ -168,6 +167,9 @@ test('supervisor recovery after verification handoff', async t => {
         await f.runner.tick();
         assert.equal(calls.length, 3);
         assert.equal(f.queue.get(f.task.id).activityDetail, detail);
+        // The watchdog's silence path defers rather than plans, so an exhausted
+        // no-output allowance stays VERIFYING and waits for a changed input
+        // (streak, planner/provider or workspace) instead of renewing spend.
         assert.equal(f.queue.get(f.task.id).status, 'VERIFYING');
         assert.equal(f.queue.countEvents(f.task.id, 'verification-interaction'), 2);
       } finally {
@@ -176,7 +178,7 @@ test('supervisor recovery after verification handoff', async t => {
       }
     });
 
-    await t.test('exhausted provider retries expose a blocker and survive reload without renewed spend', async () => {
+    await t.test('a provider outage never spends the decomposition allowance or blocks the task', async () => {
       const f = fixture();
       let calls = 0, reopened;
       planner.decideFailureDecomposition = async () => { calls++; throw Error('Provider monthly spend limit reached'); };
@@ -186,11 +188,16 @@ test('supervisor recovery after verification handoff', async t => {
           now += 300_000;
           await f.runner.tick();
         }
+        // The spend-limit refusal never reached the model, so it is refunded
+        // rather than counted: the same allowance is still available.
         assert.equal(calls, 3);
         assert.equal(f.runner.status().supervising, false);
         const task = f.queue.get(f.task.id);
-        assert.equal(task.activityPhase, 'decomposition_waiting');
+        assert.equal(task.activityPhase, 'decomposition_planning');
         assert.match(task.activityDetail, /spend limit/);
+        const job = recovery.readDecomposition(f.queue, task);
+        assert.equal(job.awaitingChange, false);
+        assert.ok(Object.values(job.inputs).every(value => value === 0), 'no allowance was spent on the outage');
         f.close();
         reopened = TaskQueue.open(f.file);
         const runner = new Orchestrator(host.context, host.output, reopened);
@@ -198,8 +205,8 @@ test('supervisor recovery after verification handoff', async t => {
         try {
           now += 3_600_000;
           await runner.tick();
-          assert.equal(calls, 3);
-          assert.ok(recovery.readDecomposition(reopened, reopened.get(f.task.id)).awaitingChange);
+          assert.equal(calls, 4);
+          assert.equal(recovery.readDecomposition(reopened, reopened.get(f.task.id)).awaitingChange, false);
           assert.equal(reopened.get(f.task.id).status, 'VERIFYING');
         } finally { runner.dispose(); }
       } finally { reopened?.close(); f.close(); }

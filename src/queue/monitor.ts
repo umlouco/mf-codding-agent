@@ -23,7 +23,7 @@ export function correctLocalTestingTarget(task: Task, testingUrl: string): Parti
   const target = new URL(testingUrl);
   if (['localhost', '127.0.0.1', '0.0.0.0', '[::1]'].includes(target.hostname)) return;
   const patch: Partial<Task> = {};
-  for (const field of ['description', 'implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand', 'splitScope'] as const) {
+  for (const field of ['description', 'solutionVerifyPrompt', 'splitScope'] as const) {
     const updated = (task[field] || '').replace(/https?:\/\/(?:localhost|127(?:\.\d+){3}|0\.0\.0\.0|\[::1\])(?::\d+)?(?=[/\s'"`]|$)/gi, target.origin);
     if (updated !== task[field]) patch[field] = updated;
   }
@@ -61,9 +61,7 @@ export interface ProgressDecision {
   reason: string;
   guidance?: string;
   rewrittenDescription?: string;
-  implVerifyPrompt?: string;
   solutionVerifyPrompt?: string;
-  solutionVerifyCommand?: string;
   splitInto?: NewTask[];
   usage: Usage;
 }
@@ -136,9 +134,8 @@ function normalize(raw: any, usage: Usage, task: Task, testingUrl = "", needsRec
   if (raw?.action === 'SPLIT_TASK' && hasSplitProposal && (!Array.isArray(raw.splitInto) || raw.splitInto.length < 2 ||
       raw.splitInto.some((p: any) => !p || typeof p.title !== 'string' || !p.title.trim() ||
         typeof p.description !== 'string' || !p.description.trim() ||
-        !(typeof p.solutionVerifyPrompt === 'string' && p.solutionVerifyPrompt.trim() ||
-          typeof p.solutionVerifyCommand === 'string' && p.solutionVerifyCommand.trim())))) {
-    throw new Error('SPLIT_TASK requires at least two complete splitInto parts, each with title, description and a behavior verification prompt or command.');
+        !(typeof p.solutionVerifyPrompt === 'string' && p.solutionVerifyPrompt.trim())))) {
+    throw new Error('SPLIT_TASK requires at least two complete splitInto parts, each with title, description and a behavior verification prompt.');
   }
   if (isLocalScope(task) && ['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION'].includes(raw?.action)) {
     throw new Error('A committed local execution ticket has fixed acceptance requirements. Do not rewrite it into the parent objective. Use CONTINUE_EXECUTION with concrete local recovery guidance, START_VALIDATION when ready, or STOP_AND_DECOMPOSE_TASK for remaining work within this ticket only.');
@@ -146,8 +143,8 @@ function normalize(raw: any, usage: Usage, task: Task, testingUrl = "", needsRec
   if (raw?.action === 'STOP_AND_REWRITE_TASK' && !(typeof raw.rewrittenDescription === 'string' && raw.rewrittenDescription.trim())) {
     throw new Error('STOP_AND_REWRITE_TASK requires rewrittenDescription containing the complete corrected task.');
   }
-  if (raw?.action === 'STOP_AND_REWRITE_VALIDATION' && !['implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'].some(field => typeof raw[field] === 'string')) {
-    throw new Error('STOP_AND_REWRITE_VALIDATION requires replacement verification fields.');
+  if (raw?.action === 'STOP_AND_REWRITE_VALIDATION' && !['solutionVerifyPrompt'].some(field => typeof raw[field] === 'string')) {
+    throw new Error('STOP_AND_REWRITE_VALIDATION requires a replacement behavior verification prompt.');
   }
   if (testingUrl) {
     const check = raw?.targetCheck;
@@ -165,22 +162,20 @@ function normalize(raw: any, usage: Usage, task: Task, testingUrl = "", needsRec
   const decision: ProgressDecision = {
     action,
     splitInto: action === 'SPLIT_TASK' && hasSplitProposal ? raw.splitInto.map((p: NewTask) => ({
-      title: p.title, description: p.description, implVerifyPrompt: p.implVerifyPrompt,
-      solutionVerifyPrompt: p.solutionVerifyPrompt, solutionVerifyCommand: p.solutionVerifyCommand,
+      title: p.title, description: p.description,
+      solutionVerifyPrompt: p.solutionVerifyPrompt,
     })) : undefined,
     reason: String(raw?.reason ?? '').trim() || 'The supervisor supplied no reason.',
     guidance: typeof raw?.guidance === 'string' ? raw.guidance.trim().slice(0, 8000) || undefined : undefined,
     rewrittenDescription: String(raw?.rewrittenDescription ?? '').trim() || undefined,
-    implVerifyPrompt: String(raw?.implVerifyPrompt ?? '').trim() || undefined,
     solutionVerifyPrompt: String(raw?.solutionVerifyPrompt ?? '').trim() || undefined,
-    solutionVerifyCommand: typeof raw?.solutionVerifyCommand === 'string' ? raw.solutionVerifyCommand.trim() : undefined,
     usage,
   };
   if (action === 'STOP_AND_REWRITE_TASK' && decision.rewrittenDescription === task.description.trim()) {
     throw new Error('STOP_AND_REWRITE_TASK requires changed rewrittenDescription, not the current task repeated. If only checks are wrong, use STOP_AND_REWRITE_VALIDATION with changed verification fields.');
   }
   if (action === 'STOP_AND_REWRITE_VALIDATION' &&
-      !(['implVerifyPrompt', 'solutionVerifyPrompt', 'solutionVerifyCommand'] as const)
+      !(['solutionVerifyPrompt'] as const)
         .some(field => decision[field] !== undefined && decision[field] !== task[field].trim())) {
     throw new Error('STOP_AND_REWRITE_VALIDATION requires changed verification fields, not the current checks repeated.');
   }
@@ -276,9 +271,7 @@ the failures below and the original goal. Preserve acceptance criteria, working 
 evidence. Correct tool syntax or environment assumptions before asking for implementation changes.
 A changed task or validation contract starts a fresh attempt budget.` : ''}
 
-IMPLEMENTATION VERIFICATION: ${task.implVerifyPrompt || '(not specified)'}
 BEHAVIOR VERIFICATION: ${task.solutionVerifyPrompt || '(not specified)'}
-COMMAND: ${task.solutionVerifyCommand || '(none)'}
 
 CURRENT STATE: ${state}
 CURRENT ACTIVITY: ${task.activityPhase || '(none)'} — ${task.activityDetail || '(none)'}
@@ -341,9 +334,7 @@ Reply with one JSON object. This protocol is fixed:
   "reason": "quality-based evidence for the decision",
   "guidance": "optional actionable advice for CONTINUE_EXECUTION; omit if unnecessary",
   "rewrittenDescription": "required only for STOP_AND_REWRITE_TASK",
-  "implVerifyPrompt": "replacement when rewriting validation",
-  "solutionVerifyPrompt": "replacement when rewriting validation",
-  "solutionVerifyCommand": "replacement when rewriting validation; empty only to remove an invalid command while preserving the required check"
+  "solutionVerifyPrompt": "replacement when rewriting validation"
 }
 Use one action from the list above and replace example values. Omit replacement fields unless
 that action needs them. The final response must be valid JSON, with no code fence or prose.`;
@@ -362,8 +353,7 @@ that action needs them. The final response must be valid JSON, with no code fenc
     const formatPrompt = `Correct the response format using the CURRENT TASK and decision below.
 Do not reopen the project goal, infer a different task, or investigate. Missing evidence is not a code defect.
 CURRENT TASK: ${JSON.stringify({ title: task.title, description: task.description,
-  implVerifyPrompt: task.implVerifyPrompt, solutionVerifyPrompt: task.solutionVerifyPrompt,
-  solutionVerifyCommand: task.solutionVerifyCommand, status: task.status })}
+  solutionVerifyPrompt: task.solutionVerifyPrompt, status: task.status })}
 CURRENT OWNER INSTRUCTIONS:
 ${opts.ownerInstructions || opts.projectNotes || '(none supplied)'}
 Validation problem: ${error instanceof Error ? error.message : String(error)}
@@ -375,8 +365,8 @@ the rewrite. A checks-only correction belongs in STOP_AND_REWRITE_VALIDATION. Co
 against the current task and checks before answering. No queue change has been applied yet.
 Return ONE JSON object: {"action":"CONTINUE_EXECUTION","reason":"concrete reason"}.
 Allowed action values: ${SUPERVISOR_ACTIONS.join(', ')}.
-For STOP_AND_REWRITE_TASK include complete rewrittenDescription and any changed verification fields.
-For STOP_AND_REWRITE_VALIDATION include changed implVerifyPrompt, solutionVerifyPrompt or solutionVerifyCommand.
+For STOP_AND_REWRITE_TASK include complete rewrittenDescription and any changed behavior verification prompt.
+For STOP_AND_REWRITE_VALIDATION include a changed solutionVerifyPrompt.
 For SPLIT_TASK give the concrete scope problem in reason; the configured planner generates replacement tasks.
 For test repair include guidance identifying the defect. Preserve requirements. Do not return a bare action.`;
     try {

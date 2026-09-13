@@ -36,12 +36,13 @@ export interface Task {
    * stay within. Empty for ordinary tasks.
    */
   region: string;
-  /** How the Supervisor should check the code and files actually exist as described. */
-  implVerifyPrompt: string;
-  /** How the Supervisor should judge that the solution behaves correctly. */
+  /**
+   * The behavior the supervisor's verification agent must establish. It is
+   * guidance for the checks the verifier derives, not a stored command: the
+   * verifier inspects what the execution agent actually produced and authors
+   * executable checks from that plus this description.
+   */
   solutionVerifyPrompt: string;
-  /** Shell command whose exit code decides the functional check. */
-  solutionVerifyCommand: string;
   status: TaskStatus;
   /** 1-based execution order. Gaps are allowed; the queue always sorts by this. */
   seq: number;
@@ -88,9 +89,7 @@ export type NewTask = Pick<Task, 'title' | 'description'> &
   Partial<
     Pick<
       Task,
-      | 'implVerifyPrompt'
       | 'solutionVerifyPrompt'
-      | 'solutionVerifyCommand'
       | 'seq'
       | 'maxAttempts'
       | 'status'
@@ -100,7 +99,7 @@ export type NewTask = Pick<Task, 'title' | 'description'> &
   >;
 
 export type TaskEditFields = Pick<Task,
-  'title' | 'description' | 'implVerifyPrompt' | 'solutionVerifyPrompt' | 'solutionVerifyCommand'>;
+  'title' | 'description' | 'solutionVerifyPrompt'>;
 
 /** A planner proposal refers to positions in the snapshot it was given. */
 export interface TaskEditPlan {
@@ -164,9 +163,7 @@ export interface LogRow {
 
 export const COLUMNS = `
   id, title, description,
-  impl_verify_prompt      AS implVerifyPrompt,
   solution_verify_prompt  AS solutionVerifyPrompt,
-  solution_verify_command AS solutionVerifyCommand,
   split_scope AS splitScope,
   status, seq, output,
   validation_report AS validationReport,

@@ -44,7 +44,7 @@ func legacyOutputSchema() map[string]any {
 }
 
 func statusEnum() []string {
-	return []string{"PENDING", "EXECUTING", "VERIFYING", "VERIFIED", "PAUSED"}
+	return []string{"PENDING", "EXECUTING", "VERIFYING", "VERIFIED", "PAUSED", "BLOCKED"}
 }
 
 func updateInputSchema() map[string]any {
@@ -112,12 +112,8 @@ func taskProperties() map[string]any {
 			"description": "Short imperative title naming the outcome."},
 		"description": map[string]any{"type": "string", "minLength": 20,
 			"description": "Self-contained implementation instructions: scope, relevant files/components, constraints, and exact done state."},
-		"implementationCheck": map[string]any{"type": "string", "minLength": 10,
-			"description": "How the executor proves the requested code/files/configuration exist and are coherent."},
 		"behaviorCheck": map[string]any{"type": "string", "minLength": 10,
-			"description": "How the executor proves observable behavior and regression safety."},
-		"verificationCommand": map[string]any{"type": "string",
-			"description": "Optional repository-root shell command that deterministically builds/tests this task and exits 0 on success."},
+			"description": "The behavior the independent verification agent must establish by testing what the executor produced."},
 		"maxAttempts": map[string]any{"type": "integer", "minimum": 1, "maximum": 20, "default": 3},
 	}
 }
@@ -126,7 +122,7 @@ func taskInputSchema() map[string]any {
 	return map[string]any{
 		"type": "object", "additionalProperties": false,
 		"properties": taskProperties(),
-		"required":   []string{"title", "description", "implementationCheck", "behaviorCheck"},
+		"required":   []string{"title", "description", "behaviorCheck"},
 	}
 }
 
@@ -151,8 +147,7 @@ func legacyPlanSchema() map[string]any {
 	item := map[string]any{"type": "object", "additionalProperties": false,
 		"properties": map[string]any{
 			"title": map[string]any{"type": "string"}, "description": map[string]any{"type": "string"},
-			"implementationCheck": map[string]any{"type": "string"}, "behaviorCheck": map[string]any{"type": "string"},
-			"verificationCommand": map[string]any{"type": "string"},
+			"behaviorCheck": map[string]any{"type": "string"},
 		}, "required": []string{"title", "description"}}
 	return map[string]any{"type": "object", "additionalProperties": false,
 		"properties": map[string]any{"tasks": map[string]any{"type": "array", "minItems": 1, "items": item}},

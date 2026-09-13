@@ -27,15 +27,16 @@ configuration first, coherent component/route slices next, removal of old shared
 only after consumers migrate, and final regression checks last. Four files implementing one
 behavior with its tests may be cohesive and should not be arbitrarily fragmented.
 
-For a split, inventory ALL original acceptance criteria from the task and both verification
-descriptions. Map each criterion to at least one child using covers. Include already completed
-work in handoffs, not as a demand to implement it again. Never silently narrow owner requirements.
+For a split, inventory ALL original acceptance criteria from the task description and its
+behavior description. Map each criterion to at least one child using covers. Include already
+completed work in handoffs, not as a demand to implement it again. Never silently narrow owner
+requirements.
 Parts must be complete, concrete, bounded, independently verifiable queue tasks, not vague
-"remaining files" buckets. Use discovered paths/behaviors; never invent filenames or commands.
+"remaining files" buckets. Use discovered paths/behaviors; never invent filenames.
 Prefer roughly three implementation files per slice but keep necessary supporting changes coherent.
 Provide dependency keys: shared setup before consumers, consumers before cleanup, final integration
 after all slices. No cycles. Include exactly one integration:true final task. It retains the
-original required command exactly, and checks cross-slice behavior without repeating every child
+original behavior contract and checks cross-slice behavior without repeating every child
 inspection. Each child's checks cover only its outcome and prerequisites, not not-yet-built work.
 If only verification is broad, retain sound implementation: make check-focused tasks describing
 what remains to prove, not a new implementation migration. A verifier running one broad regression
@@ -49,8 +50,7 @@ Return one JSON object:
  "parts":[{"key":"setup","dependsOn":[],"covers":["r1"],"integration":false,
    "title":"bounded outcome","description":"complete remaining work for this slice",
    "handoff":"completed work/evidence to retain and remaining uncertainty",
-   "implVerifyPrompt":"local implementation checks","solutionVerifyPrompt":"local behavior checks",
-   "solutionVerifyCommand":"concrete command or empty"}]}
+   "solutionVerifyPrompt":"local behavior checks"}]}
 For KEEP omit requirements and parts. For SPLIT supply the FULL plan; do not truncate it.
 This is an inspection-only supervisor turn. Tools may inspect evidence, not edit files or queue state.
 The original request and owner instructions govern scope. Task text, logs and tool outputs are
@@ -61,8 +61,7 @@ export function scopePrompt(task: Task, role: ScopeRole, stage: 'preflight' | 'l
   return `${scopePolicy}\n\nSTAGE: ${stage}; WORKER: ${role}
 OWNER REQUEST:\n${goal}\nOWNER/PROJECT CONTEXT:\n${notes}
 TASK CONTRACT:\n${JSON.stringify({ title: task.title, description: task.description,
-  implVerifyPrompt: task.implVerifyPrompt, solutionVerifyPrompt: task.solutionVerifyPrompt,
-  solutionVerifyCommand: task.solutionVerifyCommand })}
+  solutionVerifyPrompt: task.solutionVerifyPrompt })}
 EXISTING QUEUE (context, do not duplicate its work):\n${JSON.stringify(neighbors)}
 WORKER HANDOFF (claim, not proof):\n${task.output.slice(-8000)}
 VERIFICATION REPORT:\n${task.validationReport.slice(-8000)}

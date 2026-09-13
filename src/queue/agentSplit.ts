@@ -18,14 +18,12 @@ export function parseSupervisorSplit(value: unknown): NewTask[] {
       if (typeof next !== 'string' || !next.trim()) fail(`${label}.${field} must be a nonempty string.`);
       return (next as string).trim();
     };
-    if (typeof part.solutionVerifyCommand !== 'string') {
-      fail(`${label}.solutionVerifyCommand must be a string, possibly empty.`);
+    if (typeof part.solutionVerifyPrompt !== 'string' || !part.solutionVerifyPrompt.trim()) {
+      fail(`${label}.solutionVerifyPrompt must be a nonempty behavior description.`);
     }
     return {
       title: required('title'), description: required('description'),
-      implVerifyPrompt: required('implVerifyPrompt'),
       solutionVerifyPrompt: required('solutionVerifyPrompt'),
-      solutionVerifyCommand: (part.solutionVerifyCommand as string).trim(),
     };
   });
 }

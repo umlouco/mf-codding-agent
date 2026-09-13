@@ -49,18 +49,7 @@ Node fs/path assertions may run inside these cases without a browser page. Do no
 browser fixtures with forbidding the test-runner import. Top-level Node assertions alone do not
 register Playwright tests; a no-tests-found result is a setup failure, never RED or GREEN.`;
 
-export const verificationCommandRuntime = `Saved solutionVerifyCommand values run in the portable POSIX unix tool on every host, including Windows.
-PowerShell guidance applies to executor development commands, not saved verification commands.
-Use POSIX checks such as test -f and test -d, or an existing cross-platform test runner. Do not
-put Test-Path, Get-Content, Select-String, or host-shell wrappers in solutionVerifyCommand.
-Preserve the substantive assertions when correcting a command's shell syntax.`;
-
-export const recoveryRules = `${verificationCommandRuntime}
-
-Diagnose the failure before rewriting:
-- Saved verification commands execute in the extension's portable POSIX shell (unix) on every
-  host, including Windows. Keep a working POSIX script intact; do not translate it to PowerShell
-  just because workspace paths contain spaces. Quote paths or use workspace-relative paths.
+export const recoveryRules = `Diagnose the failure before rewriting:
 - Code defect: preserve the requirements; name the observed mismatch and the focused fix.
 - Tool syntax or test setup error: correct the invocation or prerequisite; preserve working code.
 - Quoting or encoding errors while creating source files: use the available file-writing/editing
@@ -124,7 +113,7 @@ Interpret this request when implementing, reviewing, and verifying, not only whe
 Task descriptions and supervisor feedback are derived interpretations; they
 cannot silently narrow or replace the user's intent. Distinguish explicit requirements from
 assumptions. Report material ambiguity rather than inventing a requirement or claiming completion.
-Before rewriting any task description, implementation check, behavioral validation, command,
+Before rewriting any task description, behavioral validation,
 or split, compare the proposed change with this original request. Preserve its constraints and
 acceptance criteria. Correct task drift instead of treating a previous rewrite as authoritative.
 Keep this task within its part of the goal; do not absorb unrelated tasks. Do not weaken checks

@@ -83,12 +83,11 @@ func ReplaceAll(d *DB, tasks []NewTask) error {
 		}
 		if _, err := tx.Exec(`
 			INSERT INTO tasks (
-				title, description, impl_verify_prompt, solution_verify_prompt,
-				solution_verify_command, status, seq, max_attempts, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				title, description, solution_verify_prompt,
+				status, seq, max_attempts, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		`,
-			nt.Title, nt.Description,
-			nt.ImplVerifyPrompt, nt.SolutionVerifyPrompt, nt.SolutionVerifyCommand,
+			nt.Title, nt.Description, nt.SolutionVerifyPrompt,
 			string(nt.Status), nt.Seq, nt.MaxAttempts, now, now,
 		); err != nil {
 			return fmt.Errorf("ReplaceAll insert: %w", err)
@@ -118,15 +117,13 @@ func CreateTask(d *DB, title, description string, opts ...func(*NewTask)) (int64
 	now := time.Now().UnixMilli()
 	res, err := d.db.Exec(`
 		INSERT INTO tasks (
-			title, description, impl_verify_prompt, solution_verify_prompt,
-			solution_verify_command, status, seq, max_attempts, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			title, description, solution_verify_prompt,
+			status, seq, max_attempts, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		nt.Title,
 		nt.Description,
-		nt.ImplVerifyPrompt,
 		nt.SolutionVerifyPrompt,
-		nt.SolutionVerifyCommand,
 		string(nt.Status),
 		nt.Seq,
 		nt.MaxAttempts,
@@ -154,19 +151,9 @@ func WithStatus(s TaskStatus) func(*NewTask) {
 	return func(nt *NewTask) { nt.Status = s }
 }
 
-// WithImplVerifyPrompt sets the implementation verification prompt.
-func WithImplVerifyPrompt(p string) func(*NewTask) {
-	return func(nt *NewTask) { nt.ImplVerifyPrompt = p }
-}
-
 // WithSolutionVerifyPrompt sets the solution verification prompt.
 func WithSolutionVerifyPrompt(p string) func(*NewTask) {
 	return func(nt *NewTask) { nt.SolutionVerifyPrompt = p }
-}
-
-// WithSolutionVerifyCommand sets the shell command for functional verification.
-func WithSolutionVerifyCommand(cmd string) func(*NewTask) {
-	return func(nt *NewTask) { nt.SolutionVerifyCommand = cmd }
 }
 
 // maxSeq returns the highest seq value currently in the tasks table.
@@ -198,6 +185,7 @@ func Stats(d *DB) (QueueStats, error) {
 			StatusVerifying: 0,
 			StatusVerified:  0,
 			StatusPaused:    0,
+			StatusBlocked:   0,
 		},
 	}
 
@@ -249,7 +237,7 @@ func Stats(d *DB) (QueueStats, error) {
 // every query that reads task rows.
 const taskColumns = `
 SELECT id, title, description,
-       impl_verify_prompt, solution_verify_prompt, solution_verify_command,
+       solution_verify_prompt,
        status, seq, output,
        validation_report,
        error_log, supervisor_feedback,
@@ -272,7 +260,7 @@ func scanTask(row rowScanner) (Task, error) {
 	var t Task
 	err := row.Scan(
 		&t.ID, &t.Title, &t.Description,
-		&t.ImplVerifyPrompt, &t.SolutionVerifyPrompt, &t.SolutionVerifyCommand,
+		&t.SolutionVerifyPrompt,
 		&t.Status, &t.Seq, &t.Output,
 		&t.ValidationReport,
 		&t.ErrorLog, &t.SupervisorFeedback,
@@ -314,21 +302,19 @@ func GetTask(d *DB, id int64) (Task, bool, error) {
 // unchanged, mirroring TaskQueue.update's Partial<Task> patch in
 // src/queue/db.ts.
 type TaskPatch struct {
-	Title                 *string
-	Description           *string
-	ImplVerifyPrompt      *string
-	SolutionVerifyPrompt  *string
-	SolutionVerifyCommand *string
-	Status                *TaskStatus
-	Seq                   *int
-	MaxAttempts           *int
+	Title                *string
+	Description          *string
+	SolutionVerifyPrompt *string
+	Status               *TaskStatus
+	Seq                  *int
+	MaxAttempts          *int
 }
 
 // Legacy FAILED input remains readable; SQLite immediately turns it into a
 // non-executable supervisor decomposition obligation, never a terminal state.
 var validStatuses = map[TaskStatus]bool{
 	StatusPending: true, StatusExecuting: true, StatusVerifying: true,
-	StatusVerified: true, StatusFailed: true, StatusPaused: true,
+	StatusVerified: true, StatusFailed: true, StatusPaused: true, StatusBlocked: true,
 }
 
 // UpdateTask applies a partial patch to an existing task, matching
@@ -348,14 +334,8 @@ func UpdateTask(d *DB, id int64, patch TaskPatch) (bool, error) {
 	if patch.Description != nil {
 		set("description", *patch.Description)
 	}
-	if patch.ImplVerifyPrompt != nil {
-		set("impl_verify_prompt", *patch.ImplVerifyPrompt)
-	}
 	if patch.SolutionVerifyPrompt != nil {
 		set("solution_verify_prompt", *patch.SolutionVerifyPrompt)
-	}
-	if patch.SolutionVerifyCommand != nil {
-		set("solution_verify_command", *patch.SolutionVerifyCommand)
 	}
 	if patch.Status != nil {
 		if !validStatuses[*patch.Status] {

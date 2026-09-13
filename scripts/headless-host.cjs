@@ -90,6 +90,47 @@ function sourceLoader(vscode) {
   return load;
 }
 
+function validateWorkerUrl(value) {
+  const url = new URL(value);
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
+    throw Error('Worker URL must be an HTTP(S) API base without embedded credentials or query parameters.');
+  return value;
+}
+
+/**
+ * Worker roles (coding/executor/vision) need an OpenAI-compatible HTTP
+ * provider; the Claude CLI provider can only serve planner/supervisor (see
+ * catalog.ts's rolesAllowed). Binding every role to claude-cli, as this host
+ * used to do, left the executor unresolvable and every run failed before it
+ * could do a single turn. Resolve one worker from explicit arguments or the
+ * environment, or leave worker roles unbound so a real preflight can say so.
+ */
+/** Pick the API key that belongs to this base URL when none was named explicitly. */
+function keyForWorker(baseURL) {
+  const host = new URL(baseURL).hostname.toLowerCase();
+  if (/(^|\.)openrouter\.ai$/.test(host)) return process.env.OPENROUTER_API_KEY || '';
+  if (/(^|\.)openai\.com$/.test(host)) return process.env.OPENAI_API_KEY || '';
+  return '';
+}
+
+function resolveWorker(options) {
+  if (options.workerUrl || options.workerModel) {
+    if (!options.workerUrl || !options.workerModel) throw Error('Both worker URL and model are required.');
+    const baseURL = validateWorkerUrl(options.workerUrl);
+    return { providerId: 'openai-compatible', name: 'HTTP workers', baseURL, model: options.workerModel,
+      apiKey: options.workerApiKey || process.env.MFAGENT_WORKER_API_KEY || keyForWorker(baseURL) };
+  }
+  const url = process.env.MFAGENT_WORKER_URL, model = process.env.MFAGENT_WORKER_MODEL;
+  if (url && model) return { providerId: 'openai-compatible', name: 'HTTP workers', baseURL: validateWorkerUrl(url),
+    model, apiKey: process.env.MFAGENT_WORKER_API_KEY || keyForWorker(url) };
+  if (process.env.OPENROUTER_API_KEY) return { providerId: 'openai-compatible', name: 'OpenRouter',
+    baseURL: 'https://openrouter.ai/api/v1', model: model || 'anthropic/claude-sonnet-4.6',
+    apiKey: process.env.OPENROUTER_API_KEY };
+  if (process.env.OPENAI_API_KEY) return { providerId: 'openai-compatible', name: 'OpenAI',
+    baseURL: 'https://api.openai.com/v1', model: model || 'gpt-4o', apiKey: process.env.OPENAI_API_KEY };
+  return null;
+}
+
 async function createHost(options) {
   const workspace = fs.realpathSync(options.workspace);
   const values = { 'queue.cronIntervalSeconds': 10, 'queue.reviewIntervalSeconds': 300,
@@ -120,22 +161,29 @@ async function createHost(options) {
   const load = sourceLoader(vscode);
   const { store } = load('src/providers/instance.ts').initProviders(context, output);
   const { ROLES } = load('src/providers/store.ts');
-  await store.update({ profiles: [{ id: 'headless-claude', name: 'Claude CLI', providerId: 'claude-cli',
-    extra: options.cli ? { cliPath: options.cli } : {} }],
-    roles: Object.fromEntries(ROLES.filter(role => role !== 'embedding').map(role =>
-      [role, { profileId: 'headless-claude', model: options.model || 'sonnet', effort: options.effort || 'medium' }])),
-    browser: { headless: true }, languages: { auto: false, list: [] } });
-  if (options.workerUrl || options.workerModel) {
-    if (!options.workerUrl || !options.workerModel) throw Error('Both worker URL and model are required.');
-    const workerURL = new URL(options.workerUrl);
-    if (!['http:', 'https:'].includes(workerURL.protocol) || workerURL.username || workerURL.password || workerURL.search || workerURL.hash)
-      throw Error('Worker URL must be an HTTP(S) API base without embedded credentials or query parameters.');
-    await store.update({ profiles: [...store.profiles, { id: 'headless-worker', name: 'HTTP workers',
-      providerId: 'openai-compatible', baseURL: options.workerUrl }],
-      roles: { ...store.settings.roles, ...Object.fromEntries(['coding', 'executor', 'supervisor', 'vision'].map(role =>
-        [role, { profileId: 'headless-worker', model: options.workerModel, effort: options.workerEffort || '' }])) } });
-    await store.setApiKey('headless-worker', options.workerApiKey || process.env.MFAGENT_WORKER_API_KEY || '');
+  const worker = resolveWorker(options);
+  // --worker-all keeps every role on the HTTP worker, so a run never depends on
+  // the Claude CLI account (its monthly spend limit stops planner/supervisor
+  // mid-run). Default keeps the strong CLI planner/supervisor.
+  const claudeRoles = options.workerAll ? [] : ['planner', 'supervisor'];
+  const workerRoles = options.workerAll
+    ? ROLES.filter(role => role !== 'embedding')
+    : ['coding', 'executor', 'vision'];
+  const roles = {};
+  for (const role of ROLES) {
+    if (role === 'embedding' || !claudeRoles.includes(role)) continue;
+    roles[role] = { profileId: 'headless-claude', model: options.model || 'sonnet', effort: options.effort || 'medium' };
   }
+  const profiles = [{ id: 'headless-claude', name: 'Claude CLI', providerId: 'claude-cli',
+    extra: options.cli ? { cliPath: options.cli } : {} }];
+  if (worker) {
+    profiles.push({ id: 'headless-worker', name: worker.name, providerId: worker.providerId, baseURL: worker.baseURL });
+    for (const role of workerRoles) {
+      roles[role] = { profileId: 'headless-worker', model: worker.model, effort: options.workerEffort || '' };
+    }
+  }
+  await store.update({ profiles, roles, browser: { headless: true }, languages: { auto: false, list: [] } });
+  if (worker) await store.setApiKey('headless-worker', worker.apiKey);
   if (options.provider) {
     // Bind planner/supervisor/executor to a real HTTP provider, mirroring the
     // roles the extension has stored. Configured before initRouter so the

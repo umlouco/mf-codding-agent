@@ -18,9 +18,7 @@ func (d *DB) migrate() error {
 			id                      INTEGER PRIMARY KEY AUTOINCREMENT,
 			title                   TEXT    NOT NULL,
 			description             TEXT    NOT NULL DEFAULT '',
-			impl_verify_prompt      TEXT    NOT NULL DEFAULT '',
 			solution_verify_prompt  TEXT    NOT NULL DEFAULT '',
-			solution_verify_command TEXT    NOT NULL DEFAULT '',
 			status                  TEXT    NOT NULL DEFAULT 'PENDING',
 			seq                     INTEGER NOT NULL,
 			output                  TEXT    NOT NULL DEFAULT '',
@@ -33,7 +31,7 @@ func (d *DB) migrate() error {
 			updated_at              INTEGER NOT NULL,
 			started_at              INTEGER,
 			finished_at             INTEGER,
-			CHECK (status IN ('PENDING','EXECUTING','VERIFYING','VERIFIED','FAILED','PAUSED'))
+			CHECK (status IN ('PENDING','EXECUTING','VERIFYING','VERIFIED','FAILED','PAUSED','BLOCKED'))
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_tasks_status_seq ON tasks(status, seq);
@@ -70,6 +68,13 @@ func (d *DB) migrate() error {
 	d.addColumn("region", "TEXT NOT NULL DEFAULT ''")
 	d.addColumn("validation_report", "TEXT NOT NULL DEFAULT ''")
 
+	// Retired columns: the verification agent derives its own checks from what
+	// the executor produced plus the task's behavior description, so the
+	// implementation-check prompt and saved verification command are no longer
+	// part of the task model.
+	d.dropColumn("impl_verify_prompt")
+	d.dropColumn("solution_verify_command")
+
 	return d.installDecompositionInvariant()
 }
 
@@ -94,4 +99,32 @@ func (d *DB) addColumn(name, decl string) {
 	}
 	// Column does not exist — add it.
 	_, _ = d.db.Exec("ALTER TABLE tasks ADD COLUMN " + name + " " + decl)
+}
+
+// dropColumn removes a retired column from tasks if an older database still
+// carries it. SQLite can drop a column in place from 3.35, which the bundled
+// driver ships, and neither retired column is referenced by an index or trigger.
+func (d *DB) dropColumn(name string) {
+	rows, err := d.db.Query("PRAGMA table_info(tasks)")
+	if err != nil {
+		return
+	}
+	present := false
+	for rows.Next() {
+		var cid int
+		var cname, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &cname, &ctype, &notnull, &dflt, &pk); err != nil {
+			continue
+		}
+		if cname == name {
+			present = true
+			break
+		}
+	}
+	rows.Close()
+	if present {
+		_, _ = d.db.Exec("ALTER TABLE tasks DROP COLUMN " + name)
+	}
 }

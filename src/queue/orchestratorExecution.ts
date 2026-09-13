@@ -3,7 +3,7 @@ import { appendAttempt } from './orchestratorState';
 import { OrchestratorVerification } from './orchestratorVerification';
 import { completionForSupervisor } from './validation';
 import { scopeBlocked } from './scopePlan';
-import { recoveryState } from './recovery';
+import { providerConfigurationError, recoveryState } from './recovery';
 import { boundedTask } from './scopeBoundary';
 import { hasRecoveryJob } from './recoverySchedule';
 import { promptOverloadReason } from './scopeEvidence';
@@ -147,7 +147,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       } else {
         const overload = promptOverloadReason(res.text);
         if (overload) {
-          this.blockForHuman(this.queue.get(task.id)!, overload);
+          this.requestFailureDecomposition(this.queue.get(task.id)!, overload);
           return;
         }
         this.queue.log(
@@ -182,6 +182,14 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       if (!current()) return;
       const msg = String(e?.message ?? e);
       journal.live.note('error', `stopped: ${msg}`);
+      // An unconfigured (or role-incompatible) provider is not a worker that
+      // died mid-turn: there was never a turn. Every task would fail the same
+      // way, so stop the run with the actual fault instead of sending it to
+      // verification and letting the supervisor split it forever.
+      if (providerConfigurationError(msg)) {
+        this.stopForProviderConfiguration(msg);
+        return;
+      }
       // A worker that died mid-turn — a dropped connection, a crashed core, or
       // abandonExecution killing it on purpose — still edited real files. Send
       // it to the supervisor with an empty validation report. The supervisor

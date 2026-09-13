@@ -25,9 +25,7 @@ export class QueueStorage {
         id                      INTEGER PRIMARY KEY AUTOINCREMENT,
         title                   TEXT    NOT NULL,
         description             TEXT    NOT NULL DEFAULT '',
-        impl_verify_prompt      TEXT    NOT NULL DEFAULT '',
         solution_verify_prompt  TEXT    NOT NULL DEFAULT '',
-        solution_verify_command TEXT    NOT NULL DEFAULT '',
         status                  TEXT    NOT NULL DEFAULT 'PENDING',
         seq                     INTEGER NOT NULL,
         output                  TEXT    NOT NULL DEFAULT '',
@@ -116,6 +114,8 @@ export class QueueStorage {
     // Task.validationReport doc comment.
     this.addColumn('validation_report', "TEXT NOT NULL DEFAULT ''");
     this.allowBlockedStatus();
+    this.dropColumn('impl_verify_prompt');
+    this.dropColumn('solution_verify_command');
     this.dropTaskEventsCascade();
     installDecompositionInvariant(this.db);
   }
@@ -148,9 +148,7 @@ export class QueueStorage {
             id                      INTEGER PRIMARY KEY AUTOINCREMENT,
             title                   TEXT    NOT NULL,
             description             TEXT    NOT NULL DEFAULT '',
-            impl_verify_prompt      TEXT    NOT NULL DEFAULT '',
             solution_verify_prompt  TEXT    NOT NULL DEFAULT '',
-            solution_verify_command TEXT    NOT NULL DEFAULT '',
             status                  TEXT    NOT NULL DEFAULT 'PENDING',
             seq                     INTEGER NOT NULL,
             output                  TEXT    NOT NULL DEFAULT '',
@@ -176,14 +174,14 @@ export class QueueStorage {
             CHECK (status IN ('PENDING','EXECUTING','VERIFYING','VERIFIED','FAILED','PAUSED','BLOCKED'))
           );
           INSERT INTO tasks_rebuild (
-            id, title, description, impl_verify_prompt, solution_verify_prompt,
-            solution_verify_command, status, seq, output, validation_report, error_log,
+            id, title, description, solution_verify_prompt,
+            status, seq, output, validation_report, error_log,
             supervisor_feedback, attempts, max_attempts, created_at, updated_at, started_at,
             finished_at, last_activity_at, activity_phase, activity_detail, tokens_in,
             tokens_out, tokens_cache_read, tokens_cache_write, kind, region, split_scope)
           SELECT
-            id, title, description, impl_verify_prompt, solution_verify_prompt,
-            solution_verify_command, status, seq, output, validation_report, error_log,
+            id, title, description, solution_verify_prompt,
+            status, seq, output, validation_report, error_log,
             supervisor_feedback, attempts, max_attempts, created_at, updated_at, started_at,
             finished_at, last_activity_at, activity_phase, activity_detail, tokens_in,
             tokens_out, tokens_cache_read, tokens_cache_write, kind, region, split_scope
@@ -206,6 +204,24 @@ export class QueueStorage {
     );
     if (!has) {
       this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${decl}`);
+    }
+  }
+
+  /**
+   * Drops a retired column from `tasks` if an older database still carries it.
+   *
+   * The implementation-check and saved-command columns are gone from the model:
+   * the verification agent derives its own checks from what the execution agent
+   * produced plus the task's behavior description, instead of a stored command.
+   * SQLite can drop a column in place from 3.35, which both drivers here ship,
+   * and neither column is referenced by an index or trigger.
+   */
+  private dropColumn(name: string): void {
+    const has = (this.db.prepare('PRAGMA table_info(tasks)').all() as any[]).some(
+      (c) => c.name === name,
+    );
+    if (has) {
+      this.db.exec(`ALTER TABLE tasks DROP COLUMN ${name}`);
     }
   }
 

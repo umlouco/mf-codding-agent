@@ -39,11 +39,10 @@ func WritePlan(d *DB, tasks []NewTask, goal string, replace bool) error {
 		}
 		_, err := tx.Exec(`
 			INSERT INTO tasks (
-				title, description, impl_verify_prompt, solution_verify_prompt,
-				solution_verify_command, status, seq, max_attempts, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
-		`, task.Title, task.Description, task.ImplVerifyPrompt,
-			task.SolutionVerifyPrompt, task.SolutionVerifyCommand,
+				title, description, solution_verify_prompt,
+				status, seq, max_attempts, created_at, updated_at
+			) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?)
+		`, task.Title, task.Description, task.SolutionVerifyPrompt,
 			start+i+1, maxAttempts, now, now)
 		if err != nil {
 			return fmt.Errorf("WritePlan task %d: %w", i+1, err)

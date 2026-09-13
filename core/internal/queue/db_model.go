@@ -11,6 +11,9 @@ const (
 	// StatusFailed is legacy input only; storage converts it to decomposition work.
 	StatusFailed TaskStatus = "FAILED"
 	StatusPaused TaskStatus = "PAUSED"
+	// StatusBlocked is the terminal state for a task the queue cannot complete:
+	// handed to a person, never split into smaller tasks.
+	StatusBlocked TaskStatus = "BLOCKED"
 )
 
 // RunState tracks the queue's overall execution state.
@@ -25,13 +28,11 @@ const (
 
 // Task is a single row in the tasks table.
 type Task struct {
-	ID                    int64      `json:"id"`
-	Title                 string     `json:"title"`
-	Description           string     `json:"description"`
-	ImplVerifyPrompt      string     `json:"implVerifyPrompt"`
-	SolutionVerifyPrompt  string     `json:"solutionVerifyPrompt"`
-	SolutionVerifyCommand string     `json:"solutionVerifyCommand"`
-	Status                TaskStatus `json:"status"`
+	ID                   int64      `json:"id"`
+	Title                string     `json:"title"`
+	Description          string     `json:"description"`
+	SolutionVerifyPrompt string     `json:"solutionVerifyPrompt"`
+	Status               TaskStatus `json:"status"`
 	Seq                   int        `json:"seq"`
 	Output                string     `json:"output"`
 	ValidationReport      string     `json:"validationReport"`
@@ -79,12 +80,10 @@ type QueueStats struct {
 
 // NewTask holds the fields accepted when creating a task.
 type NewTask struct {
-	Title                 string
-	Description           string
-	ImplVerifyPrompt      string
-	SolutionVerifyPrompt  string
-	SolutionVerifyCommand string
-	Seq                   int
-	MaxAttempts           int
-	Status                TaskStatus
+	Title                string
+	Description          string
+	SolutionVerifyPrompt string
+	Seq                  int
+	MaxAttempts          int
+	Status               TaskStatus
 }
