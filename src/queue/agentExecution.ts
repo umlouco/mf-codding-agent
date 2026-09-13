@@ -2,8 +2,8 @@ import { CompletionClaim, parseCompletionClaim, extractExecutorNotes } from './v
 import { Usage, Task } from './db';
 import * as vscode from 'vscode';
 import { ActivityRecord, RunOptions } from './agentTypes';
-import { retryBriefing, replacementHandoff, decisionOnlyReport } from './agentHistory';
-import { projectNotesContext, originalGoalContext, codingWorkflow, browserEvidence, reportContract, executorExample } from './prompts';
+import { decisionOnlyReport } from './agentHistory';
+import { buildExecutorPrompt } from './executorPrompt';
 import { runOnce, workerRounds } from './agentRuntime';
 import { taskCognition } from './cognition';
 
@@ -59,58 +59,7 @@ export async function executeTask(
   onAbort?: (abort: () => void) => void,
   onSteerable?: RunOptions['onSteerable'],
 ): Promise<ExecutionOutcome> {
-  const retry = retryBriefing(task);
-  const notes = projectNotesContext(instructions);
-
-  const prompt = `You are an execution agent. Complete exactly one task, then stop.
-
-${originalGoalContext(goal)}
-
-Compare this task with the original request before implementing. Treat the task and recovery
-feedback as working interpretations, not replacements for the user's requirements. If evidence
-shows the approach is wrong, revise your approach within this task. If correcting it requires
-changing scope or resolving material ambiguity, report NEEDS_MORE_WORK with the conflict,
-confirmed evidence, and proposed correction or precise question for supervisor recovery.
-
-${notes}TASK ${task.seq}: ${task.title}
-
-${task.description}
-
-${task.splitScope || ''}
-${replacementHandoff(task)}
-${retry}
-Own the implementation. Run ordinary development checks while you work, but do
-not make the final verification decision. A supervisor watches your database
-journal and will start a separate execution LLM to perform formal verification.
-
-Expected behaviour (the verifier will test this against what you actually produced):
-${task.solutionVerifyPrompt || 'the described behaviour works'}
-
-Rules:
-${codingWorkflow}
-
-${browserEvidence}
-
-- Stay inside this task. Do not start the next one, and do not refactor unrelated code.
-- The supervisor owns rewrites of existing tests, test fixtures and validation scripts.
-  Do not rewrite those files to repair a failed check. Report the exact test defect and request
-  supervisor test repair in your handoff. Implement application fixes when the test is valid.
-- If the task turns out to be impossible or already done, say so plainly and explain why.
-- Inspect the final code and diff yourself. Run useful development checks. For UI/browser work,
-  use the browser tools when needed and record what happened.
-- Use the shared graph memory when available: recall relevant decisions, requirements, and past
-  failures before broad exploration. Persist useful discoveries with memory_remember, including
-  reasons, affected entities, and supporting evidence. Distinguish hypotheses from observations;
-  do not record unverified work as verified. Fresh sessions share the workspace graph.
-- Put concise project-wide conventions in "notes" below as well when later tasks need them.
-  Notes complement the graph and the task handoff. Leave notes empty when there is nothing new.
-- Your final response must be ONE valid JSON object, without a code fence or trailing prose.
-${reportContract}
-  Use status READY_FOR_VALIDATION only when implementation is complete and development checks
-  support handing it to the verifier. Otherwise use NEEDS_MORE_WORK. Neither status is a formal PASS.
-  Populate filesChanged and developmentChecks with strings describing actual files and results.
-  Use an empty notes string when there is no new durable fact. Replace this example's values:
-${executorExample}`;
+  const prompt = buildExecutorPrompt(task, instructions, goal);
 
   const options: RunOptions = {
     cognition: taskCognition(task, goal, 'executor'),

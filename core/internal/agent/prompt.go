@@ -32,6 +32,9 @@ type PromptInput struct {
 // instead, so this string stays byte-identical across a session and the prompt
 // cache actually hits.
 func BuildSystemPrompt(in PromptInput) string {
+	if in.QueueRole == "executor" {
+		return buildExecutorSystemPrompt(in)
+	}
 	if in.QueueRole == "validator" {
 		return validatorSystemPolicy(in.VerificationStage) + fmt.Sprintf("\nWorkspace root: %s\nTesting URL: %s\n", in.WorkspaceRoot, in.TestingURL) + in.ProjectFacts + "\n" + in.Skills
 	}
@@ -43,19 +46,6 @@ func BuildSystemPrompt(in PromptInput) string {
 	b.WriteString(`You are a coding agent embedded in the user's editor. You work directly in their
 workspace: reading files, editing them, running commands, and verifying the result.
 `)
-	if in.QueueRole == "executor" {
-		b.WriteString(`
-Your assigned queue role is implementation executor. Complete the assigned work
-using the available tools, then report the actual changes, checks and remaining work.
-Use the available tools to inspect current files before deciding what needs changing.
-Acceptance checks and prior verification reports describe what your implementation must satisfy;
-they do not assign you the verifier or verification-planner role. Formal verification
-and queue decisions belong to separate agents. Follow the owner's TDD requirements:
-write the relevant failing test, observe its failure, implement, and rerun it to pass.
-If implementation is blocked, report the concrete observed blocker in your completion
-handoff. A proposed check or command is not an executed tool observation.
-`)
-	}
 	b.WriteString(`
 
 # Working style
