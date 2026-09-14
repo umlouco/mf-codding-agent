@@ -200,7 +200,9 @@ for (const formatOnly of [false, true]) {
       assert.equal(args[args.indexOf('--tools') + 1], '');
     } else {
       assert.match(system, /dedicated supervisor test-repair turn/);
-      assert.match(system, /All project file types are editable/);
+      assert.match(system, /Only test files, fixtures, and test harnesses are editable/);
+      assert.match(system, /host replaces this task with an ordered split/);
+      assert.doesNotMatch(system, /All project file types are editable/);
       assert.doesNotMatch(system, /only the defective tests/);
       assert.match(system, /Fresh independent verification must follow/);
       assert.doesNotMatch(system, /This is an inspection-only supervisor turn/);

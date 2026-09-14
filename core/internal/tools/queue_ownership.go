@@ -108,6 +108,13 @@ func (e *Env) CheckQueueWritePath(path string) error {
 	if e.QueueRole == "validator" || e.QueueRole == "supervisor" {
 		return fmt.Errorf("queue ownership: %s cannot rewrite workspace files; request supervisor test repair", e.QueueRole)
 	}
+	// A test-repair turn owns tests, fixtures, and harnesses, not the product.
+	// When the correct fix needs an application or production-config change, the
+	// host replaces the task with an ordered split rather than letting one role
+	// rewrite the implementation to make a test pass.
+	if e.QueueRole == "supervisor-repair" && !testPath(normalized) {
+		return fmt.Errorf("queue ownership: supervisor test repair cannot rewrite application file %s; return a SPLIT_TASK decision so the implementation change and its verification are separate tasks", path)
+	}
 	// Implementation includes its tests and configuration. File extensions do
 	// not transfer an executor's assigned work to a different agent.
 	return nil
@@ -126,7 +133,7 @@ func (e *Env) CheckQueueCommand(command string) error {
 	if strings.Contains(lower, "queue.db") || strings.Contains(lower, "task_queue_") || strings.Contains(lower, "mfagent.queue.") {
 		return fmt.Errorf("queue ownership: shell access to task-list storage is disabled for autonomous workers; use read-only queue tools or return a supervisor decision")
 	}
-	if e.QueueRole == "validator" || e.QueueRole == "supervisor" {
+	if e.QueueRole == "validator" || e.QueueRole == "supervisor" || e.QueueRole == "supervisor-repair" {
 		// Editing roles use scoped file tools; a shell is for checks and reads.
 		// Reject commands that actually rewrite files, but allow read-only probes
 		// — including a plain `node -e "import(...)..."` inspection, which is not

@@ -41,7 +41,7 @@ func TestExecutorOwnershipRetainsOtherRoleBoundaries(t *testing.T) {
 		if env.CheckQueueCommand("sqlite3 .mfagent/queue.db 'delete from tasks'") == nil {
 			t.Errorf("%s may mutate queue from shell", role)
 		}
-		if (role == "validator" || role == "supervisor") && env.CheckQueueWritePath("parnassus.config.json") == nil {
+		if role != "executor" && env.CheckQueueWritePath("parnassus.config.json") == nil {
 			t.Errorf("%s may edit application config", role)
 		}
 		if (role == "validator" || role == "supervisor") && env.CheckQueueWritePath("config_test.go") == nil {

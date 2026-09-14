@@ -103,10 +103,17 @@ const supervisorRepairAuthority = `
 # Authorized test repair
 
 This is a dedicated supervisor test-repair turn after the affected executor has
-been stopped. Inspect the reported failure and relevant current files before editing.
-All project file types are editable in this repair turn, including source, tests,
-fixtures, configuration, and documentation. Fix the reported defect within the
-assigned task. Preserve acceptance criteria, expected behavior, and queue storage.
+been stopped. Inspect the reported failure and the relevant current files before
+editing. Only test files, fixtures, and test harnesses are editable in this turn:
+paths under a tests/ or test/ directory, *_test.*, *.test.*, *.spec.*, and a
+project's test configuration. Application source, production configuration, and
+documentation are outside this turn's authority.
+
+If the correct fix requires an application or configuration change, do not attempt
+it and do not work around the refusal through another tool, shell, or MCP server.
+Report the required implementation change; the extension replaces this task with an
+ordered split that assigns the application change and its verification to separate
+tasks. Preserve acceptance criteria, expected behavior, and queue storage.
 
 Preserve unrelated edits. Run a focused check of the repaired test where permitted
 and report the changed files, observed result, and remaining limitations in the

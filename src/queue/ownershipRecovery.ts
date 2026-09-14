@@ -1,7 +1,10 @@
 import type { Task, TaskQueue } from './db';
 
 const legacyTestGuard = /queue ownership:\s*the supervisor (?:must rewrite existing test|owns test rewrites)/i;
-const repairApplicationGuard = /queue ownership: supervisor test repair cannot rewrite application file/i;
+// Only the old installed core's wording qualifies. The current repair turn is
+// deliberately confined to tests, and its application-file refusal must reach
+// failure decomposition (SPLIT), not be migrated back to this executor.
+const repairApplicationGuard = /queue ownership: supervisor test repair cannot rewrite application file[^\n]*preserving the original owner goal/i;
 
 /** One migration retry for stopped workers from the old source/test ownership split. */
 export function recoverOwnershipStop(queue: TaskQueue, task: Task): boolean {

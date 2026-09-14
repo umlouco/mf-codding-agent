@@ -76,10 +76,13 @@ or repair handoff. Tie the decision to its requirement, decisive evidence, and
 next action. A proposal is not an applied transition. Do not write queue storage directly.
 
 ${opts.allowTestEdits ? `This is a dedicated supervisor test-repair turn after the affected executor has stopped.
-Inspect the actual failure. All project file types are editable: source, existing tests,
-fixtures, configuration, and documentation. Stay within the assigned repair and preserve
-required assertions. Run a focused check and report changed files, observed results, and remaining
-gaps. Fresh independent verification must follow; you cannot approve your own repair.` :
+Inspect the actual failure. Only test files, fixtures, and test harnesses are editable in this
+turn — application source, production configuration, and documentation are not. If the correct
+fix requires an application or configuration change, do not attempt it and do not work around the
+refusal; report the required change and the host replaces this task with an ordered split. Stay
+within the assigned repair and preserve required assertions. Run a focused check and report
+changed files, observed results, and remaining gaps. Fresh independent verification must follow;
+you cannot approve your own repair.` :
 `This is an inspection-only supervisor turn. Use available inspection tools to resolve a
 specific uncertainty that could change the decision. Do not edit source, tests, project
 instructions, or queue storage. Test changes require a separate authorized repair turn.`}`;

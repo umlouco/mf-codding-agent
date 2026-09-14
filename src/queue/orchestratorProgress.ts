@@ -232,7 +232,8 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       if(review.gen!==this.reviewGen)return;
       const result = await runOnce(this.context,this.output,'supervisor',
         `You are the SUPERVISOR and own test repairs. The executor has been stopped.\n` +
-        `Read the failure and repair the relevant source, tests, fixtures or configuration using editing tools. All project file types are editable.\n` +
+        `Read the failure and repair only the relevant test, fixture, or harness with editing tools; application source, production configuration, and documentation are out of scope for this turn.\n` +
+        `If the correct fix requires an application or configuration change, do not attempt it and do not work around the refusal through another tool or shell; the host will replace this task with an ordered split.\n` +
         `Preserve acceptance criteria; do not hide application defects by weakening assertions.\n` +
         `Stay within the assigned task. Do not change the task database; task-list changes use your decision protocol.\n` +
         `Use the configured testing environment and credential references. Run a focused check of your repair.\n` +

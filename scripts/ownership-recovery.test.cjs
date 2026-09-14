@@ -76,6 +76,28 @@ test('legacy test ownership stops resume the original executor task, not a repai
       assert.equal(queue.get(exhausted.id).status, 'PENDING');
       assert.equal(queue.get(exhausted.id).attempts, 1);
     });
+    await t.test('an application-file repair rejection is split, not returned to the executor', async () => {
+      for (const previous of queue.list()) queue.update(previous.id, { status: 'VERIFIED' });
+      queue.setRunState('RUNNING');
+      const guard = 'queue ownership: supervisor test repair cannot rewrite application file parnassus.config.json; '
+        + 'return a SPLIT_TASK decision so the implementation change and its verification are separate tasks';
+      queue.insert({ title: 'Vision configuration', description: 'Update config and tests.',
+        solutionVerifyPrompt: 'Run config tests and build.', status: 'VERIFYING' }, queue.list().length + 1);
+      const task = queue.list().at(-1);
+      queue.update(task.id, { attempts: 1, status: 'VERIFYING',
+        supervisorFeedback: `[SUPERVISOR_TEST_REPAIR] ${guard}`,
+        errorLog: `[attempt 1] supervisor test repair halted: ${guard}` });
+      queue.log(task.id, 'supervisor', 'test-repair-halted', guard);
+      const splits = [];
+      runner.repairTests = Orchestrator.prototype.repairTests;
+      runner.requestFailureDecomposition = (row, reason) => { splits.push({ id: row.id, reason }); };
+      await runner.tick();
+      assert.equal(splits.length, 1, 'application-file repair rejection must enter failure decomposition');
+      assert.match(splits[0].reason, /cannot rewrite application file/);
+      const current = queue.get(task.id);
+      assert.equal(current.status, 'VERIFYING', 'the executor must not resume the obsolete ownership stop');
+      assert.equal(current.supervisorFeedback, `[SUPERVISOR_TEST_REPAIR] ${guard}`);
+    });
   } finally {
     runner.dispose();
     await host.close();

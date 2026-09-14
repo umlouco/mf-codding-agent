@@ -17,8 +17,10 @@ policies are unchanged.
 - Detailed browser guidance is included for browser/UI-related tasks or owner
   browser requirements, not merely because the wider goal mentions Playwright.
   This is guidance selection, not removal of tools or acceptance checks.
-- Execution and authorized repair turns can edit every project file type within
-  their task. Validators and inspection-only reviews remain read-only; queue
+- Execution turns own source, existing tests, and configuration within their task.
+  A dedicated supervisor test-repair turn owns only tests, fixtures, and test
+  harnesses; an application or production-config change it needs becomes an
+  ordered split. Validators and inspection-only reviews remain read-only; queue
   storage is protected.
 - Reports retain the existing JSON completion schema. No live queue or stored
   history is rewritten by prompt generation.
