@@ -123,7 +123,7 @@ export function retryBriefing(task: Task): string {
     : claim.status !== 'UNSTATED' ? completionForSupervisor(claim)
     : JSON.stringify(parseExecutorValidation(previous, false));
   return `
-THIS IS ATTEMPT ${task.attempts} of the current attempt budget. Earlier work did not finish the task.
+THIS IS ATTEMPT ${task.attempts}. Earlier work did not finish the task; it must be completed before later tasks run.
 
 How the earlier attempts ended, oldest first:
 ${attemptHistory(task)}

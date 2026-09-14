@@ -237,8 +237,7 @@ export abstract class OrchestratorState {
    */
   protected abstract requestFailureDecomposition(task: Task, reason: string): void;
   /**
-   * Terminal exit for a run-wide condition no replacement can fix: the row is
-   * marked BLOCKED and the run continues with the remaining list.
+   * Compatibility handoff: return unresolved work to the executor before later tasks.
    */
   protected abstract blockForHuman(task: Task, reason: string): void;
   protected abstract serviceFailureDecomposition(task: Task): Promise<boolean>;

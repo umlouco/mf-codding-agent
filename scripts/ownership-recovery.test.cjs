@@ -44,13 +44,13 @@ test('legacy test ownership stops resume the original executor task, not a repai
       assert.equal(queue.get(task.id).status, 'PENDING');
       assert.equal(repairs.length, 0, 'old history must not trigger another repair');
     });
-    await t.test('a still-old core is blocked after one migration retry, not retried forever', async () => {
+    await t.test('a still-old core retains remediation feedback for the next executor attempt', async () => {
       const task = queue.list()[0];
       queue.update(task.id, { attempts: task.attempts + 1, status: 'VERIFYING',
         supervisorFeedback: `[SUPERVISOR_TEST_REPAIR] ${stop}`,
         errorLog: `[attempt ${task.attempts + 1}] the core stopped the turn (supervisor_repair_required): ${stop}` });
       await runner.tick();
-      assert.equal(queue.get(task.id).status, 'BLOCKED');
+      assert.equal(queue.get(task.id).status, 'PENDING');
       assert.match(queue.get(task.id).activityDetail, /installed.*core|core.*installed/i);
       assert.equal(repairs.length, 0);
     });
@@ -61,18 +61,19 @@ test('legacy test ownership stops resume the original executor task, not a repai
       assert.equal(queue.get(task.id).status, 'PENDING');
     });
     await t.test('explicit non-ownership repair requests retain their scoped repair lane', async () => {
+      for (const previous of queue.list()) queue.update(previous.id, { status: 'VERIFIED' });
       const task = create({ output: 'Actual assertion failure.', errorLog: '',
         supervisorFeedback: '[SUPERVISOR_TEST_REPAIR] Owner requested fixture correction.' });
       await runner.tick();
       assert.equal(repairs.length, 1);
       assert.equal(queue.get(task.id).status, 'VERIFYING');
     });
-    await t.test('paused and budget-exhausted tasks are not silently given more attempts', async () => {
+    await t.test('paused tasks stay paused while exhausted work remains pending', async () => {
       const paused = create({ status: 'PAUSED' });
       const exhausted = create({ attempts: 1, maxAttempts: 1 });
       await runner.tick();
       assert.equal(queue.get(paused.id).status, 'PAUSED');
-      assert.equal(queue.get(exhausted.id).status, 'BLOCKED');
+      assert.equal(queue.get(exhausted.id).status, 'PENDING');
       assert.equal(queue.get(exhausted.id).attempts, 1);
     });
   } finally {

@@ -141,15 +141,10 @@ export function replacementTasks(assessment: ScopeAssessment, task: Task, archiv
   });
 }
 
-/**
- * Split work forms an ordered verification barrier even in continuous mode —
- * except for a predecessor that is already terminal. A BLOCKED sibling is done
- * as far as the queue is concerned, so holding later work behind it would stall
- * the run on exactly the task a human has been asked to look at.
- */
+/** Split work stays behind every unfinished predecessor, including legacy blocked rows. */
 export function scopeBlocked(task: Task, tasks: Task[]): boolean {
   return tasks.some(previous => {
-    if (previous.seq >= task.seq || previous.status === 'VERIFIED' || previous.status === 'BLOCKED' ||
+    if (previous.seq >= task.seq || previous.status === 'VERIFIED' ||
         previous.kind !== 'task') return false;
     try { return !!JSON.parse(previous.region || '{}').scopeSplit; } catch { return false; }
   });

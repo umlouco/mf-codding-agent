@@ -3,6 +3,8 @@ import * as path from 'path';
 import { openDriver } from './dbDriver';
 import { QueuePlans } from './dbPlans';
 import { COLUMNS, Task } from './dbModel';
+import { parseCompletionClaim } from './validation';
+import { completeRecoveryJob } from './recoverySchedule';
 export * from './dbModel';
 
 /** Shared durable queue; implementation is grouped by storage responsibility. */
@@ -14,6 +16,7 @@ export class TaskQueue extends QueuePlans {
     const q = new TaskQueue(db, impl, file);
     try {
       q.migrate();
+      q.recoverBlocked();
       return q;
     } catch (error) {
       q.close();
@@ -35,12 +38,14 @@ export class TaskQueue extends QueuePlans {
    * first is the one the other's `NOT EXISTS` sees.
    */
   claimNext(): Task | undefined {
+    this.recoverBlocked();
     return this.tx(() => {
       const row = this.db
         .prepare(
           `SELECT ${COLUMNS} FROM tasks WHERE status = 'PENDING'
              AND activity_phase NOT GLOB 'decomposition_*'
              AND NOT EXISTS (SELECT 1 FROM tasks WHERE status = 'EXECUTING')
+             AND id = (SELECT id FROM tasks WHERE status <> 'VERIFIED' ORDER BY seq, id LIMIT 1)
            ORDER BY seq ASC, id ASC LIMIT 1`,
         )
         .get() as Task | undefined;
@@ -89,17 +94,25 @@ export class TaskQueue extends QueuePlans {
   /** Legacy compatibility; failed attempts are represented as decomposition work. */
   anyFailed(): boolean { return false; }
 
-  /**
-   * A run is complete when no row still has work to do. BLOCKED is terminal:
-   * a task the queue could not verify is handed to a person, but it does not
-   * stop the rest of the list from finishing, and it never re-enters the queue
-   * on its own. `finish()` reports the blocked count alongside verified.
-   */
+  /** Only completed work may let the run finish. */
   isComplete(): boolean {
     const row = this.db.prepare(`SELECT COUNT(*) AS n FROM tasks
-      WHERE status IN ('PENDING','EXECUTING','VERIFYING','FAILED')
+      WHERE status <> 'VERIFIED'
         OR activity_phase GLOB 'decomposition_*'`).get();
     return (row.n as number) === 0;
+  }
+
+  /** Recover old blocked rows in place, retaining their contracts and failure evidence. */
+  recoverBlocked(): number {
+    return this.tx(() => {
+      const rows: Task[] = this.db.prepare(`SELECT ${COLUMNS} FROM tasks WHERE status = 'BLOCKED' ORDER BY seq`).all();
+      for (const task of rows) {
+        this.update(task.id, { status: 'PENDING', finishedAt: null, activityPhase: 'executor_recovery' });
+        completeRecoveryJob(this, task);
+        this.log(task.id, 'system', 'recovered', 'Blocked task returned to the executor before later work.');
+      }
+      return rows.length;
+    });
   }
 
   /**
@@ -108,8 +121,7 @@ export class TaskQueue extends QueuePlans {
    * to PENDING and the keep-alive supervisor runs it again. Nothing is sent to
    * a review lane: there is no review lane any more — see drainVerification.
    *
-   * A task whose attempt budget is already spent is blocked rather than
-   * requeued, so a worker that crashes on every attempt cannot loop forever.
+   * Attempt counts are retained as history, never used to skip unfinished work.
    * A phase (see TaskKind) always goes back in the queue: it carries no result
    * to judge, only a slice of the plan still to be expanded.
    */
@@ -126,39 +138,13 @@ export class TaskQueue extends QueuePlans {
       .all(cutoff);
     for (const t of stale) {
       const note = `${t.errorLog}\n[recovered] worker did not report back; task was left EXECUTING.`.trim();
-      // Attempts still count against the task the same as any other requeue —
-      // see `attempts` on Task — so this only changes where it lands, not
-      // whether it is retried at all.
-      if (t.kind === 'task' && t.attempts >= t.maxAttempts) {
-        this.update(t.id, {
-          status: 'BLOCKED',
-          finishedAt: Date.now(),
-          activityPhase: 'blocked',
-          activityDetail: note,
-          errorLog: `${note}\n[blocked] attempt budget spent after repeated worker loss.`,
-        });
-        this.log(t.id, 'system', 'blocked', 'attempt budget spent after repeated worker loss');
-      } else {
-        this.update(t.id, { status: 'PENDING', finishedAt: null, activityPhase: 'requeued', errorLog: note });
-        this.log(t.id, 'system', 'recovered', 'requeued');
-      }
+      this.update(t.id, { status: 'PENDING', finishedAt: null, activityPhase: 'executor_recovery', errorLog: note });
+      this.log(t.id, 'system', 'recovered', 'requeued');
     }
     return stale.length;
   }
 
-  /**
-   * Keep-alive drain for rows an older build parked in the review lane.
-   *
-   * Verification is gone, so a VERIFYING row is not waiting for anyone. One
-   * that carries a non-empty executor result finished its work before the
-   * pipeline changed and is accepted as final; one with no result is a worker
-   * that died and is retried, or blocked once its attempt budget is spent.
-   *
-   * A legacy decomposition-parked row cannot simply be requeued: the schema's
-   * own decomposition trigger rewrites any such row back to VERIFYING unless it
-   * is BLOCKED (see installDecompositionInvariant). It is therefore blocked for
-   * a person, which is the only terminal exit that invariant allows.
-   */
+  /** Resume legacy review work unless the executor explicitly reported completion. */
   drainVerification(): number {
     const rows: Task[] = this.db
       .prepare(`SELECT ${COLUMNS} FROM tasks WHERE status = 'VERIFYING' ORDER BY seq ASC`)
@@ -173,31 +159,15 @@ export class TaskQueue extends QueuePlans {
         continue;
       }
       settled++;
-      if (t.activityPhase.startsWith('decomposition_')) {
-        this.update(t.id, {
-          status: 'BLOCKED',
-          finishedAt: Date.now(),
-          activityPhase: 'blocked',
-          activityDetail: 'Legacy verification/decomposition state retired when verification was removed.',
-          errorLog: `${t.errorLog}\n[blocked] Legacy verification state retired; a person must review this row.`.trim(),
-        });
-        this.log(t.id, 'system', 'blocked', 'legacy verification state retired');
-      } else if (t.kind === 'task' && t.output.trim()) {
+      if (t.kind === 'task' && !t.activityPhase.startsWith('decomposition_') &&
+          parseCompletionClaim(t.output).status === 'READY_FOR_VALIDATION') {
         this.update(t.id, { status: 'VERIFIED', finishedAt: Date.now(), activityPhase: 'done' });
-        this.log(t.id, 'system', 'drained', 'executor result accepted as final; verification removed');
-      } else if (t.attempts >= t.maxAttempts) {
-        this.update(t.id, {
-          status: 'BLOCKED',
-          finishedAt: Date.now(),
-          activityPhase: 'blocked',
-          activityDetail: 'No executor result and the attempt budget is spent.',
-        });
-        this.log(t.id, 'system', 'blocked', 'no result after the attempt budget was spent');
+        this.log(t.id, 'system', 'drained', 'executor reported completion; verification removed');
       } else {
-        this.update(t.id, { status: 'PENDING', finishedAt: null, activityPhase: 'requeued' });
-        this.log(t.id, 'system', 'recovered',
-          t.kind === 'phase' ? 'phase expansion requeued' : 'no result produced; requeued without verification');
+        this.update(t.id, { status: 'PENDING', finishedAt: null, activityPhase: 'executor_recovery' });
+        this.log(t.id, 'system', 'recovered', 'Unfinished legacy work returned to the executor.');
       }
+      completeRecoveryJob(this, t);
     }
     return settled;
   }

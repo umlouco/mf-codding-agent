@@ -20,12 +20,10 @@ export function recoverOwnershipStop(queue: TaskQueue, task: Task): boolean {
   if (previous === task.attempts) return true;
   const reason = previous >= 0
     ? 'The installed core still uses the old test ownership guard. Install/reload the rebuilt extension before retrying.'
-    : task.attempts >= task.maxAttempts
-      ? 'The old test ownership guard blocked this task, but its attempt budget is exhausted. Review and retry explicitly.'
-      : '';
+    : '';
   queue.update(task.id, {
-    status: reason ? 'BLOCKED' : 'PENDING', finishedAt: reason ? Date.now() : null,
-    activityPhase: reason ? 'blocked' : 'requeued',
+    status: 'PENDING', finishedAt: null,
+    activityPhase: 'executor_recovery',
     activityDetail: reason || 'Resuming the executor with source, tests, and configuration ownership.',
     supervisorFeedback: reason || 'The executor now owns in-scope source, existing tests, and configuration. ' +
       'Inspect preserved work, finish the original task, and rerun its checks; old test-ownership stops are obsolete.',

@@ -14,10 +14,11 @@ remain intact. Repair turns can also make necessary application changes.
 
 On a running queue, stopped PENDING/VERIFYING rows with this old ownership failure
 receive one executor migration retry before the legacy verification drain. Output,
-history, acceptance checks, and attempts are preserved. Exhausted budgets remain
-blocked; PAUSED/BLOCKED tasks are not automatically resumed. A recurrence after
-migration blocks with an installed-core update message instead of another repair
-loop. Genuine explicit test-repair requests keep their existing lane.
+history, acceptance checks, and attempts are preserved. Exhausted attempt counts
+do not skip unfinished work. Legacy BLOCKED rows automatically return to the
+executor before later tasks run; PAUSED rows wait for Start. A recurrence after
+migration retains the installed-core update message for the next executor attempt.
+Genuine explicit test-repair requests keep their existing lane.
 
 Checks cover native ownership, the real CLI hook, role-specific CLI prompts, and
 queue recovery using real SQLite with the model transport stubbed. No live product
@@ -26,4 +27,4 @@ queue or Parnassus files were modified while testing.
 The error path under `.vscode/extensions/mflores.mf-agent-0.1.53/bin/mfcore.exe`
 identifies an installed extension binary, not this workspace's `bin/mfcore.exe`.
 Rebuilding the workspace alone does not update it. Install the rebuilt VSIX and
-reload VS Code before retrying; already blocked tasks need an explicit retry.
+reload VS Code before retrying; the queue recovers already blocked tasks automatically.

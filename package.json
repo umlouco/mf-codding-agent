@@ -261,7 +261,7 @@
             "continuous"
           ],
           "default": "lockstep",
-          "description": "lockstep = validate before next task. continuous = executors run ahead while conclusion checks follow."
+          "description": "Tasks complete in queue order in both modes. lockstep = advance on supervisor ticks. continuous = start the next eligible execution immediately."
         },
         "mfagent.queue.cronIntervalSeconds": {
           "type": "number",
@@ -315,7 +315,7 @@
           "type": "number",
           "default": 4,
           "minimum": 1,
-          "description": "Maximum LLM request/response interactions for verifying one task, shared across verification passes and reloads. Planning, plan correction, reporting and vision-backed checks each consume an interaction; ordinary tools, streamed chunks and elapsed time do not. If the budget is exhausted without a passing host-backed report, the task is BLOCKED for human review. It is never split into smaller tasks."
+          "description": "Maximum LLM request/response interactions for verifying one task, shared across verification passes and reloads. Planning, plan correction, reporting and vision-backed checks each consume an interaction; ordinary tools, streamed chunks and elapsed time do not. Unfinished work returns to the executor before later tasks run."
         },
         "mfagent.queue.maxRunTasks": {
           "type": "number",
@@ -333,7 +333,7 @@
           "type": "number",
           "default": 180,
           "minimum": 30,
-          "markdownDescription": "Hard wall-clock ceiling on a single verification or supervisor review. A validator that keeps streaming without concluding is cut off, the task is BLOCKED for a person, and the run continues. This is what guarantees the queue reaches its end instead of parking on one task."
+          "markdownDescription": "Hard wall-clock ceiling on a single verification or supervisor review. A validator that keeps streaming without concluding is cut off and unfinished work returns to the executor before later tasks run."
         },
         "mfagent.queue.maxRunMinutes": {
           "type": "number",

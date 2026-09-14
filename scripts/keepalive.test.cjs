@@ -45,12 +45,12 @@ test('execution is terminal and the supervisor only keeps the run alive', async 
       queue.close();
     });
 
-    await t.test('keep-alive blocks a lost worker once its attempts are spent', async () => {
+    await t.test('keep-alive retries a lost worker after its attempts are spent', async () => {
       const queue = fresh();
       queue.insert({ title: 'Task 3', description: 'Work.', status: 'EXECUTING', maxAttempts: 2 }, 1);
       queue.update(queue.list()[0].id, { attempts: 2 });
       assert.equal(queue.requeueStale(0), 1);
-      assert.equal(queue.list()[0].status, 'BLOCKED');
+      assert.equal(queue.list()[0].status, 'PENDING');
       queue.close();
     });
 
@@ -61,13 +61,13 @@ test('execution is terminal and the supervisor only keeps the run alive', async 
         queue.insert({ title: 'gone', description: 'x', status: 'VERIFYING' }, 2);
         queue.insert({ title: 'spent', description: 'x', status: 'VERIFYING', maxAttempts: 1 }, 3);
         const rows = queue.list();
-        queue.update(rows[0].id, { output: 'finished' });
+        queue.update(rows[0].id, { output: '{"completion":{"status":"READY_FOR_VALIDATION"}}' });
         queue.update(rows[2].id, { attempts: 1 });
         assert.equal(queue.drainVerification(), 3);
         const [done, gone, spent] = queue.list();
         assert.equal(done.status, 'VERIFIED');
         assert.equal(gone.status, 'PENDING');
-        assert.equal(spent.status, 'BLOCKED');
+        assert.equal(spent.status, 'PENDING');
       } finally {
         queue.close();
       }

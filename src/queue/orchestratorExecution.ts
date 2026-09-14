@@ -15,9 +15,8 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
   /**
    * Starts a worker on the next PENDING task, if one should start now.
    *
-   * In lockstep mode nothing starts while a task is awaiting verification, so
-   * task N+1 is never built on top of unverified task N. Continuous mode lets
-   * later executors may run ahead while conclusion checks follow behind.
+   * Both modes finish the earliest unresolved task before claiming later work.
+   * Continuous mode schedules the next eligible execution immediately.
    *
    * "At most one worker at a time" is not enforced here. `claimNext` refuses
    * to hand out a task while any row is EXECUTING, so calling this twice at
@@ -35,6 +34,8 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     // any row is EXECUTING, so this is safe to call from the cron and the
     // watchdog at once. A task ends when its executor finishes; there is no
     // separate verification stage for later work to wait behind.
+    if (this.runBreakerTripped()) return;
+    this.queue.recoverBlocked();
     const next = this.queue.list().find(task => task.status === 'PENDING');
     if (next && scopeBlocked(next, this.queue.list())) return;
     const task = this.queue.claimNext();
@@ -119,10 +120,8 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
 
       this.queue.addUsage(task.id, res.usage);
       const overload = promptOverloadReason(res.text);
-      // An ownership stop is not retryable: the executor is fenced out of
-      // rewriting an existing test, so a retry reproduces the same stop until
-      // the attempt budget is spent and the row is blocked. Route it to the
-      // supervisor's editing turn instead of requeueing it.
+      // Older cores may still reject test edits. Hand their ownership stops to
+      // the supervisor lane, where ownership migration or a repair can resolve them.
       const repairDetail = res.cutOff && res.stopReason === 'supervisor_repair_required' &&
         TEST_OWNERSHIP_STOP.test(stopDetail(res.text)) ? stopDetail(res.text) : undefined;
       // The executor is the only agent that decides a task is done: a closing
@@ -233,19 +232,12 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     }
   }
 
-  /**
-   * A partial or unfinished executor result: retry it, or block it once its
-   * attempt budget is spent so a task that never completes cannot loop forever.
-   */
+  /** Keep unfinished work at its original position, with cumulative attempt history. */
   private retryPatch(task: Task, outcome: Partial<Task>, reason: string): Partial<Task> {
     const errorLog = appendAttempt(
       (outcome.errorLog as string | undefined) ?? task.errorLog,
       `[attempt ${task.attempts}] ${reason}`,
     );
-    if (task.kind === 'task' && task.attempts >= task.maxAttempts) {
-      return { ...outcome, status: 'BLOCKED', finishedAt: Date.now(), activityPhase: 'blocked',
-        activityDetail: reason.slice(0, 2000), errorLog };
-    }
     return { ...outcome, status: 'PENDING', finishedAt: null, activityPhase: 'requeued', errorLog };
   }
 

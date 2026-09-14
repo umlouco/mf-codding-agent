@@ -145,16 +145,10 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
         task.errorLog,
         `[attempt ${task.attempts}] ${note}. The keep-alive supervisor returned it to the queue.`,
       );
-      const spent = task.kind === 'task' && task.attempts >= task.maxAttempts;
-      this.stopForDecision(task, spent
-        ? { status: 'BLOCKED', finishedAt: Date.now(), activityPhase: 'blocked',
-            activityDetail: note, errorLog }
-        : { status: 'PENDING', finishedAt: null, activityPhase: 'requeued', errorLog });
-      this.queue.log(task.id, 'system', spent ? 'blocked' : 'silent',
-        spent ? `${note}; attempt budget spent` : `${note}; requeued by the keep-alive supervisor`);
-      this.log(spent
-        ? `task ${task.seq} — ${note}; blocked after its attempt budget was spent`
-        : `task ${task.seq} — ${note}; requeued`);
+      this.stopForDecision(task, { status: 'PENDING', finishedAt: null,
+        activityPhase: 'executor_recovery', activityDetail: note, errorLog });
+      this.queue.log(task.id, 'system', 'silent', `${note}; requeued by the keep-alive supervisor`);
+      this.log(`task ${task.seq}: ${note}; requeued`);
       this.changed();
     }
   }
@@ -162,9 +156,8 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
   /** Explicit scoped repairs remain ordered; obsolete ownership stops were recovered above. */
   protected async serviceTestRepairs(): Promise<void> {
     const rows = this.queue.list();
-    const task =
-      rows.find(t => t.status === 'VERIFYING' && t.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]'));
-    if (!task) {
+    const task = rows.find(t => t.status !== 'VERIFIED');
+    if (!task || task.status !== 'VERIFYING' || !task.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
       return;
     }
     const reason = task.supervisorFeedback;
@@ -209,7 +202,7 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     }
 
     const s = this.queue.stats();
-    const open = s.byStatus.PENDING + s.byStatus.EXECUTING + s.byStatus.VERIFYING;
+    const open = s.byStatus.PENDING + s.byStatus.EXECUTING + s.byStatus.VERIFYING + s.byStatus.BLOCKED;
     if (open === 0) {
       return;
     }

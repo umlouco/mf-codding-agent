@@ -9,15 +9,9 @@ export const DECOMPOSITION_REQUIRED = 'decomposition_required';
  * Decomposition phase changes are allowed; deleting/replacing the row discharges
  * the obligation. The schema keeps FAILED readable for old database writers.
  *
- * BLOCKED is exempt on purpose. It is the one sanctioned terminal exit for a row
- * the queue cannot complete — including exactly the `decomposition_*` rows this
- * invariant guards. Without the exemption the trigger rewrites the terminal
- * `status = 'BLOCKED'` back to `VERIFYING` (and the old phase), so blockTask can
- * never commit: the supervisor re-decides the same task every tick, logs a fresh
- * verdict:BLOCKED forever, the row never leaves VERIFYING, and every later task
- * is head-of-line blocked behind it. A human-blocked row is not an accepted
- * failure, so allowing it through does not revive the failed parent the
- * invariant exists to stop.
+ * An explicit executor_recovery handback may release retired decomposition
+ * state without discarding its report or failure history. BLOCKED remains
+ * readable for compatibility and is recovered before claiming later work.
  */
 export function installDecompositionInvariant(db: Driver): void {
   db.exec('BEGIN IMMEDIATE');
@@ -27,7 +21,8 @@ export function installDecompositionInvariant(db: Driver): void {
       DROP TRIGGER IF EXISTS tasks_decomposition_update;
       CREATE TRIGGER tasks_decomposition_insert
       AFTER INSERT ON tasks
-      WHEN NEW.status <> 'BLOCKED' AND (
+      WHEN NEW.status <> 'BLOCKED'
+        AND NOT (NEW.status = 'PENDING' AND NEW.activity_phase = 'executor_recovery') AND (
         NEW.status = 'FAILED' OR
         (NEW.activity_phase GLOB 'decomposition_*' AND
           (NEW.status <> 'VERIFYING' OR NEW.finished_at IS NOT NULL)))
@@ -37,7 +32,8 @@ export function installDecompositionInvariant(db: Driver): void {
       END;
       CREATE TRIGGER tasks_decomposition_update
       AFTER UPDATE ON tasks
-      WHEN NEW.status <> 'BLOCKED' AND (
+      WHEN NEW.status <> 'BLOCKED'
+        AND NOT (NEW.status = 'PENDING' AND NEW.activity_phase = 'executor_recovery') AND (
         NEW.status = 'FAILED' OR
         (NEW.activity_phase GLOB 'decomposition_*' AND
           (NEW.status <> 'VERIFYING' OR NEW.finished_at IS NOT NULL)) OR
