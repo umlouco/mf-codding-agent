@@ -251,11 +251,33 @@ export function serializeValidation(report: ExecutorValidation): string {
 /** What the implementation agent says about its own work when it stops. */
 export type CompletionStatus = 'READY_FOR_VALIDATION' | 'NEEDS_MORE_WORK' | 'UNSTATED';
 
+type SplitProposal = import('./splitPlan').SplitProposal;
+
 export interface CompletionClaim {
   status: CompletionStatus;
   summary: string;
   filesChanged: string[];
   developmentChecks: string[];
+  /**
+   * Smaller tasks the executor proposes to replace this one. A turn that does
+   * not finish its task fails it, and a usable proposal becomes the split as-is.
+   */
+  splitInto?: SplitProposal[];
+}
+
+/** The executor's own proposed split: two or more tasks, each with a title and a description. */
+function splitProposal(value: unknown): SplitProposal[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const parts = value.flatMap((entry): SplitProposal[] => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const raw = entry as Record<string, unknown>;
+    const title = clean(raw.title, 200);
+    const description = clean(raw.description, 8000);
+    if (!title || !description) return [];
+    return [{ title, description, solutionVerifyPrompt: clean(raw.solutionVerifyPrompt, 4000),
+      targets: cleanList(raw.targets, 12) }];
+  }).slice(0, 8);
+  return parts.length >= 2 ? parts : undefined;
 }
 
 const UNSTATED: CompletionClaim = {
@@ -293,6 +315,7 @@ export function parseCompletionClaim(text: string): CompletionClaim {
       summary: clean(value.summary, 4000),
       filesChanged: cleanList(value.filesChanged, 60),
       developmentChecks: cleanList(value.developmentChecks, 40),
+      splitInto: splitProposal(value.splitInto),
     };
   } catch {
     return UNSTATED;

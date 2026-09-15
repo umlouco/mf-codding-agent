@@ -79,7 +79,8 @@ ${opts.allowTestEdits ? `This is a dedicated supervisor test-repair turn after t
 Inspect the actual failure. Only test files, fixtures, and test harnesses are editable in this
 turn — application source, production configuration, and documentation are not. If the correct
 fix requires an application or configuration change, do not attempt it and do not work around the
-refusal; report the required change and the host replaces this task with an ordered split. Stay
+refusal; report the required change and the host splits this task so that change becomes its
+own smaller task. Stay
 within the assigned repair and preserve required assertions. Run a focused check and report
 changed files, observed results, and remaining gaps. Fresh independent verification must follow;
 you cannot approve your own repair.` :

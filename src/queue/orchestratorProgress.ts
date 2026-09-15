@@ -7,6 +7,7 @@ import { OrchestratorRemediation } from './orchestratorRemediation';
 import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, recoverySucceeded, recoveryReplayLimit } from './recovery';
 import { isLocalScope } from './scopeContract';
 import { recoverOwnershipStop } from './ownershipRecovery';
+import { currentAttemptEvents, detectToolLoop, reviewExecution } from './executionWatch';
 
 export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
@@ -194,8 +195,11 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
   protected async repairTests(task: Task, reason: string): Promise<void> {
     if (recoverOwnershipStop(this.queue, task)) { this.changed(); return; }
+    // One repair per task. A repair that already halted is never restarted: the
+    // task failed, and it is split into smaller tasks instead.
     if (this.queue.countEvents(task.id, 'test-repair-halted') > 0) {
-      this.requestFailureDecomposition(task, `A previous supervisor test repair halted. Replace this task rather than restarting the exhausted repair.\n${reason}`);
+      this.requestFailureDecomposition(task, 'An earlier supervisor test repair of this task halted, so the task ' +
+        `is split instead of repaired again. Repair requested: ${reason.replace('[SUPERVISOR_TEST_REPAIR]', '').trim()}`);
       return;
     }
     // Replace the completed decision's worker without releasing the current
@@ -213,17 +217,18 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     const live = new LiveLog(this.queue, task.id, 'supervisor');
     this.queue.log(task.id,'supervisor','test-repair-started',reason);
     let ownershipFailure = '';
-    const decompose = (failure: string): void => {
+    const halt = (failure: string): void => {
       const current = this.queue.get(task.id);
       if (review.gen !== this.reviewGen || !current) return;
       // The repair narration is not the executor's original evidence. Keep the
-      // rejected parent's report/handoff intact for the replacement archive.
+      // parent's report/handoff intact for the tasks that replace it.
       this.queue.update(task.id, {output:task.output, validationReport:task.validationReport,
         errorLog:appendAttempt(current.errorLog,
         `[attempt ${task.attempts}] supervisor test repair halted: ${failure}`)});
       this.queue.log(task.id,'supervisor','test-repair-halted',failure);
       if (recoverOwnershipStop(this.queue, this.queue.get(task.id)!)) return;
-      this.requestFailureDecomposition(this.queue.get(task.id)!, failure);
+      // A repair that could not finish failed the task: it is split into smaller tasks.
+      this.requestFailureDecomposition(this.queue.get(task.id)!, `Supervisor test repair halted: ${failure}`);
     };
     try {
       const observe=this.observerEvents(task.id,'supervisor',live,()=>review.gen===this.reviewGen);
@@ -233,7 +238,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       const result = await runOnce(this.context,this.output,'supervisor',
         `You are the SUPERVISOR and own test repairs. The executor has been stopped.\n` +
         `Read the failure and repair only the relevant test, fixture, or harness with editing tools; application source, production configuration, and documentation are out of scope for this turn.\n` +
-        `If the correct fix requires an application or configuration change, do not attempt it and do not work around the refusal through another tool or shell; the host will replace this task with an ordered split.\n` +
+        `If the correct fix requires an application or configuration change, do not attempt it and do not work around the refusal through another tool or shell; stop and report it, and the host splits this task so that change becomes its own smaller task.\n` +
         `Preserve acceptance criteria; do not hide application defects by weakening assertions.\n` +
         `Stay within the assigned task. Do not change the task database; task-list changes use your decision protocol.\n` +
         `Use the configured testing environment and credential references. Run a focused check of your repair.\n` +
@@ -252,10 +257,11 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
             if(!ownershipFailure && method==='stream/tool' && params?.status==='error' &&
                 /queue ownership:/i.test(String(params.output ?? ''))) {
               ownershipFailure=String(params.output);
-              // Persist intent before abort settles: Pause/reload must not lose
-              // this host-observed failure or restart the same repair marker.
+              // Persist the refusal on the row before abort settles: the aborted
+              // turn may never report back. A reload inside that window reruns
+              // this repair once, and the same refusal then hands the task back.
               this.queue.update(task.id,{output:task.output,validationReport:task.validationReport});
-              this.queue.recordActivity(task.id,'decomposition_required',ownershipFailure,'supervisor');
+              this.queue.recordActivity(task.id,'repair_halted',ownershipFailure,'supervisor');
               this.changed();
               try { review.abort?.(); } catch { /* A blocked repair may already have exited. */ }
             }
@@ -268,18 +274,78 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         supervisorFeedback:reason.replace('[SUPERVISOR_TEST_REPAIR]', '').trim()});
       this.queue.log(task.id,'supervisor','test-repair-finished',result.text);
       if (ownershipFailure || coreHalted(result.stopReason)) {
-        decompose(ownershipFailure || `Supervisor test repair stopped (${result.stopReason}).`);
+        halt(ownershipFailure || `Supervisor test repair stopped (${result.stopReason}).`);
         return;
       }
       // Only a completed, unblocked repair proceeds to independent verification.
       await this.verifyWithExecutor(this.queue.get(task.id)!,review);
     } catch (error: any) {
       if (review.gen === this.reviewGen && error?.usage) this.queue.addUsage(task.id,error.usage);
-      decompose(ownershipFailure || `Supervisor test repair failed: ${String(error)}`);
+      halt(ownershipFailure || `Supervisor test repair failed: ${String(error)}`);
     } finally {
       live.close();
       if(this.review===review)this.review=null;
       this.changed();
+    }
+  }
+
+  /** How long one journal review may run before it is abandoned and the executor left alone. */
+  protected journalReviewTimeoutMs = 180_000;
+
+  /**
+   * Reads the running executor's journal for the two ways a live task fails: an
+   * infinite loop, or a rabbit hole. Either one stops the executor and splits the
+   * task into smaller ones. An identical tool call repeated over and over is
+   * caught without a model turn. The supervisor's own read runs at most once per
+   * review interval, and only when the executor has done something new since the
+   * last read; a review that fails or is unclear never stops the executor.
+   */
+  protected async watchExecution(): Promise<void> {
+    const task = this.queue.activeTask();
+    if (!task || task.kind !== 'task') return;
+    const events = currentAttemptEvents(this.queue.events(task.id, 200));
+    const loop = detectToolLoop(events);
+    if (loop) {
+      this.queue.log(task.id, 'supervisor', 'journal-review:LOOP', loop);
+      this.requestFailureDecomposition(task, `The supervisor found the executor in an infinite loop. ${loop}`);
+      return;
+    }
+    const latest = events[0]?.id ?? 0;
+    const last = this.reviewed.get(task.id);
+    const sameAttempt = last?.attempt === task.attempts;
+    if (Date.now() - (sameAttempt ? last!.at : task.startedAt ?? Date.now()) < this.reviewIntervalMs ||
+        latest <= (sameAttempt ? last!.eventId : 0)) return;
+    this.reviewed.set(task.id, { attempt: task.attempts, at: Date.now(), eventId: latest });
+    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen,
+      lastActivityAt: Date.now(), startedAt: Date.now() };
+    this.review = review;
+    const current = () => review.gen === this.reviewGen && !this.disposed && this.queue.runState === 'RUNNING';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { review.abort?.(); } catch { /* the review already exited */ }
+    }, this.journalReviewTimeoutMs);
+    try {
+      const result = await reviewExecution(this.context, this.output, task, events, this.queue.getMeta('goal'), {
+        onAbort: abort => { if (!current() || timedOut) abort(); else review.abort = abort; },
+      });
+      if (!current()) return;
+      this.queue.addUsage(task.id, result.usage);
+      const now = this.queue.get(task.id);
+      if (!now || now.status !== 'EXECUTING' || now.attempts !== task.attempts || now.startedAt !== task.startedAt) return;
+      this.queue.log(task.id, 'supervisor', `journal-review:${result.verdict}`, result.reason || '(no reason given)');
+      if (result.verdict === 'PROGRESS') return;
+      const finding = result.verdict === 'LOOP' ? 'in an infinite loop' : 'down a rabbit hole';
+      this.requestFailureDecomposition(now,
+        `The supervisor read the journal and found the executor ${finding}. ${result.reason}`.trim());
+    } catch (error: any) {
+      if (current()) {
+        this.log(`task ${task.seq}: journal review ${timedOut ? 'timed out' :
+          `failed: ${String(error?.message ?? error).slice(0, 200)}`}; the executor continues`);
+      }
+    } finally {
+      clearTimeout(timer);
+      if (this.review === review) this.review = null;
     }
   }
 

@@ -105,7 +105,7 @@ function clip(text: string, max: number): string {
  * the ones describing what it is doing *now*. The result is then reversed, so
  * the supervisor still reads it forwards.
  */
-function journal(events: TaskEvent[]): string {
+export function journal(events: TaskEvent[]): string {
   const lines: string[] = [];
   let budget = JOURNAL_TOTAL_CHARS;
 

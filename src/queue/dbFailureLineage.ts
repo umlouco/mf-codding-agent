@@ -16,8 +16,12 @@ export function decompositionFamily(task: Task): string {
   return persistedFailureFamily(task) || `${task.id}:${task.createdAt}`;
 }
 
-/** Bound recursive task multiplication, not productive execution. Only verified family work replenishes it. */
-export function admitDecompositionFamily(queue: FamilyStore, task: Task): boolean {
+/** Splits one family may make without producing a new verified outcome. */
+export const FAMILY_SPLIT_LIMIT = 32;
+
+/** A family's split allowance, replenished by any verified outcome it has not been credited with yet. */
+function familyAllowance(queue: FamilyStore, task: Task):
+  { key: string; state: { proofs: string[]; splits: number } } | undefined {
   const family = decompositionFamily(task);
   const key = `failureDecompositionFamily:v1:${family}`;
   const proofs = queue.list().filter(row => row.status === 'VERIFIED' &&
@@ -26,16 +30,32 @@ export function admitDecompositionFamily(queue: FamilyStore, task: Task): boolea
   const saved = queue.getMeta(key);
   if (saved) {
     try { state = JSON.parse(saved); if (!Array.isArray(state.proofs) ||
-      !Number.isSafeInteger(state.splits) || state.splits < 0) return false; }
-    catch { return false; }
+      !Number.isSafeInteger(state.splits) || state.splits < 0) return undefined; }
+    catch { return undefined; }
   }
   const fresh = proofs.filter(proof => !state.proofs.includes(proof));
   if (fresh.length) state = { proofs: [...state.proofs, ...fresh], splits: 0 };
-  if (state.splits >= 32) return false;
+  return { key, state };
+}
+
+/** Bound recursive task multiplication, not productive execution. Only verified family work replenishes it. */
+export function admitDecompositionFamily(queue: FamilyStore, task: Task): boolean {
+  const allowance = familyAllowance(queue, task);
+  if (!allowance || allowance.state.splits >= FAMILY_SPLIT_LIMIT) return false;
   // splitTask calls this inside its write transaction, so admission and replacement commit together.
-  state.splits++;
-  queue.setMeta(key, JSON.stringify(state));
+  allowance.state.splits++;
+  queue.setMeta(allowance.key, JSON.stringify(allowance.state));
   return true;
+}
+
+/**
+ * Whether admitDecompositionFamily would admit one more split, without spending
+ * it. Checked before a planner turn, so an exhausted family is rebuilt instead
+ * of paying for a plan the database will refuse.
+ */
+export function familySplitBudgetLeft(queue: FamilyStore, task: Task): boolean {
+  const allowance = familyAllowance(queue, task);
+  return !!allowance && allowance.state.splits < FAMILY_SPLIT_LIMIT;
 }
 
 /**

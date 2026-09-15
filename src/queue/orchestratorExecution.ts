@@ -4,9 +4,21 @@ import { appendAttempt, stopDetail, TEST_OWNERSHIP_STOP } from './orchestratorSt
 import { OrchestratorVerification } from './orchestratorVerification';
 import { completionForSupervisor } from './validation';
 import { scopeBlocked } from './scopePlan';
-import { providerConfigurationError } from './recovery';
+import { providerConfigurationError, providerUnavailable } from './recovery';
 import { boundedTask } from './scopeBoundary';
 import { promptOverloadReason } from './scopeEvidence';
+
+/** Why an executor turn that did not finish its task counts as a failure. */
+function executionFailure(res: ExecutionOutcome, overload?: string): string {
+  if (overload) return overload;
+  const detail = stopDetail(res.text);
+  if (res.cutOff) return `The core stopped the executor (${res.stopReason})${detail ? `: ${detail}` : ''}.`;
+  if (res.completion.status === 'NEEDS_MORE_WORK') {
+    return `The executor stopped before finishing: ${res.completion.summary || 'it reported more work remaining.'}`;
+  }
+  if (!res.ok) return `The executor ended its turn without a report (${res.stopReason || 'no stop reason'}).`;
+  return `The executor stopped without reporting the task complete (${res.stopReason || res.completion.status}).`;
+}
 
 export abstract class OrchestratorExecution extends OrchestratorVerification {
 
@@ -106,15 +118,14 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
 
       // The core stopped this turn itself rather than the model finishing it —
       // see coreHalted. The report is partial progress, so say which limit it
-      // ran into: the retry prompt feeds this back, and it is the difference
-      // between a task that needs another attempt and one whose tool calls are
-      // broken.
+      // ran into: the next task's history reads this, and it is the difference
+      // between work that was cut short and a tool that is broken.
       const cutOffNote = res.cutOff
         ? appendAttempt(
             task.errorLog,
             `[attempt ${task.attempts}] the core stopped the turn (${res.stopReason})` +
               (stopDetail(res.text) ? `: ${stopDetail(res.text)}` : '') +
-              '. The report is partial progress. The task will be retried with this history.',
+              '. The report is partial progress.',
           )
         : undefined;
 
@@ -125,10 +136,13 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       const repairDetail = res.cutOff && res.stopReason === 'supervisor_repair_required' &&
         TEST_OWNERSHIP_STOP.test(stopDetail(res.text)) ? stopDetail(res.text) : undefined;
       // The executor is the only agent that decides a task is done: a closing
-      // READY_FOR_VALIDATION claim on a complete turn ends the task. Everything
-      // else is partial work and goes back for another attempt.
+      // READY_FOR_VALIDATION claim on a complete turn ends the task. Anything
+      // else means the executor stopped working before the task was done, so
+      // the task failed and is replaced by smaller tasks. A provider outage
+      // never reaches this point: the turn throws, and the catch below retries.
       const done = !res.cutOff && res.ok && !overload &&
         res.completion.status === 'READY_FOR_VALIDATION';
+      const failure = done || repairDetail ? '' : executionFailure(res, overload);
       const outcome: Partial<Task> = {
         output: res.text,
         validationReport: '',
@@ -142,8 +156,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
         attempt,
         done ? { ...outcome, status: 'VERIFIED' }
           : repairDetail ? { ...outcome, status: 'VERIFYING' }
-          : this.retryPatch(task, outcome,
-              overload || res.stopReason || res.completion.status || 'executor reported unfinished work'),
+          : this.splitPatch(task, outcome, failure),
       );
       if (!applied) {
         this.log(`task ${task.seq} — result arrived after the run moved past this attempt; discarding it`);
@@ -175,10 +188,8 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
           this.log(`task ${task.seq} — executor stopped on a supervisor-owned test; ` +
             'a supervisor repair turn is queued');
         } else {
-          this.log(
-            `task ${task.seq} did not complete (${overload || res.stopReason || res.completion.status}); ` +
-              'returned for another attempt',
-          );
+          this.recordSplitRequest(task, failure, res.completion.splitInto);
+          this.log(`task ${task.seq} failed (${failure.slice(0, 200)}); splitting it into smaller tasks`);
         }
       }
     } catch (e: any) {
@@ -193,10 +204,11 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
         this.stopForProviderConfiguration(msg);
         return;
       }
-      // A worker that died mid-turn — a dropped connection, a crashed core, or
-      // abandonExecution killing it on purpose — still edited real files, so
-      // the task is returned for another attempt with its history; the
-      // keep-alive supervisor exists to make sure it runs again.
+      // A provider or network outage says nothing about the task, so it is
+      // retried. Any other way the worker died means the executor stopped
+      // working: the task failed and is replaced by smaller tasks. Whatever the
+      // worker changed is still on disk either way.
+      const outage = providerUnavailable(msg);
       const outcome: Partial<Task> = {
         output: task.output,
         errorLog: appendAttempt(
@@ -206,15 +218,22 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
             'activity log, rather than assuming nothing happened.',
         ),
       };
+      const failure = `The executor stopped before reporting: ${msg}`;
       const applied = this.queue.finishExecution(
         task.id,
         attempt,
-        this.retryPatch(task, outcome, 'worker stopped before reporting'),
+        outage ? this.retryPatch(task, outcome, 'the model provider was unreachable')
+          : this.splitPatch(task, outcome, failure),
       );
       if (applied) {
-        this.queue.recordActivity(task.id, 'stopped', msg);
         this.queue.log(task.id, 'executor', 'stopped', msg);
-        this.log(`task ${task.seq} stopped without reporting: ${msg}; returned for another attempt`);
+        if (outage) {
+          this.queue.recordActivity(task.id, 'stopped', msg);
+          this.log(`task ${task.seq} stopped without reporting: ${msg}; the provider was unreachable, so it is retried`);
+        } else {
+          this.recordSplitRequest(task, failure);
+          this.log(`task ${task.seq} stopped without reporting: ${msg}; splitting it into smaller tasks`);
+        }
       } else {
         this.log(`task ${task.seq} — its worker stopped after the run moved past this attempt; ignoring it`);
       }
@@ -239,6 +258,20 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       `[attempt ${task.attempts}] ${reason}`,
     );
     return { ...outcome, status: 'PENDING', finishedAt: null, activityPhase: 'requeued', errorLog };
+  }
+
+  /**
+   * The executor stopped working, so the task failed: it waits for serviceSplits
+   * to replace it with smaller tasks. Committed in the same write as the result,
+   * so the failed task can never be claimed again in between.
+   */
+  private splitPatch(task: Task, outcome: Partial<Task>, reason: string): Partial<Task> {
+    const errorLog = appendAttempt(
+      (outcome.errorLog as string | undefined) ?? task.errorLog,
+      `[attempt ${task.attempts}] ${reason}`,
+    );
+    return { ...outcome, status: 'VERIFYING', finishedAt: null, activityPhase: 'decomposition_required',
+      activityDetail: reason.slice(0, 4000), errorLog };
   }
 
   /**

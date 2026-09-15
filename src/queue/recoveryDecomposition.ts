@@ -1,7 +1,8 @@
 import { createHash } from 'crypto';
 import { statSync } from 'fs';
 import { isAbsolute, join, resolve } from 'path';
-import type { Task, TaskQueue } from './db';
+import type { NewTask, Task, TaskQueue } from './db';
+import type { SplitProposal } from './splitPlan';
 import { indexRepository } from './workInventory';
 
 export interface DecompositionJob {
@@ -21,6 +22,10 @@ export interface DecompositionJob {
    * after three tries on what was really the first split.
    */
   streak?: number;
+  /** Smaller tasks the failed executor proposed itself; preferred over a planner turn. */
+  proposal?: SplitProposal[];
+  /** The chosen replacement, saved before its commit so an interrupted commit reuses it. */
+  plan?: NewTask[];
 }
 
 export const decompositionKey = (task: Task) => `failureDecomposition:v1:${task.id}:${task.createdAt}`;
@@ -169,4 +174,4 @@ export function decompositionRetryRevision(root: string): string {
   return decompositionDigest(current);
 }
 
-export { decompositionFamily, admitDecompositionFamily, verificationStallStreak } from './dbFailureLineage';
+export { decompositionFamily, admitDecompositionFamily, familySplitBudgetLeft, verificationStallStreak } from './dbFailureLineage';

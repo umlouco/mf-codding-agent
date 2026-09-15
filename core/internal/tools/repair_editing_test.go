@@ -6,9 +6,10 @@ import (
 	"testing"
 )
 
-// A repair turn owns the test surface only. An application edit must be refused
-// with an instruction to split, never quietly permitted, or the repair can make
-// a failing test pass by changing the product it is supposed to be checking.
+// A repair turn owns the test surface only. An application edit must be refused,
+// never quietly permitted, or the repair can make a failing test pass by changing
+// the product it is supposed to be checking. The refusal names the executor as
+// the owner of that change: the keep-alive queue has no split lane to take it.
 func TestRepairEditsTestsButNotApplicationFiles(t *testing.T) {
 	env := &Env{Root: t.TempDir(), QueueRole: "supervisor-repair"}
 	for _, file := range []string{
@@ -28,8 +29,8 @@ func TestRepairEditsTestsButNotApplicationFiles(t *testing.T) {
 			t.Errorf("repair may edit application file %s", file)
 			continue
 		}
-		if !strings.Contains(err.Error(), "SPLIT_TASK") {
-			t.Errorf("repair refusal for %s does not request a split: %v", file, err)
+		if !strings.Contains(err.Error(), "splits this task") || strings.Contains(err.Error(), "SPLIT_TASK") {
+			t.Errorf("repair refusal for %s does not say the task is split: %v", file, err)
 		}
 	}
 	if err := env.CheckQueueCommand(`Set-Content parnassus.config.json -Value '{}'`); err == nil {

@@ -158,9 +158,14 @@ export class TaskQueue extends QueuePlans {
       if (t.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
         continue;
       }
+      // A failed task waiting for its split belongs to serviceSplits, which
+      // replaces it with smaller tasks. Handing it back to the executor would
+      // retry the very work that failed.
+      if (t.activityPhase.startsWith('decomposition_')) {
+        continue;
+      }
       settled++;
-      if (t.kind === 'task' && !t.activityPhase.startsWith('decomposition_') &&
-          parseCompletionClaim(t.output).status === 'READY_FOR_VALIDATION') {
+      if (t.kind === 'task' && parseCompletionClaim(t.output).status === 'READY_FOR_VALIDATION') {
         this.update(t.id, { status: 'VERIFIED', finishedAt: Date.now(), activityPhase: 'done' });
         this.log(t.id, 'system', 'drained', 'executor reported completion; verification removed');
       } else {

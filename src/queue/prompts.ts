@@ -87,6 +87,7 @@ export const executorExample = JSON.stringify({
     summary: 'State what is complete and what remains.',
     filesChanged: [],
     developmentChecks: [],
+    splitInto: [],
   },
   notes: '',
 }, null, 2);

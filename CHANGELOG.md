@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- Split every failed task into smaller tasks, and make the split land every
+  time. A task fails when its executor stops working (the turn ends without
+  READY_FOR_VALIDATION, the core cuts it off, the worker crashes, or it goes
+  silent), when the supervisor reads the journal and finds the executor in an
+  infinite loop or down a rabbit hole, or when a supervisor test repair halts.
+  Until now the keep-alive cycle had no split step at all: unfinished work was
+  retried forever, and a task marked for decomposition was either handed back to
+  the executor by `drainVerification` or, with a repair marker still set,
+  re-requested as a repair on every tick. `serviceSplits` now runs every tick
+  before the pump and replaces the failed task, deleting the original, from the
+  executor's own `completion.splitInto`, one five-minute planner turn, or
+  `mechanicalSplit` when neither yields two usable tasks; `normalizeSplitParts`
+  repairs imperfect plans instead of refusing them. `watchExecution` reads a
+  running executor's journal: an identical tool call repeated four times in its
+  last twelve is a loop without any model turn, and a supervisor review (at most
+  once per review interval, and only on new evidence) returns PROGRESS, LOOP, or
+  RABBIT_HOLE. A provider or network outage is still retried, not split.
+- Fix a halted supervisor test repair re-requesting itself every minute,
+  indefinitely, while every later task waited behind it. Confirmed live on the
+  Parnassus queue: 1,954 `test-repair-requested` events over 20 hours on one task,
+  across every installed build since 0.1.53, with 21 tasks behind it at zero
+  progress. The repair had been handed to decomposition with its
+  `[SUPERVISOR_TEST_REPAIR]` marker still set, and nothing serviced decomposition.
+  A halted repair now splits its task like any other failure, with the marker
+  cleared, and `serviceTestRepairs` skips any row waiting for its split.
+- Fix the executor-ownership migration recording success for a write that never
+  landed. 0.1.54 moved a decomposition-bound row to `PENDING`/`requeued`, which
+  `tasks_decomposition_update` silently reverts, then recorded
+  `executorOwnershipMigration:<id>` regardless; from then on `recoverOwnershipStop`
+  answered "already handled" for a row still parked in `VERIFYING`, and every
+  caller skipped it. It now re-reads the row before recording anything, "already
+  migrated" only counts for a row that actually left the stop, and a row waiting
+  for its split is left to the split.
+- Fix the rebuild steps of a runaway split family never landing.
+  `tasks_decomposition_update` silently reverts any write that moves a
+  decomposition-bound row anywhere except `PENDING`/`executor_recovery`, and both
+  `rebuildFromRoot` patches did exactly that. A family that has split 32 times
+  without a verified result is now caught before a planner turn is spent
+  (`familySplitBudgetLeft`), rebuilt from its original task as a fresh family that
+  stays waiting for its split, and after two rebuilds handed to the executor
+  through `executor_recovery`.
 - Fix a replacement planner that never goes idle running unmonitored for as
   long as it keeps streaming, however long that is. `sweepSilentReview` already
   abandoned one that stalled — no new model output for two minutes straight —

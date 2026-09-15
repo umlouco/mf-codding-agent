@@ -231,11 +231,18 @@ export abstract class OrchestratorState {
   protected abstract correctTestingTarget(task: Task): boolean;
   protected abstract repairTests(task: Task, reason: string): Promise<void>;
   /**
-   * A task the queue cannot complete is replaced by the configured planner: the
-   * supervisor requests its complete replacement, which is committed atomically
-   * and retires the original row — see orchestratorDecomposition.
+   * A failed task is replaced by smaller tasks: this marks it, and serviceSplits
+   * commits the replacement and deletes the original — see orchestratorDecomposition.
    */
-  protected abstract requestFailureDecomposition(task: Task, reason: string): void;
+  protected abstract requestFailureDecomposition(task: Task, reason: string,
+    proposal?: import('./splitPlan').SplitProposal[]): void;
+  /** The durable split request for a row its caller has already marked (see pump). */
+  protected abstract recordSplitRequest(task: Task, reason: string,
+    proposal?: import('./splitPlan').SplitProposal[]): void;
+  /** Replaces the first task waiting for its split; runs every tick, before the pump. */
+  protected abstract serviceSplits(): Promise<void>;
+  /** Reads a running executor's journal for a loop or a rabbit hole; either one fails the task. */
+  protected abstract watchExecution(): Promise<void>;
   /**
    * Compatibility handoff: return unresolved work to the executor before later tasks.
    */

@@ -36,7 +36,10 @@ export function buildExecutorPrompt(task: Task, instructions: string, goal: stri
     `Final response: ONE valid JSON object, without a code fence or trailing prose; keep it under
 1200 words. Other requested output formats are deliverables, not replacements for this report.
 Use READY_FOR_VALIDATION only when implementation and required checks are complete; otherwise
-use NEEDS_MORE_WORK. These are completion labels, not verifier verdicts. Record actual changed
+use NEEDS_MORE_WORK. These are completion labels, not verifier verdicts. A turn that ends without
+READY_FOR_VALIDATION fails the task, and the host replaces it with smaller tasks; if you cannot
+finish, propose them in completion.splitInto (2-4 ordered tasks, each with title, description,
+solutionVerifyPrompt, and targets of at most 3 files). Record actual changed
 paths and observed check results, explicitly marking missing checks. Leave notes empty unless
 there is a new durable fact useful to later tasks; do not repeat history or the task outcome.
 Replace the example values below:`,

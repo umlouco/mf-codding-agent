@@ -110,10 +110,11 @@ func (e *Env) CheckQueueWritePath(path string) error {
 	}
 	// A test-repair turn owns tests, fixtures, and harnesses, not the product.
 	// When the correct fix needs an application or production-config change, the
-	// host replaces the task with an ordered split rather than letting one role
-	// rewrite the implementation to make a test pass.
+	// host splits the task so that change becomes its own smaller task, rather
+	// than letting the repair rewrite the implementation to make a test pass.
+	// The replacement tasks read this refusal in their parent's history.
 	if e.QueueRole == "supervisor-repair" && !testPath(normalized) {
-		return fmt.Errorf("queue ownership: supervisor test repair cannot rewrite application file %s; return a SPLIT_TASK decision so the implementation change and its verification are separate tasks", path)
+		return fmt.Errorf("queue ownership: supervisor test repair cannot rewrite application file %s; stop and report the required change: the extension splits this task so that change becomes its own smaller task", path)
 	}
 	// Implementation includes its tests and configuration. File extensions do
 	// not transfer an executor's assigned work to a different agent.

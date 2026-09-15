@@ -5,7 +5,7 @@ const path = require('node:path');
 const { test } = require('node:test');
 const { createHost } = require('./headless-host.cjs');
 
-test('unfinished tasks return to the executor before later work', async t => {
+test('earlier unfinished work is resolved before any later task runs', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mf-blocked-recovery-'));
   const host = await createHost({ workspace: root, log() {} });
   const { TaskQueue } = host.load('src/queue/db.ts');
@@ -95,7 +95,7 @@ test('unfinished tasks return to the executor before later work', async t => {
       } finally { runner.dispose(); queue.close(); }
     });
 
-    await t.test('legacy incomplete and decomposition reports return to execution', () => {
+    await t.test('legacy incomplete reports return to execution; failed ones wait for their split', () => {
       const queue = fresh();
       try {
         const first = add(queue, 'VERIFYING');
@@ -103,46 +103,53 @@ test('unfinished tasks return to the executor before later work', async t => {
         queue.update(first.id, { output: '{"completion":{"status":"NEEDS_MORE_WORK"}}', attempts: 5 });
         queue.update(second.id, { output: '{"completion":{"status":"READY_FOR_VALIDATION"}}' });
         queue.drainVerification();
-        assert.deepEqual(queue.list().map(task => task.status), ['PENDING', 'PENDING']);
+        assert.deepEqual(queue.list().map(task => [task.status, task.activityPhase]),
+          [['PENDING', 'executor_recovery'], ['VERIFYING', 'decomposition_required']]);
         assert.equal(queue.claimNext().id, first.id);
       } finally { queue.close(); }
     });
 
-    await t.test('unfinished outcomes retry beyond maxAttempts in both modes', async () => {
+    await t.test('an unfinished or crashed executor turn fails its task in both modes; an outage is retried', async () => {
       const agents = host.load('src/queue/agentExecution.ts');
       const original = agents.executeTask;
+      const unfinished = async () => ({ ok: true, cutOff: false, text: 'unfinished', notes: '', stopReason: 'end_turn',
+        completion: { status: 'NEEDS_MORE_WORK', summary: 'half done', filesChanged: [], developmentChecks: [] },
+        usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 } });
+      const crashed = async () => { throw Error('connection lost'); };
+      const outage = async () => { throw Error('cannot reach https://llm.example/v1: dial tcp 10.0.0.1:443: connectex: timeout'); };
       try {
         for (const mode of ['lockstep', 'continuous']) {
-          const queue = fresh();
-          const runner = new Orchestrator(host.context, host.output, queue);
-          const first = add(queue);
-          const second = add(queue);
-          const executions = [];
-          runner.cfg = (key, fallback) => key === 'queue.mode' ? mode : fallback;
-          runner.correctTestingTarget = () => false;
-          runner.wakeAfterHandoff = () => {};
-          runner.schedule = () => {};
-          agents.executeTask = async (_context, _output, task) => {
-            executions.push(task.id);
-            if (executions.length === 2) throw Error('connection lost');
-            const done = executions.length >= 4;
-            return { ok: true, cutOff: false, text: done ? 'done' : 'unfinished', notes: '',
-              completion: { status: done ? 'READY_FOR_VALIDATION' : 'NEEDS_MORE_WORK',
-                summary: 'result', filesChanged: [], developmentChecks: [] },
-              usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 } };
-          };
-          try {
-            for (let attempt = 0; attempt < 5; attempt++) await runner.pump();
-            assert.deepEqual(executions, [first.id, first.id, first.id, first.id, second.id]);
-            assert.equal(queue.get(first.id).attempts, 4);
-            assert.match(queue.get(first.id).errorLog, /connection lost/);
-            assert.equal(queue.stats().byStatus.BLOCKED, 0);
-          } finally { runner.dispose(); queue.close(); }
+          for (const [label, run, splits] of [['unfinished', unfinished, true], ['crashed', crashed, true], ['outage', outage, false]]) {
+            const queue = fresh();
+            const runner = new Orchestrator(host.context, host.output, queue);
+            const first = add(queue);
+            add(queue);
+            const executions = [];
+            runner.cfg = (key, fallback) => key === 'queue.mode' ? mode : fallback;
+            runner.correctTestingTarget = () => false;
+            runner.wakeAfterHandoff = () => {};
+            runner.schedule = () => {};
+            agents.executeTask = async (_context, _output, task) => { executions.push(task.id); return run(); };
+            try {
+              await runner.pump();
+              await runner.pump();
+              const row = queue.get(first.id);
+              if (splits) {
+                assert.deepEqual([row.status, row.activityPhase], ['VERIFYING', 'decomposition_required'], `${mode} ${label}`);
+                assert.deepEqual(executions, [first.id], `${mode} ${label}: nothing runs until the failed task is split`);
+              } else {
+                assert.equal(row.status, 'PENDING', `${mode} ${label}`);
+                assert.deepEqual(executions, [first.id, first.id], `${mode} ${label}: an outage is simply retried`);
+              }
+              if (label === 'crashed') assert.match(row.errorLog, /connection lost/);
+              assert.equal(queue.stats().byStatus.BLOCKED, 0);
+            } finally { runner.dispose(); queue.close(); }
+          }
         }
       } finally { agents.executeTask = original; }
     });
 
-    await t.test('silent exhausted workers retry and reject late results', () => {
+    await t.test('a silent worker has stopped working: its task waits for its split and late results are rejected', () => {
       const queue = fresh();
       const runner = new Orchestrator(host.context, host.output, queue);
       try {
@@ -151,11 +158,10 @@ test('unfinished tasks return to the executor before later work', async t => {
         queue.db.prepare('UPDATE tasks SET last_activity_at = ? WHERE id = ?')
           .run(Date.now() - 3_600_000, active.id);
         runner.sweepSilentWorkers();
-        assert.equal(queue.get(active.id).status, 'PENDING');
+        const row = queue.get(active.id);
+        assert.deepEqual([row.status, row.activityPhase], ['VERIFYING', 'decomposition_required']);
         assert.equal(queue.finishExecution(active.id, active.attempts, { status: 'VERIFIED' }), false);
-        const retry = queue.claimNext();
-        assert.equal(retry.id, active.id);
-        assert.equal(retry.attempts, 2);
+        assert.equal(queue.claimNext(), undefined, 'nothing runs until the failed task is split');
       } finally { runner.dispose(); queue.close(); }
     });
 

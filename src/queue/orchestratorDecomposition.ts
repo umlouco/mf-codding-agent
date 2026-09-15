@@ -1,52 +1,36 @@
-import type { Task } from './db';
-import type { SupervisorDecision } from './agents';
+import type { NewTask, Task } from './db';
 import type { Review } from './orchestratorState';
+import { appendAttempt } from './orchestratorState';
 import { OrchestratorRecovery } from './orchestratorRecovery';
 import { bootstrapTddProblem, decideFailureDecomposition } from './failureDecomposition';
 import { LiveLog } from './liveLog';
-import { completeRecoveryJob, scheduleRecoveryJob } from './recoverySchedule';
-import { decisionEvidence, providerUnavailable } from './recovery';
+import { completeRecoveryJob } from './recoverySchedule';
 import { plannerIdentity } from './agents';
 import { requiresPlaywright } from './playwrightPolicy';
-import { admitDecomposition, decompositionAncestry, decompositionDigest, decompositionKey,
-  decompositionRetryRevision, decompositionWorkspaceRevision, deferDecomposition, readDecomposition,
-  requiresDecomposition, saveDecomposition, scheduleDecomposition, verificationStallStreak } from './recoveryDecomposition';
-
-// Changing this is a host-strategy change, not new workspace evidence. It
-// grants one newly bounded replacement-planning lane after a deployed parser
-// or prompt repair, while preserving all prior rejected plans and their spend.
-// v6 fixes the fingerprint itself: it used to include the same fine-grained
-// workspace revision that the post-call staleness check compares against, so
-// any incidental file touch during a long planning call both discarded the
-// finished plan AND looked like a brand-new input, silently renewing the
-// spent allowance every time. A task already parked as awaitingChange under
-// an older fingerprint is unblocked once by this bump and re-enters under the
-// now-correctly-enforced 3-attempt cap; see decompositionRetryRevision.
-// v7 is a prompt/parser repair: replacements must now state targets (the
-// files each one edits) and the host rejects any replacement over 3 files,
-// forcing an oversized "fix every occurrence across the codebase" task to be
-// partitioned by file population at plan time instead of only being
-// discovered as too large after it has already failed for hours.
-// v8 fixes decomposition being requested at all over a transport/provider
-// outage: a verifier or supervisor call that never reached the model (a DNS
-// failure, a dead connection, a provider quota refusal) used to count
-// identically to the model actually looking at the task and failing to
-// verify it — see providerUnavailable. Two such outages 13 seconds apart were
-// enough to retire a perfectly reasonable task and start narrowing it into
-// smaller and smaller replacements, entirely because the network, not the
-// task, was the problem. Bumping the strategy also gives any task already
-// parked under the old blind fingerprint one bounded fresh look under the
-// fixed logic.
-const DECOMPOSITION_STRATEGY = 'failure-decomposition-v8';
+import { verdictReplacementTasks } from './scopeVerdict';
+import { mechanicalSplit, normalizeSplitParts } from './splitPlan';
+import type { SplitProposal } from './splitPlan';
+import { decompositionAncestry, decompositionDigest, decompositionKey, familySplitBudgetLeft,
+  readDecomposition, requiresDecomposition, saveDecomposition, scheduleDecomposition } from './recoveryDecomposition';
 
 /** A different planner can repair a rejected proposal; credentials and clock time cannot. */
 export function decompositionPlannerIdentity(): string {
   return decompositionDigest(plannerIdentity?.() || []);
 }
 
-/** A rejected/exhausted task has only one exit: commit its complete replacement and retire its row. */
+/**
+ * A failed task has one exit: smaller tasks are committed in its place and the
+ * original row is deleted, in one transaction.
+ *
+ * A task fails when its executor stops working, or when the supervisor reads its
+ * journal and finds it looping or down a rabbit hole. Every such path calls
+ * requestFailureDecomposition, and serviceSplits (every tick, before the pump)
+ * commits the replacement. The split always lands: the executor's own proposal
+ * or the planner's is used when usable, and mechanicalSplit otherwise.
+ */
 export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
-  protected abstract applyVerdictSplit(task: Task, decision: SupervisorDecision, current: () => boolean): boolean;
+  /** One split-planner turn may run this long before the host's own split is used. */
+  protected splitPlannerTimeoutMs = 300_000;
 
   protected requireBootstrapRepair(task: Task): boolean {
     if (task.seq !== 1 || task.kind === 'phase' || !requiresPlaywright(this.queue)) return false;
@@ -56,39 +40,196 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     return true;
   }
 
-  protected requestFailureDecomposition(snapshot: Task, reason: string): void {
+  /**
+   * Marks a failed task for replacement by smaller tasks, stopping its executor
+   * if one is running. The test-repair marker is cleared on the way: it is what
+   * keeps a row in the repair lane, and a row waiting for its split must never
+   * be re-requested as a repair on every tick.
+   */
+  protected requestFailureDecomposition(snapshot: Task, reason: string, proposal?: SplitProposal[]): void {
     const task = this.queue.get(snapshot.id);
     if (!task || task.status === 'VERIFIED' || this.disposed || this.queue.runState !== 'RUNNING') return;
-    const existing = readDecomposition(this.queue, task);
+    const pending = requiresDecomposition(task);
     if (!this.stopForDecision(task, { status: 'VERIFYING', finishedAt: null,
-      activityPhase: 'decomposition_required', activityDetail: reason.slice(0, 4000) })) return;
+      activityPhase: 'decomposition_required', activityDetail: reason.slice(0, 4000),
+      ...(task.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]') ? { supervisorFeedback: '' } : {}),
+      ...(pending ? {} : { errorLog: appendAttempt(task.errorLog,
+        `[attempt ${task.attempts}] split requested: ${reason.slice(0, 1500)}`) }),
+    })) return;
     // Fence this task's callback without releasing the cycle into a concurrent provider call.
     if (this.review?.taskId === task.id) {
       const old = this.review;
       this.review = null; this.reviewGen++;
       try { old.abort?.(); } catch { /* The completed/rejected turn may already be gone. */ }
     }
-    scheduleDecomposition(this.queue, task, reason);
+    this.recordSplitRequest(task, reason, proposal);
     completeRecoveryJob(this.queue, task);
-    if (!existing) this.log(`task ${task.seq}: supervisor must replace this task with smaller work: ${reason}`);
+    if (!pending) this.log(`task ${task.seq} failed; it will be split into smaller tasks: ${reason.slice(0, 300)}`);
     this.changed();
-    if (!existing) this.wakeAfterHandoff();
+    if (!pending) this.wakeAfterHandoff();
+  }
+
+  /** Saves the latest reason, and the failed executor's own proposed split if it made one. */
+  protected recordSplitRequest(task: Task, reason: string, proposal?: SplitProposal[]): void {
+    const job = readDecomposition(this.queue, task) ?? scheduleDecomposition(this.queue, task, reason);
+    job.reason = reason;
+    job.awaitingChange = false;
+    delete job.plan;
+    if (proposal?.length) job.proposal = proposal;
+    saveDecomposition(this.queue, task, job);
   }
 
   /**
-   * A bounded replan allowance exists to stop narrowing from running forever,
-   * not to hand the run to a person. Exhausting that allowance without a
-   * verified outcome has to lead somewhere autonomous too: undo the narrowing
-   * and try the complete original job again, exactly as if a person had
-   * rewritten the run back to it. That is a structurally different move from
-   * "split narrower once more", so it earns its own fresh lineage rather than
-   * reusing the exhausted one.
+   * Replaces the first task waiting for its split. Runs every tick before the
+   * pump: a failed task at the head of a lockstep queue holds everything behind
+   * it, so it is replaced before any worker starts.
+   */
+  protected async serviceSplits(): Promise<void> {
+    const task = this.queue.list().find(row => row.status !== 'VERIFIED' && requiresDecomposition(row));
+    if (task) await this.serviceFailureDecomposition(task);
+  }
+
+  /**
+   * Replaces a failed task with smaller tasks and deletes it. Always lands: a
+   * saved plan or the executor's own proposal first, then one time-limited
+   * planner turn, then mechanicalSplit. A family that keeps splitting without a
+   * verified result is rebuilt from its original task instead, before anything
+   * is spent planning a split the database would refuse.
+   */
+  protected async serviceFailureDecomposition(snapshot: Task): Promise<boolean> {
+    let task = this.queue.get(snapshot.id);
+    if (!task || !requiresDecomposition(task)) return false;
+    if (this.disposed || this.queue.runState !== 'RUNNING') return true;
+    if (!readDecomposition(this.queue, task)) {
+      this.recordSplitRequest(task, task.activityDetail || 'The task failed and must be replaced by smaller tasks.');
+    }
+    const job = readDecomposition(this.queue, task)!;
+    if (!familySplitBudgetLeft(this.queue, task)) {
+      this.rebuildFromRoot(task, `${job.reason} Its task family has been split repeatedly without a verified result.`);
+      return true;
+    }
+    const ancestry = decompositionAncestry(this.queue, task);
+    let parts: NewTask[] | undefined;
+    let source = '';
+    const candidates: Array<[unknown, string]> = [[job.plan, 'a saved plan'], [job.proposal, "the executor's own proposal"]];
+    for (const [candidate, label] of candidates) {
+      if (!candidate) continue;
+      try { parts = normalizeSplitParts(candidate, task, ancestry); source = label; break; }
+      catch (error) {
+        this.queue.log(task.id, 'supervisor', 'split-proposal-unusable', `${label}: ${String((error as Error)?.message ?? error)}`);
+      }
+    }
+    if (!parts) {
+      const planned = await this.planSplit(task, job.reason, ancestry);
+      if (planned === null) return true;
+      if (planned) { parts = planned; source = 'the planner'; }
+    }
+    task = this.queue.get(task.id);
+    if (!task || !requiresDecomposition(task) || this.disposed || this.queue.runState !== 'RUNNING') return true;
+    if (!parts) { parts = mechanicalSplit(task, job.reason); source = "the host's own split"; }
+    const saved = readDecomposition(this.queue, task) ?? job;
+    saved.plan = parts;
+    saveDecomposition(this.queue, task, saved);
+    this.commitSplit(task, parts, saved.reason, source);
+    return true;
+  }
+
+  /** One time-limited planner turn: usable tasks, undefined when there are none, or null when superseded. */
+  private async planSplit(task: Task, reason: string, ancestry: Task[]): Promise<NewTask[] | undefined | null> {
+    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen,
+      lastActivityAt: Date.now(), startedAt: Date.now(), lastModelOutputAt: Date.now() };
+    this.review = review;
+    const current = () => review.gen === this.reviewGen && !this.disposed && this.queue.runState === 'RUNNING';
+    const live = new LiveLog(this.queue, task.id, 'supervisor');
+    const observe = this.observerEvents(task.id, 'supervisor', live, current);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { review.abort?.(); } catch { /* the planner already exited */ }
+    }, this.splitPlannerTimeoutMs);
+    this.queue.recordActivity(task.id, 'decomposition_planning', 'Planning the smaller tasks that replace this one.', 'supervisor');
+    this.changed();
+    try {
+      const decision = await decideFailureDecomposition(this.context, this.output, task, {
+        goal: this.queue.getMeta('goal'),
+        requireRunnableSuite: task.seq === 1 && requiresPlaywright(this.queue),
+        ownerInstructions: this.queue.contextInstructions + '\n' + this.queue.testingContext + this.queue.instructions,
+        evidence: JSON.stringify({ reason, errorLog: task.errorLog, report: task.validationReport.slice(0, 16000),
+          events: this.queue.events(task.id, 16, true).map(event => ({ actor: event.actor, kind: event.kind, message: event.message.slice(0, 1500) })),
+          remainingQueue: this.queue.list().filter(row => row.id !== task.id)
+            .map(row => ({ title: row.title, status: row.status })) }),
+        handoff: task.output.slice(0, 8000),
+        ancestry: ancestry.map(parent => ({ title: parent.title, description: parent.description,
+          solutionVerifyPrompt: parent.solutionVerifyPrompt })),
+      }, {
+        onAbort: abort => { if (!current() || timedOut) abort(); else review.abort = abort; },
+        onEvent: (method, params) => { if (current()) observe(method, params); },
+        onActivity: activity => { if (!current()) return; review.lastActivityAt = Date.now(); live.activity(activity); },
+      });
+      if (!current()) return null;
+      this.queue.addUsage(task.id, decision.usage);
+      return decision.splitInto;
+    } catch (error: any) {
+      if (!current()) return null;
+      if (error?.usage) this.queue.addUsage(task.id, error.usage);
+      const message = timedOut ? `no answer within ${Math.round(this.splitPlannerTimeoutMs / 1000)}s`
+        : String(error?.message ?? error);
+      this.queue.log(task.id, 'supervisor', 'split-planner-failed', message.slice(0, 4000));
+      this.log(`task ${task.seq}: split planner failed (${message.slice(0, 200)}); using the host's own split`);
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+      live.close();
+      if (this.review === review) this.review = null;
+    }
+  }
+
+  /** Commits the smaller tasks in the failed task's place and deletes it, in one transaction. */
+  protected commitSplit(task: Task, parts: NewTask[], reason: string, source: string): boolean {
+    const archiveKey = `scopeSplit:${task.id}:${task.startedAt ?? task.createdAt}:split:${Date.now()}`;
+    const replacements = verdictReplacementTasks(parts, task, archiveKey);
+    // Archive before the transaction deletes the row: a failed commit may leave an
+    // unused archive, never a missing handoff.
+    this.queue.setMeta(archiveKey, JSON.stringify({ task, reason, source, parts,
+      ownerContext: JSON.stringify([this.queue.getMeta('goal'), this.queue.testingContext + this.queue.instructions]),
+      events: this.queue.events(task.id, -1), archivedAt: Date.now() }));
+    let count = 0;
+    try {
+      count = this.queue.splitTask(task.id, replacements);
+    } catch (error: any) {
+      const message = String(error?.message ?? error);
+      if (error?.invalidDecomposition) {
+        this.rebuildFromRoot(this.queue.get(task.id) ?? task, `${reason} ${message}`);
+        return false;
+      }
+      // The plan stays saved on the job, so the next tick commits it without replanning.
+      this.queue.log(task.id, 'supervisor', 'split-commit-failed', message);
+      this.log(`task ${task.seq}: the split could not be committed (${message}); retrying next tick`);
+      return false;
+    }
+    if (count !== replacements.length) return false;
+    this.queue.setMeta(decompositionKey(task), '');
+    this.queue.log(task.id, 'supervisor', 'split-committed', `${source}: replaced by ${count} smaller tasks (${archiveKey})`);
+    this.queue.log(null, 'supervisor', 'scope-split', `${archiveKey}: task ${task.seq} replaced by ${count} smaller tasks from ${source}`);
+    const active = this.queue.activeTask();
+    if (active && active.seq > task.seq) this.abandonExecution();
+    this.reviewed.delete(task.id);
+    this.log(`task ${task.seq} split into ${count} smaller tasks (${source}); the original was deleted`);
+    this.changed();
+    this.wakeAfterHandoff();
+    return true;
+  }
+
+  /**
+   * For a family whose splits never produce a verified result: undo the narrowing
+   * and start over from the original task, on a fresh family and split allowance.
+   * Every write here is one tasks_decomposition_update accepts: the row either
+   * stays waiting for its split, or goes back to the executor through
+   * executor_recovery. Any other patch is silently reverted by that trigger.
    *
-   * A second full rebuild-and-resplit cycle failing the same way means no
-   * phrasing this host can produce converges on this job; a third rebuild
-   * would only repeat that cycle, so it hands off to ordinary autonomous
-   * recovery instead (bounded backoff, retried indefinitely) rather than
-   * rebuilding again.
+   * Two rebuilds that fail the same way mean no division this host produces
+   * converges on the job, so the executor then works on the original task
+   * directly instead of multiplying tasks further.
    */
   protected rebuildFromRoot(task: Task, reason: string): void {
     const ancestry = decompositionAncestry(this.queue, task);
@@ -101,31 +242,26 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
       root.solutionVerifyPrompt])}`;
     let rebuilds = 0;
     try { rebuilds = Math.max(0, Math.floor(JSON.parse(this.queue.getMeta(rebuildKey) || '0'))); } catch { rebuilds = 0; }
-    this.queue.setMeta(decompositionKey(task), '');
+    const original = { title: root.title, description: root.description,
+      solutionVerifyPrompt: root.solutionVerifyPrompt, region: '', splitScope: '', finishedAt: null };
     if (rebuilds >= 2) {
-      if (!this.stopForDecision(task, { activityPhase: 'recovery_execution', activityDetail: reason.slice(0, 4000) })) return;
-      const job = scheduleRecoveryJob(this.queue, task, `${reason} Two full rebuilds of the original task did not ` +
-        'converge either; continuing as ordinary autonomous recovery instead of narrowing further.');
-      this.queue.recordActivity(task.id, 'recovery_waiting',
-        `${job.reason} Autonomous recovery is scheduled for ${new Date(job.dueAt).toISOString()}.`, 'supervisor');
+      if (!this.stopForDecision(task, { ...original, status: 'PENDING', activityPhase: 'executor_recovery',
+        activityDetail: reason.slice(0, 4000),
+        supervisorFeedback: `${reason} Splitting did not converge after two rebuilds of the original task, ` +
+          'so the executor now works on the original task directly.' })) return;
+      this.queue.setMeta(decompositionKey(task), '');
       this.queue.log(task.id, 'supervisor', 'decomposition-rebuild-exhausted', reason);
-      this.log(`task ${task.seq}: repeated narrowing and two full rebuilds did not converge; handed to ordinary recovery`);
-      this.changed();
-      this.wakeAfterHandoff();
-      return;
+      this.log(`task ${task.seq}: splitting did not converge after two rebuilds; the executor continues with the original task`);
+    } else {
+      if (!this.stopForDecision(task, { ...original, status: 'VERIFYING', activityPhase: 'decomposition_required',
+        activityDetail: `${reason} Restored the original task (rebuild ${rebuilds + 1} of 2) to split it afresh.`.slice(0, 4000),
+      })) return;
+      this.queue.setMeta(rebuildKey, JSON.stringify(rebuilds + 1));
+      this.queue.setMeta(decompositionKey(task), '');
+      this.queue.log(task.id, 'supervisor', 'decomposition-rebuilt',
+        JSON.stringify({ restoredFrom: root.id, rebuilds: rebuilds + 1, reason }));
+      this.log(`task ${task.seq}: its family never produced a verified result; restored the original task to split afresh (rebuild ${rebuilds + 1} of 2)`);
     }
-    this.queue.setMeta(rebuildKey, JSON.stringify(rebuilds + 1));
-    if (!this.stopForDecision(task, {
-      title: root.title, description: root.description,
-      solutionVerifyPrompt: root.solutionVerifyPrompt,
-      status: 'PENDING', attempts: 0, finishedAt: null, output: '', errorLog: '', validationReport: '',
-      splitScope: '', activityPhase: '', activityDetail: '', region: '',
-      supervisorFeedback: `${reason} Repeated narrowing produced no verified outcome; restored the original ` +
-        `task (rebuild ${rebuilds + 1} of 2) instead of splitting it again.`,
-    })) return;
-    this.queue.log(task.id, 'supervisor', 'decomposition-rebuilt',
-      JSON.stringify({ restoredFrom: root.id, rebuilds: rebuilds + 1, reason }));
-    this.log(`task ${task.seq}: repeated narrowing did not converge; restored the original task (rebuild ${rebuilds + 1} of 2)`);
     this.pruneAbandonedLineage(task, [task, ...ancestry]);
     this.changed();
     this.wakeAfterHandoff();
@@ -160,154 +296,6 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
       pruned++;
     }
     if (pruned) this.log(`task ${kept.seq}: removed ${pruned} leftover task(s) from the abandoned split lineage`);
-  }
-
-  protected decompositionWorkspaceRevision(): string {
-    return decompositionWorkspaceRevision(this.workspaceRoot);
-  }
-
-  /** See decompositionRetryRevision: deliberately coarser than the check above. */
-  protected decompositionRetryRevision(): string {
-    return decompositionRetryRevision(this.workspaceRoot);
-  }
-
-  protected async serviceFailureDecomposition(snapshot: Task): Promise<boolean> {
-    let task = this.queue.get(snapshot.id);
-    if (!task || !requiresDecomposition(task)) return false;
-    if (this.disposed || this.queue.runState !== 'RUNNING') return true;
-    if (!readDecomposition(this.queue, task)) this.requestFailureDecomposition(task,
-      task.activityDetail || task.supervisorFeedback || task.errorLog || 'Legacy failed task requires replacement.');
-    task = this.queue.get(task.id)!;
-    const job = readDecomposition(this.queue, task)!;
-    const owner = () => JSON.stringify([this.queue.getMeta('goal'), this.queue.contextInstructions,
-      this.queue.testingContext, this.queue.instructions]);
-    const ownerAtStart = owner();
-    // workspace guards staleness (below, after the provider call); retryRevision seeds the
-    // admission fingerprint. They must stay different signals — see decompositionRetryRevision.
-    const workspace = this.decompositionWorkspaceRevision();
-    const retryRevision = this.decompositionRetryRevision();
-    const evidence = decisionEvidence(this.queue, task);
-    const contract = (row: Task) => JSON.stringify([row.createdAt, row.startedAt, row.attempts, row.title,
-      row.description, row.solutionVerifyPrompt, row.region, row.splitScope, row.output, row.validationReport]);
-    const contractAtStart = contract(task);
-    const planner = decompositionPlannerIdentity();
-    const fingerprint = decompositionDigest([DECOMPOSITION_STRATEGY, planner, ownerAtStart, contractAtStart, retryRevision, evidence]);
-    if (!admitDecomposition(this.queue, task, job, fingerprint)) {
-      // A crash on the last admitted call must not leave a row claiming to be planning forever.
-      if ((job.inputs[fingerprint] ?? 0) >= 3 && task.activityPhase !== 'decomposition_waiting') {
-        this.rebuildFromRoot(task, 'Decomposition allowance exhausted for unchanged input.');
-      }
-      return true;
-    }
-    // Splitting narrower cannot fix a verifier that cannot converge on the current
-    // shape of the task — see verificationStallStreak. Three such splits in a row
-    // in this family, with no defect and no verified proof ever produced, means
-    // narrowing itself is the failure mode; stop feeding it and rebuild instead.
-    // The streak counts decompositions, not planning attempts: it is computed
-    // once when this job is created and reused across its retries.
-    let stallStreak = job.streak;
-    if (stallStreak === undefined) {
-      stallStreak = verificationStallStreak(this.queue, task, job.reason);
-      job.streak = stallStreak;
-      saveDecomposition(this.queue, task, job);
-    }
-    if (stallStreak >= 3) {
-      this.rebuildFromRoot(task, 'Verification failed to converge for three consecutive replacements in ' +
-        'this family with no implementation defect ever observed and no verified proof produced; narrowing ' +
-        `the verification further will not help. ${job.reason}`);
-      return true;
-    }
-    const review: Review = { taskId: task.id, seq: task.seq, gen: ++this.reviewGen,
-      lastActivityAt: Date.now(), startedAt: Date.now(), lastModelOutputAt: Date.now() };
-    this.review = review;
-    const accepts = () => {
-      const current = this.queue.get(task!.id);
-      return !this.disposed && this.queue.runState === 'RUNNING' && this.reviewGen === review.gen &&
-        !!current && current.status === 'VERIFYING' && requiresDecomposition(current) &&
-        contract(current) === contractAtStart && owner() === ownerAtStart &&
-        decompositionPlannerIdentity() === planner &&
-        decisionEvidence(this.queue, current) <= evidence;
-    };
-    this.queue.recordActivity(task.id, 'decomposition_planning',
-      'Supervisor is replacing the rejected task; the original cannot execute again.', 'supervisor');
-    const live = new LiveLog(this.queue, task.id, 'supervisor');
-    const onEvent = this.observerEvents(task.id, 'supervisor', live, accepts);
-    this.changed();
-    try {
-      const decision = await decideFailureDecomposition(this.context, this.output, task, {
-        goal: this.queue.getMeta('goal'),
-        requireRunnableSuite: task.seq === 1 && requiresPlaywright(this.queue),
-        ownerInstructions: this.queue.contextInstructions + '\n' + this.queue.testingContext + this.queue.instructions,
-        evidence: JSON.stringify({ reason: job.reason, errorLog: task.errorLog, report: task.validationReport.slice(0, 16000),
-          events: this.queue.events(task.id, 16, true).map(event => ({ actor: event.actor, kind: event.kind, message: event.message.slice(0, 1500) })),
-          remainingQueue: this.queue.list().filter(row => row.id !== task!.id)
-            .map(row => ({ title: row.title, status: row.status })) }),
-        handoff: task.output.slice(0, 8000), ancestry: decompositionAncestry(this.queue, task).map(parent => ({
-          title: parent.title, description: parent.description,
-          solutionVerifyPrompt: parent.solutionVerifyPrompt })),
-        previousInvalidPlan: job.invalidPlan, previousError: job.lastError,
-        verificationStallStreak: stallStreak,
-      }, {
-        onAbort: abort => { if (!accepts()) abort(); else review.abort = abort; },
-        onEvent: (method, params) => {
-          if (!accepts()) return;
-          if ((method === 'stream/text' || method === 'stream/thinking') &&
-              typeof params?.delta === 'string' && params.delta.trim()) {
-            review.lastModelOutputAt = review.lastActivityAt = Date.now();
-          }
-          onEvent(method, params);
-        },
-        onActivity: activity => {
-          if (!accepts()) return;
-          review.lastActivityAt = Date.now();
-          live.activity(activity);
-          // Preserve the recovery phase while exposing which provider/stage is
-          // actually waiting. A heartbeat is visibility, not forward progress.
-          if (this.queue.recordActivity(task!.id, 'decomposition_planning',
-            `${activity.phase}: ${activity.detail || 'Replacement planner is active.'}`, 'supervisor')) this.changed();
-        },
-      });
-      if (!accepts()) return true;
-      this.queue.addUsage(task.id, decision.usage);
-      if (this.decompositionWorkspaceRevision() !== workspace) throw Error('Workspace changed while replacement was planned; reassess current work.');
-      if (!this.applyVerdictSplit(this.queue.get(task.id)!, decision, accepts)) {
-        throw Error('Replacement was superseded before commit; no parent was deleted.');
-      }
-    } catch (error: any) {
-      if (!accepts()) return true;
-      if (error?.usage) this.queue.addUsage(task.id, error.usage);
-      const message = String(error?.message ?? error);
-      const wasInvalid = error?.invalidDecomposition === true || typeof error?.invalidPlan === 'string';
-      if (providerUnavailable(message) && !wasInvalid) {
-        // The replacement planner was never reached — this attempt proves
-        // nothing about the task or the input, so it must not spend the
-        // bounded per-input replan allowance admitDecomposition already
-        // reserved for it before dispatch. Refund it and let the existing
-        // backoff (already set on the job's dueAt) retry later.
-        job.inputs[fingerprint] = Math.max(0, (job.inputs[fingerprint] ?? 1) - 1);
-        saveDecomposition(this.queue, task, job);
-        this.queue.recordActivity(task.id, 'decomposition_planning',
-          `Replacement planner could not reach the provider: ${message}. Retrying automatically once it answers; this is not evidence about the task.`, 'supervisor');
-        this.log(`task ${task.seq}: replacement planner unreachable, not counted against it: ${message}`);
-        this.changed();
-        return true;
-      }
-      job.invalidPlan = typeof error?.invalidPlan === 'string' ? error.invalidPlan : job.invalidPlan;
-      const next = deferDecomposition(this.queue, task, job, message, wasInvalid);
-      // deferDecomposition just wrote activity, so the snapshot captured above
-      // no longer matches updated_at; rebuild from the fresh row or its guarded
-      // stopForDecision would silently refuse to commit.
-      if (next.newlyBlocked) {
-        const current = this.queue.get(task.id);
-        if (current) this.rebuildFromRoot(current, next.detail);
-      }
-      this.log(`task ${task.seq}: replacement not committed; original evidence retained. ${next.detail}`);
-    } finally {
-      live.close();
-      if (this.review === review) this.review = null;
-      this.changed();
-    }
-    return true;
   }
 
   /** The terminal exit for a run-wide condition no replacement can fix. */

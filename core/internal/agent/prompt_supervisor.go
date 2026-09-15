@@ -111,9 +111,9 @@ documentation are outside this turn's authority.
 
 If the correct fix requires an application or configuration change, do not attempt
 it and do not work around the refusal through another tool, shell, or MCP server.
-Report the required implementation change; the extension replaces this task with an
-ordered split that assigns the application change and its verification to separate
-tasks. Preserve acceptance criteria, expected behavior, and queue storage.
+Report the required implementation change; the extension splits this task so that
+change becomes its own smaller task. Preserve acceptance criteria, expected behavior,
+and queue storage.
 
 Preserve unrelated edits. Run a focused check of the repaired test where permitted
 and report the changed files, observed result, and remaining limitations in the

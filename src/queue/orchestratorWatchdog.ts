@@ -1,17 +1,18 @@
 import { OrchestratorControl } from './orchestratorControl';
-import { appendAttempt } from './orchestratorState';
 import { hasOutstandingRecovery } from './recoverySchedule';
 import { recoverOwnershipStop } from './ownershipRecovery';
+import { requiresDecomposition } from './recoveryDecomposition';
 
 export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
   // ---- the cron tick ---------------------------------------------------
 
   /**
-   * One keep-alive cycle. There is no model turn and no review lane: the
-   * supervisor exists only to guarantee the run keeps moving. Everything below
-   * still checks `this.cycle` before acting, so a superseded cycle cannot
-   * declare the run finished or take the busy flag off its successor.
+   * One supervision cycle. It keeps the run moving, reads a running executor's
+   * journal for a loop or a rabbit hole, and replaces every failed task with
+   * smaller ones before the pump starts the next worker. Everything below still
+   * checks `this.cycle` before acting, so a superseded cycle cannot declare the
+   * run finished or take the busy flag off its successor.
    */
   protected async tick(): Promise<void> {
     this.nextTickAt = Date.now() + this.intervalMs;
@@ -33,15 +34,15 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     this.supervising = true;
     this.changed();
     try {
-      // Keep-alive, and nothing else. The supervisor's whole job is that the
-      // run never stops: a worker that has gone quiet goes back in the queue,
-      // and a row an older build parked in the review lane is settled. There is
-      // no quality review and no verification turn to take, so this cycle never
-      // calls a model.
+      // A worker that went quiet, one whose journal shows a loop or a rabbit
+      // hole, and a halted repair all end as a failed task, and serviceSplits
+      // replaces a failed task with smaller ones before any later work starts.
       this.sweepSilentWorkers();
       for (const task of this.queue.list()) recoverOwnershipStop(this.queue, task);
       this.queue.drainVerification();
       await this.serviceTestRepairs();
+      await this.watchExecution();
+      await this.serviceSplits();
 
       if (this.cycle === cycle && this.queue.isComplete() && !hasOutstandingRecovery(this.queue)) {
         this.finish();
@@ -64,9 +65,10 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
   }
 
   /**
-   * Finds workers that have gone quiet and stops pretending they are running.
+   * How long a worker may be silent before it counts as having stopped working,
+   * which fails its task: the task is split into smaller tasks.
    *
-   * This is the whole of the "is it stuck" test, and it deliberately says
+   * This is the whole of the "has it stopped" test, and it deliberately says
    * nothing about how long the task has taken. A worker on a slow local model
    * writes an activity record every half minute while it waits, and writes
    * again through a build that takes an hour, so any task that has been silent
@@ -134,6 +136,7 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
     }
   }
 
+  /** A worker that stopped working failed its task, and a failed task is split. */
   protected sweepSilentWorkers(): void {
     const silentMs = this.silentMs;
     for (const task of this.queue.silentWorkers(silentMs)) {
@@ -141,15 +144,9 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       const note =
         `the worker went silent for ${quiet} minute(s) while ${task.activityPhase || 'starting up'}` +
         (task.activityDetail ? ` (${task.activityDetail})` : '');
-      const errorLog = appendAttempt(
-        task.errorLog,
-        `[attempt ${task.attempts}] ${note}. The keep-alive supervisor returned it to the queue.`,
-      );
-      this.stopForDecision(task, { status: 'PENDING', finishedAt: null,
-        activityPhase: 'executor_recovery', activityDetail: note, errorLog });
-      this.queue.log(task.id, 'system', 'silent', `${note}; requeued by the keep-alive supervisor`);
-      this.log(`task ${task.seq}: ${note}; requeued`);
-      this.changed();
+      this.queue.log(task.id, 'system', 'silent', `${note}; the task is split into smaller tasks`);
+      this.log(`task ${task.seq}: ${note}; splitting it into smaller tasks`);
+      this.requestFailureDecomposition(task, `The executor stopped working: ${note}.`);
     }
   }
 
@@ -157,7 +154,11 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
   protected async serviceTestRepairs(): Promise<void> {
     const rows = this.queue.list();
     const task = rows.find(t => t.status !== 'VERIFIED');
-    if (!task || task.status !== 'VERIFYING' || !task.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
+    // A task waiting for its split belongs to serviceSplits even if a repair
+    // marker is still on it: re-requesting its repair is how a halted repair
+    // once looped on every tick.
+    if (!task || task.status !== 'VERIFYING' || requiresDecomposition(task) ||
+        !task.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
       return;
     }
     const reason = task.supervisorFeedback;
@@ -207,10 +208,10 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       return;
     }
     if (s.byStatus.VERIFYING > 0) {
-      // A legacy row an older build parked in the review lane. The tick settles
-      // it (accepts its result, requeues it, or blocks it) and then pumps, so a
-      // lost cron cannot leave it untouched forever.
-      this.log(`${s.byStatus.VERIFYING} legacy review row(s); settling them`);
+      // A task waiting for its split or a repair, or a legacy review row. The
+      // tick splits, repairs, or settles it and then pumps, so a lost cron
+      // cannot leave it untouched forever.
+      this.log(`${s.byStatus.VERIFYING} task(s) awaiting a split, repair, or settlement; running the supervisor`);
       this.schedule('watchdog settle check', () => this.tick());
       return;
     }

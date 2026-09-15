@@ -201,7 +201,8 @@ for (const formatOnly of [false, true]) {
     } else {
       assert.match(system, /dedicated supervisor test-repair turn/);
       assert.match(system, /Only test files, fixtures, and test harnesses are editable/);
-      assert.match(system, /host replaces this task with an ordered split/);
+      assert.match(system, /host splits this task/);
+      assert.doesNotMatch(system, /ordered split/);
       assert.doesNotMatch(system, /All project file types are editable/);
       assert.doesNotMatch(system, /only the defective tests/);
       assert.match(system, /Fresh independent verification must follow/);

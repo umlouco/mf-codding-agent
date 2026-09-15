@@ -37,8 +37,8 @@ func TestTestingHookRepairCannotEditApplicationConfig(t *testing.T) {
 	if code := runTestingHook(strings.NewReader(string(input)), &stderr); code != 2 {
 		t.Fatalf("repair application edit hook exit %d, want 2: %s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "SPLIT_TASK") {
-		t.Fatalf("repair refusal does not request a split: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "splits this task") || strings.Contains(stderr.String(), "SPLIT_TASK") {
+		t.Fatalf("repair refusal does not say the task is split: %s", stderr.String())
 	}
 }
 
