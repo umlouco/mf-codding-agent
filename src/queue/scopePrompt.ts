@@ -27,6 +27,22 @@ configuration first, coherent component/route slices next, removal of old shared
 only after consumers migrate, and final regression checks last. Four files implementing one
 behavior with its tests may be cohesive and should not be arbitrarily fragmented.
 
+PRE-LAUNCH DECOMPOSITION RULES (supervisor-only; they override the file-count guideline and
+apply to the task about to start, before any executor is launched):
+When a rule below applies, set execution.shape to broad and return SPLIT with a complete plan.
+Do not return KEEP, do not merely advise the worker to do less, and do not fold two items into
+one child. The host deletes the original task and inserts one complete, independently
+executable and verifiable task per item at its position; every child still maps its original
+requirements in covers, and the unchanged final acceptance gate preserves the original checks.
+1. The browser testing harness is already part of the agent. Never create, require or schedule
+   a task that installs, sets up or configures a testing environment, browser driver or harness;
+   verification uses the harness the agent already has.
+2. If the description contains more than one task, create one complete task per described task.
+3. If the task asks to check multiple items, create one complete check task per item.
+4. If the task asks to create multiple items, create one complete creation task per item.
+Never keep the original alongside its children, and never invent filenames or narrow acceptance
+criteria to make an item fit.
+
 For a split, inventory ALL original acceptance criteria from the task description and its
 behavior description. Map each criterion to at least one child using covers. Include already
 completed work in handoffs, not as a demand to implement it again. Never silently narrow owner

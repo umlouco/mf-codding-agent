@@ -36,6 +36,11 @@ func TestExecutorPromptPreservesRuntimeContext(t *testing.T) {
 		}
 	}
 	plain := BuildSystemPrompt(PromptInput{QueueRole: "executor"})
+	for _, capability := range []string{"playwright_skill", "playwright_cli", "playwright_install"} {
+		if !strings.Contains(plain, capability) {
+			t.Errorf("fresh host cannot discover %s", capability)
+		}
+	}
 	for _, disabled := range []string{"memory_recall", "editor__", "testing_environment", "browser_*"} {
 		if strings.Contains(plain, disabled) {
 			t.Errorf("disabled capability included: %s", disabled)

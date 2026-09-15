@@ -215,14 +215,94 @@ actually survive, the login must set a *persistent* cookie: on a WordPress login
 "Remember Me", or the cookie is a session cookie that is never written to disk. Delete
 the profile directory to sign out.
 
-**Playwright** — `playwright_status`, `playwright_test`, `playwright_install`. Runs the
-project's *own* suite, rather than a second automation stack: `playwright_test` returns
-which specs passed and failed with the assertion, the `file:line`, and any screenshot or
-trace left behind, so a failure arrives ready to act on instead of as a wall of output.
-Narrow a run with `spec` or `grep` while iterating. The browser tools above stay on CDP
-and need no Node, so a server without Playwright still has working browser tools.
+**Playwright** — the extension bundles a test runner and Microsoft's official
+`@playwright/cli`. `playwright_skill {}` loads the official skill installed at build
+time by `playwright-cli install --skills`; its linked guides are available through
+`playwright_skill {"reference":"references/<name>.md"}`. Every agent receives this
+entry point automatically, including on a fresh host with no browser installed.
+
+Use `playwright_cli {"args":["open","https://your-site.example"]}` for interactive
+automation. Arguments go directly to Node without shell parsing. The default is
+headless Chromium in a workspace-specific `mfagent` session; follow fresh snapshot
+references and close the session with `{"args":["close"]}` when done. Use
+`{"args":["--help"]}` to inspect the bundled CLI's exact commands. For missing CLI
+browsers, call `{"args":["install-browser","chromium"],"timeout_seconds":600}`.
+
+`playwright_test` runs real specs and reports assertion failures and artifacts.
+Use the same `cwd` for `playwright_status`, `playwright_install`, and `playwright_test`
+when the suite is nested, for example `{"cwd":"tests/e2e"}`. An owner-selected
+`MFAGENT_PLAYWRIGHT_ROOT` takes precedence. The suite keeps its installed version,
+or uses the bundled runner if it has none. Install missing suite browsers using
+`playwright_install {"cwd":"tests/e2e","with_deps":false}`; enable `with_deps` only
+for missing Linux libraries. CLI and suite browser revisions are separate.
+CLI screenshots do not replace a required test-suite run. Recovery decisions receive
+the actual tool names and input schemas, and invalid prescriptions are rejected.
+
+On Remote SSH, the extension, Node, browsers and browser cache all live on the
+remote workspace host. Headless runs need no desktop, X forwarding, or local
+Chrome. Playwright versions require matching browser revisions
+([Playwright browser documentation](https://playwright.dev/docs/browsers)).
+`playwright_status` now launches and closes the selected runtime's default headless
+Chromium to check it; a list of cached builds alone is not a readiness check.
+Custom suite launch options are checked by the actual suite run.
+
+With no `cwd` and no root config, the tools select a single config under
+`tests/e2e`, `e2e`, or `tests`. Multiple suites require an explicit selection;
+the mandatory verifier can use `MFAGENT_PLAYWRIGHT_ROOT`. A missing Chromium
+executable triggers one install and one retry from that same runtime, within the
+test deadline. Mixed assertion failures or already passing tests are not replayed
+automatically. Failed repair returns a blocker. Missing Linux libraries require
+`playwright_install` with `with_deps:true`; root or passwordless `sudo -n` is
+required, and browser downloads remain under the original host user.
+
+Recovery JSON is summarized as prior observations before executor handoff. It
+cannot replace the executor's role or completion format. Browser failures still
+need diagnosis when the host blocks downloads, lacks libraries or uses custom
+launch settings; the tools return those failures rather than claiming tests passed.
 
 **Memory** — `memory_recall`, `memory_trace`, `memory_remember`.
+
+### Official WordPress skills
+
+The VSIX includes all 18 skills from [WordPress/agent-skills](https://github.com/WordPress/agent-skills),
+their references, helper scripts and upstream GPL-2.0-or-later license. The pack is
+pinned to the commit in `data/wordpress-skills.lock.json`; using it needs no download.
+
+Skill bodies are **not** added to the global system prompt or enabled skill groups.
+The host selects them deterministically for the current assignment:
+
+1. Establish WordPress relevance from task text, selected/named files, or a bounded
+   scan of project markers. Generic PHP, REST or plugin terminology alone is insufficient.
+   Background editor tabs, README mentions, queue history and sibling tasks do not activate skills.
+2. Match fixed domain rules in `core/internal/wordpress/select.go`. Specific API and
+   workflow signals outrank broad plugin signals; explicit skill names rank first.
+   Ties use skill-name order, so the same inputs produce the same selection without an LLM call.
+3. Include at most **two complete skill files within 12,000 bytes**, including the
+   context header. Smaller configured model context limits reduce this ceiling.
+   Oversized/additional matches are named for on-demand loading, never partially injected.
+4. Load references and scripts only through `wordpress_skill`. Each response contains
+   at most 6,000 resource bytes with a continuation offset. Native agents retain only
+   two recent resource results from the current turn in model context; older receipts
+   remain in the transcript. Helpers are available by absolute path and never run automatically.
+5. Recompute the system suffix on each task/user turn. Skill bodies are not saved in
+   chat history. Response-only formatting and recovery turns receive no automatic skill bodies.
+
+For example, a WordPress REST task selects `wp-rest-api`; a block attribute task
+selects `wp-block-development`; an unrelated Go task receives no WordPress skill text.
+The task log records selected names, matching rules, revision and context bytes.
+External Claude CLI turns use the same selector; their subsequent resource reads
+are managed by that CLI rather than the native host's two-result window.
+
+**Update without rebuilding:** run **MF Agent: Update WordPress Skills** from the
+Command Palette in the workspace/SSH window. Node and Git fetch a complete official
+revision into extension storage, validate it, and atomically activate it for new turns.
+Failed updates keep the previous pack. Updates never edit the application repository
+or execute upstream scripts. Newly added upstream skills immediately appear in
+`wordpress_skill {}`; new automatic routing rules are reviewed in the extension source.
+
+**Maintainers:** `npm run update:wordpress` refreshes the pack and commit lock;
+`npm run build:wordpress` reproduces the pinned bundle. Commit the lock change.
+`npm run package` includes the pack and updater in the VSIX.
 
 **MCP** — every tool from every connected server, namespaced `mcp__<server>__<tool>`.
 
@@ -569,7 +649,7 @@ tab on the settings page shows what was found.
 | Screenshots | `.mfagent/screenshots/` |
 | Agent core binary | Bundled in `bin/`; `MFAGENT_CORE_PATH` overrides |
 | Chrome / Chromium | System install, then a Playwright download if one is already cached, then apt, then a cached download; `MFAGENT_CHROME_PATH` overrides |
-| Playwright | The project's own `playwright.config.*` and `node_modules/@playwright/test`; nothing is bundled |
+| Playwright | Project or owner-selected suite runtime, then bundled `@playwright/test`; official CLI and skills also bundled. Node must be installed on the workspace host. |
 
 Upgrading from an earlier version imports your old `mfagent.providers` setup into the
 new store on first launch and offers to delete the obsolete keys.
@@ -651,9 +731,9 @@ the build.
 - The browser driver needs Chrome or Edge installed; set `MFAGENT_CHROME_PATH` if
   auto-detection picks the wrong one. There are no Chromium snapshots published for
   linux-arm64, so on those servers a browser has to be installed by hand.
-- The `playwright_*` tools run the project's own suite and need Node and
-  `@playwright/test` in that project. They are always registered; `playwright_status`
-  reports which piece is missing rather than failing opaquely.
+- Playwright requires Node on the workspace host (Node 20+ for the bundled CLI).
+  Browsers are downloaded on that host, including when connected over SSH; they
+  are not shipped in the VSIX. `playwright_status` reports runtime availability.
 - **The Vision role is configured but not yet consumed.** `browser_screenshot` shows
   the image in the chat panel and hands the agent a file path; no image is sent to a
   model. Binding the role is wired end to end — the core reports it and the extension

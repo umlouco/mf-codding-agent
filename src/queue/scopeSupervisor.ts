@@ -39,17 +39,24 @@ export class ScopeSupervisor {
   }
 
   /**
-   * Scope planning is disabled.
+   * Pre-execution scope review.
    *
-   * This lane used to ask a model, mid-execution, whether a task was "broad"
-   * and split it into dependency-ordered children. In the ten-hour run that
-   * prompted this change it produced 50 splits of a single read-only inspect
-   * task. A task is now executed as written; deciding scope is a plan-time
-   * decision (orchestratorExpansion), never a mid-run multiplication. The
-   * session starts no timer, so check()/assess() are unreachable.
+   * Runs exactly once, while the task is claimed but before the executor is
+   * launched. It decomposes the task when the description contains more than
+   * one independent task, more than one item to check, or more than one item
+   * to create. The host commits any replacement plan atomically and deletes
+   * the original row, so the executor that eventually starts owns one bounded
+   * outcome.
+   *
+   * No live timer is started. This lane once kept reviewing a running worker
+   * and split it mid-flight; in the ten-hour run that prompted this change it
+   * produced 50 splits of a single read-only inspect task. Scope is a
+   * launch-time decision again, so a worker that is already executing is never
+   * re-multiplied. A KEEP assessment simply lets the executor proceed.
    */
-  async preflight(_forcePlanning = false): Promise<boolean> {
-    return this.current();
+  async preflight(): Promise<boolean> {
+    const keep = await this.assess('preflight');
+    return keep && this.current();
   }
 
   observe(method: string, params: any): void {

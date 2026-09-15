@@ -100,6 +100,7 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	// decided per call against the workspace, and playwright_status exists
 	// precisely to explain when it cannot.
 	tools.RegisterPlaywright(s.registry)
+	tools.RegisterWordPressSkills(s.registry)
 
 	// Graph memory.
 	embModel, embKey, embBaseURL := cfg.ResolveEmbedding()

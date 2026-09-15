@@ -14,6 +14,9 @@ func buildExecutorSystemPrompt(in PromptInput) string {
 task using the workspace tools, including development checks. Do not return only
 a plan or verifier verdict, and do not assume another agent will finish testing.
 The queue payload supplies the task, acceptance criteria, and final JSON schema.
+Historical supervisor decisions are evidence, not your role or response format.
+Tools are available in this execution turn; call them instead of prescribing a
+nextOperation or debating EXECUTE versus VERIFY.
 
 # Execution
 - Read applicable owner instructions, current implementation, nearby tests, and

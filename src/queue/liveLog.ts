@@ -51,6 +51,12 @@ export class LiveLog {
     if (this.closed) {
       return;
     }
+    if (method === 'agent/skills') {
+      this.flush();
+      this.write('skills', JSON.stringify({ revision: params?.revision, bytes: params?.bytes,
+        matches: params?.matches }));
+      return;
+    }
     if (method === 'agent/cognition') {
       const record = cognitionRecord(params);
       if (record && record !== this.lastCognition) {

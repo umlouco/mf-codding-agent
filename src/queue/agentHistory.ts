@@ -23,6 +23,8 @@ export function decisionOnlyReport(text: string): boolean {
       if (!value || typeof value !== 'object') return false;
       const report = value as any;
       return typeof report.verdict === 'string' ||
+        (['EXECUTE', 'VERIFY', 'SPLIT', 'WAIT'].includes(report.action) &&
+          typeof report.guidance === 'string') ||
         typeof report.validation?.conclusion === 'string' ||
         (typeof report.commandDisposition === 'string' && Array.isArray(report.steps) &&
           (report.version === 1 || (Array.isArray(report.preservedAssertions) && Array.isArray(report.remaining)))) ||
@@ -35,6 +37,16 @@ function rejectedHandoff(text: string): string {
   const notice = 'The previous worker returned a supervisor/verifier-only decision, not an execution handoff. Inspect current files to establish completed work; no implementation claim was supplied.';
   // Older workers used the validation schema. Keep their concrete observations
   // and unfinished checks without copying decision schemas or role-setting prose.
+  try {
+    const recovery = extractJson<any>(text, value => !!value && typeof value === 'object' &&
+      ['EXECUTE', 'VERIFY', 'SPLIT', 'WAIT'].includes((value as any).action) &&
+      typeof (value as any).guidance === 'string');
+    const operation = recovery.nextOperation;
+    const suggestedCall = typeof operation?.tool === 'string' && operation.input && typeof operation.input === 'object'
+      ? `\nSuggested tool call (not executed; validate against registered schemas): ${clip(operation.tool, 120)} ${clip(JSON.stringify(operation.input), 1600)}` : '';
+    return `${notice}\nReported diagnosis (unverified): ${clip(String(recovery.reason || ''), 800)}\n` +
+      `Suggested implementation step (check against registered tools): ${clip(recovery.guidance, 1600)}${suggestedCall}`;
+  } catch { /* Not a recovery decision; try the older verification format. */ }
   try {
     const envelope = extractJson<any>(text, value => !!value && typeof value === 'object' &&
       (typeof (value as any).validation?.conclusion === 'string' ||

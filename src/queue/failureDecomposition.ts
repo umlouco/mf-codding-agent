@@ -24,19 +24,15 @@ export interface FailureDecompositionInput {
   verificationStallStreak?: number;
 }
 
-/** A missing test runner is setup failure, not a RED assertion on the required behavior. */
+/** Contradictory runner instructions cannot produce the required test evidence. */
 export function bootstrapTddProblem(description: string): string | undefined {
   if (/\bnpx\s+playwright\s+test\b/i.test(description) &&
       /\bonly\s+Node\s+fs\s*\/\s*path\b/i.test(description) &&
       /\bno\s+imports?\s+from\s+['"`]?@playwright\/test\b/i.test(description)) {
     return 'The configured planner must repair the instruction to use only Node fs/path with no Playwright test import. ' + playwrightTestRegistration;
   }
-  const instructions = /\b(?:run|execute)\s+(?:(?:the|a|first|same)\s+)*(?:spec|tests?|suite)\b[^\n;.!?]{0,80}?\bbefore\s+(?:(?:running|completing)\s+)?npm\s+(?:install|ci)\b/gi;
-  for (const match of description.matchAll(instructions)) {
-    const prefix = description.slice(Math.max(0, match.index! - 30), match.index);
-    if (/\b(?:never|do not|don't|must not|cannot)\s*$/i.test(prefix)) continue;
-    return 'Install and confirm the test runner before RED. A missing runner is a setup failure, not a failing assertion. Then run the spec against missing/incorrect required configuration, implement it, and rerun the same spec GREEN. The configured planner must correct this order: ' + match[0];
-  }
+  // npm ordering alone says nothing about runner availability: the extension
+  // supplies Playwright even when the application has no installed packages.
   return undefined;
 }
 
@@ -250,21 +246,24 @@ outcome when appropriate. Do not invent product work merely to reach the minimum
 Honor the owner's TDD workflow inside EACH implementation child: specify the desired-state
 assertion, observe RED, implement, then reach GREEN in that same child. Supporting regression
 tests for that child's existing requirements are part of its implementation, not new product scope.
-When this task bootstraps Playwright and the owner requires browser testing, the FIRST child
-must create the external project AND its first executable .spec.ts/.spec.js tests and run them
-successfully. Assert the harness requirements assigned here (configuration, environment-based
-baseURL, installed runner and project settings); leave sibling site behavior to those siblings.
+Use the supplied host tools, skills and Playwright status before replanning prerequisites.
+Do not preserve a derived Playwright installation or generic harness task just because an earlier
+planner wrote it. Reuse the extension runtime and existing suite. Keep necessary application
+specs, configuration, authentication and passing checks with the implementation they verify.
+Only when the OWNER explicitly requests a reusable harness as a deliverable should a child
+create it; include its first executable .spec.ts/.spec.js tests and run them successfully.
+Honor the owner's selected test location. Assert the actual owner-required harness behavior
+(configuration, environment-based baseURL and project settings); leave sibling site behavior to those siblings.
 An empty tests directory or tests/.gitkeep alone cannot satisfy the host's mandatory suite gate.
 ${playwrightTestRegistration}
 Do not postpone the first passing suite to a later child or end any child permanently RED.
 Name the test file and the RED/GREEN commands explicitly. Preserve existing test ownership.
-Require non-vacuous assertions in that test: read package.json and assert the assigned
-devDependency, load the actual Playwright configuration and assert its baseURL, testDir and
-chromium project, and check every required scaffold artifact. A "basic pass", expect(true),
-or checking only that the runner starts is not a regression test. Missing dependencies before
-installation are a setup failure; after installing the runner, demonstrate RED on a missing
-or incorrect required configuration before implementing it. Preserve every named artifact,
-including tests/.gitkeep when required; adding a real spec does not remove that obligation.
+Require non-vacuous assertions against the assigned application behavior. For an owner-requested
+harness, check its actual configuration and required artifacts; assert a package devDependency
+only if the owner requires project-owned dependencies. A "basic pass", expect(true), or checking
+only that the runner starts is not a regression test. Missing runtime dependencies are an
+environment failure; demonstrate RED on missing or incorrect required behavior using the
+resolved runtime, then implement that behavior and reach GREEN. Preserve owner-required artifacts.
 
 Identify distinct unfinished outcomes grounded in the original contract. Each replacement owns a
 nonempty proper subset; every outcome has exactly one owner. No child may receive all the old work,

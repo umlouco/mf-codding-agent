@@ -10,6 +10,7 @@ import { registerEditorFsHandlers } from '../editorFs';
 import { getBridge } from '../mcpBridge';
 import { Usage } from './db';
 import { clip } from './agentHistory';
+import { planningCapabilities } from './planningCapabilities';
 
 /** Effective planner configuration, excluding secrets, for durable recovery identity. */
 export function plannerIdentity(): unknown[] {
@@ -149,11 +150,42 @@ async function runTurn(
   // monitor.ts, every prompt builder in this file) needs no changes: they
   // only ever see RunOptions in, TurnResult out.
   const providerRole = opts.planningOnly ? 'planner' : role;
+  const planning = opts.planningOnly || role === 'planner';
   const resolved = await getStore().resolve(providerRole);
   if (resolved.kind === 'openai-compatible' && resolved.baseURL === '' && !resolved.profile) {
     throw new AgentRunError(`No supported provider is configured for the ${role} role. Select a provider for this role in MF Agent settings.`);
   }
   if (resolved.kind === 'claude-cli') {
+    if (planning || (!opts.formatOnly && opts.skillTask)) {
+      const skills = new CoreClient(context, output);
+      let aborted = false;
+      const checkAborted = () => { if (aborted) throw new AgentRunError('Queue turn aborted'); };
+      try {
+        await skills.start();
+        const cancel = () => { aborted = true; skills.dispose(); };
+        opts.onAbort?.(cancel);
+        opts.onCancellable?.(cancel);
+        checkAborted();
+        await skills.initialize({ disableTools: true, editorTerminal: false, ...(planning ? {} : { memoryEnabled: false }) });
+        checkAborted();
+        if (planning) {
+          opts.onActivity?.({ phase: 'planning_context', detail: 'reading host tools, skills and Playwright readiness before planning', at: Date.now() });
+          prompt += '\n\n' + await planningCapabilities(skills, true);
+          checkAborted();
+          output.appendLine('[queue:planner] host tools, skills and Playwright status included before CLI request');
+        }
+        if (!opts.formatOnly && opts.skillTask) {
+          const selection = await skills.request<{ text: string; bytes: number }>('skills/context', {
+            task: opts.skillTask, budget: Math.min(12000, queueContextCeiling() > 0 ? queueContextCeiling() : 12000),
+          });
+          if (selection.text) {
+            prompt += '\n\n' + selection.text + '\nExternal CLI: use Read on the absolute skill/resource paths above; wordpress_skill is the native-host equivalent. Do not assume it is a CLI command.';
+            output.appendLine(`[wordpress] selected ${selection.bytes} bytes for this ${role} CLI turn`);
+          }
+        }
+        checkAborted();
+      } finally { skills.dispose(); }
+    }
     return runClaudeCliTurn(output, providerRole, resolved, prompt, opts);
   }
 
@@ -183,7 +215,9 @@ async function runTurn(
     // Available from the moment there is a process to kill — a core that wedges
     // during `initialize` needs aborting exactly as much as one that wedges
     // mid-turn.
-    onAbort?.(() => { aborted = true; client.stop(); });
+    const cancelPreflight = () => { aborted = true; client.stop(); };
+    onAbort?.(cancelPreflight);
+    onCancellable?.(cancelPreflight);
     checkAborted();
     const overrides = await overridesFor(role, maxIterations, opts.allowTestEdits, opts.verificationOnly, providerRole);
     if (opts.verificationOnly) overrides.verificationStage = opts.verificationStage || 'report';
@@ -202,6 +236,13 @@ async function runTurn(
       if (warning.toLowerCase().includes('runtime memory unavailable')) {
         onActivity?.({ phase: 'error', detail: warning, at: Date.now() });
       }
+    }
+
+    if (planning) {
+      onActivity?.({ phase: 'planning_context', detail: 'reading host tools, skills and Playwright readiness before planning', at: Date.now() });
+      prompt += '\n\n' + await planningCapabilities(client, !!opts.formatOnly);
+      checkAborted();
+      output.appendLine('[queue:planner] host tools, skills and Playwright status included before model request');
     }
 
     const sessionId = `queue-${role}-${Date.now()}`;
@@ -226,7 +267,7 @@ async function runTurn(
     });
     const res = await client.request<{ text: string; stopReason: string; usage?: Usage }>(
       'chat/send',
-      { sessionId, text: prompt, ...(opts.cognition ? { cognition: opts.cognition } : {}) },
+      { sessionId, text: prompt, skillTask: opts.skillTask ?? '', ...(opts.cognition ? { cognition: opts.cognition } : {}) },
     );
     const usage = { ...NO_USAGE, ...(res?.usage ?? {}) };
     output.appendLine(

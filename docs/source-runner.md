@@ -107,12 +107,17 @@ rejecting sibling paths and symlink escapes. Existing test ownership rules still
 
 Planning reviews its draft for independently verifiable outcomes before returning
 phases. TDD assertions and their implementations belong in the same phase and task;
-bootstrap setup includes the first passing tests. Large discovery indexes are sent
+necessary application-specific checks stay with their implementation. Before each planning
+request, including Claude CLI, phase expansion and response-only reviews, the host supplies
+its registered worker tools, bundled and enabled skills, and actual Playwright runtime and
+browser status. A missing project package does not trigger a Playwright setup task: the
+extension supplies the runtime. Separate reusable harness tasks require an owner request.
+Large discovery indexes are sent
 as bounded directory catalogs; the host retains the complete index for enumeration.
 Replacement workers receive the archived parent report in their execution prompt,
 so recovering prior work does not require querying the queue database.
-Replacement planning also keeps the first executable harness tests with bootstrap
-implementation and requires assertions against real configuration values.
+Replacement planning uses the same host facts and keeps executable checks with their
+implementation. Owner-requested harnesses require assertions against real configuration values.
 The host rejects a first mandatory-suite replacement that omits a named executable
 test or a passing-suite outcome and asks the planner to repair its own proposal.
 Planner instructions require registered Playwright test cases even for assertions

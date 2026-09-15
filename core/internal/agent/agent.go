@@ -11,6 +11,7 @@ import (
 	"github.com/mflores/mfagent/core/internal/config"
 	"github.com/mflores/mfagent/core/internal/llm"
 	"github.com/mflores/mfagent/core/internal/tools"
+	"github.com/mflores/mfagent/core/internal/wordpress"
 )
 
 // Ceiling on tool-calling rounds in one turn, when the config does not set one.
@@ -96,12 +97,14 @@ func (a *Agent) Reset(id string) {
 }
 
 type SendRequest struct {
-	SessionID     string           `json:"sessionId"`
-	Text          string           `json:"text"`
-	OpenFiles     []string         `json:"openFiles"`
-	Selection     string           `json:"selection"`
-	SelectionPath string           `json:"selectionPath"`
-	Cognition     *cognition.Scope `json:"cognition,omitempty"`
+	SessionID     string   `json:"sessionId"`
+	Text          string   `json:"text"`
+	OpenFiles     []string `json:"openFiles"`
+	Selection     string   `json:"selection"`
+	SelectionPath string   `json:"selectionPath"`
+	// Queue callers supply only the assigned task, excluding boilerplate/history.
+	SkillTask *string          `json:"skillTask,omitempty"`
+	Cognition *cognition.Scope `json:"cognition,omitempty"`
 }
 
 type SendResult struct {
@@ -147,6 +150,36 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	}
 	a.mu.Unlock()
 
+	// Ephemeral system suffix: never append skill bodies to Session.Messages.
+	// Recompute for each user turn/task; format-only decisions get no skills.
+	if !a.cfg.ResponseOnly {
+		task := req.Text
+		if a.cfg.QueueRole != "" {
+			task = ""
+		}
+		if req.SkillTask != nil {
+			task = *req.SkillTask
+		}
+		pack, _ := wordpress.Load()
+		budget := wordpress.MaxAutoBytes
+		if a.cfg.MaxContextTokens > 0 && a.cfg.MaxContextTokens < int64(budget) {
+			budget = int(a.cfg.MaxContextTokens)
+		}
+		selected := wordpress.Select(pack, a.env.Root, task, skillFocusPaths(req, task), budget)
+		system += selected.Text
+		if len(selected.Matches) > 0 {
+			a.emit("agent/skills", map[string]any{"sessionId": req.SessionID, "revision": selected.Revision, "matches": selected.Matches, "bytes": selected.Bytes})
+			var names []string
+			for _, match := range selected.Matches {
+				if match.Loaded {
+					names = append(names, match.Name)
+				}
+			}
+			a.activity(req.SessionID, PhaseModel, fmt.Sprintf("WordPress skills: %s; %d context bytes; revision %s", strings.Join(names, ", "), selected.Bytes, selected.Revision))
+		}
+	}
+	skillHistoryStart := len(sess.Messages) - 1
+
 	defs := a.toolDefs()
 	result := &SendResult{SessionID: req.SessionID}
 	maxIterations := a.maxIterations()
@@ -186,6 +219,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		msgs := make([]llm.Message, len(sess.Messages))
 		copy(msgs, sess.Messages)
 		a.mu.Unlock()
+		msgs = boundWordPressResources(msgs, skillHistoryStart)
 		if !a.cfg.ResponseOnly {
 			msgs = a.cognitionMessages(ctx, req.SessionID, msgs)
 		}
@@ -404,6 +438,7 @@ func (a *Agent) finalReport(
 	copy(msgs, sess.Messages)
 	msgs = append(msgs, llm.UserText(nudge))
 	a.mu.Unlock()
+	msgs = boundWordPressResources(msgs, len(msgs))
 	msgs = a.cognitionMessages(ctx, req.SessionID, msgs)
 
 	// Omit definitions for this final reporting request. This asks for text;

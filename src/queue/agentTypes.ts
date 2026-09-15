@@ -50,6 +50,8 @@ export const NO_USAGE: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 
 export type ReviewOptions = Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort' | 'cognition'> & { projectNotes?: string; failedRepairs?: number; recoveryContext?: string };
 
 export interface RunOptions {
+	/** Current assignment only; excluded from format-only turns and historical routing. */
+  skillTask?: string;
   /** Resolve planning work through the planner provider, retaining queue ownership. */
   planningOnly?: boolean;
   /** Only the dedicated supervisor test-repair turn may edit while supervising. */

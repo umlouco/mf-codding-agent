@@ -158,7 +158,9 @@ func ChromiumPaths() []string {
 			roots = append(roots, filepath.Join(p, "Library", "Caches", "ms-playwright"))
 		}
 	default:
-		if p := os.Getenv("HOME"); p != "" {
+		if p := os.Getenv("XDG_CACHE_HOME"); p != "" {
+			roots = append(roots, filepath.Join(p, "ms-playwright"))
+		} else if p := os.Getenv("HOME"); p != "" {
 			roots = append(roots, filepath.Join(p, ".cache", "ms-playwright"))
 		}
 	}
@@ -192,7 +194,18 @@ func ChromiumPaths() []string {
 				continue
 			}
 			rev, _ := strconv.Atoi(name[strings.LastIndex(name, "-")+1:])
-			for _, exe := range exes {
+			candidates := exes
+			if shell {
+				switch runtime.GOOS {
+				case "windows":
+					candidates = []string{filepath.Join("chrome-headless-shell-win64", "headless_shell.exe"), filepath.Join("chrome-win", "headless_shell.exe")}
+				case "darwin":
+					candidates = []string{filepath.Join("chrome-headless-shell-mac-arm64", "headless_shell"), filepath.Join("chrome-headless-shell-mac-x64", "headless_shell"), filepath.Join("chrome-mac", "headless_shell")}
+				default:
+					candidates = []string{filepath.Join("chrome-headless-shell-linux64", "headless_shell"), filepath.Join("chrome-linux", "headless_shell")}
+				}
+			}
+			for _, exe := range candidates {
 				p := filepath.Join(root, name, exe)
 				if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
 					found = append(found, build{rev: rev, path: p, full: full})

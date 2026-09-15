@@ -114,6 +114,33 @@ test('executor renders concise task-specific instructions through the production
       assert.match(prompt, /Build failed/);
       assert.match(prompt, /Original owner constraint: use the supplied Vision endpoint/);
     });
+    await t.test('supervisor recovery JSON is recognized and removed from executor handoffs', async () => {
+      const { decisionOnlyReport } = host.load('src/queue/agentHistory.ts');
+      const output = JSON.stringify({ action: 'EXECUTE', reason: 'Missing Chromium revision 1187.',
+        guidance: 'Install the matching suite browser.', nextOperation: { tool: 'playwright_install', input: {} } });
+      assert.equal(decisionOnlyReport(output), true);
+      const prompt = await render({ attempts: 2, output });
+      assert.match(prompt, /Missing Chromium revision 1187/);
+      assert.match(prompt, /Install the matching suite browser/);
+      assert.doesNotMatch(prompt, /"action":"EXECUTE"|"nextOperation"/);
+      assert.match(prompt, /not an execution handoff/);
+      assert.match(prompt, /Suggested tool call.*playwright_install/);
+      const stub = runtime.runOnce;
+      let calls = 0;
+      runtime.runOnce = async (...args) => {
+        calls++;
+        if (calls === 1) return { text: output, stopReason: 'end_turn',
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } };
+        assert.match(args[3], /ROLE CORRECTION/);
+        return stub(...args);
+      };
+      try {
+        const result = await executeTask(host.context, host.output, task, '', 'Finish this task.');
+        assert.equal(calls, 2);
+        assert.equal(result.usage.input, 1);
+        assert.doesNotMatch(result.text, /"action":"EXECUTE"/);
+      } finally { runtime.runOnce = stub; }
+    });
   } finally {
     runtime.runOnce = originalRun;
     await host.close();

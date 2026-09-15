@@ -154,7 +154,7 @@ async function createHost(options) {
   const state = new Map(), secrets = new Map();
   const memento = { get: (key, fallback) => state.has(key) ? state.get(key) : fallback,
     update: async (key, value) => { state.set(key, value); } };
-  const context = { extensionPath: repo, subscriptions: [], globalState: memento, workspaceState: memento,
+  const context = { extensionPath: repo, extensionUri: { fsPath: repo }, subscriptions: [], globalState: memento, workspaceState: memento,
     globalStorageUri: { fsPath: path.join(workspace, '.mfagent', 'headless') },
     secrets: { get: async key => secrets.get(key), store: async (key, value) => { secrets.set(key, value); },
       delete: async key => { secrets.delete(key); } } };
@@ -204,6 +204,8 @@ async function createHost(options) {
     await store.setApiKey(id, p.apiKey || '');
   }
   const router = load('src/llm/router.ts').initRouter(context, output);
+  load('src/playwrightRuntime.ts').activatePlaywrightRuntime(context, output);
+  load('src/wordpressSkills.ts').activateWordPressSkills(context, output);
   const bridge = load('src/mcpBridge.ts').initBridge(context, store, output);
   // queuePath lets a run use a snapshot of a live queue while the workspace
   // still points at the real files. Default is the workspace's own queue.

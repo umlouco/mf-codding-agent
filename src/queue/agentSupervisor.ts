@@ -126,6 +126,7 @@ and deletes the original atomically; it never marks the task FAILED or reruns th
 Do not duplicate the parent, repeat a rejected approach, weaken acceptance, or manufacture PASS.`;
 
   const { text, usage } = await runOnce(context, output, 'supervisor', prompt, {
+    skillTask: `${task.title || ''}\n${task.description}`,
     maxIterations: supervisorRounds(),
     ...opts,
   });

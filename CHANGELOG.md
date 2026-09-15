@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Give every planning pass the workspace host's registered tools, bundled skill catalog,
+  enabled skill instructions and Playwright status before its first model request, including
+  Claude CLI and response-only plan reviews. Remove the project-only dependency check that
+  forced the first phase into a Playwright bootstrap task despite the bundled runtime.
+  Keep application-specific checks with their implementation; create a separate reusable
+  harness only when the owner requests one.
+
+- Surface errors and malformed data inside model response streams immediately,
+  and finish at `[DONE]` even when the server keeps the connection open. Long
+  waits now explain that transport activity alone does not confirm model progress.
+
+- Check the selected suite's actual headless Chromium launch on the workspace host.
+  Discover a single conventional nested suite for mandatory checks, repair a missing
+  Chromium revision with one install/retry, and report remaining launch blockers.
+  Linux dependency installation uses noninteractive sudo and preserves the browser
+  download user's cache. Discover cached headless shells and refresh native browser
+  candidates after installations.
+- Recognize supervisor recovery JSON as a decision, preserve its diagnosis, and
+  prevent its action schema from being reused as an executor handoff.
+
+- Include the official WordPress skill pack with a pinned commit and a Command Palette
+  updater. Select skills from current task intent and project markers using fixed
+  rules; load at most two complete skill bodies within 12 KB. References are paged
+  on demand, prior-turn skill context expires, and selection reasons are logged.
+
+- Bundle Microsoft's official Playwright CLI and the skill/reference files installed
+  by `playwright-cli install --skills`. Agents discover `playwright_skill` automatically
+  and invoke `playwright_cli` with an argument array, without shell quoting or a global install.
+- Give response-only recovery decisions the actual tool registry and validate their
+  proposed tool names and arguments before handing work back to the executor.
+- Add a shared suite `cwd` option to Playwright status, installation and test tools,
+  so nested harnesses resolve their own config and browser version. Browser downloads
+  no longer attempt privileged Linux dependency installation by default.
+
 - Fix a replacement planner that never goes idle running unmonitored for as
   long as it keeps streaming, however long that is. `sweepSilentReview` already
   abandoned one that stalled — no new model output for two minutes straight —

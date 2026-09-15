@@ -21,6 +21,29 @@ const runtime = join(root, 'runtime');
 // extension commit shipping different Playwright versions, and a spec that
 // passes for one person failing for the next with no diff to point at.
 const VERSION = '1.55.0';
+const CLI_VERSION = '0.1.20';
+
+// Keep the interactive CLI's dependency tree separate from the test runner.
+// Each has its own pinned Playwright/browser revision.
+const cliRuntime = join(runtime, 'cli');
+mkdirSync(cliRuntime, { recursive: true });
+writeFileSync(join(cliRuntime, 'mfagent.config.json'), JSON.stringify({
+  browser: { browserName: 'chromium', launchOptions: { channel: 'chromium', headless: true } },
+}, null, 2) + '\n');
+writeFileSync(join(cliRuntime, 'package.json'), JSON.stringify({
+  name: 'mf-agent-playwright-cli', private: true,
+  dependencies: { '@playwright/cli': CLI_VERSION },
+}, null, 2) + '\n');
+execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm',
+  ['install', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error'], {
+    cwd: cliRuntime, stdio: 'inherit', shell: process.platform === 'win32',
+    env: { ...process.env, PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1' },
+  });
+// Use the upstream installer, including all its reference guides. Never prune
+// these Markdown files: they are runtime documentation read by playwright_skill.
+execFileSync(process.execPath,
+  [join(cliRuntime, 'node_modules', '@playwright', 'cli', 'playwright-cli.js'), 'install', '--skills'],
+  { cwd: cliRuntime, stdio: 'inherit' });
 
 const force = process.argv.includes('--force');
 

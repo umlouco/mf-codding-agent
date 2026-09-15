@@ -19,6 +19,7 @@ import { runSkillInstall } from './skillInstall';
 import { notifySkillsChanged } from './queue/registry';
 import { resolveChromium } from './chromium';
 import { activatePlaywrightRuntime, registerBrowserShowHandler } from './playwrightRuntime';
+import { activateWordPressSkills, updateWordPressSkills } from './wordpressSkills';
 import { getContext, getModelRegistry, getStore, initProviders } from './providers/instance';
 import { ProfileStore } from './providers/store';
 import { SettingsPanel } from './settings/panel';
@@ -44,6 +45,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // host all inherit this process's environment, and that is how they are told
   // where the bundled Playwright runtime lives.
   activatePlaywrightRuntime(context, output);
+  activateWordPressSkills(context, output);
 
   store = initProviders(context, output).store;
   await migrateLegacySettings(store);
@@ -474,6 +476,18 @@ async function openTaskQueue(context: vscode.ExtensionContext): Promise<void> {
 function registerCommands(context: vscode.ExtensionContext): void {
   const reg = (id: string, fn: (...a: any[]) => any) =>
     context.subscriptions.push(vscode.commands.registerCommand(id, fn));
+
+  let wordpressUpdate: Promise<void> | undefined;
+  reg('mfagent.updateWordPressSkills', () => {
+    if (!wordpressUpdate) {
+      output.appendLine('[wordpress] checking the official upstream skills repository for updates');
+      wordpressUpdate = updateWordPressSkills(context, output).catch(error => {
+        output.appendLine(`[wordpress] update failed; previous pack retained: ${error.message}`);
+        void vscode.window.showErrorMessage(`WordPress skill update failed: ${error.message}`);
+      }).finally(() => { wordpressUpdate = undefined; });
+    }
+    return wordpressUpdate;
+  });
 
   reg('mfagent.focusChat', () => {
     chat = ChatPanel.createOrShow(context, core, output);

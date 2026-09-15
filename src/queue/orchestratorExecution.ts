@@ -75,8 +75,21 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     const journal = this.streamJournal(task.id, 'executor', current);
     journal.live.note('attempt', `attempt ${task.attempts} started`);
 
+    // The supervisor inspects the task contract before any executor starts and
+    // may replace a multi-item task with one bounded task per item. It reports
+    // activity as 'supervisor' so a long preflight is not mistaken for a silent
+    // worker; see ScopeSupervisor.preflight.
+    const scope = this.scopeWatch(task, 'executor', current, (phase, detail) => {
+      if (!current()) return;
+      if (this.queue.recordActivity(task.id, phase, detail, 'supervisor')) this.changed();
+    });
+    this.executionScope = scope;
+
     try {
-      this.queue.recordActivity(task.id, 'starting', 'Starting executor');
+      this.queue.recordActivity(task.id, 'scope_review', 'Reviewing the task before execution', 'supervisor');
+      if (!await scope.preflight()) return;
+      if (!current()) return;
+      this.queue.recordActivity(task.id, 'starting', 'Scope reviewed; starting executor');
       // Every record the worker writes lands in the database as it happens, so
       // the run is legible while it is still going and survives the process
       // that produced it. This is also the only thing keeping the task off the
@@ -94,7 +107,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
             this.changed();
           }
         },
-        (method, params) => { journal.onEvent(method, params); },
+        (method, params) => { journal.onEvent(method, params); scope.observe(method, params); },
         (abort) => {
           if (!current()) { abort(); return; }
           this.executionAbort = abort;

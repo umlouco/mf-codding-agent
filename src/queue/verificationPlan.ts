@@ -115,7 +115,7 @@ export function parseVerificationPlan(text: string, capabilities: VerificationCa
 }
 
 /** Enforce the registry's structural schema before invoking any capability. */
-function validateToolInput(input: unknown, schema: any, path: string): void {
+export function validateToolInput(input: unknown, schema: any, path: string): void {
   if (!object(schema)) return;
   const fail = (detail: string): never => { throw new VerificationPlanError(`${path}: ${detail}`, 'capability'); };
   const matchesType = (type: string) => type === 'object' ? object(input) : type === 'array' ? Array.isArray(input) :

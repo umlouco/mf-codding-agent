@@ -2,6 +2,8 @@ import type * as vscode from 'vscode';
 import type { NewTask, Task, Usage } from './db';
 import { extractJson, runOnce, RunOptions } from './agents';
 import { verdictReplacementTasks } from './scopeVerdict';
+import { VerificationSession } from './verificationPlanRunner';
+import { validateToolInput, VerificationCapability } from './verificationPlan';
 
 export interface RecoveryDecision {
   action: 'EXECUTE' | 'VERIFY' | 'SPLIT' | 'WAIT';
@@ -17,7 +19,7 @@ const object = (value: unknown): value is Record<string, any> =>
 const nonempty = (value: unknown): value is string => typeof value === 'string' && !!value.trim();
 
 /** No default retry, partial split, invented success, or queue-stop action. */
-export function parseRecoveryDecision(text: string, task: Task): RecoveryDecision {
+export function parseRecoveryDecision(text: string, task: Task, capabilities?: VerificationCapability[]): RecoveryDecision {
   const value = extractJson<any>(text);
   if (!object(value) || !['EXECUTE', 'VERIFY', 'SPLIT', 'WAIT'].includes(value.action) ||
       !nonempty(value.reason) || !nonempty(value.guidance)) {
@@ -36,6 +38,11 @@ export function parseRecoveryDecision(text: string, task: Task): RecoveryDecisio
       throw Error('Changed recovery needs a concrete next tool operation, not another paraphrase of the task.');
     }
     decision.nextOperation = { tool: value.nextOperation.tool.trim(), input: value.nextOperation.input };
+    if (capabilities) {
+      const capability = capabilities.find(tool => tool.name === decision.nextOperation!.tool);
+      if (!capability) throw Error(`Recovery proposed an unregistered tool: ${decision.nextOperation.tool}`);
+      validateToolInput(decision.nextOperation.input, capability.inputSchema, capability.name);
+    }
   }
   if (value.action === 'WAIT') {
     if (!Number.isFinite(value.retryAfterSeconds) || value.retryAfterSeconds < 5 || value.retryAfterSeconds > 3600) {
@@ -58,6 +65,15 @@ export function recoveryOperation(decision: RecoveryDecision): unknown {
 /** One bounded, evidence-fed decision. Bad output is deferred by the scheduler, not retried here. */
 export async function decideRecovery(context: vscode.ExtensionContext, output: vscode.OutputChannel,
   task: Task, evidence: string, opts: RunOptions): Promise<{ decision: RecoveryDecision; usage: Usage }> {
+  // Response-only turns have no callable tools. Supply the executor's real
+  // registry as data rather than making the model guess names from prose.
+  const session = new VerificationSession(context, output, () => {}, opts.onActivity);
+  opts.onAbort?.(() => session.stop());
+  let capabilities: VerificationCapability[];
+  try {
+    await session.start(context);
+    capabilities = session.capabilities;
+  } finally { session.stop(); }
   const result = await runOnce(context, output, 'supervisor', `An autonomous run needs a DIFFERENT recovery approach.
 The queue remains RUNNING. You cannot stop it, declare success, erase history, or weaken requirements.
 Diagnose captured failures rather than inventing a psychological explanation or repeating reassuring prose.
@@ -72,6 +88,14 @@ ${JSON.stringify({ kind: task.kind, title: task.title, description: task.descrip
 
 HOST EVIDENCE AND RECOVERY HISTORY:
 ${evidence}
+
+REGISTERED NEXT-STEP TOOLS (names, descriptions and JSON input schemas from tools/list):
+${JSON.stringify(capabilities)}
+These tools are available to the execution/verification host, not callable during this response-only turn.
+Choose nextOperation only from this registry. Do not guess terminal/shell names.
+For missing Playwright SUITE browsers use playwright_install with {"with_deps":false};
+use with_deps:true only for diagnosed missing Linux libraries. playwright_status inspects
+the runtime; playwright_test runs the suite. Interactive CLI syntax comes from playwright_skill.
 
 Choose one action:
 VERIFY: A missing observation, incorrect tool invocation, or incomplete report needs host-executed verification.
@@ -94,7 +118,7 @@ Reply ONE JSON object:
 For SPLIT each entry needs title, description and solutionVerifyPrompt.
 Preserve all substantive acceptance conditions.`,
   { ...opts, formatOnly: true, maxIterations: 1 });
-  try { return { decision: parseRecoveryDecision(result.text, task), usage: result.usage }; }
+  try { return { decision: parseRecoveryDecision(result.text, task, capabilities), usage: result.usage }; }
   catch (error) {
     // Invalid JSON still consumed a provider turn; do not hide that cost.
     throw Object.assign(error as Error, { usage: result.usage });

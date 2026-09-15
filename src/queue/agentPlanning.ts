@@ -1,20 +1,15 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
-import * as path from 'path';
 import { Region, encodeRegion, runScanCommand, parseRegion } from './agentRegions';
 import { NewTask, TaskQueue, Usage, Task } from './db';
-import { getBridge } from '../mcpBridge';
 import { runOnce, baseRounds } from './agentRuntime';
 import { extractJson, isPlan, unwrapArray } from './agentJson';
 import { AgentRunError, ActivityRecord } from './agentTypes';
 import { workspaceRoot } from '../detect';
 import { attemptHistory } from './agentHistory';
-import { projectNotesContext, playwrightTestRegistration } from './prompts';
+import { projectNotesContext } from './prompts';
 import { taskCognition } from './cognition';
 import { preparePlanningGoal } from './testingEnvironment';
 import { narrowPlanningRegions, targetApplicationRegions } from './planningScope';
-import { getActiveQueue } from './registry';
-import { requiresPlaywright } from './playwrightPolicy';
 
 export const MAX_PHASES = 40;
 
@@ -47,14 +42,6 @@ export async function generatePhases(
     .map((r) => `- ${r.path}  (${r.fileCount} file(s)${languageSummary(r.languages)})`)
     .join('\n');
 
-  // Tools VS Code itself provides to every agent in this run — see
-  // McpBridge.toolsSummary. Named so the plan can lean on them, the way it
-  // already leans on the file, search, shell and browser tools.
-  const editorTools = getBridge().toolsSummary();
-  const editorToolsNote = editorTools
-    ? `\nVS CODE TOOLS every agent in this run also has, beyond files, search, shell and browser:\n${editorTools}\n`
-    : '';
-
   const prompt = `You are planning an autonomous coding run over a large workspace. The workspace has
 already been scanned and split into regions small enough for one agent to explore in a
 single sitting — you are not exploring the tree yourself, you are deciding which regions
@@ -66,7 +53,6 @@ ${goal}
 
 REGIONS (path, file count, language mix — not file contents)
 ${regionList || '(none — the workspace appears to be empty)'}
-${editorToolsNote}
 Break the goal into at most ${MAX_PHASES} phases. Reply with ONE JSON array and nothing else.
 
 Each element must be an object with exactly these keys:
@@ -85,14 +71,16 @@ Rules:
   observed dependency requires them to achieve the goal. Keep discovery with the outcome it serves.
 - Order phases in the sequence they should be expanded and executed.
 - Honor the owner's development workflow, external test location, and fixed testing settings.
-  Required test infrastructure is a dependency of application work. For TDD, plan runnable
-  baseline checks first and pair each new failing behavior assertion with its implementation
-  in the same task, which is not complete until those checks pass.
+  Use the supplied host capabilities before deciding prerequisites. Reuse the extension's
+  Playwright runtime and skills; keep necessary application tests with their implementation.
+  For TDD, pair each new failing assertion with its implementation in the same task,
+  which is not complete until those checks pass.
 - Scope phases by requested outcomes, not by every directory that happens to exist. Vendor code,
   generated assets, backups and duplicate applications are context unless the goal changes them.
 - Do not invent paths that are not in the REGIONS list.`;
 
   const draft = await runOnce(context, output, role, prompt, {
+    skillTask: goal,
     planningOnly: true,
     maxIterations: baseRounds(),
     onEvent,
@@ -113,8 +101,10 @@ Check every phase against these execution facts:
   means that SAME assertion passes after implementation. Never assert the old/undesired state
   and call its success RED; never require opposite before/after assertions to both keep passing.
   Initial-state observations belong in the TDD execution record, not permanent contrary tests.
-- If browser checks are required, bootstrap dependencies, configuration, authentication access,
-  and first passing real tests as one verifiable outcome. An empty suite is not a passing baseline.
+- If browser checks are required, reuse the host runtime and existing suites. Keep necessary
+  application-specific configuration, authentication and first passing tests with the behavior
+  they verify. Remove generic Playwright setup phases unless the owner requested a harness
+  as a deliverable. An empty suite is not a passing baseline.
 - Group by observable owner outcomes. Remove speculative directory/plugin audit phases unless
   an observed dependency requires them; keep necessary discovery with the change it supports.
 - Preserve the requested target environment, external tests, reference appearance, and all
@@ -267,10 +257,6 @@ export async function expandPhase(
   onAbort?: (abort: () => void) => void,
   projectNotes = '',
 ): Promise<PhaseExpansion> {
-  const activeQueue = getActiveQueue?.();
-  const bootstrap = phase.seq === 1 && activeQueue && requiresPlaywright(activeQueue) &&
-    !fs.existsSync(path.join(process.env.MFAGENT_PLAYWRIGHT_ROOT || workspaceRoot(),
-      'node_modules', '@playwright', 'test', 'package.json'));
   const region = parseRegion(phase.region);
   const scopeNote = region.paths.length
     ? `These paths delimit the phase's implementation scope and contain about
@@ -303,14 +289,6 @@ ${phase.description}
 
 ${scopeNote}
 ${retry}
-${bootstrap ? `MANDATORY PLAYWRIGHT BOOTSTRAP
-The configured browser suite is not installed. Every executor must run playwright_test before
-reporting a task complete. Return exactly ONE task completing this entire bootstrap phase:
-dependencies, configuration, and real baseline assertions using the configured URL and
-credentials. Pair RED and GREEN inside that task. An empty suite or "no tests found" is a FAILURE,
-never a successful scaffold.
-${playwrightTestRegistration}
-Do not split setup from the first passing tests.\n` : ''}
 First explore the region above enough to ground the plan in what is actually there. Then
 reply with ONE JSON array and nothing else, at most ${MAX_TASKS_PER_PHASE} elements.
 
@@ -336,8 +314,9 @@ Rules:
 - Order the array in the sequence the tasks must be executed.
 - Keep implementation within this phase's region; owner-authorized external tests are allowed.
 - When the owner requires TDD, pair the failing assertion (RED) and its implementation (GREEN)
-  in the same task. Establish a runnable baseline suite first. Never leave the shared suite failing
-  for a later sibling task to repair; each task must leave its own checks passing.
+  in the same task. Use the supplied host runtime and skills, adding any necessary baseline
+  checks within that task. Never leave the shared suite failing for a later sibling task to
+  repair; each task must leave its own checks passing.
 - Each task must be completable by one agent in a single sitting, touching a handful of files.
 - Give each task one concrete outcome, relevant file paths, prerequisites, and observable acceptance
   criteria. Carry forward discovered commands and paths; later workers do not see this exploration.
@@ -348,6 +327,7 @@ Rules:
 - Do not include a task for the phase itself.`;
 
   const { text, stopReason, usage } = await runOnce(context, output, 'supervisor', prompt, {
+    skillTask: `${phase.title || ''}\n${phase.description}`,
     planningOnly: true,
     cognition: taskCognition(phase, goal, 'supervisor'),
     maxIterations: baseRounds(),
@@ -380,22 +360,6 @@ Rules:
       return { tasks: [], splitRequests: [], cutOff: true, usage };
     }
     throw new AgentRunError('the phase expansion returned JSON but not an array of tasks');
-  }
-
-  if (bootstrap && (parsed.length !== 1 || parsed[0]?.kind === 'phase')) {
-    const repaired = await runOnce(context, output, 'supervisor', `${prompt}
-Your previous expansion cannot pass the mandatory per-task Playwright gate because it separates
-the bootstrap into multiple runnable rows. Replan it as exactly ONE concrete task containing all
-setup and first passing baseline tests. Preserve every substantive requirement of this phase.
-Return the complete one-element JSON array; the host will not merge or edit your task text.
-Previous expansion:\n${text}`, {
-      planningOnly: true, maxIterations: baseRounds(), onActivity, onEvent, onAbort,
-      cognition: taskCognition(phase, goal, 'supervisor'),
-    });
-    for (const key of ['input', 'output', 'cacheRead', 'cacheWrite'] as const) usage[key] = (usage[key] || 0) + (repaired.usage[key] || 0);
-    parsed = unwrapArray(extractJson<unknown>(repaired.text, isPlan));
-    if (!Array.isArray(parsed) || parsed.length !== 1 || parsed[0]?.kind === 'phase')
-      throw Object.assign(new AgentRunError('Playwright bootstrap requires one complete independently verifiable task; planner must revise its split.'), { usage });
   }
 
   const tasks: NewTask[] = [];

@@ -192,6 +192,9 @@ func (a *Agent) stream(
 					}
 				} else if total.Load() > 0 {
 					what += fmt.Sprintf("; connection alive (%d transport bytes), no model output yet", total.Load())
+					if now.Sub(started) >= 90*time.Second {
+						what += "; transport activity does not confirm model progress; check the model server for queued requests, prompt processing, or load errors"
+					}
 				}
 				a.activity(sessionID, phase, fmt.Sprintf(
 					"%s, %s in, last data %s ago", what, brief(time.Since(started)), brief(idle)))

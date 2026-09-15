@@ -59,6 +59,10 @@ export function activatePlaywrightRuntime(
   }
 
   process.env.MFAGENT_PLAYWRIGHT_HOME = home;
+  const cli = path.join(home, 'cli', 'node_modules', '@playwright', 'cli', 'playwright-cli.js');
+  output.appendLine(fs.existsSync(cli)
+    ? '[playwright] official CLI and skill tools available: playwright_cli, playwright_skill'
+    : '[playwright] bundled CLI missing; run npm run build:playwright and repackage the extension.');
   output.appendLine(`[playwright] bundled runtime ready: @playwright/test ${version ?? 'unknown'} at ${home}`);
   return { home, version };
 }

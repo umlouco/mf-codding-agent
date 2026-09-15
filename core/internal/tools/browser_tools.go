@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/mflores/mfagent/core/internal/browser"
+	"github.com/mflores/mfagent/core/internal/playwright"
 )
 
 func RegisterBrowser(r *Registry, b *browser.Browser) {
@@ -65,6 +66,8 @@ func RegisterBrowser(r *Registry, b *browser.Browser) {
 			if err := env.CheckTestingURL(a.URL, true); err != nil {
 				return Errf("%v", err)
 			}
+			// Installation may have happened after this worker started.
+			b.SetFallbacks(playwright.ChromiumPaths())
 			st, err := b.Navigate(ctx, a.URL, a.WaitFor)
 			if err != nil {
 				return Errf("navigation failed: %v", err)

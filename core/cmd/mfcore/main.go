@@ -120,6 +120,7 @@ func (s *server) register() {
 	s.conn.Register("chat/steer", s.onSteer)
 	s.conn.Register("chat/reset", s.onReset)
 	s.conn.Register("tools/list", s.onToolsList)
+	s.conn.Register("skills/context", s.onSkillsContext)
 	// File and editor tools call back into the host; keep reading their replies.
 	s.conn.RegisterAsync("tools/invoke", s.onToolsInvoke)
 	s.conn.Register("memory/stats", s.onMemoryStats)

@@ -377,12 +377,13 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
 			finished = true
-			continue
+			break // The response is complete even if the server keeps HTTP open.
 		}
 		if payload == "" {
 			continue
 		}
 		var chunk struct {
+			Error   json.RawMessage `json:"error"`
 			Choices []struct {
 				Delta struct {
 					Content string `json:"content"`
@@ -411,8 +412,24 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 				} `json:"prompt_tokens_details"`
 			} `json:"usage"`
 		}
-		if json.Unmarshal([]byte(payload), &chunk) != nil {
-			continue
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			return nil, fmt.Errorf("invalid model stream data from %s: %w", p.baseURL, err)
+		}
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			var detail struct {
+				Message string `json:"message"`
+			}
+			message := ""
+			if json.Unmarshal(chunk.Error, &detail) == nil {
+				message = detail.Message
+			}
+			if message == "" {
+				_ = json.Unmarshal(chunk.Error, &message)
+			}
+			if message == "" {
+				message = "provider returned an error without a message"
+			}
+			return nil, fmt.Errorf("model stream error from %s: %s", p.baseURL, message)
 		}
 		if chunk.Usage != nil {
 			turn.Usage.InputIncludesCache = true

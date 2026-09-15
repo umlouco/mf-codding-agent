@@ -32,6 +32,15 @@ type PromptInput struct {
 // instead, so this string stays byte-identical across a session and the prompt
 // cache actually hits.
 func BuildSystemPrompt(in PromptInput) string {
+	// Native Playwright tools are registered even when no browser is installed.
+	// Advertise the skill independently of BrowserReady so fresh SSH hosts can
+	// discover both installation and usage, without a Context-tab opt-in.
+	in.Skills += "\n# Playwright tools\nFor browser work call playwright_skill {} to load Microsoft's bundled official CLI skill and references. " +
+		"Use playwright_cli with an args array for interactive commands; no shell or global CLI install is needed. " +
+		"For suites select the directory containing the config (e.g. cwd:tests/e2e), and use that SAME cwd in playwright_status, playwright_install and playwright_test. " +
+		"All browsers, Node, caches and commands run on the workspace host over SSH, headlessly; no local desktop or X forwarding is needed. " +
+		"playwright_test repairs a missing Chromium download once; other launch failures include a diagnosis. Use with_deps:true only for missing Linux libraries. " +
+		"Never install from a parent directory or substitute another cached browser revision. After a failed repair report the observed blocker; do not repeat it without new evidence. A CLI snapshot is not a passing test suite.\n"
 	if in.QueueRole == "executor" {
 		return buildExecutorSystemPrompt(in)
 	}

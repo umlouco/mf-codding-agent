@@ -46,3 +46,14 @@ bin/**
 !runtime/**
 runtime/**/*.md
 runtime/**/.bin/**
+!runtime/cli/.claude/skills/**
+!runtime/cli/.agents/skills/**
+runtime/cli/.playwright/**
+runtime/cli/.playwright-cli/**
+
+# Official WordPress source pack: keep its instructions, references, helpers and license.
+!runtime/wordpress/**
+!support/wordpress-skills.mjs
+
+# Local agent state can also exist inside nested project folders.
+**/.mfagent/**

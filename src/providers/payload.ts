@@ -116,7 +116,7 @@ export function contextCeiling(): number {
  * each skill counted once even if more than one enabled group includes it.
  * Blank-content skills are dropped rather than sent as an empty section.
  */
-function buildSkillsText(
+export function buildSkillsText(
   skills: Skill[],
   groups: SkillGroup[],
   enabledGroupIds: ReadonlySet<string>,

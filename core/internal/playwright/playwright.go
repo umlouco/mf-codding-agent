@@ -436,15 +436,24 @@ func InstallBrowsers(ctx context.Context, s *Setup, withDeps bool) (string, erro
 	if s.NodePath == "" || s.CLIPath == "" {
 		return "", errors.New("node and a resolved @playwright/test CLI are required; no implicit package download is performed")
 	}
-	if err := s.prepare(); err != nil {
-		return "", err
-	}
 	args := []string{s.CLIPath, "install", "chromium"}
-	if withDeps && runtime.GOOS == "linux" {
-		args = append(args, "--with-deps")
-	}
 	runCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
+	var dependencyOutput string
+	if withDeps && runtime.GOOS == "linux" {
+		deps, err := dependencyCommand(runCtx, s)
+		if err != nil {
+			return "", err
+		}
+		configureCommand(deps)
+		deps.Dir = s.Root
+		deps.Env = append(s.env(), "NO_COLOR=1", "CI=1", "DEBIAN_FRONTEND=noninteractive")
+		out, err := deps.CombinedOutput()
+		dependencyOutput = tail(string(out), 3000) + "\n"
+		if err != nil {
+			return dependencyOutput, fmt.Errorf("Playwright Linux dependency installation failed: %w", err)
+		}
+	}
 
 	cmd := exec.CommandContext(runCtx, s.NodePath, args...)
 	configureCommand(cmd)
@@ -452,12 +461,12 @@ func InstallBrowsers(ctx context.Context, s *Setup, withDeps bool) (string, erro
 	cmd.Env = append(s.env(), "NO_COLOR=1", "CI=1")
 	out, err := cmd.CombinedOutput()
 	if runCtx.Err() == context.DeadlineExceeded {
-		return tail(string(out), 3000), errors.New("playwright install timed out after 15m")
+		return dependencyOutput + tail(string(out), 3000), errors.New("playwright install timed out after 15m")
 	}
 	if err != nil {
-		return tail(string(out), 3000), fmt.Errorf("playwright install failed: %w", err)
+		return dependencyOutput + tail(string(out), 3000), fmt.Errorf("playwright install failed: %w", err)
 	}
-	return tail(string(out), 3000), nil
+	return dependencyOutput + tail(string(out), 3000), nil
 }
 
 func firstLines(s string, n int) string {

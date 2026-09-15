@@ -15,3 +15,7 @@ core/mfagent-mcp.exe
 
 # Built by scripts/bundle-playwright.mjs and shipped in the VSIX, never committed.
 runtime/
+
+# Temporary checkouts used to verify the official skill pack/updater.
+.mfagent/scratch/wordpress-skills-upstream/
+.mfagent/scratch/wordpress-update-check/

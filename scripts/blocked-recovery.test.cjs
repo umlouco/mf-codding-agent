@@ -122,6 +122,9 @@ test('unfinished tasks return to the executor before later work', async t => {
           runner.correctTestingTarget = () => false;
           runner.wakeAfterHandoff = () => {};
           runner.schedule = () => {};
+          // The pre-execution scope review is a model turn; this test isolates
+          // the execution-retry state machine, so let every task through.
+          runner.scopeWatch = () => ({ preflight: async () => true, observe() {}, close() {} });
           agents.executeTask = async (_context, _output, task) => {
             executions.push(task.id);
             if (executions.length === 2) throw Error('connection lost');

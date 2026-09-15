@@ -62,6 +62,7 @@ export async function executeTask(
   const prompt = buildExecutorPrompt(task, instructions, goal);
 
   const options: RunOptions = {
+    skillTask: `${task.title || ''}\n${task.description}\n${task.solutionVerifyPrompt}`,
     cognition: taskCognition(task, goal, 'executor'),
     memoryQuery: `${task.title || ''}\n${task.description}`,
     maxIterations: workerRounds(),
