@@ -8,7 +8,7 @@ import { notifySkillsChanged, onDidChangeSkills } from './registry';
 import { saveTestingEnvironment } from './testingEnvironment';
 import { renderQueueHtml } from './panelHtml';
 import { PlanningHost, generatePlan, applyTaskEditPrompt } from './panelPlanning';
-import { confirmAutonomy, confirmDelete, confirmReset, confirmClear, setMcpKey } from './panelPrompts';
+import { confirmAutonomy, confirmDelete, confirmReset, confirmClear, confirmEditRestart, setMcpKey } from './panelPrompts';
 import { queueViewState } from './panelState';
 
 /**
@@ -291,13 +291,32 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           orch.setCronInterval(Number(msg.seconds));
           break;
 
-        case 'updateTask':
+        case 'updateTask': {
           if (msg.patch?.status !== undefined && !TASK_STATUSES.includes(msg.patch.status)) {
             throw new Error('Unsupported task status.');
           }
-          queue.update(Number(msg.id), msg.patch);
+          const id = Number(msg.id);
+          const task = queue.get(id);
+          if (!task) {
+            break;
+          }
+          const editingText = msg.patch?.description !== undefined || msg.patch?.solutionVerifyPrompt !== undefined;
+          if (editingText && task.activityPhase.startsWith('decomposition_')) {
+            void vscode.window.showWarningMessage('This task must be replaced by smaller tasks. Edit its replacements instead of changing the rejected contract.');
+            break;
+          }
+          // A running agent already read the old text. Ask before stopping it,
+          // because saving the edit is what makes the agent read it again.
+          const restart = editingText && task.status === 'EXECUTING' &&
+            ((msg.patch.description !== undefined && msg.patch.description !== task.description) ||
+             (msg.patch.solutionVerifyPrompt !== undefined && msg.patch.solutionVerifyPrompt !== task.solutionVerifyPrompt));
+          if (restart && !(await confirmEditRestart(task))) {
+            break;
+          }
+          orch.applyTaskEdit(id, msg.patch);
           this.render();
           break;
+        }
         case 'setStatus': {
           if (!TASK_STATUSES.includes(msg.status)) throw new Error('Unsupported task status.');
           const task = queue.get(Number(msg.id));
@@ -305,8 +324,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
             void vscode.window.showWarningMessage('This task requires replacement by smaller tasks. Its failure cannot be cleared by changing status.');
             break;
           }
-          queue.update(Number(msg.id), { status: msg.status });
-          queue.log(Number(msg.id), 'user', 'status-set', msg.status);
+          orch.setTaskStatus(Number(msg.id), msg.status);
           this.render();
           break;
         }
@@ -315,8 +333,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
           if (task && msg.confirm && !(await confirmDelete(task))) {
             break;
           }
-          queue.remove(Number(msg.id));
-          queue.log(null, 'user', 'task-deleted', task ? `${task.seq}: ${task.title}` : '');
+          orch.removeTask(Number(msg.id));
           this.render();
           break;
         }

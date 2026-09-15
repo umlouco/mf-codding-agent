@@ -477,8 +477,11 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
       ownerContext: JSON.stringify([this.queue.getMeta('goal'), this.queue.testingContext + this.queue.instructions]),
       events: this.queue.events(task.id, -1), archivedAt: Date.now() }));
     if (this.queue.splitTask(task.id, parts) !== parts.length) throw Error('The original task no longer accepts this replacement.');
+    // The replacement is committed and the original row is gone. Stop anything
+    // still running on it — a split must never leave the old worker editing the
+    // workspace after its task no longer exists — then fence the review.
     const active = this.queue.activeTask();
-    if (active && active.seq > task.seq) this.abandonExecution();
+    if (task.status === 'EXECUTING' || (active && active.seq > task.seq)) this.abandonExecution();
     this.abandonReview();
     this.reviewed.delete(task.id);
     this.queue.log(null, 'supervisor', 'scope-split', `${archiveKey}: committed ${parts.length} ordered replacement tasks`);

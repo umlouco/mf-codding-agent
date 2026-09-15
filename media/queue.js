@@ -13,7 +13,7 @@
   const send = (msg) => vscode.postMessage(msg);
   const getState = () => state;
   const { mountTerm, terminalBlock, onLogs } = window.MFQueueUI.terminal({ send });
-  const { renderTasks, liveLabel, tokenLabel, compact } = window.MFQueueUI.tasks({
+  const { renderTasks, liveLabel, tokenLabel, compact, hasOpenEditor } = window.MFQueueUI.tasks({
     send, getState, tasksEl, mountTerm, terminalBlock,
   });
   const { drawContext } = window.MFQueueUI.context({ send, getState, $ });
@@ -228,7 +228,10 @@
     renderCron(st);
     renderRunbar(st);
     renderCounts(state.stats);
-    renderTasks(state.tasks, st);
+    // A full list rebuild while a field is open would replace the textarea the
+    // user is typing in. The edit module keeps its draft across renders and
+    // redraws itself when Save or Cancel closes the editor.
+    if (!hasOpenEditor()) renderTasks(state.tasks, st);
     drawContext();
 
     // Not just on first render: an executor can append to this at any time

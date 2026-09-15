@@ -3,6 +3,14 @@
 window.MFQueueUI = window.MFQueueUI || {};
 window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, terminalBlock }) {
   const open = new Set();
+  // Owner edits are staged here until Save rather than written per keystroke.
+  // A state push is frequent while agents run, and rebuilding a row mid-edit
+  // used to discard text that had not been committed yet — the edit "did not
+  // take effect". The draft is restored on every re-render; Save commits it.
+  const editing = new Set();
+  const drafts = new Map();
+  const saved = new Map();
+
   function renderTasks(tasks, st) {
     if (!tasks.length) {
       tasksEl.innerHTML =
@@ -141,9 +149,23 @@ window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, termina
       t.status === 'EXECUTING' || t.status === 'VERIFYING' ? liveLabel(t) : '';
     s.querySelector('.tokens').textContent = tokenLabel(t);
 
-    // Removing a task is one click from the list, because that is where you
-    // decide you do not want it. It sits inside the summary, so it has to stop
-    // the click from also toggling the row open.
+    // Edit and remove are one click from the list, because that is where you
+    // decide. Both sit inside the summary, so they have to stop the click from
+    // also toggling the row open. They stay visible on every row: a control you
+    // can only find by hovering is a control you do not have.
+    const edit = document.createElement('button');
+    edit.className = 'rowedit';
+    edit.type = 'button';
+    edit.title = `Edit task ${t.seq}`;
+    edit.setAttribute('aria-label', `Edit task ${t.seq}: ${t.title}`);
+    edit.textContent = '✎';
+    edit.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      startEdit(t);
+    });
+    s.appendChild(edit);
+
     const del = document.createElement('button');
     del.className = 'rowdel';
     del.type = 'button';
@@ -161,19 +183,30 @@ window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, termina
     const body = document.createElement('div');
     body.className = 'body';
 
-    body.appendChild(field('Description', t.description, (v) => patch(t.id, { description: v })));
+    // Read-only by default, editable only after Edit. The two fields the agent
+    // actually reads as instructions are the ones worth staging behind Save.
+    if (editing.has(t.id)) {
+      const draft = draftFor(t);
+      body.appendChild(editField('Description', draft.description, (v) => { draft.description = v; }));
+      if (!isPhase) {
+        body.appendChild(editField('Solution verification', draft.solutionVerifyPrompt, (v) => {
+          draft.solutionVerifyPrompt = v;
+        }));
+      }
+    } else {
+      body.appendChild(readonlyBlock('Description',
+        String(t.description || '').trim() || '(empty)', false));
+      if (!isPhase) {
+        body.appendChild(readonlyBlock('Solution verification',
+          String(t.solutionVerifyPrompt || '').trim() || '(empty)', false));
+      }
+    }
 
     if (isPhase) {
       // A phase has no verify prompts of its own — those belong to the tasks
       // it expands into — but it does have the workspace slice it was scoped
       // to, which is the thing worth showing here instead.
       body.appendChild(readonlyBlock('Region', regionSummary(t.region), false));
-    } else {
-      body.appendChild(
-        field('Solution verification', t.solutionVerifyPrompt, (v) =>
-          patch(t.id, { solutionVerifyPrompt: v }),
-        ),
-      );
     }
 
     if (t.supervisorFeedback) {
@@ -192,11 +225,15 @@ window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, termina
 
     const meta = document.createElement('p');
     meta.className = 'hint';
+    const status = saved.get(t.id);
+    if (status) {
+      meta.className = 'hint saved';
+    }
     // The denominator is real again: at `maxAttempts` the supervisor must split
     // or rebuild the task, and the counter restarts on whatever replaces it. So
     // this cannot read "7 of 3" — if it ever does, the escalation in
     // superviseTask stopped firing rather than the label being wrong.
-    meta.textContent = `attempt ${t.attempts} of ${t.maxAttempts}`;
+    meta.textContent = `attempt ${t.attempts} of ${t.maxAttempts}` + (status ? ` · ${status}` : '');
     body.appendChild(meta);
 
     body.appendChild(taskActions(t));
@@ -223,10 +260,17 @@ window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, termina
     );
     row.appendChild(sel);
 
+    if (editing.has(t.id)) {
+      row.appendChild(btn('Save', 'primary', () => saveTask(t)));
+      row.appendChild(btn('Cancel', 'ghost', () => cancelEdit(t)));
+    } else {
+      row.appendChild(btn('Edit', 'ghost', () => startEdit(t)));
+    }
+
     row.appendChild(spacer());
     row.appendChild(btn('Up', 'ghost', () => move(t.id, -1)));
     row.appendChild(btn('Down', 'ghost', () => move(t.id, 1)));
-    row.appendChild(btn('Delete', 'ghost', () => send({ type: 'deleteTask', id: t.id })));
+    row.appendChild(btn('Delete', 'ghost', () => removeTask(t)));
     return row;
   }
 
@@ -239,29 +283,81 @@ window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, termina
     send({ type: 'reorder', ids });
   }
 
+  // ---- edit mode -------------------------------------------------------
+
+  /** The staged text for a task; seeded from the row the first time Edit is hit. */
+  function draftFor(t) {
+    let d = drafts.get(t.id);
+    if (!d) {
+      d = { description: t.description || '', solutionVerifyPrompt: t.solutionVerifyPrompt || '' };
+      drafts.set(t.id, d);
+    }
+    return d;
+  }
+
+  function startEdit(t) {
+    draftFor(t);
+    editing.add(t.id);
+    // Open the row so the fields being edited are the ones on screen.
+    open.add(t.id);
+    rerender();
+  }
+
+  function cancelEdit(t) {
+    editing.delete(t.id);
+    drafts.delete(t.id);
+    rerender();
+  }
+
+  function saveTask(t) {
+    const d = drafts.get(t.id) || draftFor(t);
+    const patch = { description: d.description };
+    if (t.kind !== 'phase') {
+      patch.solutionVerifyPrompt = d.solutionVerifyPrompt;
+    }
+    const changed = patch.description !== (t.description || '') ||
+      (patch.solutionVerifyPrompt !== undefined && patch.solutionVerifyPrompt !== (t.solutionVerifyPrompt || ''));
+    editing.delete(t.id);
+    drafts.delete(t.id);
+    if (!changed) {
+      saved.set(t.id, 'No changes');
+    } else {
+      saved.set(t.id, 'Saved — the next worker reads this text.');
+      send({ type: 'updateTask', id: t.id, patch });
+    }
+    rerender();
+    const at = saved.get(t.id);
+    setTimeout(() => {
+      if (saved.get(t.id) === at) {
+        saved.delete(t.id);
+        rerender();
+      }
+    }, 4000);
+  }
+
+  /** Draw the list from the last pushed state without waiting for the next push. */
+  function rerender() {
+    const st = getState();
+    if (st && st.tasks) renderTasks(st.tasks, st.status || {});
+  }
+
   // ---- small builders ----
 
-  function field(label, value, onCommit, single) {
+  function editField(label, value, onInput) {
     const wrap = document.createElement('div');
-    wrap.className = 'field';
+    wrap.className = 'field editing';
 
     const l = document.createElement('span');
     l.className = 'lbl';
     l.textContent = label;
     wrap.appendChild(l);
 
-    const input = single ? document.createElement('input') : document.createElement('textarea');
-    if (single) {
-      /** @type {HTMLInputElement} */ (input).type = 'text';
-    } else {
-      /** @type {HTMLTextAreaElement} */ (input).rows = 3;
-    }
+    const input = document.createElement('textarea');
+    input.rows = 3;
     input.value = value || '';
-    // Commit on blur rather than per keystroke: a re-render mid-edit would
-    // otherwise fight the caret.
-    input.addEventListener('blur', () => {
-      if (input.value !== (value || '')) onCommit(input.value);
-    });
+    // Update the draft on every keystroke, so a re-render triggered by a live
+    // agent mid-edit restores what has been typed instead of dropping it.
+    input.addEventListener('input', () => onInput(input.value));
     wrap.appendChild(input);
     return wrap;
   }
@@ -296,9 +392,13 @@ window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, termina
     return s;
   }
 
-  function patch(id, p) {
-    send({ type: 'updateTask', id, patch: p });
-  }
-
-  return { renderTasks, liveLabel, tokenLabel, compact };
+  return {
+    renderTasks,
+    liveLabel,
+    tokenLabel,
+    compact,
+    // queue.js skips a list rebuild while a field is open, so an incoming
+    // state push cannot destroy the caret or an uncommitted draft.
+    hasOpenEditor: () => editing.size > 0,
+  };
 };

@@ -1,5 +1,5 @@
 import { attemptsExhausted, runOnce, coreHalted } from './agents';
-import { Task, NewTask } from './db';
+import { Task, TaskStatus, NewTask } from './db';
 import { LiveLog } from './liveLog';
 import { correctLocalTestingTarget, JOURNAL_EVENTS, ProgressDecision, reviewProgress, VALIDATION_FAILED } from './monitor';
 import { appendAttempt, Review } from './orchestratorState';
@@ -311,6 +311,112 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     this.changed();
     this.wakeAfterHandoff();
     return count;
+  }
+
+  /**
+   * Owner edit from the queue panel.
+   *
+   * Stored text is what the next worker reads, so a task that has not started
+   * simply takes the new text. A task that is already EXECUTING has read the
+   * old text: persisting the edit and leaving the worker alone means the edit
+   * never reaches any agent, which is exactly the "I edit it and nothing
+   * happens" report. So the current attempt is fenced, stopped, and returned to
+   * PENDING to run again with the edit. The panel asks before restarting.
+   */
+  applyTaskEdit(id: number, patch: Partial<Task>): void {
+    const task = this.queue.get(id);
+    if (!task) {
+      return;
+    }
+    const fields = ['title', 'description', 'solutionVerifyPrompt'] as const;
+    const edit: Partial<Pick<Task, typeof fields[number]>> = {};
+    for (const field of fields) {
+      if (typeof patch[field] === 'string') {
+        edit[field] = patch[field];
+      }
+    }
+    const changed = fields.some(field => edit[field] !== undefined && edit[field] !== task[field]);
+    const logEdit = () => this.queue.log(id, 'user', 'task-edited',
+      JSON.stringify({ source: 'panel', changes: edit }));
+    if (!changed) {
+      this.queue.update(id, patch);
+      this.changed();
+      return;
+    }
+    if (task.status === 'EXECUTING') {
+      const stopped = this.stopForDecision(task, { ...edit, status: 'PENDING', finishedAt: null,
+        validationReport: '', activityPhase: 'user_edit',
+        activityDetail: 'The owner edited this task; it restarts so the agent reads the new text.' });
+      if (stopped) {
+        logEdit();
+        this.queue.log(id, 'user', 'restarted-for-edit',
+          'The running attempt was stopped so the edited text is read by the next worker.');
+        this.log(`task ${task.seq} stopped for an owner edit; restarting with the new text`);
+        this.changed();
+        this.wakeAfterHandoff();
+        return;
+      }
+    }
+    this.queue.update(id, edit);
+    logEdit();
+    this.changed();
+    this.wakeAfterHandoff();
+  }
+
+  /**
+   * Owner delete from the panel.
+   *
+   * Deleting the row used to leave an in-flight worker running with nothing to
+   * report to: the callbacks were fenced, but the process kept editing the
+   * workspace until its turn happened to end. Stop it first, then remove the
+   * row, so "deleted" and "no longer working on it" mean the same thing.
+   */
+  removeTask(id: number): void {
+    const task = this.queue.get(id);
+    if (!task) {
+      return;
+    }
+    if (this.review?.taskId === id) {
+      this.abandonReview();
+    }
+    if (task.status === 'EXECUTING') {
+      this.abandonExecution();
+    }
+    // abandonExecution requeues the in-flight row; removing it after is what
+    // makes the deletion final rather than a surprise PENDING task.
+    this.reviewed.delete(id);
+    this.queue.remove(id);
+    this.queue.log(null, 'user', 'task-deleted', `${task.seq}: ${task.title}`);
+    this.log(`task ${task.seq} removed from the panel` +
+      (task.status === 'EXECUTING' ? ' and its worker stopped' : ''));
+    this.changed();
+    this.wakeAfterHandoff();
+  }
+
+  /**
+   * Owner status change from the panel. Moving a row off EXECUTING while a
+   * worker still owns it used to leave that worker running — the row said
+   * PAUSED or PENDING while the agent kept editing the workspace, and the
+   * queue could then claim the row again and start a second worker on the
+   * same task. Fence and abort the current attempt first.
+   */
+  setTaskStatus(id: number, status: TaskStatus): void {
+    const task = this.queue.get(id);
+    if (!task || task.status === status) {
+      return;
+    }
+    if (task.status === 'EXECUTING') {
+      if (this.stopForDecision(task, { status, finishedAt: null })) {
+        this.queue.log(id, 'user', 'status-set', status);
+        this.changed();
+        this.wakeAfterHandoff();
+        return;
+      }
+    }
+    this.queue.update(id, { status, ...(status === 'PENDING' ? { finishedAt: null } : {}) });
+    this.queue.log(id, 'user', 'status-set', status);
+    this.changed();
+    this.wakeAfterHandoff();
   }
 
   protected async applyProgressDecision(

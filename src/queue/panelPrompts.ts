@@ -155,6 +155,26 @@ export async function confirmDelete(task: Task): Promise<boolean> {
   return pick === 'Remove';
 }
 
+/**
+ * Saving an edit to a task that is running has a real cost: the worker already
+ * read the old text, so the only way the edit reaches an agent is to stop the
+ * current attempt and run the task again. Ask before spending that attempt.
+ */
+export async function confirmEditRestart(task: Task): Promise<boolean> {
+  const pick = await vscode.window.showWarningMessage(
+    `Task ${task.seq} is running. Save the edit and restart it?`,
+    {
+      modal: true,
+      detail:
+        'The running agent already read the previous text, so the edit only takes effect if this ' +
+        'attempt is stopped and the task returns to PENDING. Work already written to the workspace ' +
+        'is kept; this attempt\'s report is discarded.',
+    },
+    'Save and restart',
+  );
+  return pick === 'Save and restart';
+}
+
 export async function confirmReset(): Promise<boolean> {
   const pick = await vscode.window.showWarningMessage(
     'Reset runnable tasks to PENDING?',
