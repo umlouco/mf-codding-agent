@@ -59,6 +59,19 @@ func (a *Agent) llmIdle() time.Duration {
 	return defaultLLMIdle
 }
 
+// repeatBytes is how many identical consecutive bytes of model text mark a
+// reply as degenerate. 0 disables the guard for callers that want a
+// deliberately repetitive reply preserved.
+func (a *Agent) repeatBytes() int {
+	if a.cfg.LLMRepeatBytes < 0 {
+		return 0
+	}
+	if n := a.cfg.LLMRepeatBytes; n > 0 {
+		return n
+	}
+	return repetitionMinBytes
+}
+
 func (a *Agent) activityInterval() time.Duration {
 	if n := a.cfg.ActivitySeconds; n > 0 {
 		return time.Duration(n) * time.Second
@@ -113,10 +126,13 @@ func (a *Agent) beat(sessionID, phase string, what func(time.Duration) string) (
 /*
 stream runs one provider call under an activity watch.
 
-The watch does two things and nothing else. It keeps writing for as long as the
-call is in flight, so silence in the journal means a dead worker rather than a
-busy one. If explicitly enabled, the idle guard cancels a connection that has
-delivered nothing for its configured window.
+The watch does three things and nothing else. It keeps writing for as long as
+the call is in flight, so silence in the journal means a dead worker rather than
+a busy one. If explicitly enabled, the idle guard cancels a connection that has
+delivered nothing for its configured window. And when repetition reporting is
+enabled, it cancels a reply that has collapsed into repeating itself: bytes are
+still arriving, so the idle guard cannot see that failure, but the reply is
+finished as work regardless — see repetition.go.
 */
 func (a *Agent) stream(
 	ctx context.Context,
@@ -135,9 +151,36 @@ func (a *Agent) stream(
 		lastContent atomic.Int64
 		streaming   atomic.Bool // decoded model output has started arriving
 		stalled     atomic.Bool
+		degenerate  atomic.Bool // the reply collapsed into a repeated block
 	)
 	lastByte.Store(time.Now().UnixNano())
 	lastContent.Store(time.Now().UnixNano())
+
+	// Only armed when the caller allows it. Tool arguments are deliberately not
+	// observed: a generated file can be long, and large repetition inside one is
+	// the model doing its job, not rambling.
+	var repetitions *repetitionGuard
+	if limit := a.repeatBytes(); limit > 0 {
+		repetitions = newRepetitionGuard(limit)
+	}
+
+	// stopIfDegenerate cuts a reply that has collapsed into a repeated block.
+	// It is called both as text arrives and on the activity tick, so a loop is
+	// caught within seconds of crossing the threshold rather than at the next
+	// slow heartbeat. The record and the cancellation happen exactly once.
+	stopIfDegenerate := func() {
+		if repetitions == nil {
+			return
+		}
+		bad, detail := repetitions.check()
+		if !bad || !degenerate.CompareAndSwap(false, true) {
+			return
+		}
+		a.activity(sessionID, PhaseError, fmt.Sprintf(
+			"%s: %s — stopping the reply instead of waiting for it to finish",
+			a.provider.Model(), detail))
+		cancel()
+	}
 
 	watched := func(ev llm.Event) {
 		lastByte.Store(time.Now().UnixNano())
@@ -155,6 +198,9 @@ func (a *Agent) stream(
 			streaming.Store(true)
 			decoded.Add(int64(len(ev.Text)))
 			lastContent.Store(time.Now().UnixNano())
+			if repetitions != nil && ev.Kind != llm.EventToolStart && repetitions.observe(ev.Text) {
+				stopIfDegenerate()
+			}
 		}
 		sink(ev)
 	}
@@ -180,6 +226,16 @@ func (a *Agent) stream(
 						"%s has delivered nothing for %s — dropping the connection",
 						a.provider.Name(), brief(idle)))
 					cancel()
+					return
+				}
+				// Bytes keep arriving, but if they are the same bytes over and
+				// over the reply is not progressing — see repetition.go. This is
+				// the failure the idle guard above cannot see: a local model
+				// that stays busy repeating one phrase forever. The per-event
+				// check in watched normally catches it first; this is the
+				// backstop for a loop that only spans tick boundaries.
+				stopIfDegenerate()
+				if degenerate.Load() {
 					return
 				}
 				phase, what := PhaseModel, fmt.Sprintf("waiting for the first token from %s", a.provider.Model())
@@ -214,6 +270,17 @@ func (a *Agent) stream(
 		err = fmt.Errorf(
 			"the connection to %s delivered nothing for %s and was dropped — the endpoint "+
 				"may be down, or the model may have failed to load", a.provider.Name(), brief(a.llmIdle()))
+		a.activity(sessionID, PhaseError, err.Error())
+		return nil, err
+	case degenerate.Load():
+		detail := ""
+		if repetitions != nil {
+			_, detail = repetitions.check()
+		}
+		err = fmt.Errorf(
+			"the reply from %s degenerated into repetition and was stopped after %s — %s; "+
+				"the work it had already reported stands, and the task should be retried rather "+
+				"than waiting for this reply", a.provider.Name(), brief(time.Since(started)), detail)
 		a.activity(sessionID, PhaseError, err.Error())
 		return nil, err
 	case err != nil:

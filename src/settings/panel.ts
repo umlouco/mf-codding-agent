@@ -388,9 +388,17 @@ export class SettingsPanel {
     });
   }
 
-  /** Fetch model lists for every configured profile, pushing each as it lands. */
+  /**
+   * Revalidate every configured profile's model list.
+   *
+   * `pushState` has already rendered the cached list, so this runs in the
+   * background and replaces it as each fetch lands. Forcing here (rather than
+   * trusting the cache TTL) is what keeps hosted catalogs such as OpenRouter's
+   * current: a model released minutes ago is missing from a six-hour-old cache
+   * with no other way to notice it besides a manual Refresh.
+   */
   private async warmModelLists(): Promise<void> {
-    await Promise.all(this.store.profiles.map((p) => this.loadModels(p.id, false)));
+    await Promise.all(this.store.profiles.map((p) => this.loadModels(p.id, true)));
   }
 
   private async loadModels(profileId: string, force: boolean): Promise<void> {
@@ -400,8 +408,10 @@ export class SettingsPanel {
     }
     const def = providerOrFallback(profile.providerId);
     // A provider that needs a key it does not have will only ever 401; say so
-    // instead of burning a request and showing a confusing HTTP error.
-    if (def.apiKey === 'required') {
+    // instead of burning a request and showing a confusing HTTP error. A
+    // public catalog (OpenRouter) is listed keyless, so it must not be blocked
+    // here — otherwise new models are invisible until a key is added.
+    if (def.apiKey === 'required' && !def.listWithoutKey) {
       const key = await this.store.effectiveApiKey(profile.id, def);
       if (!key) {
         this.post({
@@ -482,12 +492,15 @@ export class SettingsPanel {
 
   private html(webview: vscode.Webview): string {
     const nonce = String(Math.random()).slice(2) + Date.now().toString(36);
-    const css = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'settings.css'),
-    );
-    const js = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'settings.js'),
-    );
+    // Version the media URIs so an edited settings.js/css is never served from
+    // the webview's cache after a reload.
+    const assets = `v=${nonce}`;
+    const css = webview
+      .asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'settings.css'))
+      .with({ query: assets });
+    const js = webview
+      .asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'settings.js'))
+      .with({ query: assets });
     const csp = [
       `default-src 'none'`,
       `img-src ${webview.cspSource} data:`,

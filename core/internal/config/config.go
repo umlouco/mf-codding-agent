@@ -121,6 +121,17 @@ type Config struct {
 	// the evidence that something has gone wrong.
 	ActivitySeconds int `json:"activitySeconds"`
 
+	// How many identical consecutive bytes of assistant text count as a
+	// degenerate reply, which is stopped rather than allowed to stream on.
+	// Zero means the built-in default; negative disables the guard.
+	//
+	// The idle window above cannot see this failure: a quantised model can stay
+	// busy for an hour repeating one phrase, never silent and never finished.
+	// Repetition is the evidence that such a reply has stopped being work.
+	// Only assistant text and reasoning are measured — never tool arguments,
+	// which legitimately contain large generated files.
+	LLMRepeatBytes int `json:"llmRepeatBytes"`
+
 	MCPServers []MCPServer `json:"mcpServers"`
 
 	// EditorTools are the `vscode.lm.tools` this workspace has switched on for

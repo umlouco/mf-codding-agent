@@ -70,6 +70,13 @@ export interface CoreConfig {
   llmIdleSeconds: number;
   /** How often a waiting turn writes an activity record. */
   activitySeconds: number;
+  /**
+   * Identical consecutive bytes of assistant text or reasoning that mark a
+   * reply as a degenerate loop; the core stops such a reply rather than
+   * streaming it forever. Negative disables the guard. Tool arguments are
+   * never measured.
+   */
+  llmRepeatBytes: number;
   languages: string[];
   mcpServers: any[];
   /**
@@ -229,6 +236,8 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
     maxContextTokens: contextCeiling(),
     llmIdleSeconds: cfg.get<number>('llm.idleMinutes', 60) === 0 ? -1 : Math.max(1, cfg.get<number>('llm.idleMinutes', 60)) * 60,
     activitySeconds: Math.max(5, cfg.get<number>('activityIntervalSeconds', 30)),
+    // 0 in settings means "off", which the core reads as a negative value.
+    llmRepeatBytes: cfg.get<number>('llm.repeatBytes', 4096) === 0 ? -1 : Math.max(2048, cfg.get<number>('llm.repeatBytes', 4096)),
     languages,
     mcpServers,
     editorTools: getBridge().editorToolDefs(),

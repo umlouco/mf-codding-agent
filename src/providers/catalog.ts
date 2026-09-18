@@ -73,6 +73,13 @@ export interface ProviderDef {
   /** Environment variables checked when the profile has no stored key. */
   apiKeyEnv?: string[];
   apiKeyHelp?: string;
+  /**
+   * True when the model listing is public even though inference still needs a
+   * key. OpenRouter is the canonical case: its catalog is browsable before
+   * sign-up, so a missing key must not block discovery of newly released
+   * models. Only gates listing — the `apiKey` requirement is unchanged.
+   */
+  listWithoutKey?: boolean;
 
   listStyle: ListStyle;
   /** Absolute URL for listing when it is not `{baseURL}/models`. */
@@ -160,6 +167,7 @@ export const PROVIDERS: ProviderDef[] = [
     apiKey: 'required',
     apiKeyEnv: ['OPENROUTER_API_KEY'],
     listStyle: 'openrouter',
+    listWithoutKey: true,
     serves: { chat: true, vision: true, embedding: false },
     docsURL: 'https://openrouter.ai/keys',
     notes: 'Model listing works without a key, so you can browse before signing up.',

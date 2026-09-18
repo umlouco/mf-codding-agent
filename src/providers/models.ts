@@ -16,8 +16,10 @@ import {
  *
  * Prefer live provider listings. Documented release hints supplement stale or
  * unavailable hosted listings without changing saved model selections.
- * Results are cached per profile so opening the settings page is instant, with
- * an explicit refresh for when you have just pulled a new local model.
+ * Results are cached per profile so opening the settings page is instant; the
+ * settings page revalidates that cache in the background, and the explicit
+ * refresh covers local servers whose model set changed while the extension
+ * was idle.
  */
 
 export interface ModelInfo {

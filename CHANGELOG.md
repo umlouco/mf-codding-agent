@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- Show OpenRouter's newest models as soon as they exist. The catalog is public,
+  but the settings page refused to list it without an API key, so a profile
+  with no key never showed a single model; and opening the page trusted a
+  six-hour-old cache, which hid anything released since. Providers may now
+  declare `listWithoutKey` (OpenRouter does), the settings page revalidates
+  every profile's list in the background on open — cached models render
+  instantly and are replaced as the live fetch lands — and a failed fetch still
+  falls back to what was cached.
+
+- Make the model field on the Roles tab scrollable. It used a native
+  `<datalist>`, whose popup is drawn outside the page, cannot be styled and
+  stops scrolling on long catalogs — so OpenRouter's 400-plus models could not
+  be browsed and the executor model was effectively unpickable. The field now
+  draws its own list — filtered on id and display name, arrow/Page Up/Page
+  Down navigable, with a visible draggable scrollbar inside a capped height.
+  The list holds focus while it is scrolled or clicked, which the native popup
+  did not. Settings assets are also versioned so an edited `settings.js` is
+  never served from the webview cache after a reload.
+
+- Stop a model reply that has collapsed into a loop instead of letting it
+  stream forever. Liveness was judged only from silence: a reply that keeps
+  delivering bytes is "working", however useless those bytes are, so a local
+  model repeating one phrase stayed busy for as long as it wanted and no
+  supervisor check ever saw a reason to intervene — observed live as a worker
+  that streamed "or License: GPL v2" for forty-nine minutes and 145 KB while
+  writing an activity record every thirty seconds. A reply whose tail is the
+  same block repeated for thousands of consecutive bytes is now cut off and
+  reported as stopped, and the task is retried with that history. The tail is
+  re-examined every 512 bytes of new output rather than only on the thirty-second
+  activity tick, so on the observed model the same loop is now caught within
+  seconds instead of running for the better part of an hour. Only the assistant's
+  own text and reasoning are measured, never tool arguments, so a large generated
+  file is unaffected; the threshold is `mfagent.llm.repeatBytes` (default 4096,
+  `0` disables it).
+
 - Give every planning pass the workspace host's registered tools, bundled skill catalog,
   enabled skill instructions and Playwright status before its first model request, including
   Claude CLI and response-only plan reviews. Remove the project-only dependency check that

@@ -563,6 +563,147 @@
     ['max', 'Max (Anthropic)'],
   ];
 
+  /**
+   * A typeahead for model ids with a scrollable list.
+   *
+   * The native <datalist> popup cannot be styled and Chromium stops scrolling
+   * it on long catalogs, which left OpenRouter's 400-plus models impossible to
+   * browse. This draws its own list, keeps the committed value as the model id
+   * and filters on both the id and the display name.
+   */
+  function modelPicker(models, currentValue, enabled, key, commit) {
+    const node = el('div', { class: 'model-picker' });
+    const input = el('input', {
+      type: 'text',
+      'data-k': key,
+      value: currentValue,
+      placeholder: enabled ? 'Type or pick a model id' : 'Choose a provider first',
+      disabled: !enabled,
+      autocomplete: 'off',
+      spellcheck: 'false',
+    });
+    const menu = el('div', { class: 'model-menu', hidden: true });
+    // Keep the input focused while the list is in use. Without this, pressing
+    // the scrollbar (or dragging it) blurs the input and the 120ms close below
+    // hides the list mid-scroll — the exact "cannot scroll" symptom.
+    menu.addEventListener('mousedown', (e) => e.preventDefault());
+    let rows = [];
+    let active = -1;
+    let committed = currentValue;
+
+    const close = () => {
+      menu.hidden = true;
+      active = -1;
+    };
+    const commitValue = (value) => {
+      const next = value.trim();
+      if (next === committed) return;
+      committed = next;
+      commit(next);
+    };
+
+    function filtered() {
+      const q = input.value.trim().toLowerCase();
+      if (!q) return models;
+      return models.filter(
+        (m) => m.id.toLowerCase().includes(q) || (m.name || '').toLowerCase().includes(q),
+      );
+    }
+
+    function highlight() {
+      for (let i = 0; i < rows.length; i++) rows[i].classList.toggle('active', i === active);
+      if (active >= 0 && rows[active]) rows[active].scrollIntoView({ block: 'nearest' });
+    }
+
+    function open() {
+      menu.textContent = '';
+      rows = [];
+      active = -1;
+      const found = filtered().slice(0, 300);
+      if (!found.length) {
+        menu.appendChild(el('div', { class: 'model-empty', text: 'No matching models.' }));
+        menu.hidden = false;
+        return;
+      }
+      found.forEach((m, i) => {
+        const row = el(
+          'div',
+          {
+            class: 'model-option',
+            'data-value': m.id,
+            // The menu cancels mousedown, so the input keeps focus and this
+            // click is still delivered. Selecting here rather than on mousedown
+            // also lets a scrollbar drag that starts on a row pass through.
+            onclick: () => choose(m.id),
+            onmouseenter: () => {
+              active = i;
+              highlight();
+            },
+          },
+          [
+            el('div', { class: 'model-option-id', text: m.id }),
+            m.name && m.name !== m.id
+              ? el('div', { class: 'model-option-name', text: m.name })
+              : null,
+          ],
+        );
+        rows.push(row);
+        menu.appendChild(row);
+      });
+      menu.hidden = false;
+    }
+
+    function choose(value) {
+      input.value = value;
+      close();
+      commitValue(value);
+    }
+
+    input.addEventListener('focus', open);
+    input.addEventListener('click', open);
+    input.addEventListener('input', open);
+    input.addEventListener('blur', () => setTimeout(close, 120));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (menu.hidden) open();
+        if (rows.length) {
+          active = Math.min(active + 1, rows.length - 1);
+          highlight();
+        }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (!rows.length) return;
+        active = Math.max(active - 1, 0);
+        highlight();
+      } else if (e.key === 'PageDown') {
+        e.preventDefault();
+        if (!rows.length) return;
+        active = Math.min(active + 10, rows.length - 1);
+        highlight();
+      } else if (e.key === 'PageUp') {
+        e.preventDefault();
+        if (!rows.length) return;
+        active = Math.max(active - 10, 0);
+        highlight();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const chosen = active >= 0 ? rows[active] : null;
+        if (!menu.hidden && chosen) choose(chosen.getAttribute('data-value'));
+        else {
+          close();
+          commitValue(input.value);
+        }
+      } else if (e.key === 'Escape') {
+        close();
+      }
+    });
+
+    node.appendChild(input);
+    node.appendChild(menu);
+    return node;
+  }
+
   function renderRole(role) {
     const binding = S.settings.roles[role.id] || { profileId: '', model: '', effort: '' };
     const inheritable = role.id !== 'coding' && role.id !== 'embedding';
@@ -619,38 +760,21 @@
       if (filtered.length) choices = filtered;
     }
 
-    const listId = `models-${role.id}`;
-    const datalist = el('datalist', { id: listId });
-    for (const m of choices.slice(0, 500)) {
-      // Only set `label` when there is one: an empty label attribute makes
-      // Chromium render a blank row instead of the model id.
-      datalist.appendChild(
-        el('option', m.name && m.name !== m.id ? { value: m.id, label: m.name } : { value: m.id }),
-      );
-    }
-
     const currentModel =
       binding.model || (inherited ? S.settings.roles.coding.model : '') || '';
 
-    const modelInput = el('input', {
-      type: 'text',
-      list: listId,
-      'data-k': `role:${role.id}:model`,
-      value: currentModel,
-      placeholder: profile ? 'Type or pick a model id' : 'Choose a provider first',
-      disabled: !profile,
-      onchange: (e) =>
-        send({
-          type: 'setRole',
-          role: role.id,
-          // Keep the provider as it was: an empty profileId means "inherit",
-          // and a model typed against an inherited provider stays an override
-          // of the model alone.
-          profileId: binding.profileId,
-          model: e.target.value.trim(),
-          effort: binding.effort || '',
-        }),
-    });
+    const picker = modelPicker(choices, currentModel, !!profile, `role:${role.id}:model`, (model) =>
+      // Keep the provider as it was: an empty profileId means "inherit",
+      // and a model typed against an inherited provider stays an override
+      // of the model alone.
+      send({
+        type: 'setRole',
+        role: role.id,
+        profileId: binding.profileId,
+        model,
+        effort: binding.effort || '',
+      }),
+    );
 
     // Effort column. Embeddings never reason, so the control would be pure
     // noise there; every other role can point at a reasoning model.
@@ -714,8 +838,7 @@
       ]),
       el('div', {}, [select]),
       el('div', {}, [
-        modelInput,
-        datalist,
+        picker,
         el('div', { class: 'meta' + (bad ? ' bad' : ''), text: meta.join(' · ') }),
       ]),
       el(
