@@ -2,6 +2,15 @@ import { QueueMetadata } from './dbMetadata';
 import { COLUMNS, TASK_STATUSES, Task, QueueStats, TaskStatus, Usage, TaskEvent, LogRow } from './dbModel';
 
 export class QueueJournal extends QueueMetadata {
+  /** Lightweight live view: never load every task's reports/output per tick. */
+  liveTasks(): Pick<Task, 'id' | 'status' | 'activityPhase' | 'activityDetail' |
+    'lastActivityAt' | 'tokensIn' | 'tokensOut' | 'tokensCacheRead'>[] {
+    return this.db.prepare(`SELECT id, status, activity_phase AS activityPhase,
+      activity_detail AS activityDetail, last_activity_at AS lastActivityAt,
+      tokens_in AS tokensIn, tokens_out AS tokensOut, tokens_cache_read AS tokensCacheRead
+      FROM tasks WHERE status IN ('EXECUTING', 'VERIFYING') ORDER BY seq, id`).all();
+  }
+
   /** Reserve before dispatch; retries/reloads and concurrent hosts cannot overspend. */
   reserveVerificationInteraction(taskId: number, limit: number, stage: string): number | undefined {
     return this.tx(() => {

@@ -64,7 +64,7 @@ function serialize<T>(work: () => Promise<T>): Promise<T> {
   const next = queue.then(work, work);
   // Keep the chain alive after a rejection: the failure belongs to the caller
   // that asked for it, not to every command queued behind it.
-  queue = next.catch(() => undefined);
+  queue = next.then(() => undefined, () => undefined);
   return next;
 }
 
@@ -172,7 +172,13 @@ async function collect(
     settle = resolve;
   });
 
-  const chunks: string[] = [];
+  // Keep a diagnostic tail, even for commands that produce output indefinitely.
+  const maxChars = 256 * 1024;
+  let output = '';
+  let truncated = false;
+  let stopped = false;
+  const iterator = execution.read()[Symbol.asyncIterator]();
+  const captured = () => (truncated ? '[Earlier terminal output truncated]\n' : '') + stripAnsi(output);
   let finished = false;
 
   const endSub = vscode.window.onDidEndTerminalShellExecution((e) => {
@@ -188,7 +194,7 @@ async function collect(
     // error message at the end of a failed build.
     void reading.then(() =>
       settle({
-        output: stripAnsi(chunks.join('')),
+        output: captured(),
         exitCode: e.exitCode ?? null,
         timedOut: false,
       }),
@@ -200,16 +206,25 @@ async function collect(
       return;
     }
     endSub.dispose();
+    stopped = true;
     // The command keeps running — it is the user's terminal, and killing it
     // from under them is not ours to do. What we report is that we stopped
     // waiting, which run_shell passes on verbatim.
-    settle({ output: stripAnsi(chunks.join('')), exitCode: null, timedOut: true });
+    settle({ output: captured(), exitCode: null, timedOut: true });
+    output = '';
+    // Stop the subscription, not the user's command. A pending next() may
+    // settle later; the reader checks stopped before retaining its value.
+    void iterator.return?.().catch(() => undefined);
   }, Math.max(1000, timeoutMs));
 
   const reading = (async () => {
     try {
-      for await (const chunk of execution.read()) {
-        chunks.push(chunk);
+      while (!stopped) {
+        const next = await iterator.next();
+        if (stopped || next.done) break;
+        const chunk = next.value;
+        truncated ||= output.length + chunk.length > maxChars;
+        output = (output + chunk).slice(-maxChars);
       }
     } catch {
       // A stream that ends abruptly still leaves usable output behind.

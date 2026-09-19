@@ -1,7 +1,7 @@
 // @ts-check
 /* Cohesive queue view helpers; loaded before queue.js under the webview nonce. */
 window.MFQueueUI = window.MFQueueUI || {};
-window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, terminalBlock }) {
+window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, unmountTerm, prepareTasks, terminalBlock }) {
   const open = new Set();
   // Owner edits are staged here until Save rather than written per keystroke.
   // A state push is frequent while agents run, and rebuilding a row mid-edit
@@ -12,6 +12,11 @@ window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, termina
   const saved = new Map();
 
   function renderTasks(tasks, st) {
+    const ids = new Set(tasks.map(t => t.id));
+    for (const collection of [open, editing, drafts, saved]) {
+      for (const id of collection.keys()) if (!ids.has(id)) collection.delete(id);
+    }
+    prepareTasks(tasks.filter(t => open.has(t.id)).map(t => String(t.id)));
     if (!tasks.length) {
       tasksEl.innerHTML =
         '<div class="empty">No tasks yet.<br>Use the <strong>Plan</strong> tab to generate a queue.</div>';
@@ -115,15 +120,16 @@ window.MFQueueUI.tasks = function ({ send, getState, tasksEl, mountTerm, termina
       `task ${t.status}` + (isPhase ? ' phase' : '') + (st.currentTaskId === t.id ? ' current' : '');
     d.dataset.id = String(t.id);
     d.open = open.has(t.id);
-    // The terminal is drawn only while the row is open: a closed row's stream
-    // keeps buffering in `terms`, and appears the moment the row opens.
+    // Closed rows keep their stream in SQLite and fetch a tail when opened.
     const term = terminalBlock();
     d.addEventListener('toggle', () => {
+      if (!d.isConnected) return;
       if (d.open) {
         open.add(t.id);
         mountTerm(String(t.id), term.pre);
       } else {
         open.delete(t.id);
+        unmountTerm(String(t.id));
       }
     });
 

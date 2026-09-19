@@ -18,6 +18,30 @@ export interface Driver {
   close(): void;
 }
 
+/** Reuse native statements instead of allocating new ones on every live poll. */
+export function cachedDriver(driver: Driver): Driver {
+  const statements = new Map<string, Stmt>();
+  return {
+    prepare(sql) {
+      let stmt = statements.get(sql);
+      if (stmt) statements.delete(sql);
+      else stmt = driver.prepare(sql);
+      statements.set(sql, stmt);
+      // Update queries have variable shapes; they must not grow the cache forever.
+      if (statements.size > 128) statements.delete(statements.keys().next().value!);
+      return stmt;
+    },
+    exec(sql) {
+      if (/\b(?:CREATE|ALTER|DROP)\b/i.test(sql)) statements.clear();
+      driver.exec(sql);
+    },
+    close() {
+      statements.clear();
+      driver.close();
+    },
+  };
+}
+
 /**
  * Opens the database on better-sqlite3, or on Node's built-in `node:sqlite`
  * when no native build for this host exists.
@@ -49,14 +73,14 @@ export function openDriver(file: string): { db: Driver; impl: string } {
       'better_sqlite3.node',
     );
     const options = fs.existsSync(shipped) ? { nativeBinding: shipped } : undefined;
-    return { db: new BetterSqlite3(file, options) as Driver, impl: 'better-sqlite3' };
+    return { db: cachedDriver(new BetterSqlite3(file, options) as Driver), impl: 'better-sqlite3' };
   } catch {
     /* not installed, or built against a different ABI — fall through */
   }
 
   try {
     const { DatabaseSync } = require('node:sqlite');
-    return { db: new DatabaseSync(file) as Driver, impl: 'node:sqlite' };
+    return { db: cachedDriver(new DatabaseSync(file) as Driver), impl: 'node:sqlite' };
   } catch (e: any) {
     // Name the host: this is the failure a remote extension host hits, where
     // the server's Node is not the Electron runtime the same VS Code uses

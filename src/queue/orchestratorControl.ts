@@ -52,12 +52,12 @@ export abstract class OrchestratorControl extends OrchestratorState {
   status(): OrchestratorStatus {
     // "Is a worker doing useful work" is answered by reading the row
     // claimNext wrote, not by a flag mirrored here — see activeTask.
-    const active = this.queue.activeTask();
+    const activeId = this.queue.activeTaskId();
     return {
       running: this.queue.runState === 'RUNNING',
-      executing: !!active,
+      executing: activeId !== null,
       supervising: this.supervising,
-      currentTaskId: active?.id ?? null,
+      currentTaskId: activeId,
       nextTickAt: this.nextTickAt,
       intervalMs: this.intervalMs,
       intervalOwn: this.queue.cronIntervalSeconds > 0,

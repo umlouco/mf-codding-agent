@@ -91,6 +91,12 @@ export class TaskQueue extends QueuePlans {
       .get();
   }
 
+  /** Status polling only needs the running task's identity, not its full report. */
+  activeTaskId(): number | null {
+    return this.db.prepare("SELECT id FROM tasks WHERE status = 'EXECUTING' ORDER BY seq ASC LIMIT 1")
+      .get()?.id ?? null;
+  }
+
   /** Legacy compatibility; failed attempts are represented as decomposition work. */
   anyFailed(): boolean { return false; }
 

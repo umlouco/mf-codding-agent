@@ -34,7 +34,7 @@ import { queueViewState } from './panelState';
  * working, and a reply that takes a minute reads as a minute of text arriving
  * rather than a minute of nothing.
  */
-export class QueueViewProvider implements vscode.WebviewViewProvider {
+export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   public static readonly viewType = 'mfagent.queue';
 
   /** How often the live table is read while the view is showing. */
@@ -51,6 +51,10 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   private streamTimer?: NodeJS.Timeout;
   /** What the last pulse said, so an unchanged one is not sent again. */
   private pulseSig = '';
+  private queueSubscription?: vscode.Disposable;
+  private viewSubscriptions: vscode.Disposable[] = [];
+  private readonly skillsSubscription: vscode.Disposable;
+  private modelsPending = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -58,24 +62,27 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
     /** Re-runs the open attempt; resolves once `attach` or `fail` has been called. */
     private readonly reopen: () => Promise<void>,
   ) {
-    context.subscriptions.push(onDidChangeSkills(() => this.render()));
+    this.skillsSubscription = onDidChangeSkills(() => this.render());
   }
 
   /** The queue opened: wire it up and drop any previous failure. */
   attach(queue: TaskQueue, orch: Orchestrator): void {
+    this.queueSubscription?.dispose();
     this.queue = queue;
     this.orch = orch;
     this.problem = undefined;
     // Start streaming from now: what came before is fetched per terminal as
     // it is opened, not replayed wholesale into a view that just appeared.
     this.lastLogId = queue.latestLogId();
-    orch.onDidChange(() => this.render());
+    this.queueSubscription = orch.onDidChange(() => this.render());
     this.render();
     this.syncStreaming();
   }
 
   /** The queue could not be opened. The view says so instead of spinning. */
   fail(reason: string): void {
+    this.queueSubscription?.dispose();
+    this.queueSubscription = undefined;
     this.queue = undefined;
     this.orch = undefined;
     this.problem = reason;
@@ -84,21 +91,37 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
+    this.clearView();
     this.view = view;
     view.webview.options = {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')],
     };
     view.webview.html = renderQueueHtml(this.context, view.webview);
-    view.webview.onDidReceiveMessage((msg) => void this.onMessage(msg));
+    this.viewSubscriptions.push(view.webview.onDidReceiveMessage((msg) => void this.onMessage(msg)));
     // A hidden view has nobody reading it; the poll stops with it and picks
     // up where the table is when it shows again.
-    view.onDidChangeVisibility(() => this.syncStreaming());
-    view.onDidDispose(() => {
-      this.view = undefined;
+    this.viewSubscriptions.push(view.onDidChangeVisibility(() => {
+      if (view.visible) this.render();
       this.syncStreaming();
-    });
+    }), view.onDidDispose(() => this.clearView()));
     this.syncStreaming();
+  }
+
+  private clearView(): void {
+    for (const sub of this.viewSubscriptions) sub.dispose();
+    this.viewSubscriptions = [];
+    this.view = undefined;
+    this.pulseSig = '';
+    this.syncStreaming();
+  }
+
+  dispose(): void {
+    this.clearView();
+    this.queueSubscription?.dispose();
+    this.skillsSubscription.dispose();
+    this.queue = undefined;
+    this.orch = undefined;
   }
 
   // ---- the live stream ---------------------------------------------------
@@ -131,19 +154,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
         this.post({ type: 'logs', rows });
       }
       const status = this.orch?.status();
-      const tasks = queue
-        .list()
-        .filter((t) => t.status === 'EXECUTING' || t.status === 'VERIFYING')
-        .map((t) => ({
-          id: t.id,
-          status: t.status,
-          activityPhase: t.activityPhase,
-          activityDetail: t.activityDetail,
-          lastActivityAt: t.lastActivityAt,
-          tokensIn: t.tokensIn,
-          tokensOut: t.tokensOut,
-          tokensCacheRead: t.tokensCacheRead,
-        }));
+      const tasks = queue.liveTasks();
       const sig = JSON.stringify([tasks, status?.executing, status?.supervising, status?.nextTickAt]);
       if (sig !== this.pulseSig) {
         this.pulseSig = sig;
@@ -408,7 +419,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   }
 
   render(): void {
-    if (!this.view) {
+    if (!this.view?.visible) {
       return;
     }
     const queue = this.queue;
@@ -429,20 +440,28 @@ export class QueueViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async postRoleModels(): Promise<void> {
-    const store = getStore();
-    const [planner, supervisor, executor] = await Promise.all([
-      store.resolve('planner'),
-      store.resolve('supervisor'),
-      store.resolve('executor'),
-    ]);
-    this.post({
-      type: 'models',
-      models: {
-        planner: planner.model,
-        supervisor: supervisor.model,
-        executor: executor.model,
-      },
-    });
+    if (this.modelsPending) return;
+    this.modelsPending = true;
+    try {
+      const store = getStore();
+      const [planner, supervisor, executor] = await Promise.all([
+        store.resolve('planner'),
+        store.resolve('supervisor'),
+        store.resolve('executor'),
+      ]);
+      this.post({
+        type: 'models',
+        models: {
+          planner: planner.model,
+          supervisor: supervisor.model,
+          executor: executor.model,
+        },
+      });
+    } catch (error) {
+      this.output.appendLine(`[queue:ui] model resolution failed: ${error}`);
+    } finally {
+      this.modelsPending = false;
+    }
   }
 
 

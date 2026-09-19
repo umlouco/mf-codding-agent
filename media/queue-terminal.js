@@ -4,7 +4,7 @@ window.MFQueueUI = window.MFQueueUI || {};
 window.MFQueueUI.terminal = function ({ send }) {
   // ---- live output ----
   //
-  // One terminal per task, plus one for the planner (keyed 'planner'), fed by
+  // One terminal per open task, plus one for the planner (keyed 'planner'), fed by
   // the extension's 200 ms poll of the agent_logs table. The buffer lives
   // here rather than in the DOM because the task list is rebuilt on every
   // state push, and a terminal that emptied itself each time a token count
@@ -29,21 +29,29 @@ window.MFQueueUI.terminal = function ({ send }) {
 
   /** Streamed text folds into the previous block; everything else starts one. */
   function pushRow(t, row) {
+    const chunk = String(row.chunk).slice(-MAX_CHARS);
     const last = t.blocks[t.blocks.length - 1];
     const folds = row.kind === 'response' || row.kind === 'reasoning';
     if (folds && last && last.actor === row.actor && last.kind === row.kind) {
-      last.text += row.chunk;
-      if (last.el) appendText(last, row.chunk);
+      last.text += chunk;
+      if (last.el) appendText(last, chunk);
     } else {
-      const block = { actor: row.actor, kind: row.kind, text: row.chunk, el: null };
+      const block = { actor: row.actor, kind: row.kind, text: chunk, el: null };
       t.blocks.push(block);
       if (t.el) mountBlock(t, block);
     }
-    t.chars += row.chunk.length;
+    t.chars += chunk.length;
     while (t.blocks.length > MAX_BLOCKS || (t.chars > MAX_CHARS && t.blocks.length > 1)) {
       const gone = t.blocks.shift();
       t.chars -= gone.text.length;
       if (gone.el) gone.el.remove();
+    }
+    // A single continuous response must obey the limit too.
+    if (t.chars > MAX_CHARS) {
+      const block = t.blocks[0];
+      block.text = block.text.slice(-MAX_CHARS);
+      t.chars = block.text.length;
+      if (block.el) block.el.querySelector('.tb-t').textContent = block.text;
     }
   }
 
@@ -94,12 +102,37 @@ window.MFQueueUI.terminal = function ({ send }) {
 
   function onLogs(m) {
     if (m.reset) {
-      const t = termFor(termKey(m.taskId));
+      const t = terms.get(termKey(m.taskId));
+      if (!t) return; // A tail reply can arrive after the row was closed.
       t.blocks = [];
       t.chars = 0;
       if (t.el) t.el.textContent = '';
     }
-    for (const row of m.rows || []) pushRow(termFor(termKey(row.taskId)), row);
+    for (const row of m.rows || []) {
+      const t = terms.get(termKey(row.taskId));
+      if (t) pushRow(t, row);
+    }
+  }
+
+  function unmountTerm(key) {
+    const t = terms.get(key);
+    if (!t) return;
+    if (t.el) t.el.textContent = '';
+    terms.delete(key);
+  }
+
+  // Drop references into the old task tree before rebuilding it. Only open
+  // rows retain text; closed/deleted rows reload their tail from SQLite.
+  function prepareTasks(keys) {
+    const keep = new Set(keys);
+    for (const [key, t] of terms) {
+      if (key === 'planner') continue;
+      if (!keep.has(key)) unmountTerm(key);
+      else {
+        t.el = null;
+        for (const block of t.blocks) block.el = null;
+      }
+    }
   }
 
   /** The collapsible terminal inside a task row. Mounted only while the row is open. */
@@ -117,5 +150,5 @@ window.MFQueueUI.terminal = function ({ send }) {
     return { wrap, pre };
   }
 
-  return { mountTerm, terminalBlock, onLogs };
+  return { mountTerm, unmountTerm, prepareTasks, terminalBlock, onLogs };
 };

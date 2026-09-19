@@ -298,6 +298,7 @@ function registerTaskQueue(context: vscode.ExtensionContext): void {
   // host — into a UI that looks hung and reports nothing.
   queueView = new QueueViewProvider(context, output, () => openTaskQueue(context));
   context.subscriptions.push(
+    queueView,
     vscode.window.registerWebviewViewProvider(QueueViewProvider.viewType, queueView, {
       webviewOptions: { retainContextWhenHidden: true },
     }),

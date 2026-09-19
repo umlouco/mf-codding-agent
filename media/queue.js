@@ -12,9 +12,9 @@
   let state = null;
   const send = (msg) => vscode.postMessage(msg);
   const getState = () => state;
-  const { mountTerm, terminalBlock, onLogs } = window.MFQueueUI.terminal({ send });
+  const { mountTerm, unmountTerm, prepareTasks, terminalBlock, onLogs } = window.MFQueueUI.terminal({ send });
   const { renderTasks, liveLabel, tokenLabel, compact, hasOpenEditor } = window.MFQueueUI.tasks({
-    send, getState, tasksEl, mountTerm, terminalBlock,
+    send, getState, tasksEl, mountTerm, unmountTerm, prepareTasks, terminalBlock,
   });
   const { drawContext } = window.MFQueueUI.context({ send, getState, $ });
   let testingDirty = false;

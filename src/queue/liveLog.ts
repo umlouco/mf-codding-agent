@@ -147,6 +147,9 @@ export class LiveLog {
   close(): void {
     this.flush();
     this.closed = true;
+    this.toolNames.clear();
+    this.lastActivity = '';
+    this.lastCognition = '';
   }
 
   private schedule(): void {

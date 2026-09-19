@@ -133,6 +133,7 @@ export class LmProxy implements vscode.Disposable {
 
   dispose(): void {
     this.server?.close();
+    this.server?.closeAllConnections();
     this.server = undefined;
     this.listening = undefined;
   }
@@ -247,125 +248,136 @@ export class LmProxy implements vscode.Disposable {
     let done = false;
     // The response closing early is the client going away: the core killed
     // the turn, or died. Cancelling the token is what stops the model.
-    res.on('close', () => {
+    const onClose = () => {
       if (!done) {
         cts.cancel();
       }
-    });
-
-    let response: vscode.LanguageModelChatResponse;
-    try {
-      response = await model.sendRequest(
-        messages,
-        {
-          tools: tools.length ? tools : undefined,
-          toolMode: vscode.LanguageModelChatToolMode.Auto,
-          justification: JUSTIFICATION,
-        },
-        cts.token,
-      );
-    } catch (e) {
-      throw fromLmError(e, model);
-    }
-
-    const id = `chatcmpl-${crypto.randomBytes(8).toString('hex')}`;
-    const created = Math.floor(Date.now() / 1000);
-    const chunk = (delta: object, finish: string | null): string =>
-      JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model: model.id,
-        choices: [{ index: 0, delta, finish_reason: finish }],
-      });
-    const send = (json: string): void => {
-      res.write(`data: ${json}\n\n`);
     };
+    res.once('close', onClose);
 
-    if (streaming) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-      });
-      res.flushHeaders();
-    }
-
-    let text = '';
-    const calls: ToolCall[] = [];
     try {
-      for await (const part of response.stream) {
-        if (part instanceof vscode.LanguageModelTextPart) {
-          text += part.value;
-          if (streaming) {
-            send(chunk({ content: part.value }, null));
-          }
-        } else if (part instanceof vscode.LanguageModelToolCallPart) {
-          const index = calls.length;
-          const args = JSON.stringify(part.input ?? {});
-          calls.push({ id: part.callId, name: part.name, args });
-          if (streaming) {
-            send(
-              chunk(
-                {
-                  tool_calls: [
-                    { index, id: part.callId, type: 'function', function: { name: part.name, arguments: args } },
-                  ],
-                },
-                null,
-              ),
-            );
-          }
-        }
-        // Data parts — images and the like — have no place in the core's
-        // text protocol and are dropped.
+      if (res.destroyed) {
+        cts.cancel();
+        return;
       }
-    } catch (e) {
-      throw fromLmError(e, model);
+
+      let response: vscode.LanguageModelChatResponse;
+      try {
+        response = await model.sendRequest(
+          messages,
+          {
+            tools: tools.length ? tools : undefined,
+            toolMode: vscode.LanguageModelChatToolMode.Auto,
+            justification: JUSTIFICATION,
+          },
+          cts.token,
+        );
+      } catch (e) {
+        throw fromLmError(e, model);
+      }
+
+      const id = `chatcmpl-${crypto.randomBytes(8).toString('hex')}`;
+      const created = Math.floor(Date.now() / 1000);
+      const chunk = (delta: object, finish: string | null): string =>
+        JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model: model.id,
+          choices: [{ index: 0, delta, finish_reason: finish }],
+        });
+      const send = (json: string): void => {
+        res.write(`data: ${json}\n\n`);
+      };
+
+      if (streaming) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        });
+        res.flushHeaders();
+      }
+
+      let text = '';
+      const calls: ToolCall[] = [];
+      try {
+        for await (const part of response.stream) {
+          if (part instanceof vscode.LanguageModelTextPart) {
+            text += part.value;
+            if (streaming) {
+              send(chunk({ content: part.value }, null));
+            }
+          } else if (part instanceof vscode.LanguageModelToolCallPart) {
+            const index = calls.length;
+            const args = JSON.stringify(part.input ?? {});
+            calls.push({ id: part.callId, name: part.name, args });
+            if (streaming) {
+              send(
+                chunk(
+                  {
+                    tool_calls: [
+                      { index, id: part.callId, type: 'function', function: { name: part.name, arguments: args } },
+                    ],
+                  },
+                  null,
+                ),
+              );
+            }
+          }
+          // Data parts — images and the like — have no place in the core's
+          // text protocol and are dropped.
+        }
+      } catch (e) {
+        throw fromLmError(e, model);
+      }
+
+      const finish = calls.length ? 'tool_calls' : 'stop';
+      const usage = await estimateUsage(model, messages, text, calls);
+      if (streaming) {
+        send(chunk({}, finish));
+        // What the core's stream_options.include_usage asks for: a final chunk
+        // with no choices and the usage block.
+        send(JSON.stringify({ id, object: 'chat.completion.chunk', created, model: model.id, choices: [], usage }));
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          id,
+          object: 'chat.completion',
+          created,
+          model: model.id,
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: text || null,
+                ...(calls.length
+                  ? {
+                      tool_calls: calls.map((c) => ({
+                        id: c.id,
+                        type: 'function',
+                        function: { name: c.name, arguments: c.args },
+                      })),
+                    }
+                  : {}),
+              },
+              finish_reason: finish,
+            },
+          ],
+          usage,
+        }),
+      );
     } finally {
       done = true;
+      res.off('close', onClose);
+      cts.cancel();
+      cts.dispose();
     }
-
-    const finish = calls.length ? 'tool_calls' : 'stop';
-    const usage = await estimateUsage(model, messages, text, calls);
-    if (streaming) {
-      send(chunk({}, finish));
-      // What the core's stream_options.include_usage asks for: a final chunk
-      // with no choices and the usage block.
-      send(JSON.stringify({ id, object: 'chat.completion.chunk', created, model: model.id, choices: [], usage }));
-      res.write('data: [DONE]\n\n');
-      res.end();
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        id,
-        object: 'chat.completion',
-        created,
-        model: model.id,
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: text || null,
-              ...(calls.length
-                ? {
-                    tool_calls: calls.map((c) => ({
-                      id: c.id,
-                      type: 'function',
-                      function: { name: c.name, arguments: c.args },
-                    })),
-                  }
-                : {}),
-            },
-            finish_reason: finish,
-          },
-        ],
-        usage,
-      }),
-    );
   }
 }
 

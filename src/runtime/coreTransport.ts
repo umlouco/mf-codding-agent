@@ -138,5 +138,11 @@ export class CoreTransport implements Disposable {
     }, 1500);
     proc.once('close', () => clearTimeout(timer));
   }
-  dispose(): void { this.disposed = true; this.stop(); this.onDidExit.dispose(); }
+  dispose(): void {
+    this.disposed = true;
+    this.stop();
+    this.notifications.clear();
+    this.handlers.clear();
+    this.onDidExit.dispose();
+  }
 }
