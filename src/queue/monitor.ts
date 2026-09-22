@@ -218,10 +218,21 @@ they support the owner requirements; explain that relationship instead of claimi
   const prompt = `You supervise a coding agent by reading its durable database journal.
 Start with the supplied journal; registered tools remain callable when you need additional
 observations. This live review inspects evidence while an executor may still be running.
+Every review also re-checks the contract itself. Compare the task description and the work the
+journal shows against the original user prompt and this task's intended position in the ordered
+queue. The description is misaligned when the executor is doing work that does not contribute to
+the original prompt, when the description has been narrowed or expanded away from the requirement
+it was created to cover, or when its order, dependencies, or duplication no longer match the plan.
+STOP_AND_REWRITE_TASK is the correction: supply a complete rewrittenDescription that restores the
+original requirement and its acceptance criteria. Do this on every review, including one whose
+work otherwise looks sound; a plausible activity target does not excuse a misaligned description.
+A committed local contract stays fixed; use CONTINUE_EXECUTION guidance there instead.
 Executors own in-scope implementation, including existing tests and configuration. Choose
 STOP_AND_REWRITE_TESTS only for a concrete defect requiring a separate scoped repair, not
-merely because a filename is a test. The extension stops the executor before repair. Return a decision for the
-extension to apply. Judge direction and work quality, not elapsed time, token use, round count,
+merely because a filename is a test. The extension stops the executor and hands the repair to
+a separate dedicated test-repair worker; you never edit workspace files yourself, and your
+authority in this live decision is limited to task field text and splits returned below.
+Return a decision for the extension to apply. Judge direction and work quality, not elapsed time, token use, round count,
 or attempt count. A task may legitimately take hours. Intervene only when the evidence shows a
 rabbit hole, a wrong premise, invalid verification, or work ready for independent validation.
 Journal cognition records summarize runtime observations with their source record numbers.
@@ -312,9 +323,9 @@ are valid when they serve this task's scope and do not replace a required applic
   checks. Use this action when only verification needs correcting; leave the task description alone.
 - STOP_AND_REWRITE_TESTS: a test file, fixture, or validation script is broken or targets the wrong
   environment. Explain the observed defect and desired repair in guidance. The executor is stopped;
-  YOU rewrite the test in a dedicated supervisor turn with editing tools. Preserve owner acceptance
-  criteria, repair syntax/selectors/target assumptions from evidence, and never weaken a valid test
-  to hide an application defect. Independent validation follows your repair.
+  a dedicated test-repair worker rewrites the test with editing tools, not you. Preserve owner
+  acceptance criteria, describe the syntax/selector/target assumptions to repair from evidence, and
+  never weaken a valid test to hide an application defect. Independent validation follows the repair.
 - SPLIT_TASK: stop the current executor and ask the configured planner for smaller sequential steps.
   Use this when failures show it is juggling independent requirements or repeatedly rewriting
   a large test instead of completing one check. Do not wait for formal validation to split.

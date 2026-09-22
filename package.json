@@ -2,7 +2,7 @@
   "name": "mf-agent",
   "displayName": "MF Agent",
   "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
-  "version": "0.1.69",
+  "version": "0.1.76",
   "publisher": "mflores",
   "license": "MIT",
   "pricing": "Free",
@@ -331,13 +331,13 @@
           "type": "number",
           "default": 200,
           "minimum": 0,
-          "markdownDescription": "Run circuit breaker: stop the run when the queue holds more than this many task rows. Splitting on failure is disabled, so this only ever trips on runaway phase expansion or repeated planner edits. Set to 0 to disable."
+          "markdownDescription": "Run circuit breaker: when the run has added more than this many task rows since it started, stop subdividing and let the work in flight finish on a fresh budget. This only ever trips on runaway phase expansion or repeated planner edits. The run is never stopped. The count resets on start, stop, reset and finish, and whenever a breaker trips. Set to 0 to disable."
         },
         "mfagent.queue.maxRunTokens": {
           "type": "number",
           "default": 50000000,
           "minimum": 0,
-          "markdownDescription": "Run circuit breaker: stop the run when its tasks have spent more than this many input+output tokens in total. The token totals are the durable per-task counters in the queue, so they survive reloads. Set to 0 to disable."
+          "markdownDescription": "Run circuit breaker: when the run has spent more than this many tokens since it started, the task in flight is replaced by smaller tasks and the run continues on a fresh budget. Spend counts fresh input plus output; cache reads are not billed again, so re-sending a cached prompt each round does not consume the budget. The run is never stopped. The count resets on start, stop, reset and finish, and whenever a breaker trips. Set to 0 to disable."
         },
         "mfagent.queue.verificationMaxSeconds": {
           "type": "number",
@@ -347,9 +347,9 @@
         },
         "mfagent.queue.maxRunMinutes": {
           "type": "number",
-          "default": 480,
+          "default": 0,
           "minimum": 0,
-          "markdownDescription": "Run circuit breaker: stop the run after it has been continuously RUNNING for this many minutes. The clock resets on start, stop, reset and finish, and is preserved across a window reload. Set to 0 to disable."
+          "markdownDescription": "Run circuit breaker: after the run has been continuously RUNNING for this many minutes, the task in flight is replaced by smaller tasks and the run continues on a fresh clock. The run is never stopped. The clock resets on start, stop, reset and finish, and whenever a breaker trips, and is preserved across a window reload. 0 (the default) disables the wall-clock limit, so a run may stay RUNNING indefinitely."
         },
         "mfagent.queue.maxContextTokens": {
           "type": "number",

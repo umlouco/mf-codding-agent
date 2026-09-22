@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fix the task queue repeatedly reclaiming a task after blocked scope discovery.
+  Discard old blocked inventory caches and reassess the current task and its source
+  references. Failed preflight reviews now retry after 30 seconds, backing off to
+  five minutes; deadlines survive reloads and prevent later tasks from skipping
+  unfinished work. Changed owner instructions or task contracts allow an immediate
+  reassessment. No executor is reported as crashed when it never started.
+
 - Show OpenRouter's newest models as soon as they exist. The catalog is public,
   but the settings page refused to list it without an API key, so a profile
   with no key never showed a single model; and opening the page trusted a

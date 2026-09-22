@@ -455,6 +455,19 @@ export abstract class OrchestratorVerification extends OrchestratorScope {
         this.log(`supervisor rewrote task ${edit.seq}`);
       }
     }
+    // Deletions are resolved to ids before any row is removed: `remove` closes
+    // the sequence gap by renumbering, so later seqs would otherwise refer to
+    // the wrong tasks. Finished work is never deleted.
+    const removals = (decision.deletes ?? [])
+      .filter((seq) => seq !== currentSeq)
+      .map((seq) => ({ seq, target: this.queue.list().find((t) => t.seq === seq) }))
+      .filter(({ target }) => !!target && target.status !== 'VERIFIED');
+    for (const { seq, target } of removals) {
+      this.queue.log(target!.id, 'supervisor', 'task-deleted',
+        `Deleted as misaligned with the original request (task ${seq}).`);
+      this.log(`supervisor deleted task ${seq} as misaligned with the original request`);
+      this.removeTask(target!.id);
+    }
   }
 
   /** Persist all replacements before retiring callbacks; SQL failure keeps the parent intact. */

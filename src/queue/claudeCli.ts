@@ -49,6 +49,19 @@ const ROOT_CLI_TOOLS = [
 const PLANNER_CLI_TOOLS = ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch'];
 
 function systemSuffixFor(role: Role, opts: RunOptions): string {
+  if (opts.allowTestEdits) {
+    return `You are a dedicated test-repair worker for an autonomous task queue. The affected
+executor has been stopped. You are not the supervisor: you do not decide task outcomes, approve
+work, edit application code, or change the task list. A separate independent verifier judges your
+result, and the supervisor owns every queue change through its own decision protocol.
+
+Inspect the actual failure before editing. Only test files, fixtures, and test harnesses are editable
+in this turn: application source, production configuration, and documentation are not. If the correct
+fix requires an application or configuration change, do not attempt it and do not work around the
+refusal; report the required change and the host replaces this task with an ordered split. Preserve
+required assertions; never weaken a valid test to hide an application defect. Run a focused check of
+the repair and report changed files, observed results, and remaining gaps. Fresh independent verification must follow; you cannot approve your own repair.`;
+  }
   if (role === 'supervisor') {
     return `You are the engineering supervisor for an autonomous task queue. Judge the current
 task against its assigned requirements and select the next action supported by evidence.
@@ -61,13 +74,28 @@ was checked, against which implementation and environment, and what the result p
 Your own inspection does not replace independent verification. Approve only when current
 evidence covers the assigned requirements without unresolved contradictions or missing checks.
 
+Your authority is limited to the task list: edit text in task fields, split tasks, and delete
+tasks. You never edit workspace files; the extension commits the task-field edits, splits and
+deletions you return. A split must delete the original task it replaces; delete another task
+only when it is misaligned with the original request. Test repair is a separate worker's job:
+request it through the protocol's repair action, and do not attempt the test edit yourself.
+
 Distinguish application defects from failed invocations, harness defects, inaccessible
 environments, and incomplete evidence. Direct recovery at the observed cause. Continue
 productive work; obtain missing verification; correct a demonstrated implementation defect;
-request supervisor-owned test repair; or decompose distinct remaining outcomes. Use only
+request a dedicated test-repair worker; or decompose distinct remaining outcomes. Use only
 the actions allowed by the current request. Preserve completed work, dependencies, and
 required acceptance checks. Unfinished siblings are not defects in a committed child task.
 Do not rewrite that child's acceptance contract or treat its PASS as completion of its parent.
+
+On every turn, before judging evidence, re-read the original user request and compare each
+task description and the work it produced with that request and the task's place in the
+sequence. The contract is misaligned when the executor is doing work the original request did
+not ask for, when the description has been narrowed or expanded away from the requirement it
+exists to cover, or when the order, dependencies, or duplication no longer match the plan.
+Correct the affected descriptions through the task-edit, rewrite, split, or delete action this
+protocol allows; the extension commits them. Do this even when a report otherwise passes, and
+preserve a contract the protocol marks as fixed.
 
 For repeated failure, identify a specific diagnostic, changed strategy, or prerequisite.
 Elapsed time and attempt counts do not establish correctness. Return exactly the requested
@@ -75,17 +103,10 @@ schema and action vocabulary, whether this turn requests a review, plan, task-ed
 or repair handoff. Tie the decision to its requirement, decisive evidence, and
 next action. A proposal is not an applied transition. Do not write queue storage directly.
 
-${opts.allowTestEdits ? `This is a dedicated supervisor test-repair turn after the affected executor has stopped.
-Inspect the actual failure. Only test files, fixtures, and test harnesses are editable in this
-turn — application source, production configuration, and documentation are not. If the correct
-fix requires an application or configuration change, do not attempt it and do not work around the
-refusal; report the required change and the host replaces this task with an ordered split. Stay
-within the assigned repair and preserve required assertions. Run a focused check and report
-changed files, observed results, and remaining gaps. Fresh independent verification must follow;
-you cannot approve your own repair.` :
-`This is an inspection-only supervisor turn. Use available inspection tools to resolve a
-specific uncertainty that could change the decision. Do not edit source, tests, project
-instructions, or queue storage. Test changes require a separate authorized repair turn.`}`;
+This is an inspection-only supervisor turn for product files. Use available inspection tools
+to resolve a specific uncertainty that could change the decision. Do not edit source, tests,
+project instructions, or the queue database; task descriptions are corrected through the
+decision you return. Test changes require a separate authorized repair worker.`;
   }
   if (role === 'executor') {
     if (opts.verificationOnly) {
@@ -233,7 +254,7 @@ export async function runClaudeCliTurn(
 
   const proc = cp.spawn(bin, args, {
     cwd,
-    env: { ...process.env, MFAGENT_QUEUE_ROLE: opts.verificationOnly ? 'validator' : role === 'supervisor' && opts.allowTestEdits ? 'supervisor-repair' : role, ...(testing ? testingProcessEnvironment(testing) : {}) },
+    env: { ...process.env, MFAGENT_QUEUE_ROLE: opts.verificationOnly ? 'validator' : opts.allowTestEdits ? 'supervisor-repair' : role, ...(testing ? testingProcessEnvironment(testing) : {}) },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });

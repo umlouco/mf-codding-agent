@@ -7,6 +7,7 @@ import { scopeBlocked } from './scopePlan';
 import { providerConfigurationError } from './recovery';
 import { boundedTask } from './scopeBoundary';
 import { promptOverloadReason } from './scopeEvidence';
+import { clearScopeRetry } from './scopeRetry';
 
 export abstract class OrchestratorExecution extends OrchestratorVerification {
 
@@ -85,10 +86,13 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     });
     this.executionScope = scope;
 
+    let preflightComplete = false;
     try {
       this.queue.recordActivity(task.id, 'scope_review', 'Reviewing the task before execution', 'supervisor');
       if (!await scope.preflight()) return;
       if (!current()) return;
+      preflightComplete = true;
+      clearScopeRetry(this.queue, task);
       this.queue.recordActivity(task.id, 'starting', 'Scope reviewed; starting executor');
       // Every record the worker writes lands in the database as it happens, so
       // the run is legible while it is still going and survives the process
@@ -206,6 +210,20 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
         this.stopForProviderConfiguration(msg);
         return;
       }
+      if (!preflightComplete) {
+        const retry = this.queue.deferScopeReview(task, msg,
+          appendAttempt(task.errorLog, `[attempt ${attempt}] scope review failed: ${msg}`));
+        if (retry) {
+          const detail = `${msg}\nFresh scope review after ${new Date(retry.dueAt).toISOString()} ` +
+            `(failure ${retry.failures}); executor has not started.`;
+          this.queue.recordActivity(task.id, 'scope_waiting', detail, 'supervisor');
+          this.queue.log(task.id, 'supervisor', 'scope-deferred', detail);
+          this.log(`task ${task.seq}: ${detail}`);
+        }
+        // The normal cron services the durable deadline. Do not wake an
+        // immediate pump in either lockstep or continuous mode.
+        return;
+      }
       // A worker that died mid-turn — a dropped connection, a crashed core, or
       // abandonExecution killing it on purpose — still edited real files, so
       // the task is returned for another attempt with its history; the
@@ -232,6 +250,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
         this.log(`task ${task.seq} — its worker stopped after the run moved past this attempt; ignoring it`);
       }
     } finally {
+      scope.close();
       journal.live.close();
       if (this.executionGen === gen) { this.executionAbort = null; this.executionScope = undefined; }
       this.changed();

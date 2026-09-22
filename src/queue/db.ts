@@ -5,6 +5,7 @@ import { QueuePlans } from './dbPlans';
 import { COLUMNS, Task } from './dbModel';
 import { parseCompletionClaim } from './validation';
 import { completeRecoveryJob } from './recoverySchedule';
+import { deferScopeRetry, scopeRetryReady } from './scopeRetry';
 export * from './dbModel';
 
 /** Shared durable queue; implementation is grouped by storage responsibility. */
@@ -49,7 +50,7 @@ export class TaskQueue extends QueuePlans {
            ORDER BY seq ASC, id ASC LIMIT 1`,
         )
         .get() as Task | undefined;
-      if (!row) {
+      if (!row || !scopeRetryReady(this, row)) {
         return undefined;
       }
       const now = Math.max(Date.now(), (row.startedAt ?? 0) + 1);
@@ -68,6 +69,17 @@ export class TaskQueue extends QueuePlans {
       // Return the committed claim, including its new start identity and cleared
       // validation report. The pre-update row belongs to the previous attempt.
       return this.get(row.id);
+    });
+  }
+
+  /** Commit the retry deadline with the returned claim, including across hosts. */
+  deferScopeReview(task: Task, reason: string, errorLog: string) {
+    return this.tx(() => {
+      if (this.get(task.id)?.startedAt !== task.startedAt ||
+          !this.finishExecution(task.id, task.attempts, {
+            status: 'PENDING', finishedAt: null, activityPhase: 'scope_waiting', errorLog,
+          })) return undefined;
+      return deferScopeRetry(this, task, reason);
     });
   }
 
@@ -199,6 +211,7 @@ export class TaskQueue extends QueuePlans {
       `);
       this.db.exec(`DELETE FROM agent_logs WHERE task_id IS NULL OR task_id NOT IN
         (SELECT id FROM tasks WHERE activity_phase GLOB 'decomposition_*')`);
+      this.db.exec("DELETE FROM queue_meta WHERE key GLOB 'scopeRetry:v1:*'");
       this.setMeta('runState', 'IDLE');
       this.log(null, 'system', 'reset', 'runnable tasks returned to PENDING; required decomposition retained');
     });

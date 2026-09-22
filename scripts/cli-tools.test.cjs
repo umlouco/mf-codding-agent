@@ -193,13 +193,13 @@ for (const formatOnly of [false, true]) {
       'Repair the reported test defect.', { allowTestEdits: true, formatOnly });
     const flag = formatOnly ? '--system-prompt' : '--append-system-prompt';
     const system = args[args.indexOf(flag) + 1];
-    assert.match(system, /engineering supervisor/);
     if (formatOnly) {
+      assert.match(system, /engineering supervisor/);
       assert.match(system, /tools are unavailable/);
       assert.doesNotMatch(system, /use scoped editing tools/);
       assert.equal(args[args.indexOf('--tools') + 1], '');
     } else {
-      assert.match(system, /dedicated supervisor test-repair turn/);
+      assert.match(system, /dedicated test-repair worker/);
       assert.match(system, /Only test files, fixtures, and test harnesses are editable/);
       assert.match(system, /host replaces this task with an ordered split/);
       assert.doesNotMatch(system, /All project file types are editable/);

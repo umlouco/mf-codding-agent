@@ -1,14 +1,41 @@
 import * as cp from 'child_process';
 import * as vscode from 'vscode';
-import { QueueStats, Task } from './db';
+import { QueueStats, Task, Usage } from './db';
 import { appendAttempt, OrchestratorState, OrchestratorStatus, RunMode, WATCHDOG_MS } from './orchestratorState';
 import { recoveryKey, resumeRecovery } from './recovery';
 import { restoreScopedContracts } from './scopeContract';
 import { hasOutstandingRecovery, recoveryJobKey } from './recoverySchedule';
 import { requiresDecomposition } from './recoveryDecomposition';
 
+/**
+ * Fresh input plus output — what the run breaker means by "spent".
+ *
+ * `input` does not mean the same thing for every provider. An
+ * OpenAI-compatible `prompt_tokens` already contains the cache hits, while
+ * Anthropic reports cache reads *outside* `input_tokens`; the core carries
+ * that distinction as `Usage.InputIncludesCache` but does not serialise it,
+ * so derive it here from the counters themselves. Cached context is re-sent
+ * on every round of a turn, so summing raw input over a long task counts the
+ * same prompt dozens of times: a run whose fresh input was 3.7M tokens had
+ * booked 56M of it, which is what tripped a breaker configured for spend.
+ */
+function spentTokens(usage: Usage): number {
+  const input = usage.input || 0;
+  const cacheRead = usage.cacheRead || 0;
+  // Cache reads inside `input` are subtracted; ones reported alongside it
+  // (they routinely dwarf the fresh tokens) leave `input` already correct.
+  return (input > cacheRead ? input - cacheRead : input) + (usage.output || 0);
+}
+
 export abstract class OrchestratorControl extends OrchestratorState {
   private ownedWork?: Set<Promise<void>>;
+
+  /**
+   * Retires a task and commits a complete replacement for it. Implemented far
+   * below this class, declared here because the run breaker is the one caller
+   * that has to reach it from the top of a pump.
+   */
+  protected abstract requestFailureDecomposition(snapshot: Task, reason: string): void;
 
   // ---- configuration ---------------------------------------------------
 
@@ -146,12 +173,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
     } else {
       this.queue.setRunState('RUNNING');
     }
-    // Wall-clock origin for the run circuit breaker. Set on every transition
-    // into RUNNING so a breaker configured in minutes measures this run, not
-    // the age of the database.
-    if (!Number(this.queue.getMeta('runStartedAt') || 0)) {
-      this.queue.setMeta('runStartedAt', String(Date.now()));
-    }
+    this.stampRunOrigin();
 
     this.arm();
     // Deliberately not cleared by stop or pause: those set the run state, and
@@ -192,7 +214,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
     this.abandonReview();
     this.abandonExecution();
     this.queue.setRunState('STOPPED');
-    this.queue.setMeta('runStartedAt', '');
+    this.clearRunOrigin();
     this.changed();
     this.log('stopped');
   }
@@ -240,27 +262,60 @@ export abstract class OrchestratorControl extends OrchestratorState {
    *
    * The per-task policy above stops a task that cannot be verified. This is the
    * backstop for a run that is not converging across tasks: too many rows, too
-   * many tokens, or too much wall-clock. Any of the three trips the run and
-   * requeues whatever is active. Each limit is configurable; 0 disables it.
+   * many tokens, or too much wall-clock. Any of the three breaks the work in
+   * flight into smaller tasks and keeps going — see tripBreaker, which never
+   * stops the run. Each limit is configurable; 0 disables it.
+   *
+   * Every limit is measured from the origin `start()` stamped, never against
+   * the lifetime of the database. Rows and tokens are durable and only ever
+   * grow, so a breaker that read the totals directly could not be escaped:
+   * the next Start set RUNNING, the first pump tripped the same limit in the
+   * same second, and the queue was left permanently unstartable. See
+   * stampRunOrigin.
    */
   protected runBreakerTripped(): boolean {
     const maxTasks = this.cfg<number>('queue.maxRunTasks', 200);
     const maxTokens = this.cfg<number>('queue.maxRunTokens', 50_000_000);
-    const maxMinutes = this.cfg<number>('queue.maxRunMinutes', 480);
+    const maxMinutes = this.cfg<number>('queue.maxRunMinutes', 0);
     const stats = this.queue.stats();
 
-    if (maxTasks > 0 && stats.total > maxTasks) {
-      return this.tripBreaker(`run holds ${stats.total} tasks, over the ${maxTasks} limit`);
+    const tasks = stats.total - Number(this.queue.getMeta('runTaskBaseline') || 0);
+    if (maxTasks > 0 && tasks > maxTasks) {
+      return this.tripBreaker(`run added ${tasks} tasks, over the ${maxTasks} limit`, false);
     }
-    const tokens = (stats.usage.input || 0) + (stats.usage.output || 0);
+    const tokens = spentTokens(stats.usage) - Number(this.queue.getMeta('runTokenBaseline') || 0);
     if (maxTokens > 0 && tokens > maxTokens) {
-      return this.tripBreaker(`run spent ${tokens} tokens, over the ${maxTokens} limit`);
+      return this.tripBreaker(`run spent ${tokens} tokens, over the ${maxTokens} limit`, true);
     }
     const startedAt = Number(this.queue.getMeta('runStartedAt') || 0);
     if (maxMinutes > 0 && startedAt > 0 && Date.now() - startedAt > maxMinutes * 60_000) {
-      return this.tripBreaker(`run has been RUNNING for over ${maxMinutes} minute(s)`);
+      return this.tripBreaker(`run has been RUNNING for over ${maxMinutes} minute(s)`, true);
     }
     return false;
+  }
+
+  /**
+   * Where this run started: the wall clock, and what the durable counters
+   * already held. Stamped on every transition into RUNNING so the breakers
+   * measure this run — and so an explicit Start after a trip is a genuinely
+   * fresh run instead of an instant re-trip on totals it cannot undo.
+   *
+   * Left alone when a run is already under way: activation calls `start()`
+   * for a queue that was RUNNING before the window reloaded, and that is the
+   * same run, with the same origin.
+   */
+  private stampRunOrigin(force = false): void {
+    if (!force && Number(this.queue.getMeta('runStartedAt') || 0)) return;
+    const stats = this.queue.stats();
+    this.queue.setMeta('runStartedAt', String(Date.now()));
+    this.queue.setMeta('runTokenBaseline', String(spentTokens(stats.usage)));
+    this.queue.setMeta('runTaskBaseline', String(stats.total));
+  }
+
+  private clearRunOrigin(): void {
+    this.queue.setMeta('runStartedAt', '');
+    this.queue.setMeta('runTokenBaseline', '');
+    this.queue.setMeta('runTaskBaseline', '');
   }
 
   /**
@@ -274,20 +329,46 @@ export abstract class OrchestratorControl extends OrchestratorState {
     if (active) this.blockTask(active, reason);
     this.disarm();
     this.queue.setRunState('STOPPED');
-    this.queue.setMeta('runStartedAt', '');
+    this.clearRunOrigin();
     this.queue.log(active?.id ?? null, 'supervisor', 'provider-configuration-error', reason.slice(0, 8000));
     this.log(`run stopped — provider configuration error: ${reason}`);
     this.changed();
   }
 
-  private tripBreaker(reason: string): boolean {
+  /**
+   * A tripped breaker subdivides the work. It never stops the run.
+   *
+   * A limit reached means the task in flight is too big to finish as one
+   * task — not that the queue is done. So it goes to the decomposition path,
+   * which commits a complete replacement and retires the original row, and
+   * the run carries on into the replacements. A run that halts here needs a
+   * person to notice and press Start, which is the one thing this queue
+   * exists not to require.
+   *
+   * `split` is false for the row-count limit alone: that limit trips *because*
+   * rows are multiplying, and decomposing in response would add more of them.
+   * There the fresh window is the whole remedy — stop subdividing and let the
+   * work in flight finish.
+   */
+  private tripBreaker(reason: string, split: boolean): boolean {
     const active = this.queue.activeTask();
-    if (active) this.blockTask(active, `Run circuit breaker: ${reason}.`);
-    // Unlike a single task retry, a tripped breaker stops the whole run.
-    this.disarm();
-    this.queue.setRunState('STOPPED');
-    this.queue.setMeta('runStartedAt', '');
-    this.log(`run circuit breaker tripped: ${reason}`);
+    // A fresh window first, and unconditionally. The counters that just
+    // tripped are durable and do not fall when a task is replaced, so without
+    // this the next pump trips on the very same numbers and the queue
+    // decomposes on a loop. Before the handoff, too: decomposition refuses to
+    // act on a queue that is not RUNNING, and rejects a stale origin with it.
+    this.stampRunOrigin(true);
+    // The journal is the only place this survives a window reload: `notify`
+    // runs a command the user has probably not configured, and the output
+    // channel is gone by the time anyone asks what happened.
+    this.queue.log(active?.id ?? null, 'supervisor', 'breaker', reason.slice(0, 8000));
+    if (split && active) {
+      this.requestFailureDecomposition(active,
+        `Run circuit breaker: ${reason}. Replace this task with smaller tasks that can each finish inside the limit.`);
+      this.log(`run circuit breaker tripped: ${reason} — task ${active.seq} goes back for replacement`);
+    } else {
+      this.log(`run circuit breaker tripped: ${reason} — continuing on a fresh budget`);
+    }
     this.changed();
     this.notify('breaker', this.queue.stats());
     return true;
@@ -314,7 +395,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
     // resetAll zeroes `attempts`, so a stale entry here would read as a review
     // of the attempt about to start rather than of the run just thrown away.
     this.reviewed.clear();
-    this.queue.setMeta('runStartedAt', '');
+    this.clearRunOrigin();
     this.changed();
     this.log('reset — every task back to PENDING');
   }
@@ -351,7 +432,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
     if (!this.queue.isComplete() || hasOutstandingRecovery(this.queue)) return;
     this.disarm();
     this.queue.setRunState('IDLE');
-    this.queue.setMeta('runStartedAt', '');
+    this.clearRunOrigin();
     this.changed();
 
     const s = this.queue.stats();

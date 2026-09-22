@@ -68,7 +68,7 @@ func (a *Agent) executeTool(ctx context.Context, sessionID string, call llm.Bloc
 	}
 	if !a.toolAllowed(tool) {
 		ticket := a.beginCognition(ctx, sessionID, recorded, false)
-		result := tools.Errf("tool %s is unavailable during this live inspection-only review. Request STOP_AND_REWRITE_TESTS to stop the executor and let the supervisor repair the test with editing tools", call.Name)
+		result := tools.Errf("tool %s is unavailable during this live inspection-only review. Request STOP_AND_REWRITE_TESTS to stop the executor and hand the repair to a separate test-repair worker", call.Name)
 		a.finishCognition(ctx, sessionID, ticket, result)
 		return result
 	}

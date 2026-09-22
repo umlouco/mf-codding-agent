@@ -38,9 +38,10 @@ Your own tool use does not replace the independent verification report required 
 The host allows at most two verification passes and two recovery decisions per task.
 When the evidence is not sufficient, make exactly one
 recovery decision: REVERIFY for a missing/invalid check or report without an observed code defect,
-REPAIR_TESTS for a test/harness defect that YOU must rewrite after the executor stops,
-RETRY for an observed application implementation defect, or SPLIT into smaller ordered tasks.
-All task-list rewrites and test repairs belong to you. The executor follows the assigned contract.
+REPAIR_TESTS for a test/harness defect that a separate test-repair worker must rewrite after the
+executor stops, RETRY for an observed application implementation defect, or SPLIT into smaller
+ordered tasks. Task-list changes belong to you; test repair belongs to that separate worker, and
+you never edit workspace files. The executor follows the assigned contract.
 Whether the work passes is decided by the evidence alone and never by how many attempts it took.
 
 ${originalGoalContext(goal)}
@@ -86,21 +87,32 @@ check; earlier task rewrites and earlier PASS labels are not authority to discar
 Earlier attempt outcomes:
 ${attemptHistory(task)}
 
+Your authority is limited to the task list, and you never edit workspace files: the extension
+commits the task-field text, splits and deletions you return. Edit task field text through
+taskEdits, split a task through splitInto, and delete tasks through deletes. A split must delete
+the original task it replaces; delete another task only when it is misaligned with the original
+request. On every review, before judging evidence, compare the task description and the work it
+produced with the original prompt and this task's place in the sequence. When the executor is
+doing work the original prompt did not ask for, or the description has been narrowed or expanded
+away from the requirement it exists to cover, correct it in this decision. When the ordering,
+dependencies, or duplication no longer match the plan, choose SPLIT so the planner restructures it.
+
 Reply with ONE JSON object and nothing else:
 {
   "verdict": "RETRY",
   "feedback": "why the stored validation is or is not sufficient",
   "splitInto": [],
   "taskEdits": [{ "seq": ${task.seq}, "description": "...",
-                  "solutionVerifyPrompt": "..." }]
+                  "solutionVerifyPrompt": "..." }],
+  "deletes": []
 }
 
 Set verdict to VERIFIED, REVERIFY, RETRY, SPLIT, or REPAIR_TESTS. Choose REPAIR_TESTS when an existing
-test or validation script needs rewriting: the extension stops execution and gives YOU a test-editing
-turn, then independently runs the repaired checks. Do not delegate test rewrites to the executor.
+test or validation script needs rewriting: the extension stops execution and hands the repair to a
+dedicated test-repair worker, then independently runs the repaired checks. You never edit test files.
 For SPLIT give the concrete scope problem in feedback and leave splitInto empty: the configured
-planner authors and validates the replacement tasks. Use empty taskEdits
-unless making edits. Replace example strings with concrete instructions, not placeholders.
+planner authors and validates the replacement tasks. Use empty taskEdits and deletes
+unless making those changes. Replace example strings with concrete instructions, not placeholders.
 In feedback, state the original requirement this task covers and why the actual evidence satisfies
 it or what remains missing. Never accept report formatting or a demonstration as a replacement for
 the requested application behavior. If the task itself drifted, correct it through RETRY or SPLIT;
@@ -168,6 +180,9 @@ Do not duplicate the parent, repeat a rejected approach, weaken acceptance, or m
   const taskEdits = (Array.isArray(d.taskEdits) ? d.taskEdits : []).filter(
     (e: any) => e && typeof e === 'object' && typeof e.seq === 'number',
   );
+  const deletes = (Array.isArray((d as any).deletes) ? (d as any).deletes : []).filter(
+    (n: any) => typeof n === 'number' && Number.isSafeInteger(n) && n > 0,
+  );
 
   const decision: SupervisorDecision = {
     verdict: settled,
@@ -175,6 +190,7 @@ Do not duplicate the parent, repeat a rejected approach, weaken acceptance, or m
     resetFromSeq: typeof d.resetFromSeq === 'number' ? d.resetFromSeq : undefined,
     splitInto: splitInto.length >= 2 ? splitInto : undefined,
     taskEdits,
+    deletes,
     usage: total,
   };
 
@@ -192,6 +208,7 @@ Do not duplicate the parent, repeat a rejected approach, weaken acceptance, or m
   if (settled !== 'RETRY') {
     if (settled === 'REVERIFY' || settled === 'VERIFIED') {
       decision.taskEdits = [];
+      decision.deletes = [];
       decision.splitInto = undefined;
     }
     return decision;

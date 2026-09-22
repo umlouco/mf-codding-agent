@@ -47,8 +47,11 @@ func BuildSystemPrompt(in PromptInput) string {
 	if in.QueueRole == "validator" {
 		return validatorSystemPolicy(in.VerificationStage) + fmt.Sprintf("\nWorkspace root: %s\nTesting URL: %s\n", in.WorkspaceRoot, in.TestingURL) + in.ProjectFacts + "\n" + in.Skills
 	}
-	if in.QueueRole == "supervisor" || in.QueueRole == "supervisor-repair" {
+	if in.QueueRole == "supervisor" {
 		return buildSupervisorSystemPrompt(in)
+	}
+	if in.QueueRole == "supervisor-repair" {
+		return buildTestRepairSystemPrompt(in)
 	}
 	var b strings.Builder
 

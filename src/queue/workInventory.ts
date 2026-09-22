@@ -145,6 +145,12 @@ function discoveryIndex(repository: RepositoryIndex): unknown {
 export function discoveryPrompt(task: Task, goal: string, notes: string, repository: RepositoryIndex): string {
   return `You are the discovery stage of an engineering supervisor. Do not execute the task or rewrite its acceptance criteria.
 First determine the real population of work from the original task AND its behavior description.
+Assess the CURRENT TASK below; the owner request is the overall goal, not an instruction to restart planning.
+An empty OWNER CONTEXT does not by itself block a task whose description, checks or referenced files
+already supply the required source material. Inspect the task's referenced documents and inventories
+before declaring that material missing. Do not require the entire original input to be repeated inline
+for an already specified task. If blocked, name the concrete prerequisite for THIS task, the referenced
+paths you inspected and what evidence is still absent. Never invent missing requirements.
 A narrow title can conceal a project-wide contract. Conversely, one shared fix with many callers may be indivisible.
 Do not repeatedly inspect individual members before enumerating the population. Identify the units once, then execute them in order.
 Use your semantic understanding of the request and repository, not elapsed time or file count, to choose:
@@ -169,8 +175,11 @@ HANDOFF (claim, not proof):\n${task.output?.slice(-4000) || '(none)'}`;
 }
 
 export async function discoverWork(task: Task, goal: string, notes: string, repository: RepositoryIndex,
-  ask: (prompt: string) => Promise<string>, parse: (text: string) => unknown = JSON.parse): Promise<WorkInventory> {
-  const prompt = discoveryPrompt(task, goal, notes, repository);
+  ask: (prompt: string) => Promise<string>, parse: (text: string) => unknown = JSON.parse,
+  previousFailure = ''): Promise<WorkInventory> {
+  const prompt = discoveryPrompt(task, goal, notes, repository) + (previousFailure
+    ? `\nPREVIOUS DISCOVERY FAILURE (unverified, reassess against current task and files):\n${previousFailure.slice(0, 4000)}\n`
+    : '');
   let repair = '';
   for (let attempt = 0; attempt < 2; attempt++) {
     const text = await ask(prompt + repair);

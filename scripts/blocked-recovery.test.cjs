@@ -173,7 +173,8 @@ test('unfinished tasks return to the executor before later work', async t => {
         assert.match(queue.get(first.id).errorLog, /review did not finish/);
         runner.cfg = (key, fallback) => key === 'queue.maxRunTasks' ? 1 : fallback;
         await runner.pump();
-        assert.equal(queue.runState, 'STOPPED');
+        // A tripped breaker subdivides the work; it never stops the run.
+        assert.equal(queue.runState, 'RUNNING');
         assert.equal(queue.stats().byStatus.EXECUTING, 0);
         assert.equal(queue.stats().byStatus.BLOCKED, 0);
         assert.equal(queue.isComplete(), false);

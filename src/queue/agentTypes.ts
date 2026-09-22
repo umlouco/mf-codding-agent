@@ -54,7 +54,7 @@ export interface RunOptions {
   skillTask?: string;
   /** Resolve planning work through the planner provider, retaining queue ownership. */
   planningOnly?: boolean;
-  /** Only the dedicated supervisor test-repair turn may edit while supervising. */
+  /** Run the separate test-repair worker; the decision supervisor never edits files. */
   allowTestEdits?: boolean;
   /** Validators may inspect and execute checks but cannot rewrite workspace files. */
   verificationOnly?: boolean;

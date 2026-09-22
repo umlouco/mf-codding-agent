@@ -144,11 +144,12 @@ required shape — as ONE JSON object and nothing else:
   "splitInto": [{ "title": "...", "description": "...",
                   "solutionVerifyPrompt": "..." }],
   "taskEdits": [{ "seq": ${task.seq}, "description": "...",
-                  "solutionVerifyPrompt": "..." }]
+                  "solutionVerifyPrompt": "..." }],
+  "deletes": []
 }
 
 Set verdict to VERIFIED, REVERIFY, RETRY, SPLIT, or REPAIR_TESTS to match the original conclusion. Use empty arrays for
-splitInto and taskEdits when they do not apply. Return valid JSON, without code fences.
+splitInto, taskEdits and deletes when they do not apply. Return valid JSON, without code fences.
 
 If your reply above reached a clear conclusion — the work is correct, it needs another attempt,
 it is too big to finish in one sitting — that conclusion,

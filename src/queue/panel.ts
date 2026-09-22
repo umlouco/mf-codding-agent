@@ -55,6 +55,8 @@ export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Dis
   private viewSubscriptions: vscode.Disposable[] = [];
   private readonly skillsSubscription: vscode.Disposable;
   private modelsPending = false;
+  /** A render skipped because the view was hidden, owed to it when it shows. */
+  private pendingRender = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -102,7 +104,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     // A hidden view has nobody reading it; the poll stops with it and picks
     // up where the table is when it shows again.
     this.viewSubscriptions.push(view.onDidChangeVisibility(() => {
-      if (view.visible) this.render();
+      if (view.visible && this.pendingRender) this.paint();
       this.syncStreaming();
     }), view.onDidDispose(() => this.clearView()));
     this.syncStreaming();
@@ -113,6 +115,7 @@ export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.viewSubscriptions = [];
     this.view = undefined;
     this.pulseSig = '';
+    this.pendingRender = false;
     this.syncStreaming();
   }
 
@@ -181,7 +184,10 @@ export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Dis
       // Answerable with no queue behind the view.
       switch (msg.type) {
         case 'ready':
-          this.render();
+          // The webview has loaded and is waiting for its first state. It says
+          // so exactly once, so this must not be filtered by `visible`, which
+          // VS Code may not have set yet for a view it has only just resolved.
+          this.paint();
           return;
         case 'showLog':
           this.output.show();
@@ -418,8 +424,25 @@ export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.render();
   }
 
+  /**
+   * Draws the view, unless it is hidden — building state for a panel nobody is
+   * reading is the cost this skip exists to avoid. The skip is remembered and
+   * repaid when the view shows again: dropping it silently is what left the
+   * queue looking like it never loaded, because the one `ready` that asks for
+   * the first state had arrived while `visible` was still false.
+   */
   render(): void {
-    if (!this.view?.visible) {
+    if (this.view && !this.view.visible) {
+      this.pendingRender = true;
+      return;
+    }
+    this.paint();
+  }
+
+  /** Renders whatever the view state is, with no visibility test of its own. */
+  private paint(): void {
+    this.pendingRender = false;
+    if (!this.view) {
       return;
     }
     const queue = this.queue;

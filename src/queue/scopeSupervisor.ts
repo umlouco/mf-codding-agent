@@ -9,6 +9,7 @@ import { parseScopeAssessment, ScopeAssessment, ScopeRole } from './scopePlan';
 import { scopePrompt } from './scopePrompt';
 import { discoverWork, indexRepository, WorkInventory } from './workInventory';
 import { inventoryScopePlan, scopeBoundary } from './scopeBoundary';
+import { readScopeRetry } from './scopeRetry';
 
 export interface ScopeHost {
   context: vscode.ExtensionContext;
@@ -101,8 +102,19 @@ export class ScopeSupervisor {
           snapshot.description, snapshot.solutionVerifyPrompt,
           ownerContext, repository.fingerprint])).digest('hex');
         const cached = queue.getMeta(key);
-        if (cached) inventory = JSON.parse(cached);
-        else {
+        let previousFailure = readScopeRetry(queue, snapshot)?.reason || '';
+        if (cached) {
+          try { inventory = JSON.parse(cached); } catch { /* Reassess invalid cache entries. */ }
+          // Older builds cached blocked discoveries forever. They are claims
+          // about missing evidence, not reusable admission decisions. Retain
+          // the journal, but ask again, even when repository paths are unchanged.
+          if (inventory?.strategy === 'blocked') {
+            previousFailure ||= inventory.reason;
+            inventory = undefined;
+          }
+          if (!inventory) queue.setMeta(key, '');
+        }
+        if (!inventory) {
           inventory = await discoverWork(snapshot, queue.getMeta('goal'), queue.contextInstructions, repository,
             async prompt => {
               const result = await runOnce(this.host.context, this.host.output, 'supervisor', prompt, {
@@ -119,8 +131,8 @@ export class ScopeSupervisor {
               if (!this.current()) throw Error('Discovery was superseded.');
               queue.addUsage(task.id, result.usage);
               return result.text;
-            }, text => extractJson(text, v => !!v && typeof v === 'object' && 'strategy' in v));
-          queue.setMeta(key, JSON.stringify(inventory));
+            }, text => extractJson(text, v => !!v && typeof v === 'object' && 'strategy' in v), previousFailure);
+          if (inventory.strategy !== 'blocked') queue.setMeta(key, JSON.stringify(inventory));
           queue.log(task.id, 'supervisor', 'work-inventory', JSON.stringify(inventory));
         }
         if (!this.current()) return false;

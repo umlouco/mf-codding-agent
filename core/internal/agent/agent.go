@@ -137,7 +137,7 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 	sess.Messages = append(sess.Messages, llm.UserText(user))
 	system := a.system
 	if a.cfg.InspectOnly {
-		system = "This turn is a live inspection-only review. Read evidence and return the requested decision. The supervisor owns test rewrites: request STOP_AND_REWRITE_TESTS to stop the executor and enter a dedicated supervisor repair turn with editing tools. Mutating tools and arbitrary commands are unavailable during this live inspection.\n\n" + system
+		system = "This turn is a live inspection-only review. Read evidence and return the requested decision. You never edit workspace files: the extension commits the task field text, splits and deletions you return. A separate test-repair worker performs test edits: request STOP_AND_REWRITE_TESTS to stop the executor and hand that repair to it. Mutating tools and arbitrary commands are unavailable during this live inspection.\n\n" + system
 	}
 	if a.cfg.ResponseOnly {
 		system = "You review supplied text and evidence. Follow the current request and its response schema exactly. You cannot inspect files or execute tools in this turn. Do not propose tool calls, XML checks, or an investigation. Owner requirements outrank derived task instructions and prior agent conclusions. Preserve required behavior and assertions. Return the requested decision using only the supplied information; distinguish missing evidence from a proven defect."

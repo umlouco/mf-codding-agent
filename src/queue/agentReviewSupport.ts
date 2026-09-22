@@ -55,7 +55,7 @@ If the evidence is not sufficient, choose exactly one:
  - SPLIT, when scope is the obstacle: the report reads as several unfinished threads rather than
    one unfinished thing, or no single agent can hold all of this at once. Return the ordered
    smaller tasks that replace it.
- - REPAIR_TESTS, for a test or harness defect requiring a supervisor-owned rewrite;
+ - REPAIR_TESTS, for a test or harness defect requiring a separate test-repair worker;
  - RETRY, for an application code defect requiring executor changes, or a task that has drifted
    from the owner's requirements. Preserve the goal and required behavior. Write a self-contained task
    using the observed failures, completed work, and a concrete different approach.
@@ -89,6 +89,12 @@ export interface SupervisorDecision {
     description?: string;
     solutionVerifyPrompt?: string;
   }[];
+  /**
+   * Sequence numbers the supervisor wants deleted as misaligned with the
+   * original request. A split deletes its own parent; this is for tasks that
+   * contribute nothing to the goal and cannot be realigned.
+   */
+  deletes?: number[];
   /**
    * This decision was made at the attempt ceiling, so what it replaces the task
    * with is a restructuring rather than another pass at the same one — which is
