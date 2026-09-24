@@ -375,9 +375,9 @@ tokenizer, since the API reports none.
 
 Or pick from Anthropic, OpenAI, OpenRouter, Google Gemini, DeepSeek, Mistral,
 Groq, xAI, Together, Fireworks, Cerebras, Ollama, LM Studio, vLLM, Voyage, any
-OpenAI-compatible endpoint, or the Claude Code CLI. Each one asks for the fields
-it actually needs. You can keep several — an editor model, a hosted account and a
-local server side by side.
+OpenAI-compatible endpoint, or the Claude Code or Codex CLI. Each one asks for the
+fields it actually needs. You can keep several — an editor model, a hosted account
+and a local server side by side.
 
 **API keys** go to the OS keychain via VS Code's `SecretStorage`. Leave a key blank
 to fall back to the provider's environment variable (`ANTHROPIC_API_KEY`,
@@ -412,6 +412,18 @@ ignores it or gets it silently dropped on retry, the same way an unsupported
 `stream_options` already does.
 
 **Export / Import** moves a setup between machines, with or without the keys.
+
+**CLI providers.** Claude Code and Codex are selectable like any other provider,
+but they are complete agents spawned as a subprocess — their own tool loop, their
+own permissions — so they run one ephemeral turn at a time and are offered for the
+**Planner** and **Supervisor** roles only. Install and sign in to the CLI first
+(`claude`, or `codex` with a ChatGPT login or `OPENAI_API_KEY`); leave the CLI
+command blank to use the one on `PATH`, or point it at an explicit path. Codex
+takes a direct **Codex CLI (add provider)** option in either role's provider
+dropdown; choosing it creates and binds a reusable profile automatically. Codex
+takes its MCP servers from its own `~/.codex/config.toml` (`codex mcp add`), not
+from `mcp.json`; every CLI turn is told to reach Jira, Confluence and other
+MCP-covered services through those tools and never through the browser.
 
 ### Project instructions
 

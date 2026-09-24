@@ -26,6 +26,20 @@ function loadCli(spawn, overrides = {}, runtime = { getuid: () => 1000, geteuid:
     '../providers/instance': {},
     ...overrides,
   };
+  const commonSource = readFileSync(path.join(__dirname, '..', 'src/queue/cliCommon.ts'), 'utf8');
+  const commonJs = ts.transpileModule(commonSource, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const common = {};
+  vm.runInNewContext(commonJs, {
+    exports: common,
+    require: (name) => {
+      if (name === '../mcp') return { MCP_SERVER_NAME: 'mfagent-task-queue', resolveMcpServers: async () => [] };
+      if (name === '../providers/instance') return dependencies[name];
+      assert.fail(`unexpected cliCommon dependency: ${name}`);
+    },
+  }, { filename: 'src/queue/cliCommon.ts' });
+  dependencies['./cliCommon'] = common;
   const exports = {};
   vm.runInNewContext(outputText, {
     exports,

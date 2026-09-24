@@ -530,13 +530,6 @@
     const host = $('roleList');
     host.textContent = '';
 
-    if (!S.settings.profiles.length) {
-      host.appendChild(
-        el('div', { class: 'empty', text: 'Add a provider first — roles bind to a provider.' }),
-      );
-      return;
-    }
-
     for (const role of S.roles) {
       host.appendChild(renderRole(role));
     }
@@ -714,16 +707,23 @@
 
     // Provider column.
     const select = el('select', {
-      onchange: (e) =>
+      onchange: (e) => {
+        if (e.target.value === 'add:codex-cli') {
+          send({ type: 'addRoleProvider', role: role.id, providerId: 'codex-cli' });
+          return;
+        }
+        const picked = profileById(e.target.value);
         send({
           type: 'setRole',
           role: role.id,
           profileId: e.target.value,
           // Switching provider invalidates the model id, so clear it rather
           // than send a model the new endpoint has never heard of.
-          model: e.target.value === binding.profileId ? binding.model : '',
+          model: e.target.value === binding.profileId ? binding.model :
+            picked?.providerId === 'codex-cli' ? 'default' : '',
           effort: binding.effort || '',
-        }),
+        });
+      },
     });
     if (inheritable) {
       const opt = el('option', { value: '', text: 'Same as Coding' });
@@ -746,6 +746,10 @@
       });
       if (bound) opt.selected = true;
       select.appendChild(opt);
+    }
+    if ((role.id === 'planner' || role.id === 'supervisor') &&
+        !S.settings.profiles.some(p => p.providerId === 'codex-cli')) {
+      select.appendChild(el('option', { value: 'add:codex-cli', text: 'Codex CLI (add provider)' }));
     }
 
     // Model column.

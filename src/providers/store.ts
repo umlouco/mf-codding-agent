@@ -152,9 +152,10 @@ export interface ResolvedRole {
   profile?: Profile;
   def?: ProviderDef;
   /**
-   * The provider kind: 'anthropic', 'openai-compatible', 'claude-cli' or
-   * 'vscode-lm'. The last two are not endpoints the core can dial as they
-   * are — llm/router.ts decides how a turn on either is actually carried.
+   * The provider kind: 'anthropic', 'openai-compatible', 'claude-cli',
+   * 'codex-cli' or 'vscode-lm'. The last three are not endpoints the core can
+   * dial as they are — llm/router.ts decides how a turn on any of them is
+   * actually carried.
    */
   kind: string;
   model: string;
@@ -239,7 +240,8 @@ export class ProfileStore {
     // The first profile is almost always meant to be the coding one; wiring it
     // up saves a step and stops the extension booting with nothing bound.
     const roles = { ...this.cache.roles };
-    if (profiles.length === 1 && !roles.coding.profileId) {
+    if (profiles.length === 1 && !roles.coding.profileId &&
+        (!def.rolesAllowed || def.rolesAllowed.includes('coding'))) {
       roles.coding = { profileId: profile.id, model: '', effort: '' };
     }
 

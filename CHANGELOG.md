@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Add the **Codex CLI** as a provider, alongside the Claude Code CLI. Run the
+  OpenAI Codex CLI (`codex exec`) as a subprocess for the Planner and Supervisor
+  roles, using whatever login it already has (ChatGPT or `OPENAI_API_KEY`). The
+  Roles dropdown can create and bind a Codex CLI profile directly. The
+  turn is spawned through `cmd.exe` on Windows so an npm-installed `codex.cmd`
+  shim works, and a spaced workspace or output path is not split. Codex reads its
+  own `~/.codex/config.toml` for MCP servers; every CLI turn is now told to reach
+  Jira, Confluence and other MCP-covered services through those tools and never
+  the browser. The role policy and MCP rule are shared with the Claude transport
+  so the two cannot drift apart.
+
 - Fix the task queue repeatedly reclaiming a task after blocked scope discovery.
   Discard old blocked inventory caches and reassess the current task and its source
   references. Failed preflight reviews now retry after 30 seconds, backing off to

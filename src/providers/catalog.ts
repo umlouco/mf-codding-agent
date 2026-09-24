@@ -12,7 +12,7 @@
  * `/v1/chat/completions`.
  */
 
-export type ProviderKind = 'anthropic' | 'openai-compatible' | 'claude-cli' | 'vscode-lm';
+export type ProviderKind = 'anthropic' | 'openai-compatible' | 'claude-cli' | 'codex-cli' | 'vscode-lm';
 
 /**
  * The six things a profile can be bound to. Lives here rather than in
@@ -93,7 +93,7 @@ export interface ProviderDef {
    * Which of the six roles this provider may be bound to, beyond the
    * chat/vision/embedding capability triple above. Absent means every
    * chat-capable role — only a provider that is not a plain HTTP endpoint
-   * (see `kind: 'claude-cli'`) needs this.
+   * (see `kind: 'claude-cli'` / `'codex-cli'`) needs this.
    */
   rolesAllowed?: Role[];
 
@@ -375,6 +375,41 @@ export const PROVIDERS: ProviderDef[] = [
     notes:
       'Runs the claude CLI as a subprocess, using whatever login it already has (subscription or ' +
       'API key) — install and sign in with claude first. Planner and Supervisor only.',
+  },
+  {
+    id: 'codex-cli',
+    label: 'Codex CLI',
+    kind: 'codex-cli',
+    group: 'CLI',
+    defaultBaseURL: '',
+    baseURLEditable: false,
+    apiKey: 'none',
+    listStyle: 'none',
+    // Codex picks the model its account actually serves. A ChatGPT login
+    // rejects names such as gpt-5-codex with a 400, so the only safe default is
+    // the sentinel; an account that supports a specific model can type its id.
+    staticModels: ['default'],
+    serves: { chat: true, vision: false, embedding: false },
+    // Like Claude CLI, this is spawned as a subprocess directly by
+    // queue/agents.ts's runOnce, bypassing the Go core entirely, so it only
+    // makes sense for the two roles that run one ephemeral turn at a time.
+    rolesAllowed: ['planner', 'supervisor'],
+    extraFields: [
+      {
+        key: 'cliPath',
+        label: 'CLI command or path',
+        placeholder: 'codex',
+        required: false,
+        description: 'Leave blank to use "codex" on PATH.',
+      },
+    ],
+    docsURL: 'https://github.com/openai/codex',
+    notes:
+      'Runs the codex CLI (`codex exec`) as a subprocess, using whatever login it already has ' +
+      '(ChatGPT subscription or OPENAI_API_KEY) — install and sign in with codex first. Planner ' +
+      'and Supervisor only. Codex reads its own ~/.codex/config.toml for MCP servers; the agent is ' +
+      'instructed to reach Jira, Confluence and other covered services through those MCP tools and ' +
+      'never the browser.',
   },
 ];
 

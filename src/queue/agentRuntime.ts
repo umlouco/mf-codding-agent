@@ -6,6 +6,7 @@ import * as vscode from 'vscode';
 import { contextCeiling } from '../providers/payload';
 import * as cp from 'child_process';
 import { runClaudeCliTurn } from './claudeCli';
+import { runCodexCliTurn } from './codexCli';
 import { registerEditorFsHandlers } from '../editorFs';
 import { getBridge } from '../mcpBridge';
 import { Usage } from './db';
@@ -142,20 +143,20 @@ async function runTurn(
   prompt: string,
   opts: RunOptions = {},
 ): Promise<TurnResult> {
-  // Claude CLI is a complete agent on its own — its own tool loop, its own
-  // permission handling — so it is never routed through mfcore's agent loop
-  // the way an HTTP provider is; see providers/store.ts's rolesAllowed guard
-  // for which queue roles it supports. Branching here, before the
-  // core is even spawned, means every caller downstream (orchestrator.ts,
-  // monitor.ts, every prompt builder in this file) needs no changes: they
-  // only ever see RunOptions in, TurnResult out.
+  // A CLI provider (Claude Code, Codex) is a complete agent on its own — its
+  // own tool loop, its own permission handling — so it is never routed through
+  // mfcore's agent loop the way an HTTP provider is; see providers/store.ts's
+  // rolesAllowed guard for which queue roles each supports. Branching here,
+  // before the core is even spawned, means every caller downstream
+  // (orchestrator.ts, monitor.ts, every prompt builder in this file) needs no
+  // changes: they only ever see RunOptions in, TurnResult out.
   const providerRole = opts.planningOnly ? 'planner' : role;
   const planning = opts.planningOnly || role === 'planner';
   const resolved = await getStore().resolve(providerRole);
   if (resolved.kind === 'openai-compatible' && resolved.baseURL === '' && !resolved.profile) {
     throw new AgentRunError(`No supported provider is configured for the ${role} role. Select a provider for this role in MF Agent settings.`);
   }
-  if (resolved.kind === 'claude-cli') {
+  if (resolved.kind === 'claude-cli' || resolved.kind === 'codex-cli') {
     if (planning || (!opts.formatOnly && opts.skillTask)) {
       const skills = new CoreClient(context, output);
       let aborted = false;
@@ -186,7 +187,9 @@ async function runTurn(
         checkAborted();
       } finally { skills.dispose(); }
     }
-    return runClaudeCliTurn(output, providerRole, resolved, prompt, opts);
+    return resolved.kind === 'codex-cli'
+      ? runCodexCliTurn(output, providerRole, resolved, prompt, opts)
+      : runClaudeCliTurn(output, providerRole, resolved, prompt, opts);
   }
 
   const client = new CoreClient(context, output);

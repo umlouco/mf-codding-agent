@@ -20,6 +20,8 @@ import { LmProxy } from './lmProxy';
  *               VS Code already has.
  *   claude-cli  the Claude Code CLI as a subprocess, for the roles that run
  *               one turn at a time — see queue/claudeCli.ts.
+ *   codex-cli   the OpenAI Codex CLI (`codex exec`) as a subprocess, likewise
+ *               for one-shot roles — see queue/codexCli.ts.
  *
  * Model selection per task type is the Roles tab: each queue role — planner,
  * supervisor, executor — binds its own provider and model, and an editor model
@@ -35,7 +37,7 @@ export interface LmModelInfo {
   maxInputTokens: number;
 }
 
-export type Transport = 'core' | 'claude-cli';
+export type Transport = 'core' | 'claude-cli' | 'codex-cli';
 
 /** What the Go core is told to dial for a role. */
 export interface CoreEndpoint {
@@ -84,7 +86,10 @@ export class LLMRouter implements vscode.Disposable {
   }
 
   transportFor(kind: string): Transport {
-    return kind === 'claude-cli' ? 'claude-cli' : 'core';
+    if (kind === 'claude-cli' || kind === 'codex-cli') {
+      return kind;
+    }
+    return 'core';
   }
 
   /**

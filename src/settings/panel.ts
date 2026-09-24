@@ -6,6 +6,7 @@ import { PROVIDERS, providerOrFallback } from '../providers/catalog';
 import { ModelList, ModelRegistry } from '../providers/models';
 import { ROLES, ROLE_LABELS, Role, ProfileStore } from '../providers/store';
 import { testClaudeCliBinary } from '../queue/claudeCli';
+import { testCodexCliBinary } from '../queue/codexCli';
 import { discoverInstalledSkills, SKILL_INSTALL_AGENTS } from '../skills';
 import { getActiveQueue, notifySkillsChanged, onDidChangeSkills } from '../queue/registry';
 import { scheduleRestart } from '../coreRestart';
@@ -113,6 +114,23 @@ export class SettingsPanel {
           void this.loadModels(profile.id, false);
           break;
         }
+        case 'addRoleProvider': {
+          const role = String(msg.role);
+          const providerId = String(msg.providerId);
+          const def = PROVIDERS.find(p => p.id === providerId);
+          if (!def || !def.rolesAllowed?.includes(role as Role)) {
+            throw new Error(`Provider ${providerId} cannot serve ${role}.`);
+          }
+          const profile = await this.store.addProfile(providerId);
+          await this.store.setRole(role as Role, {
+            profileId: profile.id,
+            model: def.staticModels?.[0] ?? '',
+            effort: '',
+          });
+          await this.pushState(profile.id);
+          void this.loadModels(profile.id, false);
+          break;
+        }
         case 'updateProfile': {
           const patch = msg.patch ?? {};
           await this.store.updateProfile(String(msg.id), patch);
@@ -161,7 +179,9 @@ export class SettingsPanel {
           const result =
             def.kind === 'claude-cli'
               ? await testClaudeCliBinary(profile.extra?.cliPath)
-              : await this.models.test(profile.providerId, profile.baseURL, await this.store.effectiveApiKey(profile.id, def));
+              : def.kind === 'codex-cli'
+                ? await testCodexCliBinary(profile.extra?.cliPath)
+                : await this.models.test(profile.providerId, profile.baseURL, await this.store.effectiveApiKey(profile.id, def));
           this.post({ type: 'testResult', profileId: profile.id, ...result });
           break;
         }
