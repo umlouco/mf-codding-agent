@@ -3,6 +3,9 @@ package agent
 import (
 	"strings"
 	"testing"
+
+	"github.com/mflores/mfagent/core/internal/config"
+	"github.com/mflores/mfagent/core/internal/tools"
 )
 
 func TestExecutorPromptOwnershipAndSize(t *testing.T) {
@@ -70,5 +73,37 @@ func TestMCPPolicyPresentForAllRoles(t *testing.T) {
 	}
 	if strings.Contains(BuildSystemPrompt(PromptInput{QueueRole: "executor"}), "# MCP servers") {
 		t.Error("MCP policy should not appear when no server is connected")
+	}
+}
+
+// MCP tools are registered Mutating (an external server's side effects are
+// unknown), which used to hide every mcp__ tool from an inspection-only review.
+// The supervisor then had no credentialed way to read Jira or Confluence and
+// reached for the browser instead. This pins the exemption: inspection-only
+// roles keep MCP tools, and still lose ordinary mutating tools.
+func TestInspectOnlyKeepsMCPTools(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.Add(&tools.Tool{Name: "mcp__jira__get_issue", Mutating: true})
+	reg.Add(&tools.Tool{Name: "mcp__connexall-confluence__get_page", Mutating: true})
+	reg.Add(&tools.Tool{Name: "read_file"})
+	reg.Add(&tools.Tool{Name: "write_file", Mutating: true})
+	reg.Add(&tools.Tool{Name: "browser_open", Mutating: true})
+
+	supervisor := &Agent{cfg: &config.Config{QueueRole: "supervisor", InspectOnly: true}, registry: reg}
+	got := supervisor.toolNames()
+	for _, want := range []string{"mcp__jira__get_issue", "mcp__connexall-confluence__get_page", "read_file"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("inspection-only review lost %s; has: %s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"write_file", "browser_open"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("inspection-only review still sees %s; has: %s", unwanted, got)
+		}
+	}
+
+	executor := &Agent{cfg: &config.Config{QueueRole: "executor"}, registry: reg}
+	if !strings.Contains(executor.toolNames(), "mcp__jira__get_issue") {
+		t.Error("executor lost MCP tool access")
 	}
 }
