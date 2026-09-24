@@ -50,3 +50,25 @@ func TestExecutorPromptPreservesRuntimeContext(t *testing.T) {
 		t.Error("interactive coder policy changed")
 	}
 }
+
+func TestMCPPolicyPresentForAllRoles(t *testing.T) {
+	servers := []string{"jira", "connexall-confluence"}
+	roles := []PromptInput{
+		{QueueRole: "", MCPServers: servers},
+		{QueueRole: "executor", MCPServers: servers},
+		{QueueRole: "supervisor", MCPServers: servers},
+		{QueueRole: "validator", VerificationStage: "report", MCPServers: servers},
+		{QueueRole: "supervisor-repair", MCPServers: servers},
+	}
+	for _, in := range roles {
+		prompt := BuildSystemPrompt(in)
+		for _, want := range []string{"jira", "connexall-confluence", "MCP server", "browser"} {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("role %q lost MCP policy text %q", in.QueueRole, want)
+			}
+		}
+	}
+	if strings.Contains(BuildSystemPrompt(PromptInput{QueueRole: "executor"}), "# MCP servers") {
+		t.Error("MCP policy should not appear when no server is connected")
+	}
+}

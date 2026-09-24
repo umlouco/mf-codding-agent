@@ -38,7 +38,7 @@ func (e *Env) CheckQueueOwnership(name string, input json.RawMessage, mutating b
 	if !mutating {
 		return nil
 	}
-	if (e.QueueRole == "validator" || e.QueueRole == "supervisor") && !testingBrowserTool(name) && !cleanupTool(name) {
+	if (e.QueueRole == "validator" || e.QueueRole == "supervisor") && !testingBrowserTool(name) && !cleanupTool(name) && !MCPTool(name) {
 		return fmt.Errorf("queue ownership: %s may inspect files and run checks but cannot use a writing tool; request a supervisor test-repair decision for test changes", e.QueueRole)
 	}
 	var inspect func(any) error

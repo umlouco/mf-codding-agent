@@ -254,6 +254,19 @@ func (r *Registry) Add(t *Tool) {
 	r.tools[t.Name] = t
 }
 
+// MCPTool reports whether a registered tool is served by a connected MCP
+// server — the core names those mcp__<server>__<tool> (see registerMCPTools in
+// cmd/mfcore). They are marked Mutating because an external server's side
+// effects are unknown, but they are also the only credentialed path to the
+// external services a workspace depends on (Jira, Confluence, code and
+// knowledge search). Callers use this to keep that path available to
+// inspection-only roles, which would otherwise be left with the browser — a
+// tool that has none of those credentials — as their only way to "read" such a
+// service.
+func MCPTool(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "mcp__")
+}
+
 func (r *Registry) Remove(prefix string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

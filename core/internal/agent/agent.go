@@ -633,6 +633,13 @@ func (a *Agent) toolAllowed(t *tools.Tool) bool {
 	if !tools.QueueToolAllowed(a.cfg.QueueRole, t.Name) {
 		return false
 	}
+	// Connected MCP servers are the required, credentialed path to external
+	// services (Jira, Confluence, code/knowledge search). An inspection-only
+	// review must still be able to read them, so they are exempt from the
+	// mutating-tool filter below; server-side permissions remain the boundary.
+	if tools.MCPTool(t.Name) {
+		return true
+	}
 	// Shell command classification is for scheduling, not an inspection
 	// guarantee. A reviewer uses dedicated read tools instead of arbitrary
 	// commands, browser scripts or third-party tools that can change state.
