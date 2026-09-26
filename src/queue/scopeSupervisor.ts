@@ -11,6 +11,16 @@ import { discoverWork, indexRepository, WorkInventory } from './workInventory';
 import { inventoryScopePlan, scopeBoundary } from './scopeBoundary';
 import { readScopeRetry } from './scopeRetry';
 
+/**
+ * At or below this many files, the deterministic workspace scan already bounds
+ * a task's scope, so a discovery model turn cannot reveal a population it would
+ * have missed. Above it, discovery runs as before. Set 0 to always discover.
+ */
+function smallScopeFiles(): number {
+  const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.scopeDiscoveryMinFiles', 20);
+  return Number.isFinite(configured) ? Math.max(0, configured) : 20;
+}
+
 export interface ScopeHost {
   context: vscode.ExtensionContext;
   output: vscode.OutputChannel;
@@ -18,21 +28,15 @@ export interface ScopeHost {
   task: Task;
   role: ScopeRole;
   current: () => boolean;
-  intervalMs: number;
   split: (assessment: ScopeAssessment, snapshot: Task) => boolean;
   preflightActivity: (phase: string, detail: string, at: number) => void;
 }
 
 /** An independent scope lane: a long verifier must not occupy its own supervisor. */
 export class ScopeSupervisor {
-  private evidence = new ScopeEvidence();
   private closed = false;
   private busy = false;
-  private timer?: NodeJS.Timeout;
   private abort?: () => void;
-  private lastReview = 0;
-  private reviewedRevision = 0;
-  private breadthReviewed = false;
   constructor(private host: ScopeHost) {}
 
   private current(): boolean {
@@ -60,34 +64,27 @@ export class ScopeSupervisor {
     return keep && this.current();
   }
 
-  observe(method: string, params: any): void {
-    if (this.current()) this.evidence.observe(method, params);
+  /**
+   * Records a KEEP that was decided from recorded facts rather than a model
+   * turn, so the audit trail still shows what authorized execution and why.
+   */
+  private keepDeterministically(stage: 'preflight', role: ScopeRole, snapshot: Task,
+    reason: string, evidence?: unknown): boolean {
+    this.host.queue.log(snapshot.id, 'supervisor', 'scope-assessment', JSON.stringify({
+      stage, role, action: 'KEEP', reason, deterministic: true, ...(evidence === undefined ? {} : { evidence }),
+    }));
+    return true;
   }
 
-  async check(): Promise<void> {
-    if (!this.current()) { this.close(); return; }
-    if (this.busy || this.evidence.revision <= this.reviewedRevision) return;
-    // First widening gets an early look; subsequent looks need fresh evidence AND
-    // the normal review interval. None of these counts chooses KEEP or SPLIT.
-    const interval = this.evidence.breadthSignal && !this.breadthReviewed ? 30_000 : this.host.intervalMs;
-    if (Date.now() - this.lastReview < interval) return;
-    try { await this.assess('live'); } catch (error: any) {
-      if (this.current()) this.host.queue.log(this.host.task.id, 'supervisor', 'scope-error',
-        `${error?.message ?? error}; current work preserved, retry after fresh evidence.`);
-    }
-  }
-
-  private async assess(stage: 'preflight' | 'live'): Promise<boolean> {
+  private async assess(stage: 'preflight'): Promise<boolean> {
     if (!this.current() || this.busy) return false;
     this.busy = true;
-    this.lastReview = Date.now();
-    this.reviewedRevision = this.evidence.revision;
-    this.breadthReviewed ||= this.evidence.breadthSignal;
     const { queue, task, role } = this.host;
     const snapshot = queue.get(task.id)!;
     const ownerContext = JSON.stringify([queue.getMeta('goal'), queue.contextInstructions]);
     const live = new LiveLog(queue, task.id, 'supervisor');
-    const evidence = this.evidence.snapshot();
+    // Preflight runs before the worker starts, so there is no execution evidence yet.
+    const evidence = new ScopeEvidence().snapshot();
     const prompt = scopePrompt(snapshot, role, stage, queue.getMeta('goal'), queue.contextInstructions,
       evidence, queue.events(task.id, 40, true).filter(e => e.actor !== 'supervisor').reverse().map(e => ({ actor: e.actor, kind: e.kind,
         message: e.message.slice(0, 1600) })),
@@ -95,9 +92,21 @@ export class ScopeSupervisor {
         .map(t => ({ seq: t.seq, title: t.title, status: t.status }))) + `\n${scopeBoundary(snapshot)}`;
     try {
       const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      // Two deterministic KEEPs. The model turns below were the single largest
+      // avoidable cost per task: on a small project every task paid a discovery
+      // call and an assessment call before any code was written. Neither fact
+      // can change what discovery would find, so neither needs a model.
+      if (scopeBoundary(snapshot)) {
+        return this.keepDeterministically(stage, role, snapshot,
+          'Committed execution ticket; its scope is already bounded and changing it is forbidden.');
+      }
       let inventory: WorkInventory | undefined;
-      if (root && !scopeBoundary(snapshot)) {
+      if (root) {
         const repository = indexRepository(root);
+        if (repository.files.length <= smallScopeFiles()) {
+          return this.keepDeterministically(stage, role, snapshot,
+            `The workspace has ${repository.files.length} file(s); the deterministic region already bounds this task.`);
+        }
         const key = 'workInventory:' + createHash('sha256').update(JSON.stringify([task.id, task.createdAt,
           snapshot.description, snapshot.solutionVerifyPrompt,
           ownerContext, repository.fingerprint])).digest('hex');
@@ -125,7 +134,7 @@ export class ScopeSupervisor {
                 onActivity: a => {
                   if (!this.current()) return;
                   live.activity(a);
-                  if (stage === 'preflight') this.host.preflightActivity('scope_review', a.detail, a.at);
+                  this.host.preflightActivity('scope_review', a.detail, a.at);
                 },
               });
               if (!this.current()) throw Error('Discovery was superseded.');
@@ -144,6 +153,13 @@ export class ScopeSupervisor {
         }
         if (!inventory) throw Error('Discovery returned no inventory.');
         if (inventory.strategy === 'blocked') throw Error(`Discovery needs evidence: ${inventory.reason}`);
+        // "atomic" is already the host's definition of one independently
+        // checkable outcome. A second model turn to confirm KEEP adds no
+        // information, and every task was paying for it.
+        if (inventory.strategy === 'atomic') {
+          return this.keepDeterministically(stage, role, snapshot,
+            `Discovery found one independently checkable outcome: ${inventory.reason}`, inventory);
+        }
         if (inventory.strategy === 'enumerate') {
           if (indexRepository(root).fingerprint !== repository.fingerprint) throw Error('Repository membership changed during discovery; re-inventory before scheduling.');
           const decision = parseScopeAssessment(inventoryScopePlan(snapshot, inventory), snapshot, inventory);
@@ -162,7 +178,7 @@ export class ScopeSupervisor {
           onActivity: a => {
             if (!this.current()) return;
             live.activity(a);
-            if (stage === 'preflight') this.host.preflightActivity('scope_review', a.detail, a.at);
+            this.host.preflightActivity('scope_review', a.detail, a.at);
           },
         });
         if (!this.current()) return false;
@@ -204,7 +220,6 @@ export class ScopeSupervisor {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    if (this.timer) clearInterval(this.timer);
     try { this.abort?.(); } catch { /* Already stopped. */ }
     this.abort = undefined;
   }

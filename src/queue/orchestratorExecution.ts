@@ -1,8 +1,8 @@
-import { executeTask, ExecutionOutcome } from './agents';
+import { executeTask } from './agents';
 import type { Task } from './db';
 import { appendAttempt, stopDetail, TEST_OWNERSHIP_STOP } from './orchestratorState';
 import { OrchestratorVerification } from './orchestratorVerification';
-import { completionForSupervisor } from './validation';
+import { completionForSupervisor, parseCompletionClaim } from './validation';
 import { scopeBlocked } from './scopePlan';
 import { providerConfigurationError } from './recovery';
 import { boundedTask } from './scopeBoundary';
@@ -111,7 +111,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
             this.changed();
           }
         },
-        (method, params) => { journal.onEvent(method, params); scope.observe(method, params); },
+        (method, params) => journal.onEvent(method, params),
         (abort) => {
           if (!current()) { abort(); return; }
           this.executionAbort = abort;
@@ -141,24 +141,25 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       // the supervisor lane, where ownership migration or a repair can resolve them.
       const repairDetail = res.cutOff && res.stopReason === 'supervisor_repair_required' &&
         TEST_OWNERSHIP_STOP.test(stopDetail(res.text)) ? stopDetail(res.text) : undefined;
-      // The executor is the only agent that decides a task is done: a closing
-      // READY_FOR_VALIDATION claim on a complete turn ends the task. Everything
-      // else is partial work and goes back for another attempt.
-      const done = !res.cutOff && res.ok && !overload &&
+      // The coder never decides a task is done. A closing READY_FOR_VALIDATION
+      // claim on a complete turn hands the task to the tester (VERIFYING with no
+      // report); the supervisor's next cycle runs the tester and only a PASS
+      // backed by executed checks makes it VERIFIED. Anything else is partial
+      // work and goes back to the coder.
+      const handoff = !res.cutOff && res.ok && !overload &&
         res.completion.status === 'READY_FOR_VALIDATION';
       const outcome: Partial<Task> = {
         output: res.text,
         validationReport: '',
-        activityPhase: done ? 'done' : repairDetail ? 'needs_review' : 'needs_work',
-        finishedAt: done ? Date.now() : null,
+        activityPhase: handoff ? 'awaiting_tester' : repairDetail ? 'needs_review' : 'needs_work',
+        finishedAt: null,
         ...(cutOffNote ? { errorLog: cutOffNote } : {}),
         ...(repairDetail ? { supervisorFeedback: `[SUPERVISOR_TEST_REPAIR] ${repairDetail}` } : {}),
       };
       const applied = this.queue.finishExecution(
         task.id,
         attempt,
-        done ? { ...outcome, status: 'VERIFIED' }
-          : repairDetail ? { ...outcome, status: 'VERIFYING' }
+        handoff || repairDetail ? { ...outcome, status: 'VERIFYING' }
           : this.retryPatch(task, outcome,
               overload || res.stopReason || res.completion.status || 'executor reported unfinished work'),
       );
@@ -168,7 +169,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
         this.queue.log(
           task.id,
           'executor',
-          done ? 'completed' : res.cutOff ? 'cut-off' : 'unfinished',
+          handoff ? 'completed' : res.cutOff ? 'cut-off' : 'unfinished',
           res.text.slice(0, 4000),
         );
         // Recorded separately from the raw reply, and normalised: a durable,
@@ -184,9 +185,9 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
           this.queue.appendInstruction(res.notes, `task ${task.seq}, attempt ${task.attempts}`);
           this.queue.log(task.id, 'executor', 'notes-added', res.notes);
         }
-        if (done) {
-          this.recordSharedMemory(task, res);
-          this.log(`task ${task.seq} complete — execution is the final step`);
+        if (handoff) {
+          this.queue.log(task.id, 'supervisor', 'handoff:tester', 'The coder reported the task ready; the tester verifies it next.');
+          this.log(`task ${task.seq} implemented — handed to the tester`);
         } else if (repairDetail) {
           this.queue.log(task.id, 'executor', 'test-repair-requested', repairDetail);
           this.log(`task ${task.seq} — executor stopped on a supervisor-owned test; ` +
@@ -274,14 +275,14 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
   }
 
   /**
-   * Records a compact, durable outcome in the queue's shared notes, so every
-   * later task session starts with what this one accomplished — the same
+   * Records a compact, durable outcome in the queue's shared notes once a task is
+   * VERIFIED, so every later task session starts with what this one accomplished — the same
    * cross-session memory as the workspace graph, kept where a fresh worker is
    * guaranteed to read it.
    */
-  private recordSharedMemory(task: Task, res: ExecutionOutcome): void {
-    const claim = res.completion;
-    const summary = (claim.summary || res.text).replace(/\s+/g, ' ').trim().slice(0, 800);
+  protected recordSharedMemory(task: Task): void {
+    const claim = parseCompletionClaim(task.output);
+    const summary = (claim.summary || task.output).replace(/\s+/g, ' ').trim().slice(0, 800);
     const files = claim.filesChanged.slice(0, 12).join(', ');
     const line = `task ${task.seq} "${task.title}" complete${files ? ` — files: ${files}` : ''}: ${summary}`;
     this.queue.appendInstruction(line, `task ${task.seq} outcome`);

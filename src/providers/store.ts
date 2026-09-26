@@ -24,7 +24,8 @@ const INHERITS_CODING: ReadonlySet<Role> = new Set<Role>([
   'vision',
   'planner',
   'supervisor',
-  'executor',
+  'coder',
+  'tester',
 ]);
 
 export const ROLE_LABELS: Record<Role, { title: string; blurb: string }> = {
@@ -48,9 +49,13 @@ export const ROLE_LABELS: Record<Role, { title: string; blurb: string }> = {
     title: 'Queue · Supervisor',
     blurb: 'Verifies finished tasks. Use your strongest model.',
   },
-  executor: {
-    title: 'Queue · Executor',
-    blurb: 'Does the work, one task per process. A fast local model fits well.',
+  coder: {
+    title: 'Queue · Coder',
+    blurb: 'Writes the implementation, one task per process. A fast, strong coding model fits well.',
+  },
+  tester: {
+    title: 'Queue · Tester',
+    blurb: 'Runs and judges the checks (tests, browser, behavior). Use a careful model — NVIDIA Nemotron works well.',
   },
 };
 
@@ -635,7 +640,8 @@ export class ProfileStore {
       bind('embedding', cfg.get<any>('embedding'));
       bind('planner', cfg.get<any>('queue.planner'));
       bind('supervisor', cfg.get<any>('queue.supervisor'));
-      bind('executor', cfg.get<any>('queue.executor'));
+      // The old single executor binding becomes Coder; Tester starts inherited.
+      bind('coder', cfg.get<any>('queue.executor'));
 
       const languages = cfg.get<string[]>('languages', []) ?? [];
 
@@ -674,6 +680,7 @@ function guessProviderId(type: string, baseURL: string): string {
     'anthropic',
     'openrouter',
     'deepseek',
+    'nvidia',
     'mistral',
     'groq',
     'together',
@@ -740,8 +747,11 @@ function normalise(raw: unknown): AgentSettings {
 
   const known = new Set(profiles.map((p) => p.id));
   const roles = emptyRoles();
+  // Settings saved before the Coder/Tester split stored one `executor` binding.
+  // It becomes Coder; Tester is left unbound and inherits coding until set.
+  const legacyExecutor = (r.roles as any)?.executor;
   for (const role of ROLES) {
-    const b = (r.roles as any)?.[role];
+    const b = (r.roles as any)?.[role] ?? (role === 'coder' ? legacyExecutor : undefined);
     const profileId = String(b?.profileId ?? '');
     roles[role] = {
       profileId: known.has(profileId) ? profileId : '',

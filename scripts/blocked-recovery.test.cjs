@@ -95,16 +95,17 @@ test('unfinished tasks return to the executor before later work', async t => {
       } finally { runner.dispose(); queue.close(); }
     });
 
-    await t.test('legacy incomplete and decomposition reports return to execution', () => {
+    await t.test('a task waiting on the tester gates later work', () => {
       const queue = fresh();
       try {
         const first = add(queue, 'VERIFYING');
-        const second = add(queue, 'FAILED');
-        queue.update(first.id, { output: '{"completion":{"status":"NEEDS_MORE_WORK"}}', attempts: 5 });
-        queue.update(second.id, { output: '{"completion":{"status":"READY_FOR_VALIDATION"}}' });
-        queue.drainVerification();
-        assert.deepEqual(queue.list().map(task => task.status), ['PENDING', 'PENDING']);
-        assert.equal(queue.claimNext().id, first.id);
+        add(queue);
+        queue.update(first.id, { output: '{"completion":{"status":"READY_FOR_VALIDATION"}}', attempts: 1 });
+        // The coder's claim alone never completes a task: until the tester's
+        // PASS is accepted, nothing after it may be claimed.
+        assert.equal(queue.claimNext(), undefined);
+        assert.equal(queue.isComplete(), false);
+        assert.equal(queue.get(first.id).status, 'VERIFYING');
       } finally { queue.close(); }
     });
 
@@ -136,8 +137,15 @@ test('unfinished tasks return to the executor before later work', async t => {
           };
           try {
             for (let attempt = 0; attempt < 5; attempt++) await runner.pump();
-            assert.deepEqual(executions, [first.id, first.id, first.id, first.id, second.id]);
+            // The fourth attempt reported READY: the task waits for the tester
+            // and later work is not claimed until it is verified.
+            assert.deepEqual(executions, [first.id, first.id, first.id, first.id]);
+            assert.equal(queue.get(first.id).status, 'VERIFYING');
+            assert.equal(queue.get(first.id).activityPhase, 'awaiting_tester');
             assert.equal(queue.get(first.id).attempts, 4);
+            queue.update(first.id, { status: 'VERIFIED' });
+            await runner.pump();
+            assert.deepEqual(executions, [first.id, first.id, first.id, first.id, second.id]);
             assert.match(queue.get(first.id).errorLog, /connection lost/);
             assert.equal(queue.stats().byStatus.BLOCKED, 0);
           } finally { runner.dispose(); queue.close(); }

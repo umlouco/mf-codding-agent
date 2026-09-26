@@ -110,6 +110,7 @@ function keyForWorker(baseURL) {
   const host = new URL(baseURL).hostname.toLowerCase();
   if (/(^|\.)openrouter\.ai$/.test(host)) return process.env.OPENROUTER_API_KEY || '';
   if (/(^|\.)openai\.com$/.test(host)) return process.env.OPENAI_API_KEY || '';
+  if (/(^|\.)nvidia\.com$/.test(host)) return process.env.NVIDIA_API_KEY || '';
   return '';
 }
 
@@ -168,7 +169,7 @@ async function createHost(options) {
   const claudeRoles = options.workerAll ? [] : ['planner', 'supervisor'];
   const workerRoles = options.workerAll
     ? ROLES.filter(role => role !== 'embedding')
-    : ['coding', 'executor', 'vision'];
+    : ['coding', 'coder', 'vision'];
   const roles = {};
   for (const role of ROLES) {
     if (role === 'embedding' || !claudeRoles.includes(role)) continue;
@@ -182,11 +183,35 @@ async function createHost(options) {
       roles[role] = { profileId: 'headless-worker', model: worker.model, effort: options.workerEffort || '' };
     }
   }
+  // The embedding role is separate from the chat workers by design: graph memory
+  // needs a real embeddings endpoint. Bind it from an explicit URL/model or the
+  // environment so a headless run gets hybrid recall instead of keyword-only.
+  const embeddingUrl = options.embeddingUrl || process.env.MFAGENT_EMBEDDING_URL;
+  const embeddingModel = options.embeddingModel || process.env.MFAGENT_EMBEDDING_MODEL;
+  const embeddingKey = options.embeddingApiKey || process.env.MFAGENT_EMBEDDING_API_KEY || '';
+  if (embeddingUrl && embeddingModel) {
+    const baseURL = validateWorkerUrl(embeddingUrl);
+    profiles.push({ id: 'headless-embedding', name: 'Embeddings', providerId: 'openai-compatible', baseURL });
+    roles.embedding = { profileId: 'headless-embedding', model: embeddingModel, effort: '' };
+  }
+  // The Tester role is split from the Coder on purpose: bind it to its own
+  // endpoint so verification can run on a different model (NVIDIA Nemotron by
+  // default). Falls back to the worker binding when unset.
+  const testerUrl = options.testerUrl || process.env.MFAGENT_TESTER_URL;
+  const testerModel = options.testerModel || process.env.MFAGENT_TESTER_MODEL;
+  const testerKey = options.testerApiKey || process.env.MFAGENT_TESTER_API_KEY || process.env.NVIDIA_API_KEY || '';
+  if (testerUrl && testerModel) {
+    const baseURL = validateWorkerUrl(testerUrl);
+    profiles.push({ id: 'headless-tester', name: 'Tester', providerId: 'openai-compatible', baseURL });
+    roles.tester = { profileId: 'headless-tester', model: testerModel, effort: options.testerEffort || '' };
+  }
   await store.update({ profiles, roles, browser: { headless: true }, languages: { auto: false, list: [] } });
   if (worker) await store.setApiKey('headless-worker', worker.apiKey);
+  if (testerUrl && testerModel) await store.setApiKey('headless-tester', testerKey);
+  if (embeddingUrl && embeddingModel) await store.setApiKey('headless-embedding', embeddingKey);
   if (options.provider) {
-    // Bind planner/supervisor/executor to a real HTTP provider, mirroring the
-    // roles the extension has stored. Configured before initRouter so the
+    // Bind planner/supervisor/coder/tester to a real HTTP provider, mirroring
+    // the roles the extension has stored. Configured before initRouter so the
     // router reads these bindings, not the default claude-cli profile.
     const p = options.provider;
     const id = p.id || 'headless-provider';
@@ -198,7 +223,8 @@ async function createHost(options) {
         coding:     { profileId: id, model: p.codingModel || p.executorModel || p.plannerModel, effort: p.effort || '' },
         planner:    { profileId: id, model: p.plannerModel, effort: p.effort || '' },
         supervisor: { profileId: id, model: p.supervisorModel || p.plannerModel, effort: p.effort || '' },
-        executor:   { profileId: id, model: p.executorModel || p.plannerModel, effort: p.effort || '' },
+        coder:      { profileId: id, model: p.coderModel || p.executorModel || p.plannerModel, effort: p.effort || '' },
+        tester:     { profileId: id, model: p.testerModel || p.executorModel || p.plannerModel, effort: p.effort || '' },
       },
     });
     await store.setApiKey(id, p.apiKey || '');

@@ -2,8 +2,8 @@ import * as cp from 'child_process';
 import * as readline from 'readline';
 import * as vscode from 'vscode';
 import { resolveCoreBinary, resolveMcpBinary, workspaceRoot } from '../detect';
-import { ResolvedRole } from '../providers/store';
-import { killTree, Role, RunOptions, TurnResult } from './agents';
+import { ResolvedRole, Role as ProviderRole } from '../providers/store';
+import { killTree, RunOptions, TurnResult } from './agents';
 import { Usage } from './db';
 import { getActiveQueue } from './registry';
 import { loadTestingEnvironment, testingProcessEnvironment, testingPrompt, redactTestingSecrets } from './testingEnvironment';
@@ -48,7 +48,7 @@ const ROOT_CLI_TOOLS = [
 // local permission settings, MCP servers, or delegation to another agent.
 const PLANNER_CLI_TOOLS = ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch'];
 
-function systemSuffixFor(role: Role, opts: RunOptions): string {
+function systemSuffixFor(role: ProviderRole, opts: RunOptions): string {
   if (opts.allowTestEdits) {
     return `You are a dedicated test-repair worker for an autonomous task queue. The affected
 executor has been stopped. You are not the supervisor: you do not decide task outcomes, approve
@@ -63,55 +63,32 @@ required assertions; never weaken a valid test to hide an application defect. Ru
 the repair and report changed files, observed results, and remaining gaps. Fresh independent verification must follow; you cannot approve your own repair.`;
   }
   if (role === 'supervisor') {
-    return `You are the engineering supervisor for an autonomous task queue. Judge the current
-task against its assigned requirements and select the next action supported by evidence.
-The executor implements, an independent verifier establishes evidence, and the extension
-commits queue transitions and controls worker lifecycles.
+    return `You are the supervisor and orchestrator of an autonomous task queue. A planner turned the
+owner's original request into an ordered task list; for each task a coder agent implements it and a
+separate tester agent verifies it with real checks. You direct them; the extension commits queue
+transitions and controls worker lifecycles.
 
-Start with the supplied task journal, current snapshot, executor handoff, and verification
-report. Separate observations from claims. For each material requirement, establish what
-was checked, against which implementation and environment, and what the result proves.
-Your own inspection does not replace independent verification. Approve only when current
-evidence covers the assigned requirements without unresolved contradictions or missing checks.
+Start with the supplied task journal, current snapshot, coder handoff, and tester report. Separate
+observations from claims: a completion claim, a file read, or a tool that merely ran proves nothing
+about behavior. Your own inspection does not replace independent verification by the tester.
 
-Your authority is limited to the task list: edit text in task fields, split tasks, and delete
-tasks. You never edit workspace files; the extension commits the task-field edits, splits and
-deletions you return. A split must delete the original task it replaces; delete another task
-only when it is misaligned with the original request. Test repair is a separate worker's job:
-request it through the protocol's repair action, and do not attempt the test edit yourself.
+Every turn, compare the current task, the coder's work, and the remaining sequence with the original
+request. Correct drift through the rewrite or split action the protocol offers; a split replaces the
+original task. While the coder runs, let productive work continue, steer it with concrete guidance, or
+stop and correct it. After a failed test, send a concrete defect back to the coder, rewrite an unclear
+contract, split oversized work, re-run the tester when its own invocation failed, or request the
+separate test-repair worker for a defective test. Attempt counts and elapsed time are not evidence.
 
-Distinguish application defects from failed invocations, harness defects, inaccessible
-environments, and incomplete evidence. Direct recovery at the observed cause. Continue
-productive work; obtain missing verification; correct a demonstrated implementation defect;
-request a dedicated test-repair worker; or decompose distinct remaining outcomes. Use only
-the actions allowed by the current request. Preserve completed work, dependencies, and
-required acceptance checks. Unfinished siblings are not defects in a committed child task.
-Do not rewrite that child's acceptance contract or treat its PASS as completion of its parent.
-
-On every turn, before judging evidence, re-read the original user request and compare each
-task description and the work it produced with that request and the task's place in the
-sequence. The contract is misaligned when the executor is doing work the original request did
-not ask for, when the description has been narrowed or expanded away from the requirement it
-exists to cover, or when the order, dependencies, or duplication no longer match the plan.
-Correct the affected descriptions through the task-edit, rewrite, split, or delete action this
-protocol allows; the extension commits them. Do this even when a report otherwise passes, and
-preserve a contract the protocol marks as fixed.
-
-For repeated failure, identify a specific diagnostic, changed strategy, or prerequisite.
-Elapsed time and attempt counts do not establish correctness. Return exactly the requested
-schema and action vocabulary, whether this turn requests a review, plan, task-edit proposal,
-or repair handoff. Tie the decision to its requirement, decisive evidence, and
-next action. A proposal is not an applied transition. Do not write queue storage directly.
-
-This is an inspection-only supervisor turn for product files. Use available inspection tools
-to resolve a specific uncertainty that could change the decision. Do not edit source, tests,
-project instructions, or the queue database; task descriptions are corrected through the
-decision you return. Test changes require a separate authorized repair worker.`;
+Return exactly the requested schema and action vocabulary, tied to the requirement, the decisive
+evidence, and the next action. A proposal is not an applied transition.
+This is an inspection-only supervisor turn: do not edit source, tests, project instructions, or the
+queue database.`;
   }
-  if (role === 'executor') {
-    if (opts.verificationOnly) {
-      return 'You are an independent verification worker. Inspect and run checks without editing source, tests, or configuration. Return the requested verification schema.';
-    }
+  if (role === 'tester' || opts.verificationOnly) {
+    return 'You are the independent tester. Verify the task by running checks yourself — tests, builds, a served page ' +
+      'and the browser tools — without editing source, tests, or configuration. Return the requested verification schema.';
+  }
+  if (role === 'coder') {
     return 'You are the implementation executor. Complete the assigned task and its checks. ' +
       'You may update source, existing tests, and configuration within its scope. Preserve required assertions and unrelated edits. ' +
       'Do not rewrite task-list entries, owner instructions, or acceptance criteria. Return the requested completion JSON.';
@@ -148,7 +125,7 @@ export function testClaudeCliBinary(cliPath?: string): Promise<{ ok: boolean; me
 
 export async function runClaudeCliTurn(
   output: vscode.OutputChannel,
-  role: Role,
+  role: ProviderRole,
   resolved: ResolvedRole,
   prompt: string,
   opts: RunOptions,

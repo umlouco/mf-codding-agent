@@ -9,7 +9,8 @@ const { createHost } = require('./headless-host.cjs');
 test('scope discovery failures recover without a cached-error claim loop', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mf-scope-retry-'));
   fs.writeFileSync(path.join(root, 'source.md'), 'The supplied source sentence.');
-  const host = await createHost({ workspace: root, log() {} });
+  // Discovery is exercised on a tiny fixture, so the small-workspace shortcut is off.
+  const host = await createHost({ workspace: root, log() {}, settings: { 'queue.scopeDiscoveryMinFiles': 0 } });
   const { TaskQueue } = host.load('src/queue/db.ts');
   const { Orchestrator } = host.load('src/queue/orchestrator.ts');
   const { indexRepository } = host.load('src/queue/workInventory.ts');
@@ -117,7 +118,9 @@ test('scope discovery failures recover without a cached-error claim loop', async
         await runner.pump();
         assert.equal(discoveries, 2);
         assert.equal(executions, 1);
-        assert.equal(queue.get(task.id).status, 'VERIFIED');
+        // Admitted execution completed; the task now waits for the tester.
+        assert.equal(queue.get(task.id).status, 'VERIFYING');
+        assert.equal(queue.get(task.id).activityPhase, 'awaiting_tester');
         assert.equal(queue.get(task.id).attempts, 2);
         assert.equal(readScopeRetry(queue, task), undefined, 'admission clears old retry history');
       } finally { runner.dispose(); queue.close(); }

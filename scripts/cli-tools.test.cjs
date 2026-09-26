@@ -47,12 +47,12 @@ for (const runtime of [
   { platform: 'win32', getuid: undefined, geteuid: undefined },
 ]) {
   for (const [role, opts] of [
-    ['planner', {}], ['supervisor', {}], ['executor', {}],
+    ['planner', {}], ['supervisor', {}], ['coder', {}],
     ['supervisor', { allowTestEdits: true }],
     ['planner', { formatOnly: true }],
     ['supervisor', { formatOnly: true }],
-    ['executor', { formatOnly: true, verificationOnly: true }],
-    ['executor', { verificationOnly: true }],
+    ['tester', { formatOnly: true, verificationOnly: true }],
+    ['tester', { verificationOnly: true }],
   ]) {
     const root = runtime.getuid?.() === 0 || runtime.geteuid?.() === 0;
     test(`${role} starts with ${JSON.stringify(opts)} on ${runtime.platform}, uid=${runtime.getuid?.()}, euid=${runtime.geteuid?.()}`, async () => {
@@ -107,7 +107,7 @@ for (const runtime of [
   }
 }
 
-for (const role of ['supervisor', 'executor', 'planner']) {
+for (const role of ['supervisor', 'coder', 'planner']) {
   test(`${role} CLI turns retain role-appropriate tools and configured controls`, async () => {
     let call;
     const cli = loadCli((bin, args, options) => {
@@ -162,7 +162,7 @@ for (const role of ['supervisor', 'executor', 'planner']) {
       assert.match(suffix, /supplied task journal/);
       assert.match(suffix, /inspection-only supervisor turn/);
       assert.match(suffix, /does not replace independent verification/);
-    } else if (role === 'executor') {
+    } else if (role === 'coder') {
       assert.match(suffix, /implementation executor/);
       assert.match(suffix, /may update source, existing tests, and configuration/);
       assert.doesNotMatch(suffix, /Only the supervisor may.*existing tests/);
@@ -234,7 +234,7 @@ test('CLI tool evidence retains streamed arguments and distinguishes failed resu
     });
     return proc;
   });
-  await cli.runClaudeCliTurn({ appendLine() {} }, 'executor', { model: 'configured', profile: { extra: {} } },
+  await cli.runClaudeCliTurn({ appendLine() {} }, 'coder', { model: 'configured', profile: { extra: {} } },
     'Run verification.', { onEvent: (method, params) => events.push({ method, ...params }) });
   assert.equal(events.find(e => e.id === 'shell-1' && e.input?.command).input.command, 'go test ./...');
   assert.equal(events.find(e => e.id === 'shell-1' && e.output).status, 'error');
@@ -256,7 +256,7 @@ test(`CLI turns retain testing tools, private credentials and execution hook for
   '../detect':{workspaceRoot:()=> 'workspace',resolveMcpBinary:()=> 'C:/tool folder/mfagent-mcp.exe',resolveCoreBinary:()=>({path:"C:/tool's folder/mfcore.exe"})},
   './testingEnvironment':{loadTestingEnvironment:async()=>testing,testingProcessEnvironment:()=>({MFAGENT_TEST_URL:testing.url,MFAGENT_CREDENTIAL_PASSWORD:testing.credentials.password}),testingPrompt:text=>text,redactTestingSecrets:text=>text},
  }, { getuid: () => uid, geteuid: () => uid });
- await cli.runClaudeCliTurn({appendLine(){}},'executor',{model:'configured',profile:{extra:{}}},'Test the app.',{});
+ await cli.runClaudeCliTurn({appendLine(){}},'coder',{model:'configured',profile:{extra:{}}},'Test the app.',{});
  const args=invocation.args;
  const mcp=JSON.parse(args[args.indexOf('--mcp-config')+1]);assert.equal(mcp.mcpServers.mfagent.command,'C:/tool folder/mfagent-mcp.exe');
  if(uid===0) assert.ok(args[args.indexOf('--allowedTools')+1].split(',').includes('mcp__mfagent__*'));

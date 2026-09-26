@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import { createHash } from 'crypto';
-import { SupervisorDecision } from './agents';
 import { NewTask, QueueStats, Task, TaskQueue } from './db';
 import { LiveLog } from './liveLog';
 import { ProgressDecision } from './monitor';
@@ -137,14 +136,6 @@ export function stopDetail(text: string): string {
 /** Legacy guard text, retained to recognize evidence from older installed cores. */
 export const TEST_OWNERSHIP_STOP = /queue ownership:\s*the supervisor (?:must rewrite existing test|owns test rewrites)/i;
 
-/**
- * Identifies a current-attempt stop from the retired source/test ownership split.
- * ownershipRecovery supplies a bounded migration retry without discarding evidence.
- */
-export function testOwnershipStop(task: Task): boolean {
-  return task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (supervisor_repair_required)`) &&
-    TEST_OWNERSHIP_STOP.test(task.output);
-}
 export abstract class OrchestratorState {
 
   protected timer: NodeJS.Timeout | undefined;
@@ -226,7 +217,6 @@ export abstract class OrchestratorState {
   protected abstract abandonReview(): void;
   protected abstract abandonExecution(): void;
   protected abstract sweepSilentWorkers(): void;
-  protected abstract get reviewIntervalMs(): number;
   protected abstract shouldReview(task: Task, latestEventId: number): boolean;
   protected abstract correctTestingTarget(task: Task): boolean;
   protected abstract repairTests(task: Task, reason: string): Promise<void>;
@@ -252,13 +242,9 @@ export abstract class OrchestratorState {
   protected abstract stopForDecision(task: Task, patch: Partial<Task>): boolean;
   protected abstract observerEvents(taskId: number, actor: string, live: LiveLog, accepts?: () => boolean): (method: string, params: any) => void;
   protected abstract streamJournal(taskId: number, actor: 'executor' | 'validator', accepts?: () => boolean): { flush: () => void; onEvent: (method: string, params: any) => void; live: LiveLog };
-  protected abstract verifyWithExecutor(task: Task, review: Review): Promise<void>;
-  protected abstract startIndependentVerification(task: Task): Promise<void>;
+  protected abstract verifyWithExecutor(task: Task, review?: Review): Promise<void>;
   protected abstract currentHostVerification(task: Task): boolean;
   protected abstract wakeAfterHandoff(): void;
-  protected abstract supervise(task: Task): Promise<void>;
-  protected abstract rewrites(task: Task): number;
-  protected abstract applyTaskEdits(decision: SupervisorDecision, currentSeq?: number): void;
   protected abstract pump(): Promise<void>;
   protected abstract runExpansion(task: Task, attempt: number, gen: number, current: () => boolean): Promise<void>;
   protected abstract resplitPhaseRegion(

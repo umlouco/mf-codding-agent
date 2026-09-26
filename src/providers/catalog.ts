@@ -15,11 +15,16 @@
 export type ProviderKind = 'anthropic' | 'openai-compatible' | 'claude-cli' | 'vscode-lm';
 
 /**
- * The six things a profile can be bound to. Lives here rather than in
- * `store.ts` because a `ProviderDef` needs to say which of them it may serve
+ * The roles a profile can be bound to. Lives here rather than in `store.ts`
+ * because a `ProviderDef` needs to say which of them it may serve
  * (`rolesAllowed`) — and `store.ts` already imports from this module, so the
  * dependency can only run one way. `store.ts` re-exports both names so every
  * existing `import { Role } from '../providers/store'` keeps working.
+ *
+ * The queue's implementation agent is split in two so each half can run on a
+ * different model: `coder` writes the implementation, `tester` runs and judges
+ * the checks. They are separate provider bindings, but both drive the core's
+ * `executor`/`validator` roles — the core has no notion of the split.
  */
 export const ROLES = [
   'coding',
@@ -27,7 +32,8 @@ export const ROLES = [
   'embedding',
   'planner',
   'supervisor',
-  'executor',
+  'coder',
+  'tester',
 ] as const;
 
 export type Role = (typeof ROLES)[number];
@@ -200,6 +206,28 @@ export const PROVIDERS: ProviderDef[] = [
     docsURL: 'https://platform.deepseek.com/api_keys',
     notes: 'DeepSeek V4.1 Flash uses model ID deepseek-flash and supports image input. ' +
       'Live discovery retains other available models; existing selections are not changed.',
+  },
+  {
+    id: 'nvidia',
+    label: 'NVIDIA NIM',
+    kind: 'openai-compatible',
+    group: 'Hosted',
+    defaultBaseURL: 'https://integrate.api.nvidia.com/v1',
+    baseURLEditable: true,
+    apiKey: 'required',
+    apiKeyEnv: ['NVIDIA_API_KEY', 'NGC_API_KEY'],
+    listStyle: 'openai',
+    staticModels: [
+      'nvidia/nemotron-3-super-120b-a12b',
+      'nvidia/nemotron-nano-3-30b-a3b',
+      'nvidia/nemotron-3-ultra-550b-a55b',
+      'nvidia/llama-3.1-nemotron-70b-instruct',
+    ],
+    serves: { chat: true, vision: false, embedding: true },
+    docsURL: 'https://build.nvidia.com/explore/discover',
+    notes:
+      'NVIDIA NIM (build.nvidia.com). The Nemotron family is the usual choice; it suits the ' +
+      'Tester role well. Uses the OpenAI-compatible endpoint.',
   },
   {
     id: 'mistral',
@@ -379,10 +407,6 @@ export const PROVIDERS: ProviderDef[] = [
 ];
 
 const BY_ID = new Map(PROVIDERS.map((p) => [p.id, p]));
-
-export function getProvider(id: string): ProviderDef | undefined {
-  return BY_ID.get(id);
-}
 
 /**
  * Resolves a provider by id, falling back to the generic OpenAI-compatible

@@ -67,16 +67,11 @@ type Session struct {
 
 func New(cfg *config.Config, p llm.Provider, r *tools.Registry, env *tools.Env, emit Emitter, system string) *Agent {
 	env.QueueRole = cfg.QueueRole
+	env.InspectOnly = cfg.InspectOnly
 	return &Agent{
 		cfg: cfg, provider: p, registry: r, env: env, emit: emit,
 		sessions: map[string]*Session{}, system: system,
 	}
-}
-
-func (a *Agent) SetSystem(s string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.system = s
 }
 
 func (a *Agent) Session(id string) *Session {

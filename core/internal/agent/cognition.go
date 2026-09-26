@@ -60,6 +60,14 @@ func (a *Agent) InvokeDirectTool(ctx context.Context, call llm.Block, tool *tool
 func (a *Agent) executeTool(ctx context.Context, sessionID string, call llm.Block, tool *tools.Tool, mutating bool) tools.Result {
 	recorded := call
 	recorded.Input = a.env.RedactTestingInput(call.Input)
+	if detail, bad := llm.InvalidArguments(call.Input); bad {
+		ticket := a.beginCognition(ctx, sessionID, recorded, false)
+		result := tools.Errf("the arguments for %s were not valid JSON (%s), so the tool did not run. "+
+			"This usually means a very large argument was cut off. Resend the call with complete JSON; "+
+			"split large file contents or long batches across several smaller calls.", call.Name, detail)
+		a.finishCognition(ctx, sessionID, ticket, result)
+		return result
+	}
 	if err := a.env.CheckQueueOwnership(call.Name, call.Input, mutating); err != nil {
 		ticket := a.beginCognition(ctx, sessionID, recorded, false)
 		result := tools.Errf("%v", err)

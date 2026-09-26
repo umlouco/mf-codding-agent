@@ -53,8 +53,6 @@ export function providerConfigurationError(message: string): boolean {
   return /no supported provider is configured for the .* role|select a provider for this role|http 401\b|unauthori[sz]ed|invalid api key|no cookie auth credentials/i
     .test(message);
 }
-const contract = (task: Task) => digest(JSON.stringify([task.description,
-  task.solutionVerifyPrompt]));
 const fresh = (): RecoveryState => ({ version: 1, cursor: 0, revision: 0, seen: [], repeats: 0,
   recoveries: 0, unchanged: 0, checkpoint: 0, failures: {} });
 
@@ -168,13 +166,6 @@ export function recoveryFailure(queue: TaskQueue, task: Task, lane: string): str
 export function recoverySucceeded(queue: TaskQueue, task: Task, lane: string): void {
   const state = recoveryState(queue, task);
   delete state.failures[lane];
-  saveRecovery(queue, task, state);
-}
-
-export function blockRecovery(queue: TaskQueue, task: Task, reason: string): void {
-  const state = recoveryState(queue, task);
-  state.blocked = reason;
-  state.blockedContract = contract(task);
   saveRecovery(queue, task, state);
 }
 

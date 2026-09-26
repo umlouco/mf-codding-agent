@@ -2,12 +2,11 @@ import type { Task } from './db';
 import type { SupervisorDecision } from './agents';
 import type { Review } from './orchestratorState';
 import { OrchestratorRecovery } from './orchestratorRecovery';
-import { bootstrapTddProblem, decideFailureDecomposition } from './failureDecomposition';
+import { decideFailureDecomposition } from './failureDecomposition';
 import { LiveLog } from './liveLog';
 import { completeRecoveryJob, scheduleRecoveryJob } from './recoverySchedule';
 import { decisionEvidence, providerUnavailable } from './recovery';
 import { plannerIdentity } from './agents';
-import { requiresPlaywright } from './playwrightPolicy';
 import { admitDecomposition, decompositionAncestry, decompositionDigest, decompositionKey,
   decompositionRetryRevision, decompositionWorkspaceRevision, deferDecomposition, readDecomposition,
   requiresDecomposition, saveDecomposition, scheduleDecomposition, verificationStallStreak } from './recoveryDecomposition';
@@ -47,14 +46,6 @@ export function decompositionPlannerIdentity(): string {
 /** A rejected/exhausted task has only one exit: commit its complete replacement and retire its row. */
 export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
   protected abstract applyVerdictSplit(task: Task, decision: SupervisorDecision, current: () => boolean): boolean;
-
-  protected requireBootstrapRepair(task: Task): boolean {
-    if (task.seq !== 1 || task.kind === 'phase' || !requiresPlaywright(this.queue)) return false;
-    const problem = bootstrapTddProblem(task.description);
-    if (!problem) return false;
-    this.requestFailureDecomposition(task, problem);
-    return true;
-  }
 
   protected requestFailureDecomposition(snapshot: Task, reason: string): void {
     const task = this.queue.get(snapshot.id);
@@ -236,7 +227,7 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     try {
       const decision = await decideFailureDecomposition(this.context, this.output, task, {
         goal: this.queue.getMeta('goal'),
-        requireRunnableSuite: task.seq === 1 && requiresPlaywright(this.queue),
+        requireRunnableSuite: task.seq === 1 && !!this.queue.testingUrl && this.queue.testingCredentialNames.length > 0,
         ownerInstructions: this.queue.contextInstructions + '\n' + this.queue.testingContext + this.queue.instructions,
         evidence: JSON.stringify({ reason: job.reason, errorLog: task.errorLog, report: task.validationReport.slice(0, 16000),
           events: this.queue.events(task.id, 16, true).map(event => ({ actor: event.actor, kind: event.kind, message: event.message.slice(0, 1500) })),

@@ -1,7 +1,6 @@
 package cognition
 
 import (
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -139,22 +138,6 @@ func Apply(s *State, e Event) error {
 	}
 	s.Seq, s.Epoch = e.Seq, e.Epoch
 	return nil
-}
-
-func Replay(events []Event) (State, error) {
-	s := NewState()
-	for _, e := range events {
-		if err := Apply(&s, e); err != nil {
-			return State{}, err
-		}
-		if e.StateHash != "" {
-			data, _ := json.Marshal(s)
-			if digest(string(data)) != e.StateHash {
-				return State{}, fmt.Errorf("replay state hash mismatch at %d", e.Seq)
-			}
-		}
-	}
-	return s, nil
 }
 
 func unresolved(v Evidence) bool { return v.IsError || v.Unknown || v.FailureSeq > v.RecoverySeq }

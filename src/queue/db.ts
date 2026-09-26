@@ -3,7 +3,6 @@ import * as path from 'path';
 import { openDriver } from './dbDriver';
 import { QueuePlans } from './dbPlans';
 import { COLUMNS, Task } from './dbModel';
-import { parseCompletionClaim } from './validation';
 import { completeRecoveryJob } from './recoverySchedule';
 import { deferScopeRetry, scopeRetryReady } from './scopeRetry';
 export * from './dbModel';
@@ -109,9 +108,6 @@ export class TaskQueue extends QueuePlans {
       .get()?.id ?? null;
   }
 
-  /** Legacy compatibility; failed attempts are represented as decomposition work. */
-  anyFailed(): boolean { return false; }
-
   /** Only completed work may let the run finish. */
   isComplete(): boolean {
     const row = this.db.prepare(`SELECT COUNT(*) AS n FROM tasks
@@ -136,8 +132,8 @@ export class TaskQueue extends QueuePlans {
   /**
    * Recovers tasks orphaned by a crashed worker or a window reload. Anything
    * still EXECUTING at startup has no live process behind it, so it goes back
-   * to PENDING and the keep-alive supervisor runs it again. Nothing is sent to
-   * a review lane: there is no review lane any more — see drainVerification.
+   * to PENDING and the coder runs it again. A task already VERIFYING is left
+   * alone: the supervisor cycle runs its tester or decides on its report.
    *
    * Attempt counts are retained as history, never used to skip unfinished work.
    * A phase (see TaskKind) always goes back in the queue: it carries no result
@@ -162,41 +158,6 @@ export class TaskQueue extends QueuePlans {
     return stale.length;
   }
 
-  /** Resume legacy review work unless the executor explicitly reported completion. */
-  drainVerification(): number {
-    const rows: Task[] = this.db
-      .prepare(`SELECT ${COLUMNS} FROM tasks WHERE status = 'VERIFYING' ORDER BY seq ASC`)
-      .all();
-    let settled = 0;
-    for (const t of rows) {
-      // A row awaiting a supervisor test repair is not abandoned legacy state:
-      // the repair turn runs in the same tick, after this drain. Settling it
-      // here would accept the executor result that triggered the ownership stop
-      // and skip the rewrite the row is waiting for.
-      if (t.supervisorFeedback.startsWith('[SUPERVISOR_TEST_REPAIR]')) {
-        continue;
-      }
-      settled++;
-      if (t.kind === 'task' && !t.activityPhase.startsWith('decomposition_') &&
-          parseCompletionClaim(t.output).status === 'READY_FOR_VALIDATION') {
-        this.update(t.id, { status: 'VERIFIED', finishedAt: Date.now(), activityPhase: 'done' });
-        this.log(t.id, 'system', 'drained', 'executor reported completion; verification removed');
-      } else {
-        this.update(t.id, { status: 'PENDING', finishedAt: null, activityPhase: 'executor_recovery' });
-        this.log(t.id, 'system', 'recovered', 'Unfinished legacy work returned to the executor.');
-      }
-      completeRecoveryJob(this, t);
-    }
-    return settled;
-  }
-
-  /** Compatibility hook for callers from older builds; never requeues a failed parent. */
-  reviveFailed(): number {
-    const result = this.db.prepare(`UPDATE tasks SET status = 'VERIFYING',
-      activity_phase = 'decomposition_required', finished_at = NULL WHERE status = 'FAILED'`).run();
-    return result.changes;
-  }
-
   /** Resets runnable work; required decomposition retains its complete identity/evidence. */
   resetAll(): void {
     this.tx(() => {
@@ -214,22 +175,6 @@ export class TaskQueue extends QueuePlans {
       this.db.exec("DELETE FROM queue_meta WHERE key GLOB 'scopeRetry:v1:*'");
       this.setMeta('runState', 'IDLE');
       this.log(null, 'system', 'reset', 'runnable tasks returned to PENDING; required decomposition retained');
-    });
-  }
-
-  /** Resets this task and every task after it — the supervisor's rollback. */
-  resetFrom(seq: number, feedback: string): number {
-    return this.tx(() => {
-      const info = this.db
-        .prepare(
-          `UPDATE tasks SET status = 'PENDING', attempts = 0, output = '', validation_report = '',
-             started_at = NULL, finished_at = NULL,
-             supervisor_feedback = ?, updated_at = ?
-           WHERE seq >= ? AND activity_phase NOT GLOB 'decomposition_*'`,
-        )
-        .run(feedback, Date.now(), seq);
-      this.log(null, 'supervisor', 'reset-from', `seq >= ${seq}: ${feedback}`);
-      return info.changes;
     });
   }
 

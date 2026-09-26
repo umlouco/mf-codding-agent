@@ -1,4 +1,5 @@
 import { Role, RoleConfig, RunOptions, TurnResult, AgentRunError, NO_USAGE } from './agentTypes';
+import type { Role as ProviderRole } from '../providers/store';
 import { getStore } from '../providers/instance';
 import { getRouter } from '../llm/router';
 import { CoreConfig, CoreClient } from '../core';
@@ -11,6 +12,7 @@ import { getBridge } from '../mcpBridge';
 import { Usage } from './db';
 import { clip } from './agentHistory';
 import { planningCapabilities } from './planningCapabilities';
+import { getActiveQueue } from './registry';
 
 /** Effective planner configuration, excluding secrets, for durable recovery identity. */
 export function plannerIdentity(): unknown[] {
@@ -31,7 +33,7 @@ export function plannerIdentity(): unknown[] {
  * The store already knows how to fall back to the coding role, so this is a
  * thin adapter down to the fields the core needs.
  */
-export async function roleConfig(role: Role): Promise<RoleConfig> {
+export async function roleConfig(role: ProviderRole): Promise<RoleConfig> {
   const r = await getStore().resolve(role);
   // The router decides what the core actually dials: a role on one of the
   // editor's own models gets the loopback proxy, every other kind is what the
@@ -50,7 +52,8 @@ export async function roleConfig(role: Role): Promise<RoleConfig> {
  * Rewrites the core config so an ephemeral worker binds this role's model as
  * its coding provider — the core only ever drives one model per process.
  */
-export async function overridesFor(role: Role, maxIterations = 0, allowTestEdits = false, verificationOnly = false, providerRole: Role = role): Promise<Partial<CoreConfig>> {
+export async function overridesFor(role: Role, maxIterations = 0, allowTestEdits = false, verificationOnly = false,
+  providerRole: ProviderRole = (role === 'executor' ? 'coder' : role as ProviderRole)): Promise<Partial<CoreConfig>> {
   const rc = await roleConfig(providerRole);
   return {
     providers: [{
@@ -93,6 +96,12 @@ export function queueContextCeiling(): number {
 export function workerRounds(): number {
   const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.workerMaxRounds', 80);
   return Number.isFinite(configured) ? Math.max(4, Math.min(200, Math.floor(configured))) : 80;
+}
+
+/** Model calls one tester turn may make (the tester's budget, not a time limit). */
+export function testerRounds(): number {
+  const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.testerMaxRounds', 40);
+  return Number.isFinite(configured) ? Math.max(4, Math.min(200, Math.floor(configured))) : 40;
 }
 
 /** Base tool-calling rounds for one unattended executor turn. */
@@ -149,11 +158,15 @@ async function runTurn(
   // core is even spawned, means every caller downstream (orchestrator.ts,
   // monitor.ts, every prompt builder in this file) needs no changes: they
   // only ever see RunOptions in, TurnResult out.
-  const providerRole = opts.planningOnly ? 'planner' : role;
+  // The core role picks the prompt and tool ownership; the provider role picks
+  // the model. An executor turn runs on Coder, a verification turn on Tester,
+  // unless the caller named a provider role explicitly.
+  const providerRole: ProviderRole = opts.providerRole ?? (opts.planningOnly ? 'planner'
+    : role === 'executor' ? (opts.verificationOnly ? 'tester' : 'coder') : role as ProviderRole);
   const planning = opts.planningOnly || role === 'planner';
   const resolved = await getStore().resolve(providerRole);
   if (resolved.kind === 'openai-compatible' && resolved.baseURL === '' && !resolved.profile) {
-    throw new AgentRunError(`No supported provider is configured for the ${role} role. Select a provider for this role in MF Agent settings.`);
+    throw new AgentRunError(`No supported provider is configured for the ${providerRole} role. Select a provider for this role in MF Agent settings.`);
   }
   if (resolved.kind === 'claude-cli') {
     if (planning || (!opts.formatOnly && opts.skillTask)) {
@@ -197,6 +210,11 @@ async function runTurn(
     ? supervisorRounds() : opts.maxIterations ?? 0;
 
   client.onNotification((method, params) => {
+    // The core announces every model call as "round N…" before sending it;
+    // that is the unit the run's call budget is counted in.
+    if (method === 'agent/activity' && params?.phase === 'model_wait' && /^round \d+/.test(String(params?.detail ?? ''))) {
+      getActiveQueue()?.countModelCall();
+    }
     if (method === 'agent/activity' && onActivity) {
       onActivity({
         phase: String(params?.phase ?? ''),

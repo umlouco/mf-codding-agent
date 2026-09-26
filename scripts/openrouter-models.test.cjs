@@ -10,7 +10,7 @@ test('OpenRouter models come from the live catalog and list without a key', asyn
   const root = fs.mkdtempSync(path.join(scratch, 'openrouter-models-'));
   const host = await createHost({ workspace: root, log() {} });
   const { ModelRegistry } = host.load('src/providers/models.ts');
-  const { getProvider } = host.load('src/providers/catalog.ts');
+  const { providerOrFallback: getProvider } = host.load('src/providers/catalog.ts');
   const registry = new ModelRegistry(host.context, host.output);
   const originalFetch = global.fetch;
   try {

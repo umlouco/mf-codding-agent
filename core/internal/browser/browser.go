@@ -45,14 +45,6 @@ type Browser struct {
 	profileDir string
 }
 
-// Resolved reports which executable actually started, for status output. Empty
-// means chromedp found one on its own, or nothing has started yet.
-func (b *Browser) Resolved() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.resolved
-}
-
 func describePath(p string) string {
 	if p == "" {
 		return "chromedp's own search"

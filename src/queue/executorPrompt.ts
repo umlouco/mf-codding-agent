@@ -25,8 +25,11 @@ export function buildExecutorPrompt(task: Task, instructions: string, goal: stri
 - Follow owner TDD requirements: observe the relevant test fail, implement, then rerun it.
   You may update source, existing tests, and configuration within the assigned task.
   Correct demonstrated test defects without weakening required assertions or bypassing refusals.
-- Run the required checks yourself and inspect the final diff. A skipped check, tool error,
-  or empty test run is not a pass. No later verifier is assumed to finish your work.
+- Before reporting READY_FOR_VALIDATION, run focused development checks yourself: build,
+  the tests that belong to this task, and a quick smoke of the behavior. A skipped check,
+  tool error, or empty test run is not a pass. An independent tester then verifies the
+  acceptance criteria with its own tools, so do not build test infrastructure or extra
+  suites beyond what the task asks for; report and stop once the task's behavior works.
 - Use the supplied environment for relevant application checks; never substitute a demo.
   Do not expose credentials. Local unit/build checks do not require browser navigation
   unless an explicit owner requirement says otherwise.

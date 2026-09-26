@@ -507,8 +507,10 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request, sink func(Even
 			continue
 		}
 		args := strings.TrimSpace(c.Function.Arguments)
-		if args == "" || !json.Valid([]byte(args)) {
+		if args == "" {
 			args = "{}"
+		} else if !json.Valid([]byte(args)) {
+			args = InvalidArgumentsInput(args)
 		}
 		id := c.ID
 		if id == "" {

@@ -1,8 +1,5 @@
 import type { Driver } from './dbDriver';
 
-/** A failed attempt is unresolved work for the supervisor, never terminal work. */
-export const DECOMPOSITION_REQUIRED = 'decomposition_required';
-
 /**
  * Keep the invariant in SQLite so old workers, native MCP clients, stale results
  * and bulk resets cannot revive the same failed parent or silently accept it.

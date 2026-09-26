@@ -74,9 +74,7 @@ export class ScopeEvidence {
     return { paths: [...new Set(paths)], command: String(input?.command ?? input?.cmd ?? '').slice(0, 1200) };
   }
 
-  get revision(): number { return this.activityRevision; }
   get promptOverload(): string | undefined { return promptOverloadReason(this.focus); }
-  get breadthSignal(): boolean { return this.edits.size > 3 || this.reads.size >= 12; }
   snapshot() {
     return { completedTools: this.completed, distinctReadTargets: this.reads.size,
       distinctEditTargets: this.edits.size, countsAreLowerBounds: true, trackingCapped: this.capped,

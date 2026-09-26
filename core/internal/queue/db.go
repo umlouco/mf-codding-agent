@@ -49,9 +49,6 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
-// Path returns the filesystem path to the database file.
-func (d *DB) Path() string { return d.path }
-
 // ReplaceAll deletes every task row and inserts the given tasks in a single
 // transaction, resetting the autoincrement sequence. The caller supplies
 // title/description pairs; other columns use defaults.
@@ -136,19 +133,9 @@ func CreateTask(d *DB, title, description string, opts ...func(*NewTask)) (int64
 	return res.LastInsertId()
 }
 
-// WithSeq sets the task's execution order (1-based).
-func WithSeq(seq int) func(*NewTask) {
-	return func(nt *NewTask) { nt.Seq = seq }
-}
-
 // WithMaxAttempts sets how many times the task may be retried.
 func WithMaxAttempts(n int) func(*NewTask) {
 	return func(nt *NewTask) { nt.MaxAttempts = n }
-}
-
-// WithStatus sets the initial status (defaults to PENDING).
-func WithStatus(s TaskStatus) func(*NewTask) {
-	return func(nt *NewTask) { nt.Status = s }
 }
 
 // WithSolutionVerifyPrompt sets the solution verification prompt.

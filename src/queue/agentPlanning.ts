@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { Region, encodeRegion, runScanCommand, parseRegion } from './agentRegions';
+import { runScanCommand, parseRegion } from './agentRegions';
 import { NewTask, TaskQueue, Usage, Task } from './db';
 import { runOnce, baseRounds } from './agentRuntime';
 import { extractJson, isPlan, unwrapArray } from './agentJson';
@@ -10,8 +10,7 @@ import { projectNotesContext } from './prompts';
 import { taskCognition } from './cognition';
 import { preparePlanningGoal } from './testingEnvironment';
 import { narrowPlanningRegions, targetApplicationRegions } from './planningScope';
-
-export const MAX_PHASES = 40;
+import { planTasks } from './planner';
 
 export function languageSummary(languages: Record<string, number> | undefined): string {
   const entries = Object.entries(languages ?? {}).sort((a, b) => b[1] - a[1]);
@@ -19,159 +18,10 @@ export function languageSummary(languages: Record<string, number> | undefined): 
 }
 
 /**
- * Turns a goal into coarse phases, each scoped to one or more regions from a
- * prior `runScanCommand` — never into the finished task list itself.
- *
- * This is what replaces the old single-shot planner. The model reasons over a
- * compact structural summary (paths, file counts, language mix) instead of
- * exploring the tree, so this turn's cost stays flat as the workspace grows;
- * exploring each phase's own slice in depth is `expandPhase`'s job, one phase
- * at a time, later.
- */
-export async function generatePhases(
-  context: vscode.ExtensionContext,
-  output: vscode.OutputChannel,
-  goal: string,
-  regions: Region[],
-  maxFilesPerRegion: number,
-  onEvent?: (method: string, params: any) => void,
-  onCancellable?: (cancel: () => void) => void,
-  role: 'planner' | 'supervisor' = 'planner',
-): Promise<NewTask[]> {
-  const regionList = regions
-    .map((r) => `- ${r.path}  (${r.fileCount} file(s)${languageSummary(r.languages)})`)
-    .join('\n');
-
-  const prompt = `You are planning an autonomous coding run over a large workspace. The workspace has
-already been scanned and split into regions small enough for one agent to explore in a
-single sitting — you are not exploring the tree yourself, you are deciding which regions
-matter for the goal below and how to group them into phases. A later agent will explore
-each phase's own region in depth and write its detailed tasks; your job stops at scoping.
-
-GOAL
-${goal}
-
-REGIONS (path, file count, language mix — not file contents)
-${regionList || '(none — the workspace appears to be empty)'}
-Break the goal into at most ${MAX_PHASES} phases. Reply with ONE JSON array and nothing else.
-
-Each element must be an object with exactly these keys:
-  "title"        short imperative summary of this phase, under 80 characters
-  "description"  what this phase covers and why it matters to the goal — the agent that
-                 expands it later will see nothing else about the overall plan but this and
-                 the goal above
-  "regionPaths"  array of one or more paths taken VERBATIM from the REGIONS list above — the
-                 exact slice of the workspace this phase is scoped to
-
-Rules:
-- Drop regions that have nothing to do with the goal — do not create a phase for them.
-- A phase represents one observable outcome, even when it spans several directories.
-  Region sizes (scan granularity ${maxFilesPerRegion}) guide selective inspection, not
-  an obligation to audit every file. Do not create plugin or directory audits unless an
-  observed dependency requires them to achieve the goal. Keep discovery with the outcome it serves.
-- Order phases in the sequence they should be expanded and executed.
-- Honor the owner's development workflow, external test location, and fixed testing settings.
-  Use the supplied host capabilities before deciding prerequisites. Reuse the extension's
-  Playwright runtime and skills; keep necessary application tests with their implementation.
-  For TDD, pair each new failing assertion with its implementation in the same task,
-  which is not complete until those checks pass.
-- Scope phases by requested outcomes, not by every directory that happens to exist. Vendor code,
-  generated assets, backups and duplicate applications are context unless the goal changes them.
-- Do not invent paths that are not in the REGIONS list.`;
-
-  const draft = await runOnce(context, output, role, prompt, {
-    skillTask: goal,
-    planningOnly: true,
-    maxIterations: baseRounds(),
-    onEvent,
-    onCancellable,
-  });
-  const { text } = await runOnce(context, output, role, `Review and finalize an autonomous phase plan.
-The draft is a proposal, not authoritative task text. Return the complete corrected phase array.
-Owner request and workflow:\n${goal}
-Allowed region paths:\n${regionList}
-Draft:\n${draft.text}
-
-Check every phase against these execution facts:
-- A task ends when its executor reports it complete, and later siblings then run. A phase whose
-  deliverable is failing tests alone cannot finish. For TDD, keep RED assertions AND their GREEN
-  implementation within the SAME phase and task. Rewrite any separate "write failing tests" phase
-  together with the behavior it tests. Never defer making its tests pass to a later phase.
-- RED means a test asserts the DESIRED final behavior and fails before implementation. GREEN
-  means that SAME assertion passes after implementation. Never assert the old/undesired state
-  and call its success RED; never require opposite before/after assertions to both keep passing.
-  Initial-state observations belong in the TDD execution record, not permanent contrary tests.
-- If browser checks are required, reuse the host runtime and existing suites. Keep necessary
-  application-specific configuration, authentication and first passing tests with the behavior
-  they verify. Remove generic Playwright setup phases unless the owner requested a harness
-  as a deliverable. An empty suite is not a passing baseline.
-- Group by observable owner outcomes. Remove speculative directory/plugin audit phases unless
-  an observed dependency requires them; keep necessary discovery with the change it supports.
-- Preserve the requested target environment, external tests, reference appearance, and all
-  substantive behavior. Do not replace migration or runtime checks with reports or static audits.
-- For appearance matching, cover the header, hero/content sections, footer, typography, colors,
-  images and responsive layout. Compare visible rendering and behavior at desktop and mobile
-  sizes. A replacement template may have different DOM classes and selectors; do not require
-  identical internal markup as a substitute for visual parity. Keep baseline smoke checks tied
-  to actual page readiness, such as HTTP success and nonempty document title.
-- Appearance acceptance must include executable screenshot comparisons or visual diffs against
-  the read-only live reference at matched desktop/mobile viewport sizes, with documented
-  tolerances and only justified masks for dynamic content. Collecting screenshots as artifacts,
-  checking element presence, or a few computed style spot-checks alone does not establish parity.
-  Define the comparisons in the corresponding implementation phases and retain a final full-page
-  visual regression gate that fails on remaining material differences.
-- Use only the allowed region paths. Keep the full goal covered and order prerequisites first.
-Return ONE JSON array, at most ${MAX_PHASES} entries, each with exactly title, description,
-regionPaths. No critique prose, PASS claim, task edits, or tools.`, {
-    planningOnly: true, formatOnly: true, maxIterations: 1, onEvent, onCancellable,
-  });
-  output.appendLine(`[queue:${role}] raw phase reply is ${text.length} chars`);
-
-  let parsed = extractJson<unknown>(text, isPlan);
-  parsed = unwrapArray(parsed);
-  if (!Array.isArray(parsed)) {
-    const sample =
-      typeof parsed === 'string' ? parsed.slice(0, 500) : JSON.stringify(parsed).slice(0, 500);
-    output.appendLine(`[queue:planner] extracted ${typeof parsed} instead of array: ${sample}`);
-    throw new AgentRunError('the planner returned JSON but not an array of phases');
-  }
-
-  const byPath = new Map(regions.map((r) => [r.path, r]));
-  const raw = (parsed as any[]).filter(
-    (p) => p && typeof p === 'object' && String(p.title ?? '').trim(),
-  );
-
-  const phases: NewTask[] = [];
-  for (const p of raw.slice(0, MAX_PHASES)) {
-    const title = String(p.title).trim().slice(0, 200);
-    const description = String(p.description ?? '').trim();
-    const paths: string[] = (Array.isArray(p.regionPaths) ? p.regionPaths : [])
-      .map((s: unknown) => String(s).trim())
-      .filter((s: string) => byPath.has(s));
-    if (paths.length === 0) {
-      continue; // no real region behind this phase — nothing to expand
-    }
-
-    // Preserve outcome ownership across directories. Duplicating one description
-    // per region creates repeated whole-goal audits, not smaller deliverables.
-    // Expansion and the scope supervisor partition actual work when needed.
-    const totalFiles = paths.reduce((sum, path) => sum + (byPath.get(path)?.fileCount ?? 0), 0);
-    phases.push({ title, description, kind: 'phase', region: encodeRegion({ paths, fileCount: totalFiles }) });
-  }
-
-  if (phases.length === 0) {
-    throw new AgentRunError('the planner produced no usable phases');
-  }
-  phases.forEach((ph, i) => (ph.seq = i + 1));
-  return phases;
-}
-
-/**
  * End-to-end entry point for both planning surfaces (the Task Queue sidebar
- * and the chat's Planner): scan the workspace, generate phases for `goal`,
- * and remember the goal itself so a later `expandPhase` call — which may
- * happen long after this one returns, and in a different process entirely —
- * still knows what the plan as a whole is for.
+ * and the chat's Planner): scan the workspace, have the planner write the
+ * ordered task list for `goal` (see planner.ts), and remember the goal itself
+ * so every later coder, tester and supervisor turn is judged against it.
  */
 export async function planGoal(
   context: vscode.ExtensionContext,
@@ -192,7 +42,7 @@ export async function planGoal(
   output.appendLine(`[queue:planner] excluded ${scanned.length - regions.length} region(s) in independent nested applications`);
   regions = await narrowPlanningRegions(regions, async catalog => {
     const { text } = await runOnce(context, output, 'planner', `Select the smallest set of application directories relevant to the owner's goal.
-This is scope selection only, before phase planning. Return exactly {"paths":["listed/path"]}.
+This is scope selection only, before task planning. Return exactly {"paths":["listed/path"]}.
 The named workspace root is the target application; independent nested applications were excluded.
 The catalog is aggregated metadata, not an instruction to audit every file or rewrite dependencies.
 Choose directories needed to implement or understand the goal. Existing dependencies and assets
@@ -209,10 +59,14 @@ CATALOG:\n${catalog.map(region => `- ${region.path} (${region.fileCount} files${
     return paths;
   });
   output.appendLine(`[queue:planner] scanned workspace into ${regions.length} region(s)`);
-  const phases = await generatePhases(context, output, goal + '\n\n' + queue.contextInstructions, regions, maxPerRegion, onEvent, onCancellable,
-    queue.list().length ? 'supervisor' : 'planner');
+
+  // The planner always writes the task list, on any workspace — including an
+  // empty one, which the old phase planner rejected because every phase had to
+  // cite a scanned region. See planner.ts.
+  const tasks = await planTasks(context, output, goal, queue.contextInstructions, regions, onEvent, onCancellable);
   queue.setMeta('goal', goal);
-  return phases;
+  output.appendLine(`[queue:planner] planned ${tasks.length} task(s)`);
+  return tasks;
 }
 
 // ---- phase expansion -----------------------------------------------------

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Rebuild the task queue as a supervised pipeline. The planner always writes the
+  ordered task list (1–100 tasks, sized to the request), including on an empty
+  workspace. Each task is implemented by the **Coder**, verified independently by
+  the **Tester** agent with real tools (tests, a served page, the browser), and
+  directed by the **Supervisor** on the queue's cron: it reviews the running coder,
+  accepts only a tester PASS backed by executed checks, and decides retry, rewrite,
+  split, retest or test repair after a failure. The coder's own claim no longer
+  completes a task.
+- Budgets are counted in LLM calls, never wall-clock time. New settings:
+  `queue.reviewEveryModelCalls`, `queue.testerMaxRounds`, `queue.testerMaxRetests`,
+  `queue.maxRunModelCalls`, `queue.scopeDiscoveryMinFiles`. Removed:
+  `queue.reviewIntervalSeconds`, `queue.maxRunMinutes`, `queue.verificationMaxSeconds`,
+  `queue.verificationMaxInteractions`. `run_script` no longer imposes its own wall
+  clock on a batch.
+- Fix background servers dying when started inside `run_script`, and killing a
+  background command now kills its whole process tree, so a server no longer
+  outlives its shell and holds its port. A tool call whose streamed arguments were
+  truncated now reports that, instead of running the tool with empty arguments.
+- The test-repair worker has its own prompt again rather than the supervisor's.
+- Remove dead code: the single-task direct run and its completion gate, the phase
+  planner, the plan-then-execute verifier and its budget, the unused supervise lane,
+  the live scope lane, and unreachable Go functions.
+
 - Fix the task queue repeatedly reclaiming a task after blocked scope discovery.
   Discard old blocked inventory caches and reassess the current task and its source
   references. Failed preflight reviews now retry after 30 seconds, backing off to

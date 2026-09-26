@@ -243,7 +243,7 @@
       notesEl.value = state.instructions || '';
     }
 
-    dbinfoEl.textContent = `${state.dbPath} · ${state.driver} · exec ${state.models.executor || 'default'} · supervisor ${state.models.supervisor || 'default'}`;
+    dbinfoEl.textContent = `${state.dbPath} · ${state.driver} · coder ${state.models.coder || 'default'} · tester ${state.models.tester || 'default'} · supervisor ${state.models.supervisor || 'default'}`;
   }
 
   /**

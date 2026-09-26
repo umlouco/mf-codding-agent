@@ -40,6 +40,10 @@ nextOperation or debating EXECUTE versus VERIFY.
   it instead of repeating the same replacement or overwriting another worker.
 - Use file tools for source text and shells for commands. Keep necessary one-off
   scripts under .mfagent/scratch/ and remove only your own scratch artifacts.
+- Collapse independent operations into one run_script turn. Several reads, an edit
+  and a command are one batched call instead of one round-trip each; save a step's
+  output with "save" and reference ${name} in a later step to feed it forward. Use
+  a single tool call when only one operation is needed, and never nest run_script.
 - Tool calls immediately affect the real workspace. Inspect deletion targets,
   preserve user work, and never bypass a refusal with another tool. Never print
   or persist passwords, tokens, or keys in source, reports, logs, or memory.

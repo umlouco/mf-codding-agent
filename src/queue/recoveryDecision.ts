@@ -2,8 +2,7 @@ import type * as vscode from 'vscode';
 import type { NewTask, Task, Usage } from './db';
 import { extractJson, runOnce, RunOptions } from './agents';
 import { verdictReplacementTasks } from './scopeVerdict';
-import { VerificationSession } from './verificationPlanRunner';
-import { validateToolInput, VerificationCapability } from './verificationPlan';
+import { ToolCapability, ToolRegistry, validateToolInput } from './toolCapabilities';
 
 export interface RecoveryDecision {
   action: 'EXECUTE' | 'VERIFY' | 'SPLIT' | 'WAIT';
@@ -19,7 +18,7 @@ const object = (value: unknown): value is Record<string, any> =>
 const nonempty = (value: unknown): value is string => typeof value === 'string' && !!value.trim();
 
 /** No default retry, partial split, invented success, or queue-stop action. */
-export function parseRecoveryDecision(text: string, task: Task, capabilities?: VerificationCapability[]): RecoveryDecision {
+export function parseRecoveryDecision(text: string, task: Task, capabilities?: ToolCapability[]): RecoveryDecision {
   const value = extractJson<any>(text);
   if (!object(value) || !['EXECUTE', 'VERIFY', 'SPLIT', 'WAIT'].includes(value.action) ||
       !nonempty(value.reason) || !nonempty(value.guidance)) {
@@ -67,13 +66,13 @@ export async function decideRecovery(context: vscode.ExtensionContext, output: v
   task: Task, evidence: string, opts: RunOptions): Promise<{ decision: RecoveryDecision; usage: Usage }> {
   // Response-only turns have no callable tools. Supply the executor's real
   // registry as data rather than making the model guess names from prose.
-  const session = new VerificationSession(context, output, () => {}, opts.onActivity);
-  opts.onAbort?.(() => session.stop());
-  let capabilities: VerificationCapability[];
+  const registry = new ToolRegistry(context, output, opts.onActivity);
+  opts.onAbort?.(() => registry.stop());
+  let capabilities: ToolCapability[];
   try {
-    await session.start(context);
-    capabilities = session.capabilities;
-  } finally { session.stop(); }
+    await registry.start();
+    capabilities = registry.capabilities;
+  } finally { registry.stop(); }
   const result = await runOnce(context, output, 'supervisor', `An autonomous run needs a DIFFERENT recovery approach.
 The queue remains RUNNING. You cannot stop it, declare success, erase history, or weaken requirements.
 Diagnose captured failures rather than inventing a psychological explanation or repeating reassuring prose.

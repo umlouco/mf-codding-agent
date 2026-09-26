@@ -3,8 +3,7 @@ export { Role, RoleConfig, AgentRunError, ActivityRecord, TurnResult, ReviewOpti
 export { roleConfig, workerRounds, killTree, runOnce, plannerIdentity } from './agentRuntime';
 export { extractJson, unwrapArray } from './agentJson';
 export { Region, runScanCommand, RegionInfo, parseRegion, encodeRegion, withinRegion } from './agentRegions';
-export { generatePhases, planGoal, PhaseSplitRequest, PhaseExpansion, expandPhase } from './agentPlanning';
+export { planGoal, PhaseSplitRequest, PhaseExpansion, expandPhase } from './agentPlanning';
 export { TaskEditResult, editTasks, parseTaskEditResult } from './agentTaskEdits';
 export { ExecutionOutcome, coreHalted, executeTask } from './agentExecution';
-export { Verdict, attemptsExhausted, SupervisorDecision } from './agentReviewSupport';
-export { superviseTask } from './agentSupervisor';
+export { attemptsExhausted, SupervisorDecision } from './agentReviewSupport';

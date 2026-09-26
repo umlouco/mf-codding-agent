@@ -168,10 +168,6 @@ export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
   }
 
-  reveal(): void {
-    void vscode.commands.executeCommand(`${QueueViewProvider.viewType}.focus`);
-  }
-
   /** Entry point for the `Generate Task Queue` command palette action. */
   generateFromCommand(goal: string): Promise<void> {
     return this.generate(goal, false);
@@ -372,10 +368,6 @@ export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Dis
         case 'generateDocs':
           await vscode.commands.executeCommand('mfagent.generateDocumentation');
           break;
-
-        case 'showEvents':
-          this.post({ type: 'events', events: queue.events(Number(msg.id) || null, 60) });
-          break;
       }
     } catch (e: any) {
       this.output.appendLine(`[queue:ui] ${e?.message ?? e}`);
@@ -467,17 +459,19 @@ export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.modelsPending = true;
     try {
       const store = getStore();
-      const [planner, supervisor, executor] = await Promise.all([
+      const [planner, supervisor, coder, tester] = await Promise.all([
         store.resolve('planner'),
         store.resolve('supervisor'),
-        store.resolve('executor'),
+        store.resolve('coder'),
+        store.resolve('tester'),
       ]);
       this.post({
         type: 'models',
         models: {
           planner: planner.model,
           supervisor: supervisor.model,
-          executor: executor.model,
+          coder: coder.model,
+          tester: tester.model,
         },
       });
     } catch (error) {
@@ -486,7 +480,6 @@ export class QueueViewProvider implements vscode.WebviewViewProvider, vscode.Dis
       this.modelsPending = false;
     }
   }
-
 
 }
 

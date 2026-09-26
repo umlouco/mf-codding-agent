@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"context"
 	"fmt"
 	"net/http"
@@ -89,5 +90,35 @@ func TestOpenAIStreamKeepalivesDoNotHideModelOutput(t *testing.T) {
 	}
 	if turn.StopReason != "tool_use" || len(turn.ToolCalls()) != 1 {
 		t.Fatalf("tool call lost: %+v", turn)
+	}
+}
+
+// A truncated tool-call argument must reach the agent as a marked invalid call,
+// never as "{}": an empty object made run_script report "needs at least one
+// step" three times in a row without saying the JSON had been cut off.
+func TestOpenAIStreamMarksInvalidToolArguments(t *testing.T) {
+	server := openStreamServer(t,
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"run_script\",\"arguments\":\"{\\\"steps\\\":[{\\\"tool\\\":\\\"write_file\\\",\\\"args\\\":{\\\"content\\\":\\\"abc\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"+
+			"data: [DONE]\n\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	provider := NewOpenAICompat(server.URL, "", "local-model", 128, "")
+	turn, err := provider.Stream(ctx, Request{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := turn.ToolCalls()
+	if len(calls) != 1 {
+		t.Fatalf("tool call lost: %+v", turn)
+	}
+	if !json.Valid(calls[0].Input) {
+		t.Fatalf("replacement input must stay valid JSON for the transcript: %s", calls[0].Input)
+	}
+	detail, bad := InvalidArguments(calls[0].Input)
+	if !bad || !strings.Contains(detail, "bytes") {
+		t.Fatalf("invalid arguments were not marked: %s", calls[0].Input)
+	}
+	if _, bad := InvalidArguments(json.RawMessage(`{"steps":[]}`)); bad {
+		t.Fatal("a valid call must not be reported as invalid")
 	}
 }

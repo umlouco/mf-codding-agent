@@ -7,7 +7,7 @@ export abstract class OrchestratorScope extends OrchestratorJournal {
   protected scopeWatch(task: Task, role: ScopeRole, current: () => boolean,
     activity: (phase: string, detail: string, at: number) => void): ScopeSupervisor {
     return new ScopeSupervisor({ context: this.context, output: this.output, queue: this.queue,
-      task, role, current, intervalMs: this.reviewIntervalMs, preflightActivity: activity,
+      task, role, current, preflightActivity: activity,
       split: (assessment, snapshot) => this.applyScopeSplit(assessment, snapshot, current) });
   }
 

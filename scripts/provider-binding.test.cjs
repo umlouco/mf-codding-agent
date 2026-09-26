@@ -13,7 +13,7 @@ const path = require('node:path');
 const { createHost } = require('./headless-host.cjs');
 const { preflight } = require('./queue-runner.cjs');
 
-const MESSAGE = 'No supported provider is configured for the executor role. Select a provider for this role in MF Agent settings.';
+const MESSAGE = 'No supported provider is configured for the coder role. Select a provider for this role in MF Agent settings.';
 
 function scratch() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mf-provider-'));
@@ -51,7 +51,7 @@ test('a missing provider is a configuration error, not an outage', async () => {
   } finally { await host.close(); fs.rmSync(workspace, { recursive: true, force: true }); }
 });
 
-test('without a worker the executor is unusable and preflight refuses to start', async () => {
+test('without a worker the coder is unusable and preflight refuses to start', async () => {
   const saved = savedEnv();
   for (const key of Object.keys(saved)) delete process.env[key];
   const workspace = scratch();
@@ -61,13 +61,13 @@ test('without a worker the executor is unusable and preflight refuses to start',
       const resolved = await host.store.resolveAll();
       assert.equal(usable('planner')(resolved), true, 'planner keeps Claude CLI');
       assert.equal(usable('supervisor')(resolved), true, 'supervisor keeps Claude CLI');
-      assert.equal(usable('executor')(resolved), false, 'executor must not silently inherit Claude CLI');
-      await assert.rejects(() => preflight(host), /No usable provider for role\(s\): executor/);
+      assert.equal(usable('coder')(resolved), false, 'coder must not silently inherit Claude CLI');
+      await assert.rejects(() => preflight(host), /No usable provider for role\(s\): coder/);
     } finally { await host.close(); }
   } finally { restoreEnv(saved); fs.rmSync(workspace, { recursive: true, force: true }); }
 });
 
-test('an explicit worker bounds the executor while planner stays on Claude CLI', async () => {
+test('an explicit worker binds the coder and tester while planner stays on Claude CLI', async () => {
   const saved = savedEnv();
   for (const key of Object.keys(saved)) delete process.env[key];
   const workspace = scratch();
@@ -76,9 +76,27 @@ test('an explicit worker bounds the executor while planner stays on Claude CLI',
     try {
       const resolved = await host.store.resolveAll();
       assert.equal(usable('planner')(resolved), true);
-      assert.equal(usable('executor')(resolved), true);
-      assert.equal(resolved.executor.baseURL, 'http://127.0.0.1:9/v1');
+      assert.equal(usable('coder')(resolved), true);
+      assert.equal(resolved.coder.baseURL, 'http://127.0.0.1:9/v1');
+      assert.equal(resolved.tester.baseURL, 'http://127.0.0.1:9/v1', 'an unbound tester inherits the worker');
       await preflight(host);
+    } finally { await host.close(); }
+  } finally { restoreEnv(saved); fs.rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test('a separate tester endpoint binds the Tester role to its own model', async () => {
+  const saved = savedEnv();
+  for (const key of Object.keys(saved)) delete process.env[key];
+  const workspace = scratch();
+  try {
+    const host = await createHost({ workspace, log: () => {}, workerUrl: 'http://127.0.0.1:9/v1', workerModel: 'coder-model',
+      testerUrl: 'https://integrate.api.nvidia.com/v1', testerModel: 'nvidia/nemotron-3-super-120b-a12b', testerApiKey: 'nv-key' });
+    try {
+      const resolved = await host.store.resolveAll();
+      assert.equal(resolved.coder.model, 'coder-model');
+      assert.equal(resolved.tester.model, 'nvidia/nemotron-3-super-120b-a12b');
+      assert.equal(resolved.tester.baseURL, 'https://integrate.api.nvidia.com/v1');
+      assert.equal(resolved.tester.apiKey, 'nv-key');
     } finally { await host.close(); }
   } finally { restoreEnv(saved); fs.rmSync(workspace, { recursive: true, force: true }); }
 });
@@ -93,8 +111,8 @@ test('an explicit OpenRouter worker URL picks up OPENROUTER_API_KEY', async () =
       workerModel: 'anthropic/claude-sonnet-4.6' });
     try {
       const resolved = await host.store.resolveAll();
-      assert.equal(usable('executor')(resolved), true);
-      assert.equal(resolved.executor.apiKey, 'test-key', 'the URL-specific env key must be attached');
+      assert.equal(usable('coder')(resolved), true);
+      assert.equal(resolved.coder.apiKey, 'test-key', 'the URL-specific env key must be attached');
     } finally { await host.close(); }
   } finally { restoreEnv(saved); fs.rmSync(workspace, { recursive: true, force: true }); }
 });
@@ -108,7 +126,7 @@ test('--worker-all binds planner and supervisor to the HTTP worker too', async (
       workerModel: 'worker-model', workerAll: true });
     try {
       const resolved = await host.store.resolveAll();
-      for (const role of ['planner', 'supervisor', 'executor', 'coding']) {
+      for (const role of ['planner', 'supervisor', 'coder', 'tester', 'coding']) {
         assert.equal(usable(role)(resolved), true, `${role} should be on the worker`);
         assert.equal(resolved[role].baseURL, 'http://127.0.0.1:9/v1');
       }
@@ -127,9 +145,9 @@ test('OPENROUTER_API_KEY is auto-detected as the worker provider', async () => {
     const host = await createHost({ workspace, log: () => {} });
     try {
       const resolved = await host.store.resolveAll();
-      assert.equal(usable('executor')(resolved), true);
-      assert.equal(resolved.executor.baseURL, 'https://openrouter.ai/api/v1');
-      assert.equal(resolved.executor.model, 'anthropic/claude-sonnet-4.5');
+      assert.equal(usable('coder')(resolved), true);
+      assert.equal(resolved.coder.baseURL, 'https://openrouter.ai/api/v1');
+      assert.equal(resolved.coder.model, 'anthropic/claude-sonnet-4.5');
       await preflight(host);
     } finally { await host.close(); }
   } finally { restoreEnv(saved); fs.rmSync(workspace, { recursive: true, force: true }); }

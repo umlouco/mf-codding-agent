@@ -14,7 +14,7 @@ test('the run breaker subdivides the work instead of stopping the run', async t 
   const host = await createHost({
     workspace: root,
     log() {},
-    settings: { 'queue.maxRunTokens': LIMIT, 'queue.maxRunMinutes': 0, 'queue.maxRunTasks': 0 },
+    settings: { 'queue.maxRunTokens': LIMIT, 'queue.maxRunModelCalls': 0, 'queue.maxRunTasks': 0 },
   });
   const { TaskQueue } = host.load('src/queue/db.ts');
   const { Orchestrator } = host.load('src/queue/orchestrator.ts');
@@ -123,12 +123,39 @@ test('the run breaker subdivides the work instead of stopping the run', async t 
         // One row over a limit of one added row.
         runner.cfg = (key, fallback) =>
           key === 'queue.maxRunTasks' ? 1 : key === 'queue.maxRunTokens' ? 0 :
-          key === 'queue.maxRunMinutes' ? 0 : fallback;
+          key === 'queue.maxRunModelCalls' ? 0 : fallback;
         queue.insert({ title: 'Extra 1', description: 'x' }, 2);
         queue.insert({ title: 'Extra 2', description: 'x' }, 3);
 
         assert.equal(runner.runBreakerTripped(), true);
         assert.equal(splits, 0, 'decomposing here would multiply the rows that tripped it');
+        assert.equal(queue.runState, 'RUNNING');
+      } finally {
+        runner.dispose();
+        queue.close();
+      }
+    });
+
+    await t.test('the call budget counts model calls from this run, never wall-clock time', async () => {
+      const { queue, runner } = fresh();
+      try {
+        for (let i = 0; i < 5; i++) queue.countModelCall();
+        runner.start();
+        const id = queue.list()[0].id;
+        queue.update(id, { status: 'EXECUTING' });
+        let splits = 0;
+        runner.requestFailureDecomposition = () => { splits++; };
+        runner.cfg = (key, fallback) =>
+          key === 'queue.maxRunModelCalls' ? 3 : key === 'queue.maxRunTokens' ? 0 : key === 'queue.maxRunTasks' ? 0 : fallback;
+        // Calls made before this run started do not count against it.
+        assert.equal(runner.runBreakerTripped(), false);
+        // An hour-long single call is still one call.
+        queue.db.prepare("UPDATE queue_meta SET value = ? WHERE key = 'runStartedAt'").run(String(Date.now() - 3_600_000));
+        for (let i = 0; i < 3; i++) queue.countModelCall();
+        assert.equal(runner.runBreakerTripped(), false, 'three calls is the limit, not over it');
+        queue.countModelCall();
+        assert.equal(runner.runBreakerTripped(), true);
+        assert.equal(splits, 1, 'the task in flight is replaced, the run keeps going');
         assert.equal(queue.runState, 'RUNNING');
       } finally {
         runner.dispose();

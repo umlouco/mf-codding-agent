@@ -78,24 +78,23 @@ command (*Ask About Selection*, *Edit Selection*, *Explain Problems*) goes to it
 regardless of what the selector is set to — those are questions about the
 conversation.
 
-**Planner** does not join the conversation, and it does not try to plan the whole
-project in one turn either. The workspace is scanned first — a deterministic,
-non-LLM pass that splits it into regions no larger than
-`mfagent.queue.maxFilesPerRegion` files each, so the size of that scan never
-depends on a model's judgement of its own context budget. A throwaway core on the
-**Queue · Planner** model then reasons over that compact region list (paths, file
-counts, languages — not file contents) and scopes a handful of **phases**, which
-land in the **Task Queue** as their own kind of row. What you see in the chat is
-the scan, then the phases. If the queue already has tasks you are asked whether to
+**Planner** does not join the conversation. The workspace is scanned first — a
+deterministic, non-LLM pass that splits it into regions no larger than
+`mfagent.queue.maxFilesPerRegion` files each. The **Queue · Planner** model then
+writes the ordered task list directly: between 1 and 100 tasks sized to the request,
+each one coder session with one observable outcome and acceptance criteria the tester
+can execute. It uses the region list (paths, file counts, languages) and read-only
+tools to ground the plan, and an empty workspace gets a from-scratch plan whose first
+task creates the project. If the queue already has tasks you are asked whether to
 replace them or append.
 
-Nothing starts running on its own. Review the phases in the Task Queue view and
-press **Start**: each phase is claimed the same way a task is, explored within its
-own region by a fresh throwaway core, and expanded into the concrete, verifiable
-tasks that carry it out — so the same crash-safe claim/cron machinery that runs
-the autonomous execution covers planning a large codebase too, and a phase whose
-region turns out to still be too big splits further by re-scanning it, rather than
-asking a model to size its own work.
+Nothing starts running on its own. Review the tasks in the Task Queue view and press
+**Start**. For each task, in order: the **Coder** implements it; the **Tester**
+verifies it independently with real tools (tests, a served page, the browser); the
+**Supervisor**, woken by the queue's cron, directs both — it reviews the running
+coder, accepts a tester PASS backed by executed checks, and decides retry, rewrite,
+split, retest or test repair after a failure. See
+[docs/supervision-architecture.md](docs/supervision-architecture.md).
 
 ---
 
@@ -487,19 +486,27 @@ state changed shape, and — while the view is showing — a 200 ms poll of the
 `agent_logs` table, which every agent writes to as it works: the text and
 reasoning it produces, each tool call and what came back, and the activity
 records it writes while it waits. Open a task and its **Live output** terminal
-shows all of that from every agent that touches it — executor, verifier,
-supervisor, and for a phase the planner. Planning from the Plan tab has a
+shows all of that from every agent that touches it — coder, tester and
+supervisor. Planning from the Plan tab has a
 terminal of its own. Rows are pruned per task (`mfagent.queue.liveLogKeep`); the
 durable journal the supervisor reads, `task_events`, is separate and never pruned.
 
-The supervisor loop wakes every `mfagent.queue.cronIntervalSeconds` (10 s by
-default) and reads the `tasks` and `agent_logs` tables to decide, per task,
-whether work continues, stops, is broken down, or goes to verification. In the
-protocol the agents speak those are `CONTINUE_EXECUTION`, `STOP_AND_REWRITE_TASK`
-and `STOP_AND_REWRITE_VALIDATION`, `SPLIT`, and `START_VALIDATION` — see
-`src/queue/monitor.ts` and `src/queue/orchestrator.ts`. A tick that finds nothing
-new costs a few indexed reads; a full review of live work is a model turn and is
-rate-limited separately (`mfagent.queue.reviewIntervalSeconds`).
+The supervisor loop wakes every `mfagent.queue.cronIntervalSeconds`, and immediately
+after every handoff, and routes the task at the head of the queue: run the tester,
+accept a supported PASS, decide after a failure, or review the running coder. The live
+review's actions are `CONTINUE_EXECUTION`, `STOP_AND_REWRITE_TASK`,
+`STOP_AND_REWRITE_VALIDATION`, `SPLIT_TASK`, `START_VALIDATION`, `STOP_AND_REWRITE_TESTS`
+and `STOP_AND_DECOMPOSE_TASK` — see `src/queue/orchestratorPipeline.ts` and
+`src/queue/monitor.ts`. A tick that finds nothing new costs a few indexed reads.
+
+Every budget is counted in LLM calls, never in wall-clock time, so a local model that
+takes half an hour over one call is slow, not over budget: the coder gets
+`mfagent.queue.workerMaxRounds` calls per attempt, the tester `mfagent.queue.testerMaxRounds`,
+a running coder is reviewed every `mfagent.queue.reviewEveryModelCalls` coder calls, and
+the optional run breaker `mfagent.queue.maxRunModelCalls` counts every queue call. Only
+liveness is time-based: a worker that records nothing at all for
+`mfagent.queue.workerSilentMinutes` has lost its process (a waiting worker writes a
+heartbeat every 30 seconds).
 
 The Task Queue has a **Testing environment** section with an optional HTTP(S)
 **Testing URL** and named **Credentials**. Save these once for the workspace.
@@ -538,8 +545,7 @@ preserved and reported with the backup location. The tool cannot enable server-l
 modules or override permissions: see [Apache's rewrite documentation](https://httpd.apache.org/docs/2.4/mod/mod_rewrite.html).
 The CLI hook uses the documented [PreToolUse blocking protocol](https://code.claude.com/docs/en/hooks#exit-code-2).
 
-Project notes reach execution, verification, supervision, recovery, and phase
-expansion. Supplied application URLs and login instructions remain part of the
+Project notes reach planning, execution, testing, supervision, and recovery. Supplied application URLs and login instructions remain part of the
 test requirements. New agent findings are stored separately from your editable
 notes, labelled with their task/attempt, and bounded in the context passed forward.
 The extension executes a saved verification command unchanged through its portable
@@ -565,8 +571,13 @@ VS Code settings editor is genuinely good at:
 | `mfagent.queue.cronIntervalSeconds` | `10` | How often the supervisor loop reads the queue. A task list that picks its own interval in the Task Queue view wins |
 | `mfagent.queue.liveLogKeep` | `2000` | Live-output rows kept per task in `agent_logs` |
 | `mfagent.queue.maxRounds` | `80` | Maximum tool-calling rounds per unattended turn; retries keep the same ceiling and repeated identical failures stop early |
-| `mfagent.queue.maxFilesPerRegion` | `150` | Largest file count one region of the workspace may hold before the deterministic scan splits it further — bounds how much a phase's expansion agent explores in one sitting, regardless of project size |
+| `mfagent.queue.maxFilesPerRegion` | `150` | Largest file count one region of the workspace may hold before the deterministic scan splits it further — keeps the region list the planner reasons over compact, regardless of project size |
 | `mfagent.queue.workerSilentMinutes` | `10` | How long a worker may write nothing before it counts as dead |
+| `mfagent.queue.reviewEveryModelCalls` | `8` | Coder model calls between the supervisor's live reviews of a running task |
+| `mfagent.queue.testerMaxRounds` | `40` | Model calls one Tester turn may make while verifying a task |
+| `mfagent.queue.testerMaxRetests` | `2` | Tester re-runs per attempt when the tester's own check failed to run |
+| `mfagent.queue.maxRunModelCalls` | `0` | Optional run breaker counted in model calls; the task in flight is split and the run continues. 0 disables it |
+| `mfagent.queue.scopeDiscoveryMinFiles` | `20` | Workspaces this small skip the scope-discovery model turn before each task |
 | `mfagent.activityIntervalSeconds` | `30` | How often a working agent records what it is doing |
 | `mfagent.llm.idleMinutes` | `60` | How long a reply may deliver nothing before the connection counts as dropped |
 | `mfagent.queue.notifyCommand` | `""` | Run with a JSON summary as its one argument when an autonomous run finishes — a script that pings your phone, Slack, or anything else, for the run that finished after you stopped watching |

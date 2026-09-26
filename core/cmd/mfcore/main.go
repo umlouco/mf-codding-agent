@@ -107,10 +107,6 @@ func (s *server) shutdown() {
 	tools.KillAllBgProcs()
 }
 
-func (s *server) log(level, msg string) {
-	_ = s.conn.Notify("log", map[string]any{"level": level, "message": msg})
-}
-
 func (s *server) register() {
 	s.conn.Register("initialize", s.onInitialize)
 	// A chat turn runs for minutes; it must not block cancels or the

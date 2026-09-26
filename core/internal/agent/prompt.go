@@ -51,6 +51,8 @@ func BuildSystemPrompt(in PromptInput) string {
 		return buildSupervisorSystemPrompt(in)
 	}
 	if in.QueueRole == "supervisor-repair" {
+		// A separate editing worker, not the supervisor: it must not be told it
+		// owns the task list it cannot touch.
 		return buildTestRepairSystemPrompt(in)
 	}
 	var b strings.Builder

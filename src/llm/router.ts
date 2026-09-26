@@ -35,8 +35,6 @@ export interface LmModelInfo {
   maxInputTokens: number;
 }
 
-export type Transport = 'core' | 'claude-cli';
-
 /** What the Go core is told to dial for a role. */
 export interface CoreEndpoint {
   /** 'anthropic' or 'openai-compatible' — the two clients the core has. */
@@ -48,9 +46,6 @@ export interface CoreEndpoint {
 export class LLMRouter implements vscode.Disposable {
   private readonly proxy: LmProxy;
   private models: LmModelInfo[] | undefined;
-  private readonly changed = new vscode.EventEmitter<void>();
-  /** The set of editor models changed — a provider signed in, or out. */
-  readonly onDidChangeModels = this.changed.event;
   private readonly subs: vscode.Disposable[] = [];
 
   constructor(
@@ -61,7 +56,6 @@ export class LLMRouter implements vscode.Disposable {
     this.subs.push(
       vscode.lm.onDidChangeChatModels(() => {
         this.models = undefined;
-        this.changed.fire();
       }),
     );
   }
@@ -81,10 +75,6 @@ export class LLMRouter implements vscode.Disposable {
       maxInputTokens: m.maxInputTokens,
     }));
     return this.models;
-  }
-
-  transportFor(kind: string): Transport {
-    return kind === 'claude-cli' ? 'claude-cli' : 'core';
   }
 
   /**
@@ -157,7 +147,6 @@ export class LLMRouter implements vscode.Disposable {
       s.dispose();
     }
     this.proxy.dispose();
-    this.changed.dispose();
   }
 }
 

@@ -41,7 +41,7 @@ export async function generatePlan(host: PlanningHost, goal: string, append: boo
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: 'Scanning the workspace and scoping a plan…' },
       async (progress) => {
-        const phases = await planGoal(
+        const tasks = await planGoal(
           host.context,
           host.output,
           queue,
@@ -53,10 +53,10 @@ export async function generatePlan(host: PlanningHost, goal: string, append: boo
             }
           },
         );
-        const n = append ? queue.addAll(phases) : queue.replaceAll(phases);
-        live.note('plan', `${n} phase(s) written to the queue`);
+        const n = append ? queue.addAll(tasks) : queue.replaceAll(tasks);
+        live.note('plan', `${n} task(s) written to the queue`);
         void vscode.window.showInformationMessage(
-          `Generated ${n} phase(s). Press Start to expand and run them.`,
+          `Generated ${n} task(s). Press Start to run them.`,
         );
       },
     );

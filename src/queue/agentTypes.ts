@@ -1,5 +1,6 @@
 import { Usage } from './db';
 import { CognitiveBinding } from './cognition';
+import type { Role as ProviderRole } from '../providers/store';
 
 /**
  * Agent runners for autonomous runs.
@@ -52,6 +53,14 @@ export type ReviewOptions = Pick<RunOptions, 'onActivity' | 'onEvent' | 'onAbort
 export interface RunOptions {
 	/** Current assignment only; excluded from format-only turns and historical routing. */
   skillTask?: string;
+  /**
+   * Which provider binding to run this turn on, when it differs from the core
+   * role. The core role decides the prompt and tool ownership; the provider role
+   * only chooses the model. This is what lets the queue's single core `executor`
+   * role run as Coder for implementation and Tester for verification, each on
+   * its own configured model.
+   */
+  providerRole?: ProviderRole;
   /** Resolve planning work through the planner provider, retaining queue ownership. */
   planningOnly?: boolean;
   /** Run the separate test-repair worker; the decision supervisor never edits files. */
@@ -59,7 +68,7 @@ export interface RunOptions {
   /** Validators may inspect and execute checks but cannot rewrite workspace files. */
   verificationOnly?: boolean;
   /** Planning proposes typed checks; reporting judges host receipts. */
-  verificationStage?: 'plan' | 'report';
+  verificationStage?: 'plan' | 'report' | 'agent';
   /** Repair a response using supplied evidence without starting another tool investigation. */
   formatOnly?: boolean;
   /** Durable work identity; independent from this disposable process and conversation. */

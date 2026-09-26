@@ -11,43 +11,33 @@ import { recoverOwnershipStop } from './ownershipRecovery';
 export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
   /**
-   * How often the supervisor may look in on a task that is still executing.
+   * How many coder model calls pass between live reviews of a running task.
    *
-   * Separate from the cron interval, and much longer than it. The cron exists to
-   * notice things quickly — a finished task, a dead worker — and a minute is
-   * right for that. A live agent is a different subject: reviewing it is a full
-   * model turn over its journal, and a task that now legitimately runs for
-   * hours does not change its mind every minute. Judging it on every tick
-   * mostly re-reads evidence the supervisor already ruled on.
+   * Counted in LLM calls, never in wall-clock time. A hosted model makes eight
+   * calls in a minute and a local one may take an hour; either way a review
+   * after eight calls has eight rounds of new work to judge, and a slow local
+   * worker is not interrupted by a supervisor call competing for the same GPU
+   * every few minutes while it has produced nothing new.
    */
-  protected get reviewIntervalMs(): number {
-    return Math.max(30, this.cfg<number>('queue.reviewIntervalSeconds', 300)) * 1000;
+  protected get reviewEveryModelCalls(): number {
+    return Math.max(1, this.cfg<number>('queue.reviewEveryModelCalls', 8));
   }
 
   /**
    * Whether looking in on this task again would show the supervisor anything.
    *
-   * A live task needs both halves: enough time since the last look, and new
-   * evidence since the last look. Either alone is not enough — an agent that
-   * has written nothing has nothing new to judge no matter how long it has
-   * been, and an agent mid-tool-call has not finished the thought that the last
-   * review was already reading.
-   *
-   * A task that has *stopped* is not a poll at all. Nothing further will be
-   * written to its journal, and the queue does not move until someone decides
-   * what happens next, so that decision is never delayed or skipped.
+   * A running coder is reviewed once it has made `reviewEveryModelCalls` model
+   * calls since the last review of the same attempt (or since its claim). A task
+   * that has *stopped* is not a poll at all: the queue does not move until the
+   * supervisor decides, so that decision is never delayed or skipped.
    */
-  protected shouldReview(task: Task, latestEventId: number): boolean {
+  protected shouldReview(task: Task, _latestEventId: number): boolean {
     if (task.status !== 'EXECUTING') {
       return true;
     }
     const last = this.reviewed.get(task.id);
-    // A fresh attempt is a fresh subject: whatever was judged last time was
-    // judged about a worker that is no longer running.
-    if (!last || last.attempt !== task.attempts) {
-      return true;
-    }
-    return Date.now() - last.at >= this.reviewIntervalMs && latestEventId > last.eventId;
+    const since = last && last.attempt === task.attempts ? last.eventId : 0;
+    return this.queue.modelCallsSince(task.id, since) >= this.reviewEveryModelCalls;
   }
 
   /** Lets the supervisor judge live work and choose one fixed control action. */
@@ -94,6 +84,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
           recoveryContext: recoveryContext(this.queue, task),
           testingUrl: this.queue.testingUrl,
           ownerInstructions: this.queue.testingContext + this.queue.instructions,
+          silentMs: this.silentMs,
           failedRepairs: this.queue.countEvents(task.id, 'test-repair-halted'),
           refreshProgress: () => {
             if (gen !== this.reviewGen) throw new Error('Progress review was superseded.');
@@ -244,6 +235,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         `Observed check BEFORE repair: (no saved command; read the reported failure and the current files before changing the test.)\n` +
         `Fix the concrete reported failure first. Do not make identical old/new edits or cosmetic selector changes.\n` +
         `Repair requested: ${reason}\nPrevious evidence: ${task.output.slice(0,8000)}`, {
+          providerRole:'tester',
           allowTestEdits:true,
           onAbort:abort=>{if(review.gen!==this.reviewGen || ownershipFailure){abort();return;}review.abort=abort;},
           onEvent:(method,params)=>{

@@ -94,6 +94,9 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 	tools.RegisterPosix(s.registry)
 	tools.RegisterShell(s.registry)
 	tools.RegisterShellBg(s.registry)
+	// Registered after the shell so a batch can use it, and over the same
+	// registry so it also reaches the browser, MCP and editor tools added later.
+	tools.RegisterBatch(s.registry)
 	tools.RegisterTestingEnvironment(s.registry)
 	tools.RegisterApacheRewrite(s.registry)
 	// Unconditional: whether the project can actually run Playwright is

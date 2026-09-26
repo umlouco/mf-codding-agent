@@ -55,6 +55,19 @@ export class QueueMetadata extends QueueStorage {
     return this.getMeta('instructions', '');
   }
 
+  /**
+   * LLM calls made by queue workers on this queue. Budgets are measured in
+   * model calls, never in wall-clock time: a local model may take half an hour
+   * over one call, and that is slow, not over budget.
+   */
+  get modelCalls(): number {
+    return Number(this.getMeta('modelCalls', '0')) || 0;
+  }
+
+  countModelCall(): void {
+    this.setMeta('modelCalls', String(this.modelCalls + 1));
+  }
+
   setInstructions(text: string): void {
     this.setMeta('instructions', text.trim());
   }

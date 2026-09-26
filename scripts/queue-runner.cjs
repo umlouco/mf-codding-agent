@@ -30,7 +30,7 @@ function preflight(host) {
       const r = resolved[role];
       return !!r && !!r.profile && (r.kind !== 'openai-compatible' || !!r.baseURL);
     };
-    const missing = ['planner', 'supervisor', 'executor'].filter(role => !usable(role));
+    const missing = ['planner', 'supervisor', 'coder'].filter(role => !usable(role));
     if (!missing.length) return;
     throw Error(`No usable provider for role(s): ${missing.join(', ')}.\n` +
       'The Claude CLI provider can only serve planner/supervisor. Give the worker roles an OpenAI-compatible\n' +

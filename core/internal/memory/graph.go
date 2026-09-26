@@ -401,12 +401,6 @@ func (s *Store) AddObservation(nodeID int64, body, source, session string) (int6
 	return s.addObservation(nodeID, body, source, session, 0.5, nil)
 }
 
-// AddObservationWithMeta stores an observation with a confidence score and
-// free-form tags for later retrieval and lesson extraction.
-func (s *Store) AddObservationWithMeta(nodeID int64, body, source, session string, confidence float64, tags []string) (int64, error) {
-	return s.addObservation(nodeID, body, source, session, confidence, tags)
-}
-
 func (s *Store) addObservation(nodeID int64, body, source, session string, confidence float64, tags []string) (int64, error) {
 	if confidence <= 0 {
 		confidence = 0.5
@@ -429,13 +423,6 @@ func (s *Store) addObservation(nodeID int64, body, source, session string, confi
 	_, err = s.db.Exec(`INSERT INTO search(ref,title,body) VALUES(?,?,?)`,
 		fmt.Sprintf("o:%d", id), "", body)
 	return id, err
-}
-
-// RecordObservationUsage increments the usage counter on an observation. The
-// caller (memory_recall) calls this for each observation it returns, so the
-// model naturally learns which facts were useful.
-func (s *Store) RecordObservationUsage(id int64) {
-	_, _ = s.db.Exec(`UPDATE observations SET usage_count = usage_count + 1 WHERE id = ?`, id)
 }
 
 func (s *Store) Observations(nodeID int64, limit int) ([]Observation, error) {

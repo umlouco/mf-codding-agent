@@ -88,17 +88,8 @@ export class ChatPanel {
         case 'openQueue':
           await vscode.commands.executeCommand('mfagent.queue.focus');
           break;
-        case 'newSession':
-          await this.newSession();
-          break;
         case 'openFile':
           await this.openFile(msg.path, msg.line);
-          break;
-        case 'openUrl':
-          await vscode.commands.executeCommand('simpleBrowser.show', msg.url);
-          break;
-        case 'showLog':
-          this.output.show();
           break;
         case 'openSettings':
           await vscode.commands.executeCommand('mfagent.openSettings');
@@ -141,11 +132,6 @@ export class ChatPanel {
     panel.iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'icon.svg');
 
     ChatPanel.current = new ChatPanel(panel, context, core, output);
-    return ChatPanel.current;
-  }
-
-  /** Returns the current panel if it exists, undefined otherwise. */
-  static get currentPanel(): ChatPanel | undefined {
     return ChatPanel.current;
   }
 
@@ -298,9 +284,8 @@ export class ChatPanel {
 
     this.post({
       type: 'system',
-      text: 'Scanning the workspace and scoping a plan — the planner reasons over the shape of the ' +
-        'workspace before it writes the phases; each phase is explored and turned into tasks once you ' +
-        'press Start in the Task Queue view.',
+      text: 'Scanning the workspace and writing the task list. Press Start in the Task Queue view to ' +
+        'run it: the coder implements each task, the tester verifies it and the supervisor directs both.',
     });
 
     // The same stream the Plan tab's own planner writes, so the Task Queue
@@ -309,7 +294,7 @@ export class ChatPanel {
     live.note('plan', `planning from the chat: ${goal.trim()}`);
     let cancelled = false;
     try {
-      const phases = await planGoal(
+      const tasks = await planGoal(
         this.context,
         this.output,
         target.queue,
@@ -326,21 +311,21 @@ export class ChatPanel {
         },
       );
 
-      const n = append ? target.queue.addAll(phases) : target.queue.replaceAll(phases);
-      live.note('plan', `${n} phase(s) written to the queue`);
+      const n = append ? target.queue.addAll(tasks) : target.queue.replaceAll(tasks);
+      live.note('plan', `${n} task(s) written to the queue`);
       target.changed();
       this.post({ type: 'done' });
       this.post({
         type: 'plan',
         total: n,
         appended: append,
-        tasks: phases.map((p) => ({
+        tasks: tasks.map((p) => ({
           seq: p.seq ?? 0,
           title: p.title,
           command: '',
         })),
       });
-      this.output.appendLine(`[chat:planner] ${append ? 'appended' : 'wrote'} ${n} phase(s)`);
+      this.output.appendLine(`[chat:planner] ${append ? 'appended' : 'wrote'} ${n} task(s)`);
     } catch (e: any) {
       this.post({ type: 'done' });
       this.post({

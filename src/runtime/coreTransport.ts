@@ -121,9 +121,6 @@ export class CoreTransport implements Disposable {
       catch (error) { this.pending.delete(id); clearTimeout(timer); reject(error); }
     });
   }
-  notify(method: string, params: unknown = {}): void {
-    if (this.running) this.write({ jsonrpc: '2.0', method, params });
-  }
   stop(): void {
     const proc = this.proc;
     this.proc = undefined;

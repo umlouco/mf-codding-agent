@@ -54,7 +54,11 @@ function claudeTurn(config: HeadlessConfig, prompt: string, output: Output, sign
         killer.on('error', () => proc.kill());
       } else proc.kill();
     };
-    const timeout = setTimeout(() => { stop(); reject(new Error('Planner turn timed out')); }, config.turnTimeoutMs ?? 600000);
+    // No default wall clock: a planning turn is bounded by the caller's signal.
+    // An explicit turnTimeoutMs remains available for callers that want one.
+    const timeout = config.turnTimeoutMs && config.turnTimeoutMs > 0
+      ? setTimeout(() => { stop(); reject(new Error('Planner turn timed out')); }, config.turnTimeoutMs)
+      : undefined;
     const abort = () => { stop(); reject(new Error('Planner cancelled')); };
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();

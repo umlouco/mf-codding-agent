@@ -69,7 +69,14 @@ func RegisterShellBg(r *Registry) {
 			}
 
 			name, args, cleanup := shellFor(a.Command)
-			cmd := exec.CommandContext(ctx, name, args...)
+			// Deliberately not CommandContext: a background server must outlive
+			// the call that started it. Tied to the call's context it died the
+			// moment a run_script batch returned (the batch cancels its own
+			// context), so the browser step that followed hit an empty port.
+			// Lifetime is owned by shell_kill_background and KillAllBgProcs,
+			// which runs when the core shuts down at the end of the worker turn.
+			cmd := exec.Command(name, args...)
+			prepareBackground(cmd)
 			cmd.Dir = dir
 			cmd.Env = append(os.Environ(), "MFAGENT=1", "NO_COLOR=1", "CI=1")
 			cmd.Stdin = nil
@@ -228,22 +235,7 @@ func RegisterShellBg(r *Registry) {
 // killProcess terminates the process and its children. On non-Windows platforms
 // it sends SIGKILL to the process group; on Windows it uses taskkill /T.
 func killProcess(cmd *exec.Cmd) error {
-	if cmd.Process == nil {
-		return nil
-	}
-	return cmd.Process.Kill()
-}
-
-// ActiveBgProcs returns a copy of the current bgProcs map so external code
-// (e.g. the server shutdown) can clean up background processes.
-func ActiveBgProcs() map[string]*bgProc {
-	bgMu.Lock()
-	defer bgMu.Unlock()
-	out := make(map[string]*bgProc, len(bgProcs))
-	for k, v := range bgProcs {
-		out[k] = v
-	}
-	return out
+	return killTree(cmd)
 }
 
 // KillAllBgProcs kills every running background process. Call this on shutdown.
@@ -256,19 +248,3 @@ func KillAllBgProcs() {
 	}
 }
 
-// bgProcsList returns human-readable list of running background processes.
-// Registered as a private helper available to the agent via the tools.
-func bgProcsList() string {
-	bgMu.Lock()
-	defer bgMu.Unlock()
-	if len(bgProcs) == 0 {
-		return "No background processes running."
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "%d background process(es):\n", len(bgProcs))
-	for id, p := range bgProcs {
-		fmt.Fprintf(&b, "  %s  pid=%d  uptime=%s  %s\n",
-			id, p.pid, time.Since(p.started).Round(time.Second), p.label)
-	}
-	return b.String()
-}

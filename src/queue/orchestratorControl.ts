@@ -262,9 +262,11 @@ export abstract class OrchestratorControl extends OrchestratorState {
    *
    * The per-task policy above stops a task that cannot be verified. This is the
    * backstop for a run that is not converging across tasks: too many rows, too
-   * many tokens, or too much wall-clock. Any of the three breaks the work in
+   * many tokens, or too many model calls. Any of the three breaks the work in
    * flight into smaller tasks and keeps going — see tripBreaker, which never
-   * stops the run. Each limit is configurable; 0 disables it.
+   * stops the run. Each limit is configurable; 0 disables it. None of them is
+   * wall-clock time: a local model may spend half an hour on one call, and a
+   * slow run is not a failing one.
    *
    * Every limit is measured from the origin `start()` stamped, never against
    * the lifetime of the database. Rows and tokens are durable and only ever
@@ -276,7 +278,7 @@ export abstract class OrchestratorControl extends OrchestratorState {
   protected runBreakerTripped(): boolean {
     const maxTasks = this.cfg<number>('queue.maxRunTasks', 200);
     const maxTokens = this.cfg<number>('queue.maxRunTokens', 50_000_000);
-    const maxMinutes = this.cfg<number>('queue.maxRunMinutes', 0);
+    const maxCalls = this.cfg<number>('queue.maxRunModelCalls', 0);
     const stats = this.queue.stats();
 
     const tasks = stats.total - Number(this.queue.getMeta('runTaskBaseline') || 0);
@@ -287,16 +289,16 @@ export abstract class OrchestratorControl extends OrchestratorState {
     if (maxTokens > 0 && tokens > maxTokens) {
       return this.tripBreaker(`run spent ${tokens} tokens, over the ${maxTokens} limit`, true);
     }
-    const startedAt = Number(this.queue.getMeta('runStartedAt') || 0);
-    if (maxMinutes > 0 && startedAt > 0 && Date.now() - startedAt > maxMinutes * 60_000) {
-      return this.tripBreaker(`run has been RUNNING for over ${maxMinutes} minute(s)`, true);
+    const calls = this.queue.modelCalls - Number(this.queue.getMeta('runModelCallBaseline') || 0);
+    if (maxCalls > 0 && calls > maxCalls) {
+      return this.tripBreaker(`run made ${calls} model calls, over the ${maxCalls} limit`, true);
     }
     return false;
   }
 
   /**
-   * Where this run started: the wall clock, and what the durable counters
-   * already held. Stamped on every transition into RUNNING so the breakers
+   * Where this run started: a marker, and what the durable counters already
+   * held. Stamped on every transition into RUNNING so the breakers
    * measure this run — and so an explicit Start after a trip is a genuinely
    * fresh run instead of an instant re-trip on totals it cannot undo.
    *
@@ -310,12 +312,14 @@ export abstract class OrchestratorControl extends OrchestratorState {
     this.queue.setMeta('runStartedAt', String(Date.now()));
     this.queue.setMeta('runTokenBaseline', String(spentTokens(stats.usage)));
     this.queue.setMeta('runTaskBaseline', String(stats.total));
+    this.queue.setMeta('runModelCallBaseline', String(this.queue.modelCalls));
   }
 
   private clearRunOrigin(): void {
     this.queue.setMeta('runStartedAt', '');
     this.queue.setMeta('runTokenBaseline', '');
     this.queue.setMeta('runTaskBaseline', '');
+    this.queue.setMeta('runModelCallBaseline', '');
   }
 
   /**

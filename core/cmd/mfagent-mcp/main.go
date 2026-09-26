@@ -195,7 +195,7 @@ func (s *server) handleInitialize(_ context.Context, req *rpcRequest) {
 		"serverInfo": map[string]any{
 			"name":    "mfagent-mcp",
 			"title":   "MF Agent Task Queue",
-			"version": "0.1.0",
+			"version": version,
 		},
 		"instructions": "Use task_queue_write_plan to create task lists. Include ordered, self-contained tasks with implementation and behavior checks. Use dryRun before writing when requirements are uncertain. Use task_queue_update/task_queue_delete/task_queue_reorder to edit the queue afterward instead of rewriting the whole plan.",
 	}

@@ -9,12 +9,15 @@ const { createHost } = require('./headless-host.cjs');
 test('planning sees real host capabilities before HTTP and CLI requests without project Playwright', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mf-planning-capabilities-'));
   const requests = [];
-  const phases = [{ title: 'Improve registration', description: 'Add the requested registration behavior.', regionPaths: ['.'] }];
+  const plan = { tasks: [
+    { title: 'Validate registrations', description: 'Validate input and add passing tests.', acceptance: 'Reject invalid input.' },
+    { title: 'Show registration status', description: 'Show status and add passing tests.', acceptance: 'Display the saved status.' },
+  ] };
   const tasks = [
     { title: 'Validate registrations', description: 'Validate input and add passing tests.', kind: 'task', solutionVerifyPrompt: 'Reject invalid input.' },
     { title: 'Show registration status', description: 'Show status and add passing tests.', kind: 'task', solutionVerifyPrompt: 'Display the saved status.' },
   ];
-  const replies = [phases, phases, tasks];
+  const replies = [plan, tasks];
   const server = http.createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
@@ -43,14 +46,19 @@ test('planning sees real host capabilities before HTTP and CLI requests without 
   };
   try {
     const planning = host.load('src/queue/agentPlanning.ts');
+    const { planTasks } = host.load('src/queue/planner.ts');
     const regions = [{ path: '.', fileCount: 1, languages: { php: 1 } }];
     const goal = 'Improve registration in the WordPress plugin and verify the changed behavior.';
-    const result = await planning.generatePhases(host.context, host.output, goal, regions, 150);
-    assert.equal(result.length, 1);
-    host.queue.insert(result[0], 1);
+    const planned = await planTasks(host.context, host.output, goal, '', regions);
+    assert.deepEqual(planned.map(task => [task.title, task.kind, task.solutionVerifyPrompt]),
+      [['Validate registrations', 'task', 'Reject invalid input.'], ['Show registration status', 'task', 'Display the saved status.']],
+      'missing project npm package must not force a bootstrap or single-task repair');
+    // A phase row left by an older plan still expands through the legacy path.
+    host.queue.insert({ title: 'Improve registration', description: 'Add the requested registration behavior.',
+      kind: 'phase', region: JSON.stringify({ paths: ['.'], fileCount: 1 }) }, 1);
     const expansion = await planning.expandPhase(host.context, host.output, host.queue.list()[0], goal);
-    assert.equal(expansion.tasks.length, 2, 'missing project npm package must not force a bootstrap or single-task repair');
-    assert.equal(requests.length, 3, 'draft, final review and expansion each make one model request');
+    assert.equal(expansion.tasks.length, 2);
+    assert.equal(requests.length, 2, 'planning and legacy expansion each make one model request');
     for (const request of requests) checkContext(promptText(request));
     assert(!fs.existsSync(path.join(root, 'node_modules')), 'planning must not install or link packages into the application');
     assert(!fs.existsSync(path.join(root, 'package.json')), 'planning must not scaffold dependencies');
@@ -78,7 +86,7 @@ test('planning sees real host capabilities before HTTP and CLI requests without 
         { planningOnly: true, onCancellable: cancel => cancel() }), /Queue turn aborted/);
       assert.equal(cliRequests.length, 3, 'cancelling host preflight must prevent the CLI model request');
     } finally { cli.runClaudeCliTurn = run; }
-    t.diagnostic('HTTP draft, final review, phase expansion, CLI planning/review and scope selection all received host facts before the model.');
+    t.diagnostic('HTTP planning, legacy phase expansion, CLI planning/review and scope selection all received host facts before the model.');
   } finally {
     await host.close();
     await new Promise(resolve => server.close(resolve));

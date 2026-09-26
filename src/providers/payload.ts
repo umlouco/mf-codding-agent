@@ -44,7 +44,7 @@ export interface CoreConfig {
   responseOnly?: boolean;
   inspectOnly?: boolean;
   queueRole?: 'planner' | 'supervisor' | 'executor' | 'validator' | 'supervisor-repair';
-  verificationStage?: 'plan' | 'report';
+  verificationStage?: 'plan' | 'report' | 'agent';
   testingEnvironment: TestingEnvironment;
   workspaceRoot: string;
   providers: CoreProvider[];

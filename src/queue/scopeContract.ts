@@ -62,12 +62,6 @@ export function scopedContract(queue: TaskQueue, task: Task): ReturnType<typeof 
   return isLocalScope(task) ? admittedContract(queue, task) : undefined;
 }
 
-/** A marker is not proof: preflight reuse requires the exact admitted contract. */
-export function hasAdmittedScope(queue: TaskQueue, task: Task): boolean {
-  const admitted = admittedContract(queue, task);
-  return !!admitted && scopeContractFields.every(field => task[field] === admitted.contract[field]);
-}
-
 /** Read complete JSON objects from retained response chunks, never natural-language guesses. */
 function* responseObjects(text: string): Generator<any> {
   // The retained stream may begin halfway through an old response or include

@@ -11,36 +11,6 @@ export class QueueJournal extends QueueMetadata {
       FROM tasks WHERE status IN ('EXECUTING', 'VERIFYING') ORDER BY seq, id`).all();
   }
 
-  /** Reserve before dispatch; retries/reloads and concurrent hosts cannot overspend. */
-  reserveVerificationInteraction(taskId: number, limit: number, stage: string): number | undefined {
-    return this.tx(() => {
-      const task = this.get(taskId);
-      const used = this.verificationInteractionsUsed(taskId);
-      if (!task || task.status !== 'VERIFYING' || task.activityPhase.startsWith('decomposition_') || used >= limit) return;
-      this.log(taskId, 'validator', 'verification-interaction', `${used + 1}/${limit}: ${stage}`);
-      return used + 1;
-    });
-  }
-
-  /**
-   * Interactions spent in the verification pass currently running.
-   *
-   * The budget bounds one pass, not the task's whole life: a pass that has to
-   * re-plan once before producing a usable plan must not consume the allowance
-   * the report needs, and a later pass (after the supervisor sends the task
-   * back) starts fresh. The number of passes is bounded separately — see
-   * orchestratorVerification's two-pass cap — so this cannot loop forever.
-   */
-  verificationInteractionsUsed(taskId: number): number {
-    const row = this.db
-      .prepare(`SELECT COUNT(*) AS n FROM task_events
-        WHERE task_id = ? AND kind = 'verification-interaction'
-        AND id > COALESCE((SELECT MAX(id) FROM task_events
-          WHERE task_id = ? AND kind = 'verification-pass'), 0)`)
-      .get(taskId, taskId);
-    return row.n as number;
-  }
-
   stats(): QueueStats {
     const rows = this.db
       .prepare('SELECT status, COUNT(*) AS n FROM tasks GROUP BY status')
@@ -137,6 +107,18 @@ export class QueueJournal extends QueueMetadata {
    * reads zero. `idx_events_task` makes asking the database cheaper than the
    * window scan was anyway.
    */
+  /**
+   * Coder model calls on the task's current attempt with an event id above
+   * `sinceEventId`. The core announces each call as "round N…" before sending.
+   */
+  modelCallsSince(taskId: number, sinceEventId = 0): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM task_events
+      WHERE task_id = ? AND actor = 'executor' AND kind = 'activity:model_wait' AND message LIKE 'round %'
+        AND id > ? AND id >= COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'claimed'), 0)`)
+      .get(taskId, sinceEventId, taskId);
+    return row.n as number;
+  }
+
   countEvents(taskId: number, kind: string, sinceUserRetry = false): number {
     const row = this.db
       .prepare(`SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = ?

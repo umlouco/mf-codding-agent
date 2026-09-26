@@ -10,7 +10,7 @@ test('DeepSeek V4.1 Flash is discoverable without replacing saved model selectio
   const root = fs.mkdtempSync(path.join(scratch, 'deepseek-models-'));
   const host = await createHost({ workspace: root, log() {} });
   const { ModelRegistry } = host.load('src/providers/models.ts');
-  const { getProvider } = host.load('src/providers/catalog.ts');
+  const { providerOrFallback: getProvider } = host.load('src/providers/catalog.ts');
   const registry = new ModelRegistry(host.context, host.output);
   const key = 'mfagent.models.deepseek:https://api.deepseek.com/v1';
   const originalFetch = global.fetch;

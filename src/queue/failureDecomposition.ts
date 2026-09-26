@@ -182,7 +182,7 @@ export function parseFailureDecomposition(text: string, task: Task,
   if (covered.size !== required.length) throw Error('The decomposition drops original acceptance requirements.');
   if (justified.size !== known.size) throw Error('Every unfinished outcome must serve an original requirement.');
 
-  return { verdict: 'SPLIT', feedback: value.feedback.trim(), taskEdits: [], usage: { ...usage },
+  return { verdict: 'SPLIT', feedback: value.feedback.trim(), usage: { ...usage },
     splitInto: parts.map((part, index) => ({ title: part.title.trim(),
       description: part.description.trim() + (targets[index].length
         ? `\n\nAssigned files for this replacement (host-enforced limit: ${TARGET_FILE_LIMIT}): ${targets[index].join(', ')}`

@@ -48,6 +48,12 @@ export class SettingsPanel {
       // window) should be reflected here rather than silently diverge.
       store.onDidChange(() => void this.pushState()),
       onDidChangeSkills(() => void this.pushState()),
+      vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('mfagent.llm.maxContextTokens') ||
+            e.affectsConfiguration('mfagent.queue.maxContextTokens')) {
+          void this.pushState();
+        }
+      }),
       panel.onDidChangeViewState(e => { if (e.webviewPanel.visible) void this.pushState(); }),
       vscode.workspace.onDidSaveTextDocument(doc => {
         if (doc.uri.path.endsWith('/SKILL.md')) {
@@ -303,6 +309,24 @@ export class SettingsPanel {
           await this.store.update({ browser: { headless: !!msg.headless } });
           break;
 
+        case 'setContextCeiling':
+        case 'setQueueContextCeiling': {
+          const value = Number(msg.value);
+          const queueCap = msg.type === 'setQueueContextCeiling';
+          if (!Number.isInteger(value) || value < (queueCap ? 0 : -1)) {
+            throw new Error(queueCap
+              ? 'Enter a whole number of tokens; 0 inherits the model limit.'
+              : 'Enter a whole number of tokens, or -1 to switch the ceiling off.');
+          }
+          await vscode.workspace
+            .getConfiguration('mfagent')
+            .update(queueCap ? 'queue.maxContextTokens' : 'llm.maxContextTokens',
+              value, vscode.ConfigurationTarget.Workspace);
+          await this.pushState();
+          this.toast('info', 'Context limit saved; it applies to the next agent turn.');
+          break;
+        }
+
         case 'rescanLanguages':
           clearLanguageCache();
           await this.pushState();
@@ -353,6 +377,10 @@ export class SettingsPanel {
     this.post({
       type: 'state',
       settings,
+      context: {
+        llm: vscode.workspace.getConfiguration('mfagent').get<number>('llm.maxContextTokens', 200000),
+        queue: vscode.workspace.getConfiguration('mfagent').get<number>('queue.maxContextTokens', 0),
+      },
       installedSkills: discoverInstalledSkills(vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? []),
       skillQueue: getActiveQueue() ? { path: getActiveQueue()!.path, enabled: getActiveQueue()!.enabledSkillGroups } : null,
       selectProfileId,
@@ -524,7 +552,7 @@ export class SettingsPanel {
   <header class="page">
     <div>
       <h1>MF Agent</h1>
-      <p class="sub">Providers, models and roles. Nothing here is stored in <code>settings.json</code>.</p>
+      <p class="sub">Providers, models, roles and the model context limit. API keys go to the OS keychain.</p>
     </div>
     <div class="head-actions">
       <button id="exportBtn" class="ghost">Export…</button>

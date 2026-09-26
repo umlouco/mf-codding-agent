@@ -477,13 +477,6 @@ func (m *Manager) Connect(ctx context.Context, spec ServerSpec) (*Client, error)
 	return c, nil
 }
 
-func (m *Manager) Get(name string) (*Client, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	c, ok := m.clients[name]
-	return c, ok
-}
-
 type Status struct {
 	Name  string   `json:"name"`
 	Tools []string `json:"tools"`

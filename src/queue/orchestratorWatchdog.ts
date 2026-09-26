@@ -1,67 +1,9 @@
 import { OrchestratorControl } from './orchestratorControl';
 import { appendAttempt } from './orchestratorState';
-import { hasOutstandingRecovery } from './recoverySchedule';
-import { recoverOwnershipStop } from './ownershipRecovery';
 
 export abstract class OrchestratorWatchdog extends OrchestratorControl {
 
-  // ---- the cron tick ---------------------------------------------------
-
-  /**
-   * One keep-alive cycle. There is no model turn and no review lane: the
-   * supervisor exists only to guarantee the run keeps moving. Everything below
-   * still checks `this.cycle` before acting, so a superseded cycle cannot
-   * declare the run finished or take the busy flag off its successor.
-   */
-  protected async tick(): Promise<void> {
-    this.nextTickAt = Date.now() + this.intervalMs;
-    if (this.disposed || this.queue.runState !== 'RUNNING') {
-      return;
-    }
-    // The run-wide backstop runs before anything else: if the run has spent too
-    // much, produced too many rows, or run too long, stop it now rather than
-    // start another worker.
-    if (this.runBreakerTripped()) {
-      return;
-    }
-    if (this.supervising) {
-      this.log('supervisor still busy; skipping this tick');
-      return;
-    }
-
-    const cycle = ++this.cycle;
-    this.supervising = true;
-    this.changed();
-    try {
-      // Keep-alive, and nothing else. The supervisor's whole job is that the
-      // run never stops: a worker that has gone quiet goes back in the queue,
-      // and a row an older build parked in the review lane is settled. There is
-      // no quality review and no verification turn to take, so this cycle never
-      // calls a model.
-      this.sweepSilentWorkers();
-      for (const task of this.queue.list()) recoverOwnershipStop(this.queue, task);
-      this.queue.drainVerification();
-      await this.serviceTestRepairs();
-
-      if (this.cycle === cycle && this.queue.isComplete() && !hasOutstandingRecovery(this.queue)) {
-        this.finish();
-        return;
-      }
-    } catch (e: any) {
-      this.log(`supervision cycle failed: ${e?.message ?? e}`);
-    } finally {
-      if (this.cycle === cycle) {
-        this.supervising = false;
-        this.changed();
-      }
-    }
-
-    if (this.cycle !== cycle) {
-      return;
-    }
-    // The supervisor decides when the next worker starts.
-    this.schedule('execution pump after supervision', () => this.pump());
-  }
+  // The cron tick — the supervisor cycle — lives in OrchestratorPipeline.
 
   /**
    * Finds workers that have gone quiet and stops pretending they are running.
@@ -207,11 +149,10 @@ export abstract class OrchestratorWatchdog extends OrchestratorControl {
       return;
     }
     if (s.byStatus.VERIFYING > 0) {
-      // A legacy row an older build parked in the review lane. The tick settles
-      // it (accepts its result, requeues it, or blocks it) and then pumps, so a
-      // lost cron cannot leave it untouched forever.
-      this.log(`${s.byStatus.VERIFYING} legacy review row(s); settling them`);
-      this.schedule('watchdog settle check', () => this.tick());
+      // A task is waiting on the tester or a supervisor decision. Run the
+      // supervisor cycle, which pumps when it ends, so a lost cron cannot leave
+      // it waiting forever.
+      this.schedule('watchdog supervisor check', () => this.tick());
       return;
     }
     if (s.byStatus.EXECUTING === 0) {

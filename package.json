@@ -308,11 +308,30 @@
           "default": 200000,
           "markdownDescription": "Context tokens (input plus cache) one round may carry before the core stops the tool loop and asks the agent for a handoff report. This is not a budget for the work: it is the backstop for a queue turn that runs with no round ceiling, and it exists so an agent that keeps calling tools without converging stops just short of the provider refusing the request — handing its supervisor an account of what it did instead of an API error. Raise it for a large-context model; set it to `-1` to switch it off."
         },
-        "mfagent.queue.reviewIntervalSeconds": {
+        "mfagent.queue.reviewEveryModelCalls": {
           "type": "number",
-          "default": 300,
-          "minimum": 30,
-          "markdownDescription": "How often the supervisor may look in on a task that is still executing. Each look is a full model turn over the task's journal, so on a task that legitimately runs for hours a review on every `#mfagent.queue.cronIntervalSeconds#` tick is mostly re-reading evidence it has already judged. A review is skipped entirely when the journal has not grown since the last one, and this interval is never applied to a task that has stopped and is waiting on a decision."
+          "default": 8,
+          "minimum": 1,
+          "markdownDescription": "How many model calls a running coder makes between the supervisor's live reviews of it. Counted in LLM calls, not time, so a slow local model is reviewed as often per unit of work as a fast hosted one and is never interrupted while it has produced nothing new. A task that has stopped and is waiting on a decision is always reviewed immediately."
+        },
+        "mfagent.queue.scopeDiscoveryMinFiles": {
+          "type": "number",
+          "default": 20,
+          "minimum": 0,
+          "markdownDescription": "Workspaces with at most this many files skip the supervisor's scope-discovery model turn before each task: the deterministic scan already bounds the scope. Set 0 to always run discovery."
+        },
+        "mfagent.queue.testerMaxRetests": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "markdownDescription": "How many times per coder attempt the supervisor may re-run the Tester because the tester's own check failed to run (server did not start, wrong command) rather than the implementation failing."
+        },
+        "mfagent.queue.testerMaxRounds": {
+          "type": "number",
+          "default": 40,
+          "minimum": 4,
+          "maximum": 200,
+          "markdownDescription": "Model calls one Tester turn may make while verifying a task. The tester's budget is counted in LLM calls, never in wall-clock time."
         },
         "mfagent.queue.workerMaxRounds": {
           "type": "number",
@@ -320,12 +339,6 @@
           "minimum": 4,
           "maximum": 200,
           "description": "Tool rounds per executor or verifier turn. At the limit, preserve progress and hand off to automatic supervisor recovery; this never counts as a passing check."
-        },
-        "mfagent.queue.verificationMaxInteractions": {
-          "type": "number",
-          "default": 4,
-          "minimum": 1,
-          "description": "Maximum LLM request/response interactions for verifying one task, shared across verification passes and reloads. Planning, plan correction, reporting and vision-backed checks each consume an interaction; ordinary tools, streamed chunks and elapsed time do not. Unfinished work returns to the executor before later tasks run."
         },
         "mfagent.queue.maxRunTasks": {
           "type": "number",
@@ -339,17 +352,11 @@
           "minimum": 0,
           "markdownDescription": "Run circuit breaker: when the run has spent more than this many tokens since it started, the task in flight is replaced by smaller tasks and the run continues on a fresh budget. Spend counts fresh input plus output; cache reads are not billed again, so re-sending a cached prompt each round does not consume the budget. The run is never stopped. The count resets on start, stop, reset and finish, and whenever a breaker trips. Set to 0 to disable."
         },
-        "mfagent.queue.verificationMaxSeconds": {
-          "type": "number",
-          "default": 180,
-          "minimum": 30,
-          "markdownDescription": "Hard wall-clock ceiling on a single verification or supervisor review. A validator that keeps streaming without concluding is cut off and unfinished work returns to the executor before later tasks run."
-        },
-        "mfagent.queue.maxRunMinutes": {
+        "mfagent.queue.maxRunModelCalls": {
           "type": "number",
           "default": 0,
           "minimum": 0,
-          "markdownDescription": "Run circuit breaker: after the run has been continuously RUNNING for this many minutes, the task in flight is replaced by smaller tasks and the run continues on a fresh clock. The run is never stopped. The clock resets on start, stop, reset and finish, and whenever a breaker trips, and is preserved across a window reload. 0 (the default) disables the wall-clock limit, so a run may stay RUNNING indefinitely."
+          "markdownDescription": "Run circuit breaker counted in LLM calls: after the run has made this many model calls (coder, tester, supervisor and planner turns through the core), the task in flight is replaced by smaller tasks and the run continues on a fresh count. The run is never stopped. 0 (the default) disables it. There is deliberately no wall-clock limit: a local model may take half an hour over one call."
         },
         "mfagent.queue.maxContextTokens": {
           "type": "number",

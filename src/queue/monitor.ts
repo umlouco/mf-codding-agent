@@ -6,6 +6,22 @@ import { recoveryRules, originalGoalContext, projectNotesContext } from './promp
 import { taskCognition } from './cognition';
 import { scopeBoundary } from './scopeBoundary';
 import { isLocalScope } from './scopeContract';
+import {
+  SUPERVISOR_ACTIONS,
+  guardViolation,
+  isSupervisorAction,
+  rewriteViolation,
+  type GuardFacts,
+  type GuardedDecision,
+  type SplitPartShape,
+  type SupervisorAction,
+} from './supervisorGraph';
+import { isDecisionEnvelope } from './supervisorSchema';
+import { observeSupervisorFacts, type SupervisorFacts } from './supervisorFacts';
+import { allowedActionLine, reduceSupervision } from './supervisorReducer';
+
+export { SUPERVISOR_ACTIONS } from './supervisorGraph';
+export type { SupervisorAction } from './supervisorGraph';
 
 /**
  * Journal kind recording an independent validation run that did not finish.
@@ -29,33 +45,6 @@ export function correctLocalTestingTarget(task: Task, testingUrl: string): Parti
   }
   return Object.keys(patch).length ? patch : undefined;
 }
-
-/** run_shell has a hard ten-minute maximum plus one second to drain pipes.
- * This detects a violated tool contract, not a time budget for legitimate work.
- * Allow another minute for scheduling/transport before recovering the worker.
- */
-export function shellWaitViolation(phase: string, detail: string): string {
-  if (phase !== 'tool') return '';
-  const match = /^run_shell still running after (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(detail);
-  if (!match) return '';
-  const seconds = Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0);
-  return seconds > 660
-    ? `${detail}; exceeded run_shell's maximum timeout. Check whether a child server kept output pipes open before retrying.`
-    : '';
-}
-
-export const SUPERVISOR_ACTIONS = [
-  'CONTINUE_EXECUTION',
-  'STOP_AND_REWRITE_TASK',
-  'STOP_AND_REWRITE_VALIDATION',
-  'STOP_AND_REWRITE_TESTS',
-  'SPLIT_TASK',
-  'START_VALIDATION',
-  'STOP_AND_DECOMPOSE_TASK',
-] as const;
-
-export type SupervisorAction = typeof SUPERVISOR_ACTIONS[number];
-
 export interface ProgressDecision {
   action: SupervisorAction;
   reason: string;
@@ -73,11 +62,12 @@ function addUsage(target: Usage, source: Usage): void {
   target.cacheWrite += source.cacheWrite;
 }
 
+/**
+ * The candidate predicate `extractJson` uses to pick the decision value out of
+ * a prose reply. Structural shape only — see `supervisorSchema.decisionIssues`.
+ */
 function isDecision(value: unknown): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  return SUPERVISOR_ACTIONS.includes((value as any).action);
+  return isDecisionEnvelope(value);
 }
 
 /**
@@ -124,46 +114,32 @@ function journal(events: TaskEvent[]): string {
 }
 
 function normalize(raw: any, usage: Usage, task: Task, testingUrl = "", needsRecovery = false, failedRepairs = 0): ProgressDecision {
-  if (failedRepairs >= 2 && raw?.action === 'STOP_AND_REWRITE_TESTS') {
-    throw new Error('Supervisor repair has repeatedly halted. Choose SPLIT_TASK or a materially changed task/validation contract before another repair.');
-  }
-  if (needsRecovery && raw?.action === 'CONTINUE_EXECUTION') {
-    throw new Error('The current worker was halted for a wrong testing target or repeated tool failures. CONTINUE_EXECUTION would repeat the rejected approach. Supply a concrete task/validation correction or SPLIT_TASK with smaller steps.');
-  }
   const hasSplitProposal = raw?.splitInto !== undefined && !(Array.isArray(raw.splitInto) && !raw.splitInto.length);
-  if (raw?.action === 'SPLIT_TASK' && hasSplitProposal && (!Array.isArray(raw.splitInto) || raw.splitInto.length < 2 ||
-      raw.splitInto.some((p: any) => !p || typeof p.title !== 'string' || !p.title.trim() ||
-        typeof p.description !== 'string' || !p.description.trim() ||
-        !(typeof p.solutionVerifyPrompt === 'string' && p.solutionVerifyPrompt.trim())))) {
-    throw new Error('SPLIT_TASK requires at least two complete splitInto parts, each with title, description and a behavior verification prompt.');
+  // The proposed transition, resolved against the graph before any field is
+  // trusted. An action outside the vocabulary routes to CONTINUE_EXECUTION,
+  // exactly as the old inline default did.
+  const guarded: GuardedDecision = {
+    action: isSupervisorAction(raw?.action) ? raw.action : 'CONTINUE_EXECUTION',
+    hasSplitProposal,
+    splitInto: Array.isArray(raw?.splitInto) ? raw.splitInto as SplitPartShape[] : undefined,
+    rewrittenDescription: typeof raw?.rewrittenDescription === 'string' ? raw.rewrittenDescription.trim() : '',
+    solutionVerifyPrompt: typeof raw?.solutionVerifyPrompt === 'string' ? raw.solutionVerifyPrompt.trim() : '',
+    hasVerificationRewrite: typeof raw?.solutionVerifyPrompt === 'string',
+    targetCheck: raw?.targetCheck,
+    taskDescription: task.description,
+    taskSolutionVerifyPrompt: task.solutionVerifyPrompt,
+  };
+  const facts: GuardFacts = { needsRecovery, failedRepairs, localScope: isLocalScope(task), testingUrl };
+  const violation = guardViolation(guarded, facts);
+  if (violation) {
+    throw new Error(violation);
   }
-  if (isLocalScope(task) && ['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION'].includes(raw?.action)) {
-    throw new Error('A committed local execution ticket has fixed acceptance requirements. Do not rewrite it into the parent objective. Use CONTINUE_EXECUTION with concrete local recovery guidance, START_VALIDATION when ready, or STOP_AND_DECOMPOSE_TASK for remaining work within this ticket only.');
-  }
-  if (raw?.action === 'STOP_AND_REWRITE_TASK' && !(typeof raw.rewrittenDescription === 'string' && raw.rewrittenDescription.trim())) {
-    throw new Error('STOP_AND_REWRITE_TASK requires rewrittenDescription containing the complete corrected task.');
-  }
-  if (raw?.action === 'STOP_AND_REWRITE_VALIDATION' && !['solutionVerifyPrompt'].some(field => typeof raw[field] === 'string')) {
-    throw new Error('STOP_AND_REWRITE_VALIDATION requires a replacement behavior verification prompt.');
-  }
-  if (testingUrl) {
-    const check = raw?.targetCheck;
-    if (!check || check.configuredUrl !== testingUrl || typeof check.preservesOwnerScope !== "boolean" ||
-        typeof check.observedWork !== "string" || !check.observedWork.trim() || typeof check.requiredWork !== "string" || !check.requiredWork.trim()) {
-      throw new Error("The fixed testing environment requires targetCheck with the exact configuredUrl, requiredWork, observedWork, and a boolean preservesOwnerScope. Compare the actual application and behavior, not just the server address.");
-    }
-    if (!check.preservesOwnerScope && ["CONTINUE_EXECUTION", "START_VALIDATION"].includes(raw.action)) {
-      throw new Error("The target comparison reports scope drift. Do not continue or validate that approach; correct the task and its verification requirements while preserving the owner requirements.");
-    }
-  }
-  const action = SUPERVISOR_ACTIONS.includes(raw?.action)
-    ? raw.action as SupervisorAction
-    : 'CONTINUE_EXECUTION';
+  const action = guarded.action;
   const decision: ProgressDecision = {
     action,
-    splitInto: action === 'SPLIT_TASK' && hasSplitProposal ? raw.splitInto.map((p: NewTask) => ({
-      title: p.title, description: p.description,
-      solutionVerifyPrompt: p.solutionVerifyPrompt,
+    splitInto: action === 'SPLIT_TASK' && hasSplitProposal ? guarded.splitInto!.map((p) => ({
+      title: p.title as string, description: p.description as string,
+      solutionVerifyPrompt: p.solutionVerifyPrompt as string,
     })) : undefined,
     reason: String(raw?.reason ?? '').trim() || 'The supervisor supplied no reason.',
     guidance: typeof raw?.guidance === 'string' ? raw.guidance.trim().slice(0, 8000) || undefined : undefined,
@@ -171,13 +147,15 @@ function normalize(raw: any, usage: Usage, task: Task, testingUrl = "", needsRec
     solutionVerifyPrompt: String(raw?.solutionVerifyPrompt ?? '').trim() || undefined,
     usage,
   };
-  if (action === 'STOP_AND_REWRITE_TASK' && decision.rewrittenDescription === task.description.trim()) {
-    throw new Error('STOP_AND_REWRITE_TASK requires changed rewrittenDescription, not the current task repeated. If only checks are wrong, use STOP_AND_REWRITE_VALIDATION with changed verification fields.');
-  }
-  if (action === 'STOP_AND_REWRITE_VALIDATION' &&
-      !(['solutionVerifyPrompt'] as const)
-        .some(field => decision[field] !== undefined && decision[field] !== task[field].trim())) {
-    throw new Error('STOP_AND_REWRITE_VALIDATION requires changed verification fields, not the current checks repeated.');
+  const rewriteProblem = rewriteViolation({
+    action: decision.action,
+    rewrittenDescription: decision.rewrittenDescription,
+    solutionVerifyPrompt: decision.solutionVerifyPrompt,
+    taskDescription: task.description,
+    taskSolutionVerifyPrompt: task.solutionVerifyPrompt,
+  });
+  if (rewriteProblem) {
+    throw new Error(rewriteProblem);
   }
   return decision;
 }
@@ -190,12 +168,29 @@ export async function reviewProgress(
   events: TaskEvent[],
   failedValidations: number,
   opts: ReviewOptions & { testingUrl?: string; ownerInstructions?: string; recoveryContext?: string;
+    /** The workspace's silent-worker window; defaults to ten minutes. */
+    silentMs?: number;
     refreshProgress?: () => { task: Task; events: TaskEvent[]; failedValidations: number } } = {},
   goal = '',
 ): Promise<ProgressDecision> {
   opts = { ...opts, cognition: taskCognition(task, goal, 'supervisor') };
   const refreshed = opts.refreshProgress?.();
   if (refreshed) ({ task, events, failedValidations } = refreshed);
+  // OBSERVE → UPDATE: reduce the durable facts once, before the model is asked
+  // anything. The assessment never chooses an action; it names the condition,
+  // prunes the graph to the transitions the facts allow, and gives the prompt a
+  // factual preamble instead of making the model re-derive it from raw journal.
+  const facts: SupervisorFacts = observeSupervisorFacts({
+    task,
+    events,
+    failedValidations,
+    failedRepairs: opts.failedRepairs ?? 0,
+    testingUrl: opts.testingUrl ?? '',
+    now: Date.now(),
+    silentMs: opts.silentMs ?? 600_000,
+    localScope: isLocalScope(task),
+  });
+  const assessment = reduceSupervision(facts, task.status);
   const state = task.status === 'EXECUTING'
     ? 'The execution agent is still running.'
     : 'The execution agent has stopped and formal validation has not run yet.';
@@ -256,6 +251,8 @@ ${recoveryRules}
 
 ${opts.recoveryContext || ''}
 
+${assessment.preamble}
+
 ${originalGoalContext(goal)}
 
 ${projectNotesContext(opts.ownerInstructions || opts.projectNotes)}
@@ -299,7 +296,7 @@ ${clip(task.output, OUTPUT_CHARS) || '(the agent has not produced a closing resp
 RECENT DATABASE JOURNAL:
 ${journal(events)}
 
-Choose exactly one hard-coded action:
+Choose exactly one hard-coded action. ${allowedActionLine(assessment)}
 First compare the owner's required behavior and runtime/test target with what the worker is
 actually exercising. State that comparison in reason. The supplied host serving a demonstration
 does not make it the supplied application. If the task itself calls for a substitute that conflicts
@@ -355,9 +352,9 @@ that action needs them. The final response must be valid JSON, with no code fenc
     ...opts,
   });
   const usage = { ...first.usage };
-  const needsRecovery = task.status !== 'EXECUTING' &&
-    ['supervisor_repair_required', 'testing_target_blocked', 'repeated_tool_error', 'unchanged_tool_loop'].some(reason =>
-      task.errorLog.includes(`[attempt ${task.attempts}] the core stopped the turn (${reason})`));
+  // The reducer already classified this from the same durable facts; reading it
+  // back keeps the "was this attempt halted" answer in one place.
+  const needsRecovery = facts.needsRecovery;
   try {
     return normalize(extractJson(first.text, isDecision), usage, task, opts.testingUrl, needsRecovery, opts.failedRepairs);
   } catch (error) {

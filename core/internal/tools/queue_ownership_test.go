@@ -2,66 +2,6 @@ package tools
 
 import "testing"
 
-func TestTestWriteTargetDistinguishesExecutionFromRewrite(t *testing.T) {
-	cases := []struct {
-		name    string
-		command string
-		want    string
-	}{
-		// Running the suite while writing an unrelated scratch file is not a rewrite.
-		{"run suite plus scratch redirect",
-			`node test/run.js; Remove-Item .mfagent/scratch/o.txt -ErrorAction SilentlyContinue`,
-			""},
-		{"run suite with redirect to scratch",
-			`node test/run.js > .mfagent/scratch/o.txt`,
-			""},
-		{"run suite piped to tee scratch",
-			`node test/run.js | tee .mfagent/scratch/o.txt`,
-			""},
-		// A real rewrite of a test is still caught.
-		{"redirect into a test",
-			`echo x > test/foo.test.js`,
-			"test/foo.test.js"},
-		{"set-content a test",
-			`Set-Content -Path test/foo.test.js -Value x`,
-			"test/foo.test.js"},
-		{"remove-item a test",
-			`Remove-Item tests/foo.test.js`,
-			"tests/foo.test.js"},
-		{"rm a test",
-			`rm tests/foo.test.js`,
-			"tests/foo.test.js"},
-		{"sed in place a test",
-			`sed -i s/a/b/ tests/foo.test.js`,
-			"tests/foo.test.js"},
-		{"tee into a test",
-			`node build.js | tee tests/out.test.js`,
-			"tests/out.test.js"},
-		// Inline scripts defeat static reading and stay pessimistic.
-		{"node eval writes a test",
-			`node -e "require('fs').writeFileSync('test/x.test.js','')"`,
-			"test/x.test.js"},
-		{"python writes a test",
-			`python -c "open('tests/x.test.js','w')"`,
-			"tests/x.test.js"},
-		{"git restore a test",
-			`git checkout -- test/x.test.js`,
-			"test/x.test.js"},
-		// Package managers install dependencies, whatever their arguments name.
-		{"npm install playwright test package",
-			`npm install -D @playwright/test > .mfagent/scratch/npm.log`,
-			""},
-		{"plain read",
-			`grep -n assertion test/foo.test.js`,
-			""},
-	}
-	for _, tc := range cases {
-		if got := testWriteTarget(tc.command); got != tc.want {
-			t.Errorf("%s:\n  command %q\n  got %q, want %q", tc.name, tc.command, got, tc.want)
-		}
-	}
-}
-
 func TestValidatorShellWritesAllowsReadOnlyProbes(t *testing.T) {
 	cases := []struct {
 		name    string

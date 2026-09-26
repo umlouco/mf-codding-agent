@@ -66,7 +66,7 @@ or live test environments must be reported rather than replaced with invented ev
 
 Local executor and supervisor turns have no whole-turn timeout by default. Each
 model response may be silent for 60 minutes before the stream idle guard fires.
-The old `turnTimeoutMs` applies to the Claude planner only; local-specific settings
+`turnTimeoutMs` is an opt-in limit for the Claude planner only (no default); local-specific settings
 are `localTurnTimeoutMs` (0 = unlimited), `localModelIdleSeconds`, and
 `localModelAvailabilityWaitMs`. Connection startup is allowed 35 minutes too,
 with cancellable TCP probes that never submit duplicate inference requests.

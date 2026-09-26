@@ -81,6 +81,10 @@ type Env struct {
 	Testing       config.TestingEnvironment
 	testingMu     sync.Mutex
 	testingOpened bool
+	// InspectOnly mirrors the turn's live inspection-only restriction. A tool
+	// that composes other tools (run_script) must honour it for each nested
+	// call, or it becomes a second writer during a read-only review.
+	InspectOnly bool
 
 	// Emit pushes a progress line to the UI.
 	Emit func(kind string, payload any)
@@ -252,16 +256,6 @@ func (r *Registry) Add(t *Tool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.tools[t.Name] = t
-}
-
-func (r *Registry) Remove(prefix string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for name := range r.tools {
-		if strings.HasPrefix(name, prefix) {
-			delete(r.tools, name)
-		}
-	}
 }
 
 func (r *Registry) Get(name string) (*Tool, bool) {

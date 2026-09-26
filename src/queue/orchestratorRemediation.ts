@@ -7,7 +7,6 @@ import { decisionEvidence, recoveryContext, recoveryEvidence } from './recovery'
 import { readRecoveryJob, RecoveryOutcome, recoveryStrategyFingerprint, rememberRecoveryStrategy,
   strategyStreak } from './recoverySchedule';
 import { boundedTask } from './scopeBoundary';
-import { implementationRetryProblem } from './verificationRecovery';
 
 /** Recovery changes the next operation, not the owner's task or its acceptance criteria. */
 export abstract class OrchestratorRemediation extends OrchestratorDecomposition {
@@ -48,8 +47,6 @@ export abstract class OrchestratorRemediation extends OrchestratorDecomposition 
       this.queue.log(task.id, 'supervisor', 'recovery-decision', JSON.stringify(decision));
       if (decision.action === 'WAIT') return { status: 'deferred', reason: decision.reason + '\n' + decision.guidance,
         retryAfterMs: decision.retryAfterMs };
-      const retryProblem = decision.action === 'EXECUTE' ? implementationRetryProblem(task) : '';
-      if (retryProblem) return { status: 'deferred', reason: retryProblem };
       // A genuinely changed tool outcome can justify repeating a check after a
       // repair. Attempts, waiting, new prose, and reloads cannot change this key.
       const strategy = recoveryStrategyFingerprint({ operation: recoveryOperation(decision),
@@ -57,9 +54,8 @@ export abstract class OrchestratorRemediation extends OrchestratorDecomposition 
       const streak = strategyStreak(this.queue, task, strategy);
       if (!rememberRecoveryStrategy(this.queue, task, strategy)) {
         // Backing off and asking again cannot reach a different answer without
-        // new evidence, and nothing here produces any while stuck on this branch
-        // (VERIFY never runs below; EXECUTE is already rejected by
-        // implementationRetryProblem on a genuine repeat). Three consecutive
+        // new evidence, and nothing here produces any while stuck on this branch.
+        // Three consecutive
         // identical proposals is this file's own threshold elsewhere for "stop
         // asking, do something structurally different" — reuse it here instead
         // of deferring the identical question forever on a five-minute timer.
@@ -112,8 +108,6 @@ export abstract class OrchestratorRemediation extends OrchestratorDecomposition 
 function recoveryReport(serialized: string): unknown {
   try {
     const report = JSON.parse(serialized);
-    return { conclusion: report.conclusion, remaining: report.remaining,
-      claimedChecks: report.checks, observedTools: report.observedTools,
-      verificationPlan: report.verificationPlan, verificationReceipts: report.verificationReceipts };
+    return { conclusion: report.conclusion, remaining: report.remaining, claimedChecks: report.checks };
   } catch { return serialized.slice(0, 8000); }
 }

@@ -48,7 +48,6 @@ export interface EditorToolDef {
   tags: string[];
 }
 
-
 /** Task-queue server version, bumped when its tools change shape. */
 const QUEUE_SERVER_VERSION = '0.2.0';
 
@@ -210,22 +209,6 @@ export class McpBridge implements vscode.Disposable {
       }));
   }
 
-  /**
-   * A compact account of the editor tools an agent will have, for a planning
-   * prompt: enough to plan around them, not enough to crowd out the plan.
-   */
-  toolsSummary(limit = 40): string {
-    const defs = this.editorToolDefs();
-    if (defs.length === 0) {
-      return '';
-    }
-    const lines = defs.slice(0, limit).map((t) => `- editor__${sanitize(t.name)}: ${clip(t.description, 140)}`);
-    if (defs.length > limit) {
-      lines.push(`- (${defs.length - limit} more)`);
-    }
-    return lines.join('\n');
-  }
-
   /** Registers the callback a core uses to run one of those tools. */
   attach(client: CoreClient): void {
     client.onRequest('lm/invokeTool', async (params: { name?: string; input?: unknown }) => {
@@ -245,16 +228,6 @@ export class McpBridge implements vscode.Disposable {
       s.dispose();
     }
   }
-}
-
-/** Mirrors `sanitize` in core/cmd/mfcore/main.go, so a name shown here is the name the model sees. */
-function sanitize(s: string): string {
-  return s.replace(/[^A-Za-z0-9_]/g, '_');
-}
-
-function clip(s: string, max: number): string {
-  const one = s.replace(/\s+/g, ' ').trim();
-  return one.length > max ? `${one.slice(0, max)}…` : one;
 }
 
 /** A tool result as text — the only form the core's tool protocol carries. */

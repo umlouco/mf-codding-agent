@@ -8,12 +8,12 @@ const { createHost } = require('./headless-host.cjs');
 test('Playwright tools and recovery use the production core registry', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mf-playwright-tools-'));
   const host = await createHost({ workspace: root, log() {} });
-  const { VerificationSession } = host.load('src/queue/verificationPlanRunner.ts');
-  const session = new VerificationSession(host.context, host.output, () => {});
+  const { ToolRegistry } = host.load('src/queue/toolCapabilities.ts');
+  const session = new ToolRegistry(host.context, host.output);
   const agents = host.load('src/queue/agentRuntime.ts');
   const originalRun = agents.runOnce;
   try {
-    await session.start(host.context);
+    await session.start();
     const invoke = (name, input) => session.client.request('tools/invoke', { name, input });
     for (const name of ['playwright_skill', 'playwright_cli', 'playwright_status', 'playwright_install', 'playwright_test', 'run_shell']) {
       assert(session.capabilities.some(tool => tool.name === name), `${name} missing from actual registry`);

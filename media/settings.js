@@ -1386,6 +1386,39 @@
 
     host.appendChild(
       el('div', { class: 'card' }, [
+        el('h2', { text: 'Context limit' }),
+        el('p', {
+          class: 'hint',
+          text: 'Tokens one agent round may carry (input plus cache) before the run stops and hands off a report. Set this to the model\u2019s real window; it is not detected automatically.',
+        }),
+        labeled(
+          'Model context limit',
+          el('input', {
+            type: 'number',
+            min: -1,
+            step: 1000,
+            value: (S.context && S.context.llm) ?? 200000,
+            onchange: (e) => send({ type: 'setContextCeiling', value: Number(e.target.value) }),
+          }),
+          'Use -1 to switch the ceiling off.',
+        ),
+        el('div', { class: 'gap-md' }),
+        labeled(
+          'Queue context limit',
+          el('input', {
+            type: 'number',
+            min: 0,
+            step: 1000,
+            value: (S.context && S.context.queue) ?? 0,
+            onchange: (e) => send({ type: 'setQueueContextCeiling', value: Number(e.target.value) }),
+          }),
+          'Optional smaller cap for queue workers; 0 inherits the model limit.',
+        ),
+      ]),
+    );
+
+    host.appendChild(
+      el('div', { class: 'card' }, [
         el('h2', { text: 'Browser' }),
         el('p', {
           class: 'hint',

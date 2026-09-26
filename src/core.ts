@@ -6,8 +6,6 @@ import { getStore } from './providers/instance';
 import { CoreTransport } from './runtime/coreTransport';
 
 export type { CoreConfig };
-export type NotificationHandler = (method: string, params: any) => void;
-export type RequestHandler = (params: any) => Promise<any>;
 export interface InitResult {
   version: string;
   provider: string;

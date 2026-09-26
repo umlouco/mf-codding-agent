@@ -33,8 +33,6 @@ func (c *EmbeddingClient) Enabled() bool {
 	return c != nil && c.model != "" && c.baseURL != ""
 }
 
-func (c *EmbeddingClient) Model() string { return c.model }
-
 func (c *EmbeddingClient) Embed(ctx context.Context, text string) ([]float32, error) {
 	if !c.Enabled() {
 		return nil, fmt.Errorf("embedding client not configured")
@@ -82,16 +80,6 @@ func (c *EmbeddingClient) Embed(ctx context.Context, text string) ([]float32, er
 		return nil, fmt.Errorf("embedding endpoint returned empty vector")
 	}
 	return out.Data[0].Embedding, nil
-}
-
-// embedMany returns a single embedding by joining the texts with newlines and
-// embedding them together. This is cheaper than embedding each piece separately
-// for simple inputs.
-func (c *EmbeddingClient) embedMany(ctx context.Context, texts []string) ([]float32, error) {
-	if len(texts) == 0 {
-		return nil, fmt.Errorf("no text to embed")
-	}
-	return c.Embed(ctx, strings.Join(texts, "\n"))
 }
 
 // vectorToBlob packs []float32 into a little-endian byte sequence.
