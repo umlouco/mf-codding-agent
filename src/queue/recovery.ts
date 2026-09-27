@@ -47,10 +47,12 @@ export function providerUnavailable(message: string): boolean {
  * Retrying it just repeats the same error, and treating it as a failed
  * verification earns a decomposition — which is how one misconfigured run
  * rewrote the same task forever. Callers must stop the run and say what to
- * configure instead.
+ * configure instead. Testing credentials named by a queue database but absent
+ * from this host/profile's secret storage are the same fault for the same
+ * reason: the worker cannot sign in, and every retry asks it to try again.
  */
 export function providerConfigurationError(message: string): boolean {
-  return /no supported provider is configured for the .* role|select a provider for this role|http 401\b|unauthori[sz]ed|invalid api key|no cookie auth credentials/i
+  return /no supported provider is configured for the .* role|select a provider for this role|http 401\b|unauthori[sz]ed|invalid api key|no cookie auth credentials|[Tt]esting credentials unavailable/i
     .test(message);
 }
 const fresh = (): RecoveryState => ({ version: 1, cursor: 0, revision: 0, seen: [], repeats: 0,

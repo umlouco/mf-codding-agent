@@ -57,7 +57,7 @@ CATALOG:\n${catalog.map(region => `- ${region.path} (${region.fileCount} files${
     const paths = extractJson<any>(text).paths;
     output.appendLine(`[queue:planner] scope selection from ${catalog.length} catalog entries: ${JSON.stringify(paths)}`);
     return paths;
-  });
+  }, root);
   output.appendLine(`[queue:planner] scanned workspace into ${regions.length} region(s)`);
 
   // The planner always writes the task list, on any workspace — including an

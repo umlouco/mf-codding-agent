@@ -150,7 +150,24 @@ export function buildSkillsText(
   return parts.length ? `# Skills\n\n${parts.join('\n\n')}` : '';
 }
 
-export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> {
+/**
+ * Whether a core is allowed to start with named testing credentials absent.
+ *
+ * Queue workers execute against the fixed target and cannot do their job
+ * without signing in, so they refuse to start without the values. The editor
+ * core has no such job. A queue database copied to another host or profile
+ * names credentials whose values stay behind in the original profile's secret
+ * storage; refusing to start the window's chat over them left the extension
+ * with no way to open the settings page the error points at.
+ */
+export interface BuildCoreConfigOptions {
+  allowMissingCredentials?: boolean;
+}
+
+export async function buildCoreConfig(
+  store: ProfileStore,
+  options: BuildCoreConfigOptions = {},
+): Promise<CoreConfig> {
   const cfg = vscode.workspace.getConfiguration('mfagent');
   const root = workspaceRoot();
   const resolved = await store.resolveAll();
@@ -221,7 +238,11 @@ export async function buildCoreConfig(store: ProfileStore): Promise<CoreConfig> 
   const skillsText = buildSkillsText(skills, skillGroups, enabledSkillGroups);
 
   return {
-    testingEnvironment: await loadTestingEnvironment(getContext(), activeQueue),
+    testingEnvironment: await loadTestingEnvironment(
+      getContext(),
+      activeQueue,
+      options.allowMissingCredentials === true,
+    ),
     workspaceRoot: root,
     providers: [...providers.values()],
     coding,

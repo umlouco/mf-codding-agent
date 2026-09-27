@@ -39,19 +39,54 @@ export function planningCatalog(regions: Region[]): Region[] {
   throw new Error('The workspace has more than 120 top-level regions; select a narrower application root before planning.');
 }
 
-export function selectPlanningRegions(regions: Region[], catalog: Region[], selected: unknown): Region[] {
-  if (!Array.isArray(selected) || !selected.length || selected.some(value =>
-    typeof value !== 'string' || !catalog.some(region => region.path === value))) {
-    throw new Error('The scope planner selected an empty or unlisted directory.');
+export function selectPlanningRegions(regions: Region[], catalog: Region[], selected: unknown, root = ''): Region[] {
+  if (!Array.isArray(selected) || !selected.length) {
+    throw new Error('The scope planner selected no directories.');
   }
-  return regions.filter(region => selected.some(prefix => region.path === prefix ||
+  const listed = new Set(catalog.map(region => region.path));
+  const chosen: string[] = [];
+  const unknown: string[] = [];
+  for (const value of selected) {
+    const prefix = typeof value === 'string' ? normalizeSelection(value, root) : '';
+    if (!prefix) continue;
+    // The catalog is an aggregation of `regions`, not a second source of
+    // truth: a 200-file `wp-content/plugins` is listed where the scan itself
+    // returned `wp-content/plugins/pxrms`. A selection naming the actual
+    // plugin — the directory the owner's goal named — is more precise than the
+    // aggregation, not unlisted, so accept anything the scan really contains.
+    if (!listed.has(prefix) && !matchesScannedRegion(regions, prefix)) {
+      unknown.push(prefix);
+      continue;
+    }
+    if (!chosen.includes(prefix)) chosen.push(prefix);
+  }
+  if (unknown.length) {
+    throw new Error(`The scope planner selected directories that are not in this workspace: ${unknown.join(', ')}.`);
+  }
+  if (!chosen.length) {
+    throw new Error('The scope planner selected no usable directory.');
+  }
+  return regions.filter(region => chosen.some(prefix => region.path === prefix ||
     prefix !== '.' && region.path.startsWith(prefix + '/')));
 }
 
-export async function narrowPlanningRegions(regions: Region[], select: (catalog: Region[]) => Promise<unknown>): Promise<Region[]> {
+function matchesScannedRegion(regions: Region[], prefix: string): boolean {
+  return regions.some(region => region.path === prefix || region.path.startsWith(prefix + '/'));
+}
+
+/** Accepts the workspace-relative forms a model returns, including a goal's absolute path. */
+function normalizeSelection(value: string, root: string): string {
+  let text = value.trim().replace(/\\/g, '/');
+  if (!text) return '';
+  if (root && path.isAbsolute(text)) text = path.relative(root, text).replace(/\\/g, '/');
+  text = text.replace(/^\.\/+/, '').replace(/\/+$/, '');
+  return text === '' ? '.' : text;
+}
+
+export async function narrowPlanningRegions(regions: Region[], select: (catalog: Region[]) => Promise<unknown>, root = ''): Promise<Region[]> {
   for (let round = 0; round < 3 && regions.length > 120; round++) {
     const catalog = planningCatalog(regions);
-    const selected = selectPlanningRegions(regions, catalog, await select(catalog));
+    const selected = selectPlanningRegions(regions, catalog, await select(catalog), root);
     if (selected.length === regions.length) return selected;
     regions = selected;
   }

@@ -48,6 +48,8 @@ test('a missing provider is a configuration error, not an outage', async () => {
       'a billing refusal is a provider outage, not a task defect');
     assert.equal(providerConfigurationError('http 401 from https://openrouter.ai/api/v1: No cookie auth credentials found'), true,
       'a missing/invalid key must stop the run so it can be fixed');
+    assert.equal(providerConfigurationError('Testing credentials unavailable on this host/profile: password, username. Enter their values in Task Queue > Plan > Testing environment.'), true,
+      'credentials copied as names without values must stop the run, not be retried as a task defect');
   } finally { await host.close(); fs.rmSync(workspace, { recursive: true, force: true }); }
 });
 
