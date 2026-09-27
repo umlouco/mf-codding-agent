@@ -22,6 +22,18 @@ export function testingURL(value: unknown): string {
   return url.href;
 }
 
+/**
+ * True when a testing URL points at this machine. It decides who is expected to
+ * serve the address: a remote origin is an application the owner maintains and
+ * must not be replaced, while a loopback address is one the workspace itself has
+ * to bring up. The core applies the same split in `CheckTestingCommand`.
+ */
+export function isLoopbackTarget(value: string): boolean {
+  let host: string;
+  try { host = new URL(value).hostname.toLowerCase(); } catch { return false; }
+  return ['localhost', '0.0.0.0', '[::1]', '::1'].includes(host) || /^127(\.\d+){3}$/.test(host);
+}
+
 export async function loadTestingEnvironment(
   context: Pick<vscode.ExtensionContext, 'secrets'>,
   queue?: TaskQueue,
@@ -103,6 +115,12 @@ export async function preparePlanningGoal(
     return /(?:\btest(?:ing)?\b|\bplaywright\b)[^\n.!?]*$/i.test(before);
   });
   const detectedURL = targeted.length === 1 ? targeted[0] : urls.length === 1 ? urls[0] : '';
+  // A loopback address in a goal says where to serve the work, not that a
+  // running application already lives there. Adopting it as the fixed target
+  // would forbid the executor from starting the very server the goal asks for,
+  // with nothing else to serve it — the wrong-target stop with no way forward.
+  // A local target stays configurable, deliberately, in Plan > Testing environment.
+  const adoptableURL = detectedURL && !isLoopbackTarget(detectedURL) ? detectedURL : '';
   const detected: Record<string, string> = {};
   const value = '(?:"([^"\\n]+)"|\'([^\'\\n]+)\'|`([^`\\n]+)`|([^\\s,;]+))';
   const unquote = (match: RegExpMatchArray, start = 1) => match.slice(start, start + 4).find(part => part !== undefined) || '';
@@ -117,8 +135,8 @@ export async function preparePlanningGoal(
   // An existing target is a manual/previously confirmed selection. Do not attach
   // credentials from a different URL to that account.
   const differentTarget = !!current.url && !!detectedURL && testingURL(detectedURL) !== current.url;
-  if ((!current.url && detectedURL) || (additions.length && !differentTarget)) {
-    await saveTestingEnvironment(context, queue, { url: current.url || detectedURL,
+  if ((!current.url && adoptableURL) || (additions.length && !differentTarget)) {
+    await saveTestingEnvironment(context, queue, { url: current.url || adoptableURL,
       credentials: differentTarget ? [] : additions.map(([name, value]) => ({ name, value })), remove: [] });
   }
   const safe = testingPrompt(prompt, { url: detectedURL, credentials: detected });

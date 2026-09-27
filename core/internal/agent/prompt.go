@@ -5,6 +5,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/mflores/mfagent/core/internal/tools"
 )
 
 type PromptInput struct {
@@ -150,6 +152,9 @@ field for login values; use MFAGENT_CREDENTIAL_<NAME> environment variables in
 commands and tests. Do not print or save values. Node tests read process.env.MFAGENT_TEST_URL.
 For Apache rewrite problems use apache_rewrite_check before guessing .htaccess edits.
 `)
+		if tools.LoopbackTestingTarget(in.TestingURL) {
+			fmt.Fprintf(&b, "That URL is a local address this workspace serves: starting or restarting the server that hosts %s is required work, not a substitute application. Keep it on that exact origin and port.\n", in.TestingURL)
+		}
 	}
 
 	b.WriteString(`

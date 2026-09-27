@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+
+	"github.com/mflores/mfagent/core/internal/tools"
 )
 
 // Keep the stable executor policy separate from the interactive coder's tool manual.
@@ -74,6 +76,9 @@ report the observed blocker without dropping the required check.
 Use browser_fill credential references or MFAGENT_CREDENTIAL_<NAME> environment
 variables, never literal secrets. Node tests read process.env.MFAGENT_TEST_URL.
 `, in.TestingURL)
+		if tools.LoopbackTestingTarget(in.TestingURL) {
+			fmt.Fprintf(&b, "That target is a local address this workspace serves: bring up the server for %s when it is not running and keep the checks on that exact origin and port. That server is the configured target, not a substitute for it.\n", in.TestingURL)
+		}
 	}
 	if in.BrowserReady {
 		b.WriteString("\nFor UI tasks, browser_* and Playwright tools provide real application evidence. Follow the task's browser checks, authenticate in the current session, and do not assume cookies are shared across tool families.\n")

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -89,6 +90,29 @@ func sameOrigin(a, b *url.URL) bool {
 	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Hostname(), b.Hostname()) && port(a) == port(b)
 }
 
+// LoopbackTestingTarget reports whether a configured testing URL points at this
+// machine. It decides who is expected to serve that address: a remote origin is
+// an application the owner maintains, while a loopback address is one the
+// workspace itself has to bring up.
+func LoopbackTestingTarget(raw string) bool {
+	if strings.TrimSpace(raw) == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return loopbackHost(u.Hostname())
+}
+
+func loopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
+}
+
 func (e *Env) CheckTestingURL(target string, first bool) error {
 	if e.Testing.URL == "" {
 		return nil
@@ -116,7 +140,12 @@ func (e *Env) CheckTestingCommand(command string) error {
 	if e.Testing.URL == "" {
 		return nil
 	}
-	if serverCommand.MatchString(command) {
+	// Refusing a development server protects an application the owner already
+	// runs elsewhere. A loopback target has no such application behind it: this
+	// workspace is what serves that address, so the server is the configured
+	// target rather than a substitute for it, and refusing it would leave the
+	// checks with nothing to reach.
+	if serverCommand.MatchString(command) && !LoopbackTestingTarget(e.Testing.URL) {
 		return fmt.Errorf("a testing application is already configured at %s; starting a replacement development server is disabled", e.Testing.URL)
 	}
 	for _, target := range literalLoopbackURL.FindAllString(command, -1) {
@@ -202,7 +231,7 @@ func (e *Env) CheckTestingTool(name string, input json.RawMessage) error {
 }
 
 func RegisterTestingEnvironment(r *Registry) {
-	r.Add(&Tool{Name: "testing_environment", Description: "Read the owner's fixed testing URL and available named credentials. Values stay secret: use browser_fill's credential field or MFAGENT_CREDENTIAL_<NAME> environment variables in terminal commands/tests. Credentials work without a testing URL. A configured URL forbids replacement localhost servers.", Schema: obj(map[string]any{}),
+	r.Add(&Tool{Name: "testing_environment", Description: "Read the owner's fixed testing URL and available named credentials. Values stay secret: use browser_fill's credential field or MFAGENT_CREDENTIAL_<NAME> environment variables in terminal commands/tests. Credentials work without a testing URL. A configured remote URL forbids replacement localhost servers; a configured loopback URL is an address this workspace serves itself, on that exact origin.", Schema: obj(map[string]any{}),
 		Run: func(ctx context.Context, env *Env, input json.RawMessage) Result {
 			names := make([]string, 0, len(env.Testing.Credentials))
 			for name := range env.Testing.Credentials {
@@ -211,13 +240,19 @@ func RegisterTestingEnvironment(r *Registry) {
 			sort.Strings(names)
 			var out strings.Builder
 			fmt.Fprintf(&out, "Testing URL: %s\nTerminal/test URL variable: MFAGENT_TEST_URL\n", orNone(env.Testing.URL))
+			if LoopbackTestingTarget(env.Testing.URL) {
+				fmt.Fprintf(&out, "That address is served from this workspace: bring up the server for %s yourself if it is not running, and keep every check on that exact origin.\n", env.Testing.URL)
+			}
 			for _, name := range names {
 				fmt.Fprintf(&out, "Credential %s: browser_fill credential=%q; terminal environment variable MFAGENT_CREDENTIAL_%s\n", name, name, strings.ToUpper(name))
 			}
 			if len(names) == 0 {
 				out.WriteString("No credentials configured. Do not invent an account.\n")
 			}
-			out.WriteString("Use process.env in Node tests, $env:NAME in PowerShell, or $NAME in the portable unix shell. Never print or persist their values. Do not replace the supplied application with a fixture or another server.")
+			out.WriteString("Use process.env in Node tests, $env:NAME in PowerShell, or $NAME in the portable unix shell. Never print or persist their values.")
+			if !LoopbackTestingTarget(env.Testing.URL) {
+				out.WriteString(" Do not replace the supplied application with a fixture or another server.")
+			}
 			return Ok(out.String())
 		}})
 }
