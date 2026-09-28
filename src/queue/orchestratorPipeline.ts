@@ -275,6 +275,8 @@ export abstract class OrchestratorPipeline extends OrchestratorExpansion {
         this.log(`task ${task.seq} back to the coder: ${verdict.reason}`);
         return;
       case 'REWRITE':
+        if (this.holdRewriteForOwner(task, `new description: ${verdict.rewrittenDescription || '(unchanged)'}; ` +
+          `new verification: ${verdict.solutionVerifyPrompt || '(unchanged)'}`)) return;
         this.queue.update(task.id, { status: 'PENDING', finishedAt: null, activityPhase: 'requeued',
           description: verdict.rewrittenDescription || task.description,
           solutionVerifyPrompt: verdict.solutionVerifyPrompt || task.solutionVerifyPrompt,

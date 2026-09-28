@@ -58,6 +58,8 @@ export interface Review {
   lastModelOutputAt?: number;
   /** Worker evidence available when this review's prompt was assembled. */
   evidenceEventId?: number;
+  /** Journal id the previous review of this attempt saw; its work since is this review's window. */
+  progressSince?: number;
   /** Set only by a validator when its shell tool exceeds the tool's own bound. */
   validationToolViolation?: string;
   /** Kills the core process, which rejects the request wedged on it. */

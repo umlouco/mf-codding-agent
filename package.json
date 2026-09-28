@@ -2,7 +2,7 @@
   "name": "mf-agent",
   "displayName": "MF Agent",
   "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
-  "version": "0.1.80",
+  "version": "0.1.82",
   "publisher": "mflores",
   "license": "MIT",
   "pricing": "Free",
@@ -313,6 +313,12 @@
           "default": 8,
           "minimum": 1,
           "markdownDescription": "How many model calls a running coder makes between the supervisor's live reviews of it. Counted in LLM calls, not time, so a slow local model is reviewed as often per unit of work as a fast hosted one and is never interrupted while it has produced nothing new. A task that has stopped and is waiting on a decision is always reviewed immediately."
+        },
+        "mfagent.queue.maxRewrites": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "markdownDescription": "How many times the supervisor may rewrite one task's description or verification before a person decides. Each rewrite restarts the task's attempt budget, so without a limit a task that cannot finish is rephrased and retried forever. At the limit the proposed rewrite is held, not applied, and the run pauses with the proposal in the task's journal; Start resumes with a fresh allowance, and editing the task resets it too. Set to 0 for no limit."
         },
         "mfagent.queue.scopeDiscoveryMinFiles": {
           "type": "number",

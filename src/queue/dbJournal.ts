@@ -119,6 +119,28 @@ export class QueueJournal extends QueueMetadata {
     return row.n as number;
   }
 
+  /** `kind` recorded against the task's current attempt — since its latest claim. */
+  countAttemptEvents(taskId: number, kind: string): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = ?
+        AND id >= COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'claimed'), 0)`)
+      .get(taskId, kind, taskId);
+    return row.n as number;
+  }
+
+  /**
+   * Supervisor rewrites of the task's contract since a person last had a say:
+   * any owner action on the task, or the run pausing on the rewrite limit —
+   * which the owner answers by pressing Start.
+   */
+  supervisorRewritesSinceOwner(taskId: number): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND actor = 'supervisor'
+        AND kind IN ('task-edited', 'validation-edited')
+        AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?
+          AND (actor = 'user' OR kind = 'rewrite-limit')), 0)`)
+      .get(taskId, taskId);
+    return row.n as number;
+  }
+
   countEvents(taskId: number, kind: string, sinceUserRetry = false): number {
     const row = this.db
       .prepare(`SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = ?

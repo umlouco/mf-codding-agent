@@ -1,3 +1,4 @@
+import * as vscode from 'vscode';
 import { attemptsExhausted, runOnce, coreHalted } from './agents';
 import { Task, TaskStatus, NewTask } from './db';
 import { LiveLog } from './liveLog';
@@ -7,6 +8,13 @@ import { OrchestratorRemediation } from './orchestratorRemediation';
 import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, recoverySucceeded, recoveryReplayLimit } from './recovery';
 import { isLocalScope } from './scopeContract';
 import { recoverOwnershipStop } from './ownershipRecovery';
+import { workerProgress } from './workerProgress';
+
+/** Live-review actions that kill the running coder. START_VALIDATION ends a finished turn, not an unfinished one. */
+const STOPPING_ACTIONS = new Set<ProgressDecision['action']>(['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION',
+  'STOP_AND_REWRITE_TESTS', 'SPLIT_TASK', 'STOP_AND_DECOMPOSE_TASK']);
+/** Stops held per attempt while the coder is making changes; see deferStopForProgress. */
+const MAX_STOP_DEFERRALS = 2;
 
 export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
@@ -60,13 +68,16 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     if (!this.shouldReview(task, latestEventId)) {
       return;
     }
+    const previous = this.reviewed.get(task.id);
+    const progressSince = previous && previous.attempt === task.attempts ? previous.eventId : 0;
     // Recorded before the turn, not after: this is a rate, and a review that
     // fails or is abandoned still means the supervisor has just looked.
     this.reviewed.set(task.id, { attempt: task.attempts, at: Date.now(), eventId: latestEventId });
 
     this.log(`reviewing live work on task ${task.seq} — ${task.title}`);
     const gen = ++this.reviewGen;
-    const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now(), startedAt: Date.now(), evidenceEventId };
+    const review: Review = { taskId: task.id, seq: task.seq, gen, lastActivityAt: Date.now(), startedAt: Date.now(),
+      evidenceEventId, progressSince };
     this.review = review;
     // The supervisor's reasoning streams to the view like everyone else's —
     // into the live table only, never into the journal it will read next time.
@@ -442,6 +453,8 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       return;
     }
 
+    if (await this.deferStopForProgress(task, decision, review)) return;
+
     if (decision.action === 'STOP_AND_DECOMPOSE_TASK') {
       await this.replanOrPause(task, decision.reason);
       return;
@@ -471,14 +484,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
           this.log(`task ${task.seq} will resume from its handoff with the same requirements`);
         } else {
           if (decision.guidance && decision.guidance !== task.supervisorFeedback) {
-            this.queue.update(task.id, { supervisorFeedback: decision.guidance });
-            const gen = this.executionGen;
-            let accepted = false;
-            try { accepted = await this.executionSteer?.(decision.guidance) ?? false; } catch { /* Retained for the next handoff. */ }
-            if (gen === this.executionGen && this.queue.get(task.id)?.startedAt === task.startedAt) {
-              this.queue.log(task.id, 'supervisor', accepted ? 'guidance-queued' : 'guidance-saved',
-                `${accepted ? 'Queued for the next model round' : 'Saved for the next worker handoff'}: ${decision.guidance}`);
-            }
+            await this.steerWorker(task, decision.guidance);
           }
           this.log(`task ${task.seq} is progressing in the right direction; continuing`);
         }
@@ -489,6 +495,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         if (!description || description.trim() === task.description.trim()) {
           throw new Error('The supervisor requested a task rewrite without supplying changed requirements. Preserve the task and request a complete decision; do not verify the rejected approach.');
         }
+        if (this.holdRewriteForOwner(task, `new description: ${description}`)) return;
 
         if (!this.stopForDecision(task, {
           status: 'PENDING',
@@ -512,6 +519,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         if (!hasRewrite) {
           throw new Error('The supervisor requested a validation rewrite without changed checks. Preserve the task and request a complete decision; do not run the rejected checks.');
         }
+        if (this.holdRewriteForOwner(task, `new verification: ${decision.solutionVerifyPrompt}`)) return;
 
         if (!this.stopForDecision(task, {
           status: 'PENDING',
@@ -540,6 +548,83 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         await this.verifyWithExecutor(this.queue.get(task.id) ?? task, review);
         return;
     }
+  }
+
+  /** Hands guidance to the running coder's next model round, or keeps it for the next handoff. */
+  private async steerWorker(task: Task, guidance: string): Promise<void> {
+    this.queue.update(task.id, { supervisorFeedback: guidance });
+    const gen = this.executionGen;
+    let accepted = false;
+    try { accepted = await this.executionSteer?.(guidance) ?? false; } catch { /* Retained for the next handoff. */ }
+    if (gen === this.executionGen && this.queue.get(task.id)?.startedAt === task.startedAt) {
+      this.queue.log(task.id, 'supervisor', accepted ? 'guidance-queued' : 'guidance-saved',
+        `${accepted ? 'Queued for the next model round' : 'Saved for the next worker handoff'}: ${guidance}`);
+    }
+  }
+
+  /**
+   * Holds a live stop while the coder is visibly moving, and sends it as guidance instead.
+   *
+   * A stop kills the coder and the next attempt starts from the task text with
+   * none of what the last one read or learned. On a slow local model a review
+   * lands every few hours of work, often while the model is still reading its
+   * prompt, and a supervisor that sees "no output yet" and restarts the worker
+   * each time can keep a nearly finished task from ever finishing. So when the
+   * coder changed files or ran tests since the previous review (see
+   * workerProgress), the concern reaches it as guidance and the next review
+   * decides again with that work in view. At most MAX_STOP_DEFERRALS per
+   * attempt: a coder that keeps editing in the wrong direction can still be stopped.
+   */
+  private async deferStopForProgress(task: Task, decision: ProgressDecision, review: Review): Promise<boolean> {
+    if (task.status !== 'EXECUTING' || !STOPPING_ACTIONS.has(decision.action)) return false;
+    if (this.queue.countAttemptEvents(task.id, 'stop-deferred') >= MAX_STOP_DEFERRALS) return false;
+    const since = review.progressSince ?? 0;
+    const moved = workerProgress(this.queue.events(task.id, 500, true).filter(event => event.id > since));
+    if (!moved.length) return false;
+    const concern = decision.guidance || decision.reason;
+    this.queue.log(task.id, 'supervisor', 'stop-deferred',
+      `${decision.action} held: the coder completed ${moved.length} change/test outcome(s) since the last review ` +
+      `(${[...new Set(moved)].join(', ')}). ${concern}`.slice(0, 8000));
+    await this.steerWorker(task, `The supervisor considered stopping this attempt (${decision.action}) and held off ` +
+      `because you are making changes. Address its concern before continuing: ${concern}`);
+    this.log(`task ${task.seq} — ${decision.action} held; the coder is making changes, sent as guidance instead`);
+    return true;
+  }
+
+  /** Supervisor rewrites of one task's contract allowed before the owner decides; 0 is no limit. */
+  protected get maxRewrites(): number {
+    return Math.max(0, this.cfg<number>('queue.maxRewrites', 2));
+  }
+
+  /**
+   * Refuses a supervisor rewrite once the task has had `maxRewrites` of them
+   * without finishing, and pauses the run for the owner instead.
+   *
+   * Every rewrite also restarts the attempt budget (see attemptsExhausted), so
+   * without this the budget never ends: attempts run out, the supervisor
+   * rephrases the task, attempts start over. Several rephrasings that each
+   * failed are the signal that a person has to look — the requirement may be
+   * wrong, the environment broken, or the model too weak for the job. The
+   * proposal is kept in the journal and on the row; Start resumes with a fresh
+   * allowance, and any owner edit to the task resets it too.
+   */
+  protected holdRewriteForOwner(task: Task, proposal: string): boolean {
+    const limit = this.maxRewrites;
+    if (!limit) return false;
+    const used = this.queue.supervisorRewritesSinceOwner(task.id);
+    if (used < limit) return false;
+    const reason = `The supervisor has already rewritten task ${task.seq} ${used} time(s) and it still has not ` +
+      `finished; another rewrite was held for you instead of applied. Review the task and its journal, edit it ` +
+      `if needed, then press Start. Held proposal — ${proposal}`;
+    this.queue.log(task.id, 'supervisor', 'rewrite-limit', reason.slice(0, 8000));
+    this.pause();
+    this.queue.recordActivity(task.id, 'owner_review', reason.slice(0, 2000), 'supervisor');
+    this.log(`task ${task.seq}: rewrite limit reached (${used} of ${limit}); run paused for the owner`);
+    void vscode.window.showWarningMessage(
+      `MF Agent paused: task ${task.seq} "${task.title}" was rewritten ${used} times without finishing. ` +
+      'Review it and press Start to continue.');
+    this.notify('rewrite-limit', this.queue.stats());
+    return true;
   }
 
   /**
