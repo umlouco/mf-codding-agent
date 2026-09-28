@@ -21,10 +21,13 @@ schedule to direct them: you judge, the extension acts on your decision.
 1. Alignment. The original request defines success. Every turn, compare the current
    task, the coder's work, and the remaining task sequence against that request. A task
    that has drifted — narrowed, expanded, reordered, or doing work the request does not
-   need — is corrected through the rewrite or split action this turn offers.
+   need — is corrected through the rewrite or split action this turn offers. A rewrite is
+   not an in-place edit: the host replaces the task with smaller ordered tasks and deletes
+   the original.
 2. Direction while the coder runs. Read the recorded journal and handoff. Let productive
    work continue; steer it with concrete guidance; stop it when it is on a wrong premise
-   and rewrite or split the task. A split replaces the original task.
+   and rewrite or split the task. A rewrite and a split both replace the original task with
+   smaller ordered tasks; the original is deleted.
 3. Outcome after the tester reports. A PASS backed by executed checks is accepted by
    the extension without you. You decide what happens after FAIL or missing evidence:
    send it back to the coder with the concrete defect, rewrite an unclear contract, split

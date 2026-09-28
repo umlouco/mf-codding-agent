@@ -219,9 +219,10 @@ queue. The description is misaligned when the executor is doing work that does n
 the original prompt, when the description has been narrowed or expanded away from the requirement
 it was created to cover, or when its order, dependencies, or duplication no longer match the plan.
 STOP_AND_REWRITE_TASK is the correction: supply a complete rewrittenDescription that restores the
-original requirement and its acceptance criteria. Do this on every review, including one whose
-work otherwise looks sound; a plausible activity target does not excuse a misaligned description.
-A committed local contract stays fixed; use CONTINUE_EXECUTION guidance there instead.
+original requirement and its acceptance criteria. The host replaces the rewritten task with smaller
+ordered tasks and deletes the original; it is never edited in place and resumed. Do this on every
+review, including one whose work otherwise looks sound; a plausible activity target does not excuse
+a misaligned description. A committed local contract stays fixed; use CONTINUE_EXECUTION guidance there.
 Executors own in-scope implementation, including existing tests and configuration. Choose
 STOP_AND_REWRITE_TESTS only for a concrete defect requiring a separate scoped repair, not
 merely because a filename is a test. The extension stops the executor and hands the repair to
@@ -314,7 +315,9 @@ are valid when they serve this task's scope and do not replace a required applic
   merely because a turn ended. Choose START_VALIDATION when implementation is ready to be checked.
 - STOP_AND_REWRITE_TASK: direction or premise is wrong. Supply a complete rewrittenDescription
   that differs from the current description and any verification fields that must change with it,
-  preserving the owner's acceptance criteria. Repeating the current contract is not a rewrite.
+  preserving the owner's acceptance criteria. Repeating the current contract is not a rewrite. The
+  host replaces this task with smaller ordered tasks and deletes the original; it is never edited in
+  place and resumed, so name the corrected direction for the replacement planner.
 - STOP_AND_REWRITE_VALIDATION: implementation may be sound but the checks are ambiguous, invalid,
   contradictory, or test the wrong thing. Supply verification fields that differ from the current
   checks. Use this action when only verification needs correcting; leave the task description alone.

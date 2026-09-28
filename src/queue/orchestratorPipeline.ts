@@ -275,15 +275,17 @@ export abstract class OrchestratorPipeline extends OrchestratorExpansion {
         this.log(`task ${task.seq} back to the coder: ${verdict.reason}`);
         return;
       case 'REWRITE':
-        if (this.holdRewriteForOwner(task, `new description: ${verdict.rewrittenDescription || '(unchanged)'}; ` +
-          `new verification: ${verdict.solutionVerifyPrompt || '(unchanged)'}`)) return;
-        this.queue.update(task.id, { status: 'PENDING', finishedAt: null, activityPhase: 'requeued',
-          description: verdict.rewrittenDescription || task.description,
-          solutionVerifyPrompt: verdict.solutionVerifyPrompt || task.solutionVerifyPrompt,
-          validationReport: '', supervisorFeedback: verdict.guidance || verdict.reason, attempts: 0,
-          errorLog: appendAttempt(task.errorLog, note) });
-        this.queue.log(task.id, 'supervisor', 'task-edited', (verdict.rewrittenDescription || verdict.solutionVerifyPrompt || '').slice(0, 8000));
-        this.log(`task ${task.seq} rewritten by the supervisor and returned to the coder`);
+        // A rewrite corrects the contract, and it is mandatory that the
+        // corrected work becomes a split: the row is replaced by an ordered
+        // decomposition and deleted, never edited in place and re-run as-is.
+        // The supervisor's correction travels as evidence for the planner.
+        if (this.holdRewriteForOwner(task, `rewrite: ${verdict.rewrittenDescription || verdict.reason}`)) return;
+        // Recorded so supervisorRewritesSinceOwner keeps bounding rewrites;
+        // the row itself is replaced by the decomposition below.
+        this.queue.log(task.id, 'supervisor', 'task-edited',
+          (verdict.rewrittenDescription || verdict.solutionVerifyPrompt || verdict.reason || '').slice(0, 8000));
+        this.requestFailureDecomposition(task, rewriteReplacementReason(verdict));
+        this.log(`task ${task.seq} rewritten by the supervisor; replacing it with smaller tasks`);
         return;
       case 'RETEST':
         this.queue.log(task.id, 'supervisor', 'tester-retest', `attempt ${task.attempts}: ${verdict.guidance}`);
@@ -309,4 +311,18 @@ export abstract class OrchestratorPipeline extends OrchestratorExpansion {
       }
     }
   }
+}
+
+/**
+ * The evidence a rewrite hands to the replacement planner. A rewrite no longer
+ * edits the task in place, so the supervisor's corrected direction and any
+ * changed checks must reach the planner that authors the smaller tasks; the
+ * original contract is preserved by the decomposition coverage map.
+ */
+function rewriteReplacementReason(verdict: TestVerdict): string {
+  const lines = [`[SUPERVISOR_TASK_REWRITE] ${verdict.reason}`];
+  if (verdict.rewrittenDescription) lines.push(`Corrected direction: ${verdict.rewrittenDescription}`);
+  if (verdict.solutionVerifyPrompt) lines.push(`Corrected verification: ${verdict.solutionVerifyPrompt}`);
+  if (verdict.guidance) lines.push(`Guidance: ${verdict.guidance}`);
+  return lines.join('\n');
 }

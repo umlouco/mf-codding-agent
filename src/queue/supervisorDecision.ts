@@ -136,7 +136,9 @@ export function verdictPrompt(task: Task, siblings: readonly Pick<Task, 'seq' | 
 - RETRY: the report shows an implementation defect. guidance names the failing behavior, the
   observed evidence, and the concrete fix for the coder.
 - REWRITE: the task text or acceptance is wrong, ambiguous, or drifted from the original request.
-  Supply the complete corrected rewrittenDescription and/or solutionVerifyPrompt. Resets attempts.
+  Supply the complete corrected rewrittenDescription and/or solutionVerifyPrompt. The host replaces
+  this task with smaller ordered tasks and deletes the original; it is never edited in place and
+  re-run. The corrected direction is evidence for the replacement planner.
 - SPLIT: the task is too large to pass in one coder session. splitInto: 2+ ordered parts, each
   {title, description, solutionVerifyPrompt}; they replace this task.
 - RETEST: the tester's own invocation failed (server did not start, wrong command, tool error)

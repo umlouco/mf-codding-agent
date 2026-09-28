@@ -1,10 +1,11 @@
-import { executeTask } from './agents';
+import { attemptsExhausted, executeTask } from './agents';
 import type { Task } from './db';
 import { appendAttempt, stopDetail, TEST_OWNERSHIP_STOP } from './orchestratorState';
 import { OrchestratorVerification } from './orchestratorVerification';
 import { completionForSupervisor, parseCompletionClaim } from './validation';
 import { scopeBlocked } from './scopePlan';
-import { providerConfigurationError } from './recovery';
+import { providerConfigurationError, providerUnavailable } from './recovery';
+import { ScopeBlockedError } from './scopeSupervisor';
 import { boundedTask } from './scopeBoundary';
 import { promptOverloadReason } from './scopeEvidence';
 import { clearScopeRetry } from './scopeRetry';
@@ -39,6 +40,16 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     this.queue.recoverBlocked();
     const next = this.queue.list().find(task => task.status === 'PENDING');
     if (next && scopeBlocked(next, this.queue.list())) return;
+    // A row whose budget is already spent must not be claimed again: the
+    // executor-path pause stops an attempt that spends the budget in this
+    // process, but a row reloaded from the database would otherwise be
+    // re-executed at full cost before it could stop — the observed "attempt 7
+    // of 3" loop. The one claim that is still allowed is a preflight deferral,
+    // which uses the `scope_waiting` phase and keeps backing off on its own.
+    if (next && next.activityPhase !== 'scope_waiting' && attemptsExhausted(next)) {
+      this.pauseForExhaustedAttempts(next, 'its attempt budget was already spent before this claim');
+      return;
+    }
     const task = this.queue.claimNext();
     if (!task) {
       if (this.queue.isComplete()) {
@@ -156,12 +167,14 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
         ...(cutOffNote ? { errorLog: cutOffNote } : {}),
         ...(repairDetail ? { supervisorFeedback: `[SUPERVISOR_TEST_REPAIR] ${repairDetail}` } : {}),
       };
+      const exhausted = !handoff && !repairDetail && attemptsExhausted(task);
       const applied = this.queue.finishExecution(
         task.id,
         attempt,
         handoff || repairDetail ? { ...outcome, status: 'VERIFYING' }
-          : this.retryPatch(task, outcome,
-              overload || res.stopReason || res.completion.status || 'executor reported unfinished work'),
+          : exhausted ? { ...outcome, status: 'PENDING' }
+            : this.retryPatch(task, outcome,
+                overload || res.stopReason || res.completion.status || 'executor reported unfinished work'),
       );
       if (!applied) {
         this.log(`task ${task.seq} — result arrived after the run moved past this attempt; discarding it`);
@@ -192,6 +205,15 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
           this.queue.log(task.id, 'executor', 'test-repair-requested', repairDetail);
           this.log(`task ${task.seq} — executor stopped on a supervisor-owned test; ` +
             'a supervisor repair turn is queued');
+        } else if (exhausted) {
+          // The budget bounds how long one formulation may be retried. An
+          // executor that keeps returning unfinished work never hands off, so
+          // no test phase runs to spend the budget and the row was requeued
+          // forever (observed: "attempt 7 of 3", ~29 minutes and 5M input
+          // tokens per attempt). Stop and let the owner split, rewrite or fix
+          // the environment; see pauseForExhaustedAttempts.
+          this.pauseForExhaustedAttempts(this.queue.get(task.id)!,
+            `${overload || res.stopReason || res.completion.status || 'unfinished'} work`);
         } else {
           this.log(
             `task ${task.seq} did not complete (${overload || res.stopReason || res.completion.status}); ` +
@@ -209,6 +231,23 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       // way, so stop the run with the actual fault.
       if (providerConfigurationError(msg)) {
         this.stopForProviderConfiguration(msg);
+        return;
+      }
+      // Discovery blocked on something only a person can supply (a credential,
+      // an authenticated session). Retrying the scope review cannot produce it,
+      // so hand it to the owner and stop rather than re-plan the same evidence.
+      if (e instanceof ScopeBlockedError) {
+        this.pauseForBlockedPrerequisite(task, e.prerequisite);
+        return;
+      }
+      // A provider that is momentarily unreachable — a dropped connection, a
+      // 429, or a quota/credit refusal such as OpenRouter's 402 or the Claude
+      // CLI spend limit — is not a task-contract problem. Deferring the scope
+      // review and retrying re-ran the same failing request on every backoff
+      // (the run spun on the outage instead of stopping); pause for recovery
+      // exactly as the test and execution phases already do.
+      if (providerUnavailable(msg)) {
+        this.pauseForRecovery(task, msg);
         return;
       }
       if (!preflightComplete) {

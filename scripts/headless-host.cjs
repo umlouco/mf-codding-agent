@@ -90,6 +90,47 @@ function sourceLoader(vscode) {
   return load;
 }
 
+// Compiles the workspace globs detect.ts uses (nested extensions and bare filenames) to a regexp.
+function globToRegExp(glob) {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  const pattern = escaped
+    .replace(/\*\*\//g, '(?:.*/)?')
+    .replace(/\*\*/g, '.*')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\?/g, '[^/]');
+  return new RegExp('^' + pattern + '$', process.platform === 'win32' ? 'i' : '');
+}
+
+/** The subset of `vscode.workspace.findFiles` that detection needs: bounded, skip-heavy walks. */
+function findFilesUnder(root, include, maxResults = 1) {
+  const regex = globToRegExp(String(include || '**/*'));
+  const skip = new Set(['node_modules', '.git', 'dist', 'build', 'out', 'target', '.venv',
+    '__pycache__', 'vendor', '.mfagent', '.vscode', '.kilo', '.claude', '.idea']);
+  const found = [];
+  const stack = [root];
+  let visited = 0;
+  while (stack.length && found.length < maxResults && visited < 100000) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      visited++;
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!skip.has(entry.name)) stack.push(abs);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const rel = path.relative(root, abs).split(path.sep).join('/');
+      if (regex.test(rel)) {
+        found.push({ fsPath: abs });
+        if (found.length >= maxResults) break;
+      }
+    }
+  }
+  return Promise.resolve(found);
+}
+
 function validateWorkerUrl(value) {
   const url = new URL(value);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
@@ -143,6 +184,7 @@ async function createHost(options) {
     Position: files.Position, Range: files.Range, WorkspaceEdit: files.WorkspaceEdit,
     Disposable: class { constructor(dispose) { this.dispose = dispose; } },
     workspace: { ...files.workspace, workspaceFolders: [{ uri: { fsPath: workspace } }],
+      findFiles: (include, _exclude, maxResults) => findFilesUnder(workspace, include, maxResults),
       getConfiguration: () => ({ get: (key, fallback) => values[key] ?? fallback }),
       onDidChangeConfiguration: emptyEvent },
     lm: { tools: [], onDidChangeChatModels: emptyEvent, onDidChangeTools: emptyEvent,
@@ -228,6 +270,22 @@ async function createHost(options) {
       },
     });
     await store.setApiKey(id, p.apiKey || '');
+  }
+  // A providers file exported from the settings page (version 2) is the
+  // authoritative configuration when supplied: it carries the profiles, role
+  // bindings, MCP servers and API keys a real editor run would use. Applied
+  // last, after the built-in headless defaults and any single --provider, so a
+  // run can be reproduced from exactly what the user exported.
+  if (options.providersFile) {
+    const doc = JSON.parse(fs.readFileSync(path.resolve(options.providersFile), 'utf8'));
+    const patch = {};
+    for (const key of ['profiles', 'roles', 'languages', 'browser', 'skills', 'skillGroups', 'mcpServers']) {
+      if (doc[key] !== undefined) patch[key] = doc[key];
+    }
+    await store.update(patch);
+    for (const [profileId, key] of Object.entries(doc.apiKeys || {})) {
+      if (typeof key === 'string' && key.trim()) await store.setApiKey(profileId, key.trim());
+    }
   }
   const router = load('src/llm/router.ts').initRouter(context, output);
   load('src/playwrightRuntime.ts').activatePlaywrightRuntime(context, output);

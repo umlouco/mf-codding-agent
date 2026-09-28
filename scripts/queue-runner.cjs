@@ -70,7 +70,7 @@ async function main(argv) {
   loadDotEnv(path.join(repo, '.env'));
   const command = argv[0], options = {};
   const valued = ['--workspace', '--goal-file', '--instructions-file', '--url', '--model', '--effort', '--cli',
-    '--worker-url', '--worker-model'];
+    '--worker-url', '--worker-model', '--providers-file', '--queue-path'];
   if (!['plan', 'run', 'status'].includes(command)) throw Error('Expected plan, run or status; see --help.');
   for (let index = 1; index < argv.length;) {
     const key = argv[index];
@@ -87,7 +87,7 @@ async function main(argv) {
   if (options.effort && !['low', 'medium', 'high', 'xhigh', 'max'].includes(options.effort)) throw Error('Invalid --effort.');
   if (command === 'plan' && !options['goal-file']) throw Error('--goal-file is required for planning.');
   const host = await createHost({ ...options, workerUrl: options['worker-url'], workerModel: options['worker-model'],
-    workerAll: options.workerAll });
+    providersFile: options['providers-file'], queuePath: options['queue-path'], workerAll: options.workerAll });
   let poll;
   try {
     // Owner instructions plus a host-verified briefing about the local stack.

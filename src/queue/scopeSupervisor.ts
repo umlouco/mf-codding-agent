@@ -16,6 +16,21 @@ import { readScopeRetry } from './scopeRetry';
  * a task's scope, so a discovery model turn cannot reveal a population it would
  * have missed. Above it, discovery runs as before. Set 0 to always discover.
  */
+/**
+ * Whether the previous scope deferral was a discovery blocker rather than a
+ * transport or contract fault.
+ *
+ * The signal is the recorded outcome kind, not the wording: discovery rephrases
+ * the same missing prerequisite on every turn (observed: "Shape first: …" then
+ * "Shape is settled and is not the blocker: …"), so comparing reason text let
+ * the loop continue. A prior blocked deferral for the same fingerprint (see
+ * readScopeRetry, which returns nothing once the contract or owner context
+ * changes) means nothing discovery can see has changed.
+ */
+function blockedDeferral(reason: string): boolean {
+  return /^Discovery needs evidence:/.test(reason.trim());
+}
+
 function smallScopeFiles(): number {
   const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.scopeDiscoveryMinFiles', 20);
   return Number.isFinite(configured) ? Math.max(0, configured) : 20;
@@ -30,6 +45,25 @@ export interface ScopeHost {
   current: () => boolean;
   split: (assessment: ScopeAssessment, snapshot: Task) => boolean;
   preflightActivity: (phase: string, detail: string, at: number) => void;
+}
+
+/**
+ * Discovery found a prerequisite that no worker can supply — a credential, an
+ * authenticated session, or a human-attended state.
+ *
+ * This is not a transient scope-review failure. The preflight used to throw a
+ * plain error, which the executor treated as a deferred scope review and
+ * retried; discovery then returned `blocked` again on the same unchanged
+ * evidence, so the run looped on the missing prerequisite forever (observed:
+ * task 1 re-planned five times, ~1M input tokens per preflight, for a SAC.exe
+ * Administrator login no agent can perform). The typed error lets the host
+ * pause the run and hand the prerequisite to the owner instead.
+ */
+export class ScopeBlockedError extends Error {
+  constructor(readonly prerequisite: string) {
+    super(`Discovery needs evidence: ${prerequisite}`);
+    this.name = 'ScopeBlockedError';
+  }
 }
 
 /** An independent scope lane: a long verifier must not occupy its own supervisor. */
@@ -152,7 +186,16 @@ export class ScopeSupervisor {
           throw Error('Contract changed during discovery; inventory cannot authorize work.');
         }
         if (!inventory) throw Error('Discovery returned no inventory.');
-        if (inventory.strategy === 'blocked') throw Error(`Discovery needs evidence: ${inventory.reason}`);
+        if (inventory.strategy === 'blocked') {
+          // The first blocker is deferred: evidence may still arrive (a missing
+          // file written, an owner edit made), so ask again at the backoff
+          // deadline. A second blocked result on the same fingerprint means
+          // nothing discovery can see has changed — re-planning this task only
+          // repeats the missing prerequisite, so hand it to the owner.
+          const prior = readScopeRetry(queue, snapshot)?.reason || '';
+          if (blockedDeferral(prior)) throw new ScopeBlockedError(inventory.reason);
+          throw Error(`Discovery needs evidence: ${inventory.reason}`);
+        }
         // "atomic" is already the host's definition of one independently
         // checkable outcome. A second model turn to confirm KEEP adds no
         // information, and every task was paying for it.

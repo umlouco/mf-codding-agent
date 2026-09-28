@@ -16,6 +16,22 @@ const STOPPING_ACTIONS = new Set<ProgressDecision['action']>(['STOP_AND_REWRITE_
 /** Stops held per attempt while the coder is making changes; see deferStopForProgress. */
 const MAX_STOP_DEFERRALS = 2;
 
+/**
+ * Evidence a rewrite hands to the replacement planner. A rewrite no longer
+ * edits the task in place: the corrected direction and any changed checks are
+ * evidence for the planner that authors the smaller replacement tasks, and the
+ * original row is deleted with the split.
+ */
+function rewriteReplacementReason(reason: string, correctedDescription: string,
+  correctedVerification?: string, guidance?: string): string {
+  return [
+    `[SUPERVISOR_TASK_REWRITE] ${reason}`,
+    `Corrected direction: ${correctedDescription}`,
+    correctedVerification ? `Corrected verification: ${correctedVerification}` : '',
+    guidance ? `Guidance: ${guidance}` : '',
+  ].filter(Boolean).join('\n');
+}
+
 export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
   /**
@@ -495,21 +511,18 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         if (!description || description.trim() === task.description.trim()) {
           throw new Error('The supervisor requested a task rewrite without supplying changed requirements. Preserve the task and request a complete decision; do not verify the rejected approach.');
         }
-        if (this.holdRewriteForOwner(task, `new description: ${description}`)) return;
-
-        if (!this.stopForDecision(task, {
-          status: 'PENDING',
-          description,
-          solutionVerifyPrompt: decision.solutionVerifyPrompt ?? task.solutionVerifyPrompt,
-          validationReport: '',
-          finishedAt: null,
-          supervisorFeedback: decision.reason,
-          ...(attemptsExhausted(task) ? { attempts: 0 } : {}),
-        })) {
-          return;
-        }
+        if (this.holdRewriteForOwner(task, `rewrite: ${description}`)) return;
+        // Recorded so supervisorRewritesSinceOwner keeps bounding rewrites;
+        // the row itself is replaced by the decomposition below.
         this.queue.log(task.id, 'supervisor', 'task-edited', description.slice(0, 8000));
-        this.log(`task ${task.seq} stopped and rewritten from live quality evidence`);
+
+        // A rewrite no longer edits the row in place: the corrected direction
+        // is evidence for the replacement planner, and the task is replaced by
+        // an ordered split so the rejected approach cannot simply resume under
+        // new wording. The original row is deleted with the split.
+        this.requestFailureDecomposition(task, rewriteReplacementReason(decision.reason, description,
+          decision.solutionVerifyPrompt, decision.guidance));
+        this.log(`task ${task.seq} stopped for a rewrite; replacing it with smaller tasks`);
         return;
       }
 

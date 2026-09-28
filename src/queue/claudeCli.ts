@@ -7,7 +7,8 @@ import { killTree, RunOptions, TurnResult } from './agents';
 import { Usage } from './db';
 import { getActiveQueue } from './registry';
 import { loadTestingEnvironment, testingProcessEnvironment, testingPrompt, redactTestingSecrets } from './testingEnvironment';
-import { getContext } from '../providers/instance';
+import { getContext, getStore } from '../providers/instance';
+import { MCP_SERVER_NAME, resolveMcpServers } from '../mcp';
 
 /**
  * Runs one turn through the `claude` CLI as a subprocess, instead of mfcore.
@@ -192,13 +193,36 @@ export async function runClaudeCliTurn(
     }
   }
   if (testing) prompt = testingPrompt(prompt, testing);
-  if (queue && testing && !opts.formatOnly && !plannerOnly) {
+  // The servers configured on the settings page are the credentialed path to
+  // external systems (Jira, the Delphi GUI, DBISAM, the builder). Passing them
+  // only to the HTTP core left the CLI roles — including the planner asked to
+  // read a ticket — with no MCP tools at all, so a plan against a Jira item
+  // had to be guessed from the prompt text. Format-only turns stay tool-free.
+  const configuredMcp = opts.formatOnly ? [] : (await resolveMcpServers(getContext(), getStore()))
+    .filter(s => s.name !== MCP_SERVER_NAME && !s.problem && s.enabled !== false);
+  const mcpServers: Record<string, unknown> = {};
+  for (const s of configuredMcp) {
+    mcpServers[s.name] = s.url
+      ? { type: 'http', url: s.url, ...(s.headers ? { headers: s.headers } : {}) }
+      : { command: s.command, args: s.args, ...(s.env ? { env: s.env } : {}) };
+  }
+  const testingTools = !!queue && !!testing && !opts.formatOnly && !plannerOnly;
+  if (testingTools) {
     const mcp = resolveMcpBinary(getContext());
     if (!mcp) throw new Error('The bundled task queue testing tools are unavailable. Rebuild or reinstall MF Agent.');
-    args.push('--mcp-config', JSON.stringify({ mcpServers: { mfagent: { command: mcp, args: ['--workspace', cwd] } } }));
-    if (isRoot) {
-      args[args.indexOf('--allowedTools') + 1] += ',mcp__mfagent__*';
-    }
+    mcpServers.mfagent = { command: mcp, args: ['--workspace', cwd] };
+  }
+  if (Object.keys(mcpServers).length) {
+    args.push('--mcp-config', JSON.stringify({ mcpServers }));
+    const grants = Object.keys(mcpServers).map(name => `mcp__${name}__*`).join(',');
+    const allowed = args.indexOf('--allowedTools');
+    if (allowed >= 0) args[allowed + 1] += ',' + grants;
+    // A restricted --tools list must name the MCP grant too, or the tool set
+    // is narrowed back to the built-ins and the server is unreachable.
+    const tools = args.indexOf('--tools');
+    if (tools >= 0 && args[tools + 1]) args[tools + 1] += ',' + grants;
+  }
+  if (testingTools) {
     if (queue) {
       const core = resolveCoreBinary(getContext()).path;
       if (!core) throw new Error('The testing environment enforcement tool is unavailable.');
@@ -208,7 +232,7 @@ export async function runClaudeCliTurn(
         : { type: 'command', command: `${quote(core)} testing-hook`, timeout: 10 };
       args.push('--settings', JSON.stringify({ hooks: { PreToolUse: [{ hooks: [hook] }] } }));
     }
-    args[args.indexOf('--append-system-prompt') + 1] += '\n' + queue.testingContext + '\nRead testing_environment before testing. For Apache rewrites use apache_rewrite_check. Use environment variable references for credentials; never print their values.';
+    args[args.indexOf('--append-system-prompt') + 1] += '\n' + queue!.testingContext + '\nRead testing_environment before testing. For Apache rewrites use apache_rewrite_check. Use environment variable references for credentials; never print their values.';
   }
   if (queue && testing && !opts.formatOnly && plannerOnly) {
     args[args.indexOf('--append-system-prompt') + 1] += '\n' + queue.testingContext +

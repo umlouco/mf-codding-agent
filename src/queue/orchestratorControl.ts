@@ -387,6 +387,56 @@ export abstract class OrchestratorControl extends OrchestratorState {
     this.log('paused');
   }
 
+  /**
+   * Stops the run when a task is blocked on a prerequisite only the owner can
+   * supply — a credential, an authenticated session, or a human-attended state.
+   *
+   * Discovery reports these as `blocked` with a concrete prerequisite (see
+   * ScopeBlockedError). Deferring the scope review and retrying re-ran the same
+   * discovery on evidence that could never change, which is the loop this ends:
+   * the run pauses with the prerequisite on the row, its journal, and the
+   * screen, and Start resumes once the owner has supplied it.
+   */
+  protected pauseForBlockedPrerequisite(snapshot: Task, reason: string): void {
+    const task = this.queue.get(snapshot.id) ?? snapshot;
+    const prerequisite = reason.trim() || 'Discovery needs evidence this run cannot produce.';
+    this.queue.log(task.id, 'supervisor', 'blocked-prerequisite', prerequisite.slice(0, 8000));
+    this.pause();
+    this.queue.recordActivity(task.id, 'owner_review', prerequisite.slice(0, 2000), 'supervisor');
+    this.log(`task ${task.seq} is blocked on a prerequisite only you can supply; run paused`);
+    void vscode.window.showWarningMessage(
+      `MF Agent paused: task ${task.seq} "${task.title}" cannot proceed without something you must provide. ` +
+      prerequisite.slice(0, 300));
+    this.notify('blocked-prerequisite', this.queue.stats());
+  }
+
+  /**
+   * Stops the run when a task spends its whole attempt budget without ever
+   * handing off.
+   *
+   * `maxAttempts` is meant to bound how long one formulation of a task is
+   * retried, but the budget was only spent in the supervisor's test-phase
+   * decision. An executor that keeps returning unfinished work never reaches
+   * the tester, so it was requeued without bound — the same formulation ran
+   * attempt after attempt (a row reading "attempt 7 of 3") at full cost. A
+   * budget that is never spent is not a budget; pause and hand the task to the
+   * owner, who can split it, rewrite it, or fix the environment.
+   */
+  protected pauseForExhaustedAttempts(snapshot: Task, reason: string): void {
+    const task = this.queue.get(snapshot.id) ?? snapshot;
+    const detail = `Task ${task.seq} spent its ${task.attempts}-attempt budget without handing off ` +
+      `(${reason}); no test phase ran to bound it, so another identical attempt was refused. ` +
+      'Split it, rewrite it, fix the environment, then press Start.';
+    this.queue.log(task.id, 'supervisor', 'attempts-exhausted', detail.slice(0, 8000));
+    this.pause();
+    this.queue.recordActivity(task.id, 'owner_review', detail.slice(0, 2000), 'supervisor');
+    this.log(`task ${task.seq} exhausted its attempt budget; run paused for the owner`);
+    void vscode.window.showWarningMessage(
+      `MF Agent paused: task ${task.seq} "${task.title}" used its ${task.attempts} attempts without ` +
+      'finishing. Review it and press Start to continue.');
+    this.notify('attempts-exhausted', this.queue.stats());
+  }
+
   reset(): void {
     this.disarm();
     this.abandonReview();

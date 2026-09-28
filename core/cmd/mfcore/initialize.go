@@ -195,7 +195,13 @@ func (s *server) onInitialize(ctx context.Context, params json.RawMessage) (any,
 		// endpoint does, so the core has always had to pick one.
 		provEffort = "xhigh"
 	}
-	provider := llm.NewProvider(provType, provBase, provKey, provModel, 64000, provEffort, "adaptive")
+	// Output ceiling: 0 means "the provider's own default" (Anthropic 64000,
+	// OpenAI-compatible 8192 — see llm.NewAnthropic/NewOpenAICompat). Pinning
+	// every provider to 64000 used to make routers that pre-authorise against
+	// max_tokens reject a whole request over credits it would never have spent
+	// (OpenRouter answers 402 for a 64000-token reservation), and it over-sized
+	// every small completion on a provider whose model caps output lower.
+	provider := llm.NewProvider(provType, provBase, provKey, provModel, 0, provEffort, "adaptive")
 	if provModel == "" {
 		warnings = append(warnings,
 			"No coding model is set. Run \"MF Agent: Settings\" and bind a provider to the Coding role.")

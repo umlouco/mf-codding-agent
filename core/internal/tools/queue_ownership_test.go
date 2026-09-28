@@ -1,6 +1,9 @@
 package tools
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestValidatorShellWritesAllowsReadOnlyProbes(t *testing.T) {
 	cases := []struct {
@@ -61,5 +64,23 @@ func TestCleanupToolsAllowedForVerification(t *testing.T) {
 		if cleanupTool(name) {
 			t.Errorf("cleanupTool(%q) = true, want false", name)
 		}
+	}
+}
+
+// A validator's MCP read must not be mistaken for a workspace writing tool.
+// Registering MCP tools as Mutating (their external side effects are unknown)
+// used to refuse mcp__jira__get_issue with a queue-ownership error, which the
+// core treats as a fixed-target rejection and hard-stops the whole turn.
+func TestValidatorMayCallMCPTools(t *testing.T) {
+	env := &Env{Root: t.TempDir(), QueueRole: "validator"}
+	input := json.RawMessage(`{"issue_key":"WEB-1"}`)
+	if err := env.CheckQueueOwnership("mcp__jira__get_issue", input, true); err != nil {
+		t.Fatalf("validator refused an MCP read: %v", err)
+	}
+	if err := env.CheckQueueOwnership("mcp__connexall-confluence__get_page", input, true); err != nil {
+		t.Fatalf("validator refused an MCP read: %v", err)
+	}
+	if err := env.CheckQueueOwnership("write_file", json.RawMessage(`{"path":"main.go"}`), true); err == nil {
+		t.Fatal("validator may use a workspace writing tool")
 	}
 }

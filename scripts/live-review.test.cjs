@@ -22,10 +22,12 @@ test('live stops and supervisor rewrites are bounded', async t => {
   const monitor = host.load('src/queue/monitor.ts');
   const tester = host.load('src/queue/tester.ts');
   const decision = host.load('src/queue/supervisorDecision.ts');
+  const decomposition = host.load('src/queue/failureDecomposition.ts');
   const { serializeValidation } = host.load('src/queue/validation.ts');
   const realReview = monitor.reviewProgress;
   const realRunTester = tester.runTester;
   const realDecide = decision.decideAfterTest;
+  const realDecideDecomposition = decomposition.decideFailureDecomposition;
 
   let number = 0;
   const fresh = () => {
@@ -61,6 +63,18 @@ test('live stops and supervisor rewrites are bounded', async t => {
   const priorRewrites = (queue, id, n) => {
     for (let i = 0; i < n; i++) queue.log(id, 'supervisor', 'task-edited', `earlier rewrite ${i + 1}`);
   };
+  // A task rewrite now mandates replacement: the planner authors the smaller
+  // tasks and the host deletes the original.
+  const stubDecomposition = () => {
+    decomposition.decideFailureDecomposition = async () => ({
+      verdict: 'SPLIT', feedback: 'Split the rewritten task into smaller steps.', usage: USAGE,
+      splitInto: [
+        { title: 'Edit the header', description: 'Edit the header first.', solutionVerifyPrompt: 'The header shows the new name.' },
+        { title: 'Run the spec', description: 'Run the spec after the header edit.', solutionVerifyPrompt: 'The spec passes.' },
+      ],
+      decomposition: { remainingOutcomes: [], coverage: [], assignments: [] },
+    });
+  };
 
   try {
     await t.test('workerProgress counts changes and test runs, not reading', () => {
@@ -86,6 +100,7 @@ test('live stops and supervisor rewrites are bounded', async t => {
       const queue = fresh();
       const runner = runnerFor(queue);
       const calls = supervisorSays('STOP_AND_REWRITE_TASK');
+      stubDecomposition();
       try {
         const task = executing(queue);
         for (const file of ['a.php', 'b.php']) {
@@ -100,26 +115,32 @@ test('live stops and supervisor rewrites are bounded', async t => {
 
         tool(queue, task.id, 'edit_file', { path: 'c.php' });
         await runner.reviewWork(queue.get(task.id));
-        const row = queue.get(task.id);
         assert.equal(calls.length, 3);
-        assert.equal(row.status, 'PENDING', 'the third stop in one attempt is applied');
-        assert.match(row.description, /^Rewritten 3/);
+        // The third rewrite is applied as a replacement, never an in-place edit.
+        await runner.tick();
+        assert.equal(queue.get(task.id), undefined, 'the rewritten task is deleted');
+        const rows = queue.list();
+        assert.ok(rows.length >= 2, `the rewrite produced ${rows.length} smaller tasks`);
+        assert.ok(rows.every(r => r.status === 'PENDING'));
       } finally { runner.dispose(); queue.close(); }
     });
 
-    await t.test('a live rewrite of a coder that only reads is applied at once', async () => {
+    await t.test('a live rewrite of a coder that only reads is applied at once as a replacement', async () => {
       const queue = fresh();
       const runner = runnerFor(queue);
       supervisorSays('STOP_AND_REWRITE_TASK');
+      stubDecomposition();
       try {
         const task = executing(queue);
         tool(queue, task.id, 'read_file', { path: 'a.php' });
         tool(queue, task.id, 'run_shell', { command: 'grep -rn "Old Name" .' });
         await runner.reviewWork(queue.get(task.id));
-        const row = queue.get(task.id);
-        assert.equal(row.status, 'PENDING');
-        assert.match(row.description, /^Rewritten 1/);
         assert.equal(queue.countEvents(task.id, 'stop-deferred'), 0);
+        await runner.tick();
+        assert.equal(queue.get(task.id), undefined, 'the rewritten task is deleted');
+        const rows = queue.list();
+        assert.ok(rows.length >= 2, `the rewrite produced ${rows.length} smaller tasks`);
+        assert.ok(rows.every(r => r.status === 'PENDING'));
       } finally { runner.dispose(); queue.close(); }
     });
 
@@ -165,12 +186,13 @@ test('live stops and supervisor rewrites are bounded', async t => {
         assert.equal(row.description, task.description);
         assert.equal(row.attempts, 3, 'a held rewrite does not restart the attempt budget');
 
+        stubDecomposition();
         queue.resumePaused();
         await runner.tick();
-        row = queue.get(task.id);
-        assert.equal(row.status, 'PENDING');
-        assert.equal(row.description, 'Rewritten after test 2.');
-        assert.equal(row.attempts, 0);
+        assert.equal(queue.get(task.id), undefined, 'the resumed rewrite is a replacement, not an edit');
+        const rows = queue.list();
+        assert.ok(rows.length >= 2, `the rewrite produced ${rows.length} smaller tasks`);
+        assert.ok(rows.every(r => r.status === 'PENDING'));
       } finally { runner.dispose(); queue.close(); }
     });
 
@@ -180,19 +202,23 @@ test('live stops and supervisor rewrites are bounded', async t => {
       const cfg = runner.cfg.bind(runner);
       runner.cfg = (key, fallback) => key === 'queue.maxRewrites' ? 0 : cfg(key, fallback);
       supervisorSays('STOP_AND_REWRITE_TASK');
+      stubDecomposition();
       try {
         const task = executing(queue);
         priorRewrites(queue, task.id, 5);
         tool(queue, task.id, 'read_file', { path: 'a.php' });
         await runner.reviewWork(queue.get(task.id));
         assert.equal(queue.runState, 'RUNNING');
-        assert.match(queue.get(task.id).description, /^Rewritten 1/);
+        await runner.tick();
+        assert.equal(queue.get(task.id), undefined, 'the rewrite is applied as a replacement');
+        assert.ok(queue.list().length >= 2);
       } finally { runner.dispose(); queue.close(); }
     });
   } finally {
     monitor.reviewProgress = realReview;
     tester.runTester = realRunTester;
     decision.decideAfterTest = realDecide;
+    decomposition.decideFailureDecomposition = realDecideDecomposition;
     await host.close();
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }

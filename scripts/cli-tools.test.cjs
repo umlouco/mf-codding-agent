@@ -23,7 +23,8 @@ function loadCli(spawn, overrides = {}, runtime = { getuid: () => 1000, geteuid:
     './agents': { killTree: () => {} },
     './registry': { getActiveQueue: () => undefined },
     './testingEnvironment': { redactTestingSecrets: text => text },
-    '../providers/instance': {},
+    '../providers/instance': { getContext: () => ({}), getStore: () => ({ mcpServers: [] }) },
+    '../mcp': { MCP_SERVER_NAME: 'mfagent-task-queue', resolveMcpServers: async () => [] },
     ...overrides,
   };
   const exports = {};
@@ -252,7 +253,7 @@ test(`CLI turns retain testing tools, private credentials and execution hook for
   setImmediate(()=>{proc.stdout.end(JSON.stringify({type:'result',result:'Finished',stop_reason:'end_turn'})+'\n');proc.stderr.end();proc.emit('close',0)});return proc;
  },{
   './registry':{getActiveQueue:()=>({testingContext:'FIXED OWNER ENVIRONMENT'})},
-  '../providers/instance':{getContext:()=>({})},
+  '../providers/instance':{getContext:()=>({}),getStore:()=>({mcpServers:[]})},
   '../detect':{workspaceRoot:()=> 'workspace',resolveMcpBinary:()=> 'C:/tool folder/mfagent-mcp.exe',resolveCoreBinary:()=>({path:"C:/tool's folder/mfcore.exe"})},
   './testingEnvironment':{loadTestingEnvironment:async()=>testing,testingProcessEnvironment:()=>({MFAGENT_TEST_URL:testing.url,MFAGENT_CREDENTIAL_PASSWORD:testing.credentials.password}),testingPrompt:text=>text,redactTestingSecrets:text=>text},
  }, { getuid: () => uid, geteuid: () => uid });
@@ -262,7 +263,35 @@ test(`CLI turns retain testing tools, private credentials and execution hook for
  if(uid===0) assert.ok(args[args.indexOf('--allowedTools')+1].split(',').includes('mcp__mfagent__*'));
  const settings=JSON.parse(args[args.indexOf('--settings')+1]);const hook=settings.hooks.PreToolUse[0].hooks[0];
  assert.match(hook.command,/testing-hook/);if(process.platform==='win32'){assert.equal(hook.shell,'powershell');assert.match(hook.command,/tool''s folder/)}
- assert.equal(invocation.options.env.MFAGENT_CREDENTIAL_PASSWORD,'private-cli-secret');
- assert.ok(!JSON.stringify(args).includes('private-cli-secret'));
+  assert.equal(invocation.options.env.MFAGENT_CREDENTIAL_PASSWORD,'private-cli-secret');
+  assert.ok(!JSON.stringify(args).includes('private-cli-secret'));
 });
 }
+
+test('configured MCP servers reach CLI roles and are granted', async () => {
+  let call;
+  const servers = [
+    { name: 'jira', command: 'python', args: ['server.py'], env: { JIRA_ALLOWED_PROJECTS: 'SAC' }, source: 'store', enabled: true },
+    { name: 'rag', url: 'https://example.test/mcp', headers: { Authorization: 'Bearer x' }, source: 'store', enabled: true },
+  ];
+  const cli = loadCli((bin, args) => {
+    call = { args: Array.from(args) };
+    const proc = new EventEmitter(); proc.stdin = new PassThrough(); proc.stdout = new PassThrough(); proc.stderr = new PassThrough();
+    proc.stdin.on('data', () => {});
+    setImmediate(() => { proc.stdout.end(JSON.stringify({ type: 'result', result: '{}', stop_reason: 'end_turn' }) + '\n'); proc.stderr.end(); proc.emit('close', 0); });
+    return proc;
+  }, {
+    '../mcp': { MCP_SERVER_NAME: 'mfagent-task-queue', resolveMcpServers: async () => servers },
+    '../providers/instance': { getContext: () => ({}), getStore: () => ({ mcpServers: servers }) },
+  }, { getuid: () => 0, geteuid: () => 0 });
+  await cli.runClaudeCliTurn({ appendLine() {} }, 'planner', { model: 'opus' }, 'Read SAC-454.', {});
+  const mcp = JSON.parse(call.args[call.args.indexOf('--mcp-config') + 1]);
+  assert.equal(mcp.mcpServers.jira.command, 'python');
+  assert.deepEqual(mcp.mcpServers.jira.args, ['server.py']);
+  assert.equal(mcp.mcpServers.rag.type, 'http');
+  assert.equal(mcp.mcpServers.mfagent, undefined, 'the queue server is not recursively dialed');
+  const tools = call.args[call.args.indexOf('--tools') + 1].split(',');
+  assert.ok(tools.includes('mcp__jira__*'), 'restricted planner tool set grants the MCP server');
+  const allowed = call.args[call.args.indexOf('--allowedTools') + 1].split(',');
+  assert.ok(allowed.includes('mcp__jira__*') && allowed.includes('mcp__rag__*'));
+});

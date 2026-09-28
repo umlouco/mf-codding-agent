@@ -10,6 +10,17 @@
   accepts only a tester PASS backed by executed checks, and decides retry, rewrite,
   split, retest or test repair after a failure. The coder's own claim no longer
   completes a task.
+- A supervisor task rewrite is no longer an in-place edit: rewriting a task now
+  mandates that it be replaced by an ordered split of smaller tasks, with the
+  original row deleted, so a rejected approach cannot resume under new wording.
+- A task whose preflight discovery reports the same missing prerequisite twice
+  is no longer re-planned on every backoff: the run pauses for the owner with the
+  prerequisite on the row (a credential, an authenticated session, a human task).
+- The attempt budget is now enforced: an executor that returns unfinished work at
+  the limit pauses the run for the owner instead of being requeued as the same
+  formulation (which reached "attempt 7 of 3" at full cost), and a reloaded row
+  whose budget is already spent is not claimed again. Preflight deferrals still
+  back off on their own.
 - Budgets are counted in LLM calls, never wall-clock time. New settings:
   `queue.reviewEveryModelCalls`, `queue.testerMaxRounds`, `queue.testerMaxRetests`,
   `queue.maxRunModelCalls`, `queue.scopeDiscoveryMinFiles`. Removed:

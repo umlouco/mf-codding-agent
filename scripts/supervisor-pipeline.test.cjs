@@ -27,9 +27,11 @@ test('the supervisor orchestrates coder and tester', async t => {
   const { Orchestrator } = host.load('src/queue/orchestrator.ts');
   const tester = host.load('src/queue/tester.ts');
   const decision = host.load('src/queue/supervisorDecision.ts');
+  const decomposition = host.load('src/queue/failureDecomposition.ts');
   const { serializeValidation } = host.load('src/queue/validation.ts');
   const realRunTester = tester.runTester;
   const realDecide = decision.decideAfterTest;
+  const realDecideDecomposition = decomposition.decideFailureDecomposition;
   let number = 0;
   const fresh = () => {
     const queue = TaskQueue.open(path.join(root, '.mfagent', `pipeline-${++number}.db`));
@@ -63,6 +65,18 @@ test('the supervisor orchestrates coder and tester', async t => {
       return { usage: USAGE, reason: 'because', guidance: 'fix the arrow keys', ...verdict };
     };
     return calls;
+  };
+  // A rewrite now mandates replacement: the planner authors the smaller tasks
+  // and the host deletes the original, so pin the parts it commits.
+  const stubDecomposition = () => {
+    decomposition.decideFailureDecomposition = async () => ({
+      verdict: 'SPLIT', feedback: 'Split the rewritten task into smaller steps.', usage: USAGE,
+      splitInto: [
+        { title: 'Render the maze', description: 'Draw the maze itself.', solutionVerifyPrompt: 'The maze is visible.' },
+        { title: 'Handle arrow keys', description: 'Move the player with the arrow keys.', solutionVerifyPrompt: 'Arrow keys move the player.' },
+      ],
+      decomposition: { remainingOutcomes: [], coverage: [], assignments: [] },
+    });
   };
 
   try {
@@ -98,19 +112,20 @@ test('the supervisor orchestrates coder and tester', async t => {
       } finally { runner.dispose(); queue.close(); }
     });
 
-    await t.test('REWRITE replaces the contract and restarts the attempt budget', async () => {
+    await t.test('REWRITE is a mandatory split: the original is replaced and deleted', async () => {
       const queue = fresh();
       const runner = runnerFor(queue);
       stubTester({ ...passReport(), conclusion: 'FAIL', remaining: 'Wrong feature.' });
       stubDecision({ action: 'REWRITE', rewrittenDescription: 'Render the maze first.', solutionVerifyPrompt: 'The maze is visible.' });
+      stubDecomposition();
       try {
         const task = verifying(queue);
         await runner.tick();
-        const row = queue.get(task.id);
-        assert.equal(row.status, 'PENDING');
-        assert.equal(row.description, 'Render the maze first.');
-        assert.equal(row.solutionVerifyPrompt, 'The maze is visible.');
-        assert.equal(row.attempts, 0);
+        assert.equal(queue.get(task.id), undefined, 'the rewritten task is deleted, not edited in place');
+        const rows = queue.list();
+        assert.ok(rows.length >= 2, `the rewrite produced ${rows.length} smaller tasks`);
+        assert.ok(rows.every(r => r.status === 'PENDING'));
+        assert.ok(rows.some(r => /Render the maze/.test(r.title)));
       } finally { runner.dispose(); queue.close(); }
     });
 
@@ -301,6 +316,7 @@ test('the supervisor orchestrates coder and tester', async t => {
   } finally {
     tester.runTester = realRunTester;
     decision.decideAfterTest = realDecide;
+    decomposition.decideFailureDecomposition = realDecideDecomposition;
     await host.close();
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }

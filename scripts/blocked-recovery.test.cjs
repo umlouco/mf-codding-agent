@@ -109,7 +109,7 @@ test('unfinished tasks return to the executor before later work', async t => {
       } finally { queue.close(); }
     });
 
-    await t.test('unfinished outcomes retry beyond maxAttempts in both modes', async () => {
+    await t.test('unfinished outcomes retry until the attempt budget is spent in both modes', async () => {
       const agents = host.load('src/queue/agentExecution.ts');
       const original = agents.executeTask;
       try {
@@ -118,6 +118,10 @@ test('unfinished tasks return to the executor before later work', async t => {
           const runner = new Orchestrator(host.context, host.output, queue);
           const first = add(queue);
           const second = add(queue);
+          // Four attempts of this formulation are allowed, so its third failure
+          // still retries and the fourth hands off; see the exhaustion pause in
+          // orchestratorExecution.
+          queue.update(first.id, { maxAttempts: 4 });
           const executions = [];
           runner.cfg = (key, fallback) => key === 'queue.mode' ? mode : fallback;
           runner.correctTestingTarget = () => false;
@@ -150,6 +154,38 @@ test('unfinished tasks return to the executor before later work', async t => {
             assert.equal(queue.stats().byStatus.BLOCKED, 0);
           } finally { runner.dispose(); queue.close(); }
         }
+      } finally { agents.executeTask = original; }
+    });
+
+    await t.test('an exhausted task that never hands off pauses for the owner', async () => {
+      const agents = host.load('src/queue/agentExecution.ts');
+      const original = agents.executeTask;
+      try {
+        const queue = fresh();
+        const runner = new Orchestrator(host.context, host.output, queue);
+        const first = add(queue); // maxAttempts: 1
+        runner.cfg = (key, fallback) => fallback;
+        runner.correctTestingTarget = () => false;
+        runner.wakeAfterHandoff = () => {};
+        runner.schedule = () => {};
+        runner.scopeWatch = () => ({ preflight: async () => true, observe() {}, close() {} });
+        let executions = 0;
+        agents.executeTask = async () => {
+          executions++;
+          return { ok: true, cutOff: false, text: 'unfinished', notes: '',
+            completion: { status: 'NEEDS_MORE_WORK', summary: 'still working', filesChanged: [], developmentChecks: [] },
+            usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 } };
+        };
+        try {
+          await runner.pump();
+          assert.equal(executions, 1);
+          // The single attempt spent the budget without handing off, so the
+          // task pauses instead of being re-executed unanswered forever.
+          assert.equal(queue.runState, 'PAUSED');
+          assert.equal(queue.get(first.id).status, 'PAUSED');
+          assert.equal(queue.get(first.id).activityPhase, 'owner_review');
+          assert.equal(queue.events(first.id, -1).filter(e => e.kind === 'attempts-exhausted').length, 1);
+        } finally { runner.dispose(); queue.close(); }
       } finally { agents.executeTask = original; }
     });
 

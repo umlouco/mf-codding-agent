@@ -173,6 +173,31 @@ test('scope discovery failures recover without a cached-error claim loop', async
         assert.equal(queue.claimNext().id, task.id);
       } finally { runner.dispose(); queue.close(); }
     });
+
+    await t.test('a repeated identical blocker pauses for the owner instead of looping', async () => {
+      const { queue, runner, task } = setup();
+      let discoveries = 0;
+      runtime.runOnce = async () => { discoveries++; return answer(blocked); };
+      try {
+        // The first blocker is deferred: evidence may still arrive.
+        await runner.pump();
+        assert.equal(queue.runState, 'RUNNING');
+        assert.equal(discoveries, 1);
+        assert.equal(queue.get(task.id).activityPhase, 'scope_waiting');
+        assert.equal(readScopeRetry(queue, task).dueAt, now + 30_000);
+
+        // The identical blocker again means only a person can supply it, so the
+        // run pauses with the prerequisite on the row instead of re-planning it
+        // on every backoff forever.
+        now += 30_000;
+        await runner.pump();
+        assert.equal(discoveries, 2);
+        assert.equal(queue.runState, 'PAUSED');
+        assert.equal(queue.get(task.id).status, 'PAUSED');
+        assert.equal(queue.get(task.id).activityPhase, 'owner_review');
+        assert.equal(queue.events(task.id, -1).filter(e => e.kind === 'blocked-prerequisite').length, 1);
+      } finally { runner.dispose(); queue.close(); }
+    });
   } finally {
     runtime.runOnce = originalRun;
     executor.executeTask = originalExecute;
