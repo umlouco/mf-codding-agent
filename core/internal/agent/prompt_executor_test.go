@@ -85,3 +85,18 @@ func TestInspectOnlyKeepsMCPTools(t *testing.T) {
 		t.Error("executor lost MCP tool access")
 	}
 }
+
+// A queue-ownership refusal ends the turn only for a role that edits (the executor's invalid
+// premise is the supervisor's to repair). A verifier or live supervisor is read-only by design, so
+// its refusal fails one call: ending its turn turned a refused screenshot-to-scratch into an
+// INCOMPLETE report with no check run, answered by a retest that hit the same refusal.
+func TestOwnershipRefusalEndsTurnOnlyForEditingRoles(t *testing.T) {
+	for role, inspecting := range map[string]bool{
+		"validator": true, "supervisor": true, "executor": false, "supervisor-repair": false, "": false,
+	} {
+		agent := &Agent{cfg: &config.Config{QueueRole: role}}
+		if got := agent.inspectionRole(); got != inspecting {
+			t.Errorf("inspectionRole() for %q = %v, want %v", role, got, inspecting)
+		}
+	}
+}

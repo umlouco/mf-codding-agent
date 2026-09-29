@@ -577,7 +577,9 @@ VS Code settings editor is genuinely good at:
 | `mfagent.queue.testerMaxRounds` | `40` | Model calls one Tester turn may make while verifying a task |
 | `mfagent.queue.testerMaxRetests` | `2` | Tester re-runs per attempt when the tester's own check failed to run |
 | `mfagent.queue.maxRunModelCalls` | `0` | Optional run breaker counted in model calls; the task in flight is split and the run continues. 0 disables it |
-| `mfagent.queue.scopeDiscoveryMinFiles` | `20` | Workspaces this small skip the scope-discovery model turn before each task |
+| `mfagent.queue.scopePreflight` | `false` | Run a supervisor discovery model turn before each task to split repeated work across a large population of files up front. Off by default: the planner already sizes each task, and a task that still fails is split by the failure lane |
+| `mfagent.queue.scopeDiscoveryMinFiles` | `20` | With the preflight on, workspaces this small still skip the discovery turn |
+| `mfagent.queue.maxRewrites` | `2` | Supervisor rewrites of one task allowed before it is replaced by smaller tasks instead. The queue never pauses to wait for a person |
 | `mfagent.activityIntervalSeconds` | `30` | How often a working agent records what it is doing |
 | `mfagent.llm.idleMinutes` | `60` | How long a reply may deliver nothing before the connection counts as dropped |
 | `mfagent.queue.notifyCommand` | `""` | Run with a JSON summary as its one argument when an autonomous run finishes — a script that pings your phone, Slack, or anything else, for the run that finished after you stopped watching |

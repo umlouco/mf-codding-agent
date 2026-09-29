@@ -2,7 +2,7 @@
   "name": "mf-agent",
   "displayName": "MF Agent",
   "description": "A lightweight, clean-room coding agent for VS Code: graph memory, strong editing tools, native POSIX commands, browser testing and MCP — with a compiled Go core.",
-  "version": "0.1.82",
+  "version": "0.1.84",
   "publisher": "mflores",
   "license": "MIT",
   "pricing": "Free",
@@ -318,13 +318,18 @@
           "type": "number",
           "default": 2,
           "minimum": 0,
-          "markdownDescription": "How many times the supervisor may rewrite one task's description or verification before a person decides. Each rewrite restarts the task's attempt budget, so without a limit a task that cannot finish is rephrased and retried forever. At the limit the proposed rewrite is held, not applied, and the run pauses with the proposal in the task's journal; Start resumes with a fresh allowance, and editing the task resets it too. Set to 0 for no limit."
+          "markdownDescription": "How many times the supervisor may rewrite one task's description or verification before rewriting stops. Each rewrite restarts the task's attempt budget, so without a limit a task that cannot finish is rephrased and retried forever. At the limit the proposed rewrite is not applied: the task is replaced by smaller ordered tasks instead, and the run keeps going. Nothing ever pauses the queue to wait for a person. Set to 0 for no limit."
+        },
+        "mfagent.queue.scopePreflight": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Run a supervisor discovery model turn before each task to split repeated work across a large population of files up front. Off by default: the planner already sizes every task to one coder session, and a task that still fails is split by the failure lane, so the extra turn only delays the start of each task. Turn it on for goals that name a whole population (\"convert every file\")."
         },
         "mfagent.queue.scopeDiscoveryMinFiles": {
           "type": "number",
           "default": 20,
           "minimum": 0,
-          "markdownDescription": "Workspaces with at most this many files skip the supervisor's scope-discovery model turn before each task: the deterministic scan already bounds the scope. Set 0 to always run discovery."
+          "markdownDescription": "With `mfagent.queue.scopePreflight` on, workspaces with at most this many files still skip the discovery turn: the deterministic scan already bounds the scope. Set 0 to always run discovery."
         },
         "mfagent.queue.testerMaxRetests": {
           "type": "number",

@@ -49,6 +49,13 @@ const ROOT_CLI_TOOLS = [
 // local permission settings, MCP servers, or delegation to another agent.
 const PLANNER_CLI_TOOLS = ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch'];
 
+// An inspection-only supervisor review judges the journal it is handed. With the full tool
+// set and no permission prompts it spent minutes searching the machine (`find /`, the user's
+// Claude configuration file with its MCP authorization headers) for a port the journal
+// already named, and the verdict it reached was then discarded. It gets the read tools,
+// which stay inside the workspace in dontAsk mode, and nothing that can reach outside it.
+const SUPERVISOR_INSPECTION_TOOLS = ['Read', 'Glob', 'Grep'];
+
 function systemSuffixFor(role: ProviderRole, opts: RunOptions): string {
   if (opts.allowTestEdits) {
     return `You are a dedicated test-repair worker for an autonomous task queue. The affected
@@ -137,7 +144,8 @@ export async function runClaudeCliTurn(
   const testing = queue ? await loadTestingEnvironment(getContext(), queue) : undefined;
   const isRoot = process.getuid?.() === 0 || process.geteuid?.() === 0;
   const plannerOnly = role === 'planner' || opts.planningOnly;
-  const permissionMode = isRoot || opts.formatOnly || plannerOnly ? 'dontAsk' : 'bypassPermissions';
+  const inspectingSupervisor = role === 'supervisor' && !opts.allowTestEdits && !opts.formatOnly && !plannerOnly;
+  const permissionMode = isRoot || opts.formatOnly || plannerOnly || inspectingSupervisor ? 'dontAsk' : 'bypassPermissions';
 
   /*
    * The prompt goes in on stdin, never in argv.
@@ -166,6 +174,8 @@ export async function runClaudeCliTurn(
   ];
   if (plannerOnly && !opts.formatOnly) {
     args.push('--tools', PLANNER_CLI_TOOLS.join(','), '--allowedTools', PLANNER_CLI_TOOLS.join(','));
+  } else if (inspectingSupervisor) {
+    args.push('--tools', SUPERVISOR_INSPECTION_TOOLS.join(','), '--allowedTools', SUPERVISOR_INSPECTION_TOOLS.join(','));
   } else if (isRoot && !opts.formatOnly) {
     args.push('--allowedTools', ROOT_CLI_TOOLS.join(','));
   }

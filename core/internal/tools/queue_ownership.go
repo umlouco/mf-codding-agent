@@ -35,15 +35,26 @@ func (e *Env) CheckQueueOwnership(name string, input json.RawMessage, mutating b
 	if command, ok := args["command"].(string); ok {
 		return e.CheckQueueCommand(command)
 	}
+	// run_script is a container: batch.go runs every step through this same check as
+	// the call it stands for, with its own tool name, arguments and mutation flag.
+	// Judging the container by every "path" argument of every step (a list_dir of the
+	// workspace beside a database query and a window listing) refused a plain
+	// read-only sweep and ended the tester's whole turn before any check ran.
+	if name == "run_script" {
+		return nil
+	}
 	if !mutating {
 		return nil
 	}
 	// MCP tools are the credentialed path to external services (Jira,
 	// Confluence, knowledge search) and are exempt regardless of their
 	// Mutating flag: a refused read here hard-stops the whole inspection turn
-	// (see agent.go) instead of failing one check.
-	if (e.QueueRole == "validator" || e.QueueRole == "supervisor") && !testingBrowserTool(name) && !cleanupTool(name) && !MCPTool(name) {
-		return fmt.Errorf("queue ownership: %s may inspect files and run checks but cannot use a writing tool; request a supervisor test-repair decision for test changes", e.QueueRole)
+	// (see agent.go) instead of failing one check. Helper scripts stay in the
+	// run's scratch directory: a GUI verification that needs a credential
+	// injector or a capture script must be able to write it without touching
+	// the product, the tests, or the queue.
+	if (e.QueueRole == "validator" || e.QueueRole == "supervisor") && !testingBrowserTool(name) && !cleanupTool(name) && !MCPTool(name) && !e.scratchOnlyWrite(input) {
+		return fmt.Errorf("queue ownership: %s may inspect files and run checks but cannot use a writing tool (helper scripts may only be written under .mfagent/scratch/); request a supervisor test-repair decision for test changes", e.QueueRole)
 	}
 	var inspect func(any) error
 	inspect = func(value any) error {
@@ -92,6 +103,69 @@ func cleanupTool(name string) bool {
 	return strings.HasSuffix(n, "shell_kill_background") || strings.HasSuffix(n, "shell_list_background")
 }
 
+// scratchOnlyWrite reports whether every file target of the call stays inside
+// the run's helper scratch directory (<root>/.mfagent/scratch). It is the one
+// writing escape hatch for inspection-only roles: verification flows often
+// need a small helper script (credential injection, window capture, a probe),
+// and refusing that write hard-stops the whole turn while the product stays
+// perfectly untouched. Any target outside scratch keeps the refusal.
+func (e *Env) scratchOnlyWrite(input json.RawMessage) bool {
+	if e.QueueRole != "validator" && e.QueueRole != "supervisor" {
+		return false
+	}
+	var args map[string]any
+	if json.Unmarshal(input, &args) != nil {
+		return false
+	}
+	var targets []string
+	var collect func(any)
+	collect = func(value any) {
+		switch v := value.(type) {
+		case map[string]any:
+			for key, child := range v {
+				switch key {
+				case "path", "file_path", "filePath", "uri", "source", "destination":
+					if path, ok := child.(string); ok {
+						targets = append(targets, path)
+					}
+				}
+				collect(child)
+			}
+		case []any:
+			for _, child := range v {
+				collect(child)
+			}
+		}
+	}
+	collect(args)
+	if len(targets) == 0 {
+		return false
+	}
+	for _, target := range targets {
+		if !e.isScratchPath(target) {
+			return false
+		}
+	}
+	return true
+}
+
+// isScratchPath reports whether a write target resolves inside
+// <root>/.mfagent/scratch. Symlinks resolve, and a scratch path that escapes
+// the directory is not scratch.
+func (e *Env) isScratchPath(path string) bool {
+	resolved := path
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(e.Root, resolved)
+	}
+	resolved = filepath.Clean(resolved)
+	if real, err := filepath.EvalSymlinks(resolved); err == nil {
+		resolved = real
+	}
+	normalized := strings.ToLower(strings.ReplaceAll(resolved, `\`, "/"))
+	scratch := strings.ToLower(strings.ReplaceAll(filepath.Clean(filepath.Join(e.Root, ".mfagent", "scratch")), `\`, "/")) + "/"
+	return strings.HasPrefix(normalized, scratch)
+}
+
 // Check the resolved path too: aliases and symlinks must not change ownership.
 func (e *Env) CheckQueueWritePath(path string) error {
 	if e.QueueRole == "" {
@@ -110,6 +184,13 @@ func (e *Env) CheckQueueWritePath(path string) error {
 		return fmt.Errorf("queue ownership: the task database can only be changed by the extension's supervisor decision handler")
 	}
 	if e.QueueRole == "validator" || e.QueueRole == "supervisor" {
+		// Helper scripts (a credential injector, a window capture, a probe) are the one thing
+		// an inspection-only role may write, and only in the run's scratch directory. The
+		// gate in CheckQueueOwnership already lets such a call through, so the path check must
+		// agree, or the call is refused one step later with a misleading test-repair message.
+		if e.isScratchPath(path) {
+			return nil
+		}
 		return fmt.Errorf("queue ownership: %s cannot rewrite workspace files; request supervisor test repair", e.QueueRole)
 	}
 	// A test-repair turn owns tests, fixtures, and harnesses, not the product.

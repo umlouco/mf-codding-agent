@@ -80,7 +80,9 @@ for (const runtime of [
       assert.equal(result.text, plan);
       assert.equal(invocation.input, 'Plan publishing checks.');
       const args = invocation.args;
-      assert.equal(args[args.indexOf('--permission-mode') + 1], root || opts.formatOnly || role === 'planner' ? 'dontAsk' : 'bypassPermissions');
+      // An inspection-only supervisor review is confined to read tools, like the planner.
+      const inspecting = role === 'supervisor' && !opts.allowTestEdits && !opts.formatOnly;
+      assert.equal(args[args.indexOf('--permission-mode') + 1], root || opts.formatOnly || role === 'planner' || inspecting ? 'dontAsk' : 'bypassPermissions');
       assert.ok(!args.includes('--dangerously-skip-permissions'));
       assert.equal(invocation.options.env.MFAGENT_QUEUE_ROLE, opts.verificationOnly ? 'validator' : opts.allowTestEdits ? 'supervisor-repair' : role);
       if (opts.verificationOnly && !opts.formatOnly) {
@@ -95,6 +97,10 @@ for (const runtime of [
         const inspection = ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch'];
         assert.deepEqual(args[args.indexOf('--tools') + 1].split(','), inspection);
         assert.deepEqual(args[args.indexOf('--allowedTools') + 1].split(','), inspection);
+      } else if (inspecting) {
+        // No Bash, no write tools, nothing that reaches outside the workspace: the review judges its journal.
+        assert.deepEqual(args[args.indexOf('--tools') + 1].split(','), ['Read', 'Glob', 'Grep']);
+        assert.deepEqual(args[args.indexOf('--allowedTools') + 1].split(','), ['Read', 'Glob', 'Grep']);
       } else if (root) {
         const allowed = args[args.indexOf('--allowedTools') + 1].split(',');
         for (const name of ['Read', 'Glob', 'Grep', 'Bash', 'Edit', 'Write', 'WebFetch', 'WebSearch']) {
@@ -137,6 +143,9 @@ for (const role of ['supervisor', 'coder', 'planner']) {
     if (role === 'planner') {
       assert.deepEqual(call.args[call.args.indexOf('--tools') + 1].split(','), ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
       assert.ok(call.args.includes('--allowedTools'), 'planner inspection runs unattended');
+    } else if (role === 'supervisor') {
+      assert.deepEqual(call.args[call.args.indexOf('--tools') + 1].split(','), ['Read', 'Glob', 'Grep']);
+      assert.ok(call.args.includes('--allowedTools'), 'the inspection review runs unattended, inside the workspace');
     } else {
       assert.ok(!call.args.includes('--tools'), 'implementation-capable roles retain their available tools');
       assert.ok(!call.args.includes('--allowedTools'));
@@ -144,7 +153,7 @@ for (const role of ['supervisor', 'coder', 'planner']) {
     assert.ok(!call.args.includes('--disallowedTools'), 'the role must not exclude tools');
     assert.equal(call.args[0], '-p');
     for (const [flag, value] of [
-      ['--output-format', 'stream-json'], ['--permission-mode', role === 'planner' ? 'dontAsk' : 'bypassPermissions'],
+      ['--output-format', 'stream-json'], ['--permission-mode', role === 'planner' || role === 'supervisor' ? 'dontAsk' : 'bypassPermissions'],
       ['--model', 'configured-model'], ['--effort', 'high'], ['--max-budget-usd', '2'],
     ]) {
       assert.ok(call.args.includes(flag), `${flag} remains configured`);

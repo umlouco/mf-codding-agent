@@ -5,7 +5,6 @@ import { OrchestratorVerification } from './orchestratorVerification';
 import { completionForSupervisor, parseCompletionClaim } from './validation';
 import { scopeBlocked } from './scopePlan';
 import { providerConfigurationError, providerUnavailable } from './recovery';
-import { ScopeBlockedError } from './scopeSupervisor';
 import { boundedTask } from './scopeBoundary';
 import { promptOverloadReason } from './scopeEvidence';
 import { clearScopeRetry } from './scopeRetry';
@@ -47,7 +46,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     // of 3" loop. The one claim that is still allowed is a preflight deferral,
     // which uses the `scope_waiting` phase and keeps backing off on its own.
     if (next && next.activityPhase !== 'scope_waiting' && attemptsExhausted(next)) {
-      this.pauseForExhaustedAttempts(next, 'its attempt budget was already spent before this claim');
+      this.splitExhaustedAttempts(next, 'its attempt budget was already spent before this claim');
       return;
     }
     const task = this.queue.claimNext();
@@ -179,6 +178,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       if (!applied) {
         this.log(`task ${task.seq} — result arrived after the run moved past this attempt; discarding it`);
       } else {
+        this.abandonReviewOf(task.id);
         this.queue.log(
           task.id,
           'executor',
@@ -210,9 +210,9 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
           // executor that keeps returning unfinished work never hands off, so
           // no test phase runs to spend the budget and the row was requeued
           // forever (observed: "attempt 7 of 3", ~29 minutes and 5M input
-          // tokens per attempt). Stop and let the owner split, rewrite or fix
-          // the environment; see pauseForExhaustedAttempts.
-          this.pauseForExhaustedAttempts(this.queue.get(task.id)!,
+          // tokens per attempt). The task has failed: it is replaced by
+          // smaller ones, never parked for an owner; see splitExhaustedAttempts.
+          this.splitExhaustedAttempts(this.queue.get(task.id)!,
             `${overload || res.stopReason || res.completion.status || 'unfinished'} work`);
         } else {
           this.log(
@@ -231,13 +231,6 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
       // way, so stop the run with the actual fault.
       if (providerConfigurationError(msg)) {
         this.stopForProviderConfiguration(msg);
-        return;
-      }
-      // Discovery blocked on something only a person can supply (a credential,
-      // an authenticated session). Retrying the scope review cannot produce it,
-      // so hand it to the owner and stop rather than re-plan the same evidence.
-      if (e instanceof ScopeBlockedError) {
-        this.pauseForBlockedPrerequisite(task, e.prerequisite);
         return;
       }
       // A provider that is momentarily unreachable — a dropped connection, a
@@ -283,6 +276,7 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
         this.retryPatch(task, outcome, 'worker stopped before reporting'),
       );
       if (applied) {
+        this.abandonReviewOf(task.id);
         this.queue.recordActivity(task.id, 'stopped', msg);
         this.queue.log(task.id, 'executor', 'stopped', msg);
         this.log(`task ${task.seq} stopped without reporting: ${msg}; returned for another attempt`);
@@ -302,6 +296,16 @@ export abstract class OrchestratorExecution extends OrchestratorVerification {
     if (this.mode === 'continuous') {
       this.schedule('continuous execution pump', () => this.pump());
     }
+  }
+
+  /**
+   * A live review judges a running attempt. Once the attempt has ended, its verdict can only be
+   * discarded ("moved while its progress was reviewed"), yet the supervision cycle stays parked on
+   * it: the tester for the finished work waited out a review of work that no longer existed
+   * (observed: a $1, five-minute Claude turn in front of every handoff). Drop it now.
+   */
+  protected abandonReviewOf(taskId: number): void {
+    if (this.review?.taskId === taskId) this.abandonReview();
   }
 
   /** Keep unfinished work at its original position, with cumulative attempt history. */

@@ -3,6 +3,7 @@ import type { SupervisorDecision } from './agents';
 import type { Review } from './orchestratorState';
 import { OrchestratorRecovery } from './orchestratorRecovery';
 import { decideFailureDecomposition } from './failureDecomposition';
+import { mechanicalSplit } from './splitPlan';
 import { LiveLog } from './liveLog';
 import { completeRecoveryJob, scheduleRecoveryJob } from './recoverySchedule';
 import { decisionEvidence, providerUnavailable } from './recovery';
@@ -153,6 +154,29 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
     if (pruned) this.log(`task ${kept.seq}: removed ${pruned} leftover task(s) from the abandoned split lineage`);
   }
 
+  /**
+   * Replaces a failed task with the host's own deterministic split. It exists so that "no
+   * usable plan" is never a reason a failed task stays unsplit. Returns false only when the
+   * row moved while the commit was prepared (another decision won) or the commit itself
+   * was refused, in which case the caller keeps its ordinary deferral.
+   */
+  protected commitMechanicalSplit(snapshot: Task, reason: string, accepts: () => boolean): boolean {
+    const task = this.queue.get(snapshot.id);
+    if (!task || !accepts()) return false;
+    try {
+      const splitInto = mechanicalSplit(task, reason);
+      const decision: SupervisorDecision = { verdict: 'SPLIT', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        feedback: 'The replacement planner gave no usable plan, so the host divided the task itself.', splitInto };
+      this.queue.log(task.id, 'supervisor', 'mechanical-split', reason.slice(0, 4000));
+      if (!this.applyVerdictSplit(task, decision, accepts)) return false;
+      this.log(`task ${task.seq}: no usable replacement plan; the host split it into ${splitInto.length} smaller tasks`);
+      return true;
+    } catch (error: any) {
+      this.log(`task ${task.seq}: mechanical split was refused: ${error?.message ?? error}`);
+      return false;
+    }
+  }
+
   protected decompositionWorkspaceRevision(): string {
     return decompositionWorkspaceRevision(this.workspaceRoot);
   }
@@ -283,6 +307,16 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
         this.changed();
         return true;
       }
+      // A failed task is always replaced. The planner gave no usable plan (an unparseable
+      // or rejected reply, or an error the host cannot classify as an outage), and asking
+      // the same planner again on a timer cannot produce a different answer: it only delays
+      // the replacement and eventually feeds the rebuild-and-recovery ladder. So the host
+      // divides the task itself. mechanicalSplit cannot fail.
+      // The one exception is a good plan that went stale while it was being made (the workspace
+      // moved, or another decision won the row): that is a race, not a planner failure, so it is
+      // planned again rather than degraded to a mechanical split.
+      const stale = /^Workspace changed while replacement was planned|^Replacement was superseded before commit/.test(message);
+      if (!stale && this.commitMechanicalSplit(task, `${job.reason}\n${message}`, accepts)) return true;
       job.invalidPlan = typeof error?.invalidPlan === 'string' ? error.invalidPlan : job.invalidPlan;
       const next = deferDecomposition(this.queue, task, job, message, wasInvalid);
       // deferDecomposition just wrote activity, so the snapshot captured above
@@ -299,10 +333,5 @@ export abstract class OrchestratorDecomposition extends OrchestratorRecovery {
       this.changed();
     }
     return true;
-  }
-
-  /** The terminal exit for a run-wide condition no replacement can fix. */
-  protected blockForHuman(snapshot: Task, reason: string): void {
-    this.blockTask(snapshot, reason);
   }
 }

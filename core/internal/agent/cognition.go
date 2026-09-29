@@ -52,6 +52,14 @@ func (a *Agent) SetCognition(journal cognition.Journal) {
 // evidence even when the request belongs to no active model conversation.
 func (a *Agent) InvokeDirectTool(ctx context.Context, call llm.Block, tool *tools.Tool) tools.Result {
 	const sessionID = "direct-tools"
+	// Every direct call shares the "user" observer, and the store keeps one
+	// current run per observer. Overlapping calls must not interleave their
+	// start/begin/finish transactions: a Begin that loses that race fails with
+	// "run is not current", and the recording gaps it leaves pollute every
+	// later projection for the task. Serializing direct calls keeps each
+	// start..finish pair intact; they are host round-trips, not model work.
+	a.directMu.Lock()
+	defer a.directMu.Unlock()
 	ctx = a.startCognition(ctx, SendRequest{SessionID: sessionID,
 		Cognition: &cognition.Scope{WorkID: "direct-tools", Observer: "user"}})
 	return a.executeTool(ctx, sessionID, call, tool, tool.Mutates(call.Input))

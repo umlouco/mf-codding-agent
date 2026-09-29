@@ -1,9 +1,51 @@
 package cognition
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
+
+// Aggregate focus items ("N invocations were interrupted...") cite no evidence
+// of their own, and the priority sort used to index the last element of that
+// empty slice. A shared scope that had accumulated more than a couple of open
+// operations therefore crashed the whole core on its next host-initiated tool
+// call, before any model turn could start.
+func TestProjectSurvivesManyOpenOperations(t *testing.T) {
+	s := NewState()
+	s.Pending = map[string]Ticket{}
+	scope := Scope{WorkID: "direct-tools", Observer: "user"}
+	for i := int64(1); i <= 5; i++ {
+		id := fmt.Sprintf("pending-%d", i)
+		s.Pending[id] = Ticket{Scope: scope, ID: id, Action: id, Summary: "read_file " + id, StartSeq: i}
+	}
+	for i := int64(10); i <= 15; i++ {
+		id := fmt.Sprintf("interrupted-%d", i)
+		s.Interrupted = append(s.Interrupted, Interrupted{
+			Ticket: Ticket{Scope: scope, ID: id, Action: id, Summary: "run_shell " + id, StartSeq: i}, Seq: i + 100})
+	}
+
+	out := Project(s, Scope{WorkID: "direct-tools", Observer: "user", RunID: "run-1"})
+
+	var unfinished, interrupted int
+	for _, f := range out.Focus {
+		switch f.Rule {
+		case "unfinished_operations":
+			unfinished++
+			if !strings.Contains(f.Detail, "5 invocation(s) started") {
+				t.Fatalf("aggregate should count every pending record: %q", f.Detail)
+			}
+		case "interrupted_operations":
+			interrupted++
+			if !strings.Contains(f.Detail, "6 invocation(s) were interrupted") {
+				t.Fatalf("aggregate should count every interrupted record: %q", f.Detail)
+			}
+		}
+	}
+	if unfinished != 1 || interrupted != 1 {
+		t.Fatalf("want one aggregate of each kind, got unfinished=%d interrupted=%d (%+v)", unfinished, interrupted, out.Focus)
+	}
+}
 
 // A previous run's observations must not each become their own "refresh this"
 // focus item: on a multi-attempt task the whole prior journal is stale, and the

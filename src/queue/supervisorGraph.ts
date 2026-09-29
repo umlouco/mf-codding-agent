@@ -25,6 +25,15 @@ export const SUPERVISOR_ACTIONS = [
 
 export type SupervisorAction = (typeof SUPERVISOR_ACTIONS)[number];
 
+/**
+ * Test-repair turns one task may start. Counted from the journal's
+ * `test-repair-started` events, not from repairs that halted: a repair that
+ * finishes and leaves the tester still unsatisfied is exactly the loop this
+ * bounds (observed: 167 REPAIR_TESTS verdicts on one task, each answered by a
+ * repair turn that finished normally and a tester that still reported INCOMPLETE).
+ */
+export const MAX_TEST_REPAIRS = 2;
+
 export function isSupervisorAction(value: unknown): value is SupervisorAction {
   return typeof value === 'string' && (SUPERVISOR_ACTIONS as readonly string[]).includes(value);
 }

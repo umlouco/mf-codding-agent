@@ -157,7 +157,36 @@ test('unfinished tasks return to the executor before later work', async t => {
       } finally { agents.executeTask = original; }
     });
 
-    await t.test('an exhausted task that never hands off pauses for the owner', async () => {
+    await t.test('a handoff drops the moot live review instead of making the tester wait for it', async () => {
+      const agents = host.load('src/queue/agentExecution.ts');
+      const original = agents.executeTask;
+      try {
+        const queue = fresh();
+        const runner = new Orchestrator(host.context, host.output, queue);
+        const first = add(queue);
+        runner.cfg = (key, fallback) => fallback;
+        runner.correctTestingTarget = () => false;
+        runner.wakeAfterHandoff = () => {};
+        runner.schedule = () => {};
+        runner.scopeWatch = () => ({ preflight: async () => true, observe() {}, close() {} });
+        // A live review of the running attempt is in flight and the supervision cycle is parked on it.
+        let aborted = 0;
+        runner.review = { taskId: first.id, seq: first.seq, gen: 7, lastActivityAt: Date.now(), abort: () => { aborted++; } };
+        runner.supervising = true;
+        agents.executeTask = async () => ({ ok: true, cutOff: false, text: 'done', notes: '',
+          completion: { status: 'READY_FOR_VALIDATION', summary: 'ready', filesChanged: [], developmentChecks: [] },
+          usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 } });
+        try {
+          await runner.pump();
+          assert.equal(queue.get(first.id).status, 'VERIFYING', 'the finished attempt goes to the tester');
+          assert.equal(aborted, 1, 'the review of the ended attempt was killed');
+          assert.equal(runner.review, null);
+          assert.equal(runner.supervising, false, 'the cycle is free to run the tester at once');
+        } finally { runner.dispose(); queue.close(); }
+      } finally { agents.executeTask = original; }
+    });
+
+    await t.test('an exhausted task that never hands off is replaced, not parked for an owner', async () => {
       const agents = host.load('src/queue/agentExecution.ts');
       const original = agents.executeTask;
       try {
@@ -180,11 +209,16 @@ test('unfinished tasks return to the executor before later work', async t => {
           await runner.pump();
           assert.equal(executions, 1);
           // The single attempt spent the budget without handing off, so the
-          // task pauses instead of being re-executed unanswered forever.
-          assert.equal(queue.runState, 'PAUSED');
-          assert.equal(queue.get(first.id).status, 'PAUSED');
-          assert.equal(queue.get(first.id).activityPhase, 'owner_review');
+          // task is a failed task: it goes to the split lane instead of being
+          // re-executed unanswered forever, and the run keeps running because
+          // no owner is ever asked to press Start.
+          assert.equal(queue.runState, 'RUNNING');
+          assert.equal(queue.get(first.id).status, 'VERIFYING');
+          assert.equal(queue.get(first.id).activityPhase, 'decomposition_required');
+          assert.notEqual(queue.get(first.id).activityPhase, 'owner_review');
           assert.equal(queue.events(first.id, -1).filter(e => e.kind === 'attempts-exhausted').length, 1);
+          // Nothing else may be claimed while the replacement is pending.
+          assert.equal(queue.claimNext(), undefined);
         } finally { runner.dispose(); queue.close(); }
       } finally { agents.executeTask = original; }
     });

@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+- Harden the supervised pipeline against the loops and over-validation seen when a
+  real 39-task Delphi GUI queue ran for 21 hours and verified only four tasks. The run
+  now goes on without a person at every point where it used to stop or spin:
+  - No pause waits for an owner. An exhausted attempt budget, a supervisor rewrite past
+    `queue.maxRewrites`, and a twice-repeated discovery blocker no longer pause the run.
+    They replace the task with smaller ones (or, for the blocker, start the executor
+    with the risk on its row). The split lane the earlier `web-123` branch built is
+    back on `main`: a failed task's split always lands, because when the replacement
+    planner gives no usable plan the host divides the task itself
+    (`mechanicalSplit`, ported from that branch). Plans are now repaired rather than
+    refused, and the planner prompt is far shorter. A provider outage is still retried,
+    not split.
+  - `REPAIR_TESTS` is bounded by repairs started, not repairs halted: a repair that
+    finished and left the tester unsatisfied used to repeat without limit (167 verdicts
+    on one task). Two per task, then the task is replaced.
+  - The per-task scope-discovery model turn is off by default (`queue.scopePreflight`).
+    On a Claude CLI planner it was an Opus-class request in front of every task, and it
+    only delayed starts.
+  - A live supervisor review of a running coder is abandoned the moment that attempt
+    ends (it blocked the tester behind a five-minute, one-dollar review whose verdict
+    was certain to be discarded), its cadence now scales with the model calls it
+    overlapped instead of firing back to back, and guidance-only verdicts survive
+    evidence that moved on while they were made. Inspection-only supervisor reviews of
+    a Claude CLI run read the workspace only (Read, Glob, Grep): with unrestricted tools
+    one searched the whole machine and printed the user's Claude configuration file.
+  - The verifier is no longer ended by its own scope limits. A read-only `run_script`
+    batch was refused as a "write" because a `list_dir` step named a path, and any
+    ownership refusal by a verifier or live supervisor ended its turn. The container is
+    now judged by its steps, helper scripts may be written under `.mfagent/scratch`, and
+    a refusal fails one call. A verifier that is cut off, answers in prose, or concludes
+    PASS with a caveat in `remaining` gets one tool-free repair pass to state its verdict
+    from what it observed, instead of a full re-verification. The tester is told to be
+    economical, and MCP tools that build, query or drive the product count as executed
+    checks.
+  - A stale descriptive detail in a task (a caption, page order or count the product
+    legitimately does differently) is routed to a cheap `RETEST` with the corrected fact,
+    not a `REWRITE` that costs a full Opus replanning turn.
+  - The Go core no longer panics on a workspace whose cognition scope has more than two
+    open operations (an aggregate focus item with no evidence indexed an empty slice).
+  - The source runner (`scripts/queue-runner.cjs`) takes `--mcp-file`, `--mcp-servers` and
+    `--settings-file`, so a headless run can use the MCP servers and settings of the
+    editor it stands in for.
+
 - Rebuild the task queue as a supervised pipeline. The planner always writes the
   ordered task list (1–100 tasks, sized to the request), including on an empty
   workspace. Each task is implemented by the **Coder**, verified independently by
@@ -14,13 +57,15 @@
   mandates that it be replaced by an ordered split of smaller tasks, with the
   original row deleted, so a rejected approach cannot resume under new wording.
 - A task whose preflight discovery reports the same missing prerequisite twice
-  is no longer re-planned on every backoff: the run pauses for the owner with the
-  prerequisite on the row (a credential, an authenticated session, a human task).
+  is no longer re-planned on every backoff, and the run does not pause for it: the
+  executor starts with the blocker on its row as an unverified risk, confirms it
+  with real tools, and a prerequisite that is truly absent fails that attempt with
+  evidence for the ordinary failure lane.
 - The attempt budget is now enforced: an executor that returns unfinished work at
-  the limit pauses the run for the owner instead of being requeued as the same
-  formulation (which reached "attempt 7 of 3" at full cost), and a reloaded row
-  whose budget is already spent is not claimed again. Preflight deferrals still
-  back off on their own.
+  the limit is a failed task and is replaced by smaller ones instead of being
+  requeued as the same formulation (which reached "attempt 7 of 3" at full cost),
+  and a reloaded row whose budget is already spent is not claimed again. Preflight
+  deferrals still back off on their own.
 - Budgets are counted in LLM calls, never wall-clock time. New settings:
   `queue.reviewEveryModelCalls`, `queue.testerMaxRounds`, `queue.testerMaxRetests`,
   `queue.maxRunModelCalls`, `queue.scopeDiscoveryMinFiles`. Removed:

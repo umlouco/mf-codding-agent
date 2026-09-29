@@ -9,8 +9,10 @@ const { createHost } = require('./headless-host.cjs');
 test('scope discovery failures recover without a cached-error claim loop', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mf-scope-retry-'));
   fs.writeFileSync(path.join(root, 'source.md'), 'The supplied source sentence.');
-  // Discovery is exercised on a tiny fixture, so the small-workspace shortcut is off.
-  const host = await createHost({ workspace: root, log() {}, settings: { 'queue.scopeDiscoveryMinFiles': 0 } });
+  // Discovery is off by default; it is exercised here on a tiny fixture, so it is
+  // switched on and the small-workspace shortcut is off.
+  const host = await createHost({ workspace: root, log() {},
+    settings: { 'queue.scopePreflight': true, 'queue.scopeDiscoveryMinFiles': 0 } });
   const { TaskQueue } = host.load('src/queue/db.ts');
   const { Orchestrator } = host.load('src/queue/orchestrator.ts');
   const { indexRepository } = host.load('src/queue/workInventory.ts');
@@ -174,7 +176,7 @@ test('scope discovery failures recover without a cached-error claim loop', async
       } finally { runner.dispose(); queue.close(); }
     });
 
-    await t.test('a repeated identical blocker pauses for the owner instead of looping', async () => {
+    await t.test('a repeated identical blocker executes with the risk on the row instead of pausing or looping', async () => {
       const { queue, runner, task } = setup();
       let discoveries = 0;
       runtime.runOnce = async () => { discoveries++; return answer(blocked); };
@@ -186,16 +188,19 @@ test('scope discovery failures recover without a cached-error claim loop', async
         assert.equal(queue.get(task.id).activityPhase, 'scope_waiting');
         assert.equal(readScopeRetry(queue, task).dueAt, now + 30_000);
 
-        // The identical blocker again means only a person can supply it, so the
-        // run pauses with the prerequisite on the row instead of re-planning it
-        // on every backoff forever.
+        // The identical blocker again means discovery cannot see anything new,
+        // and nobody is going to supply it. The run neither pauses nor
+        // re-plans on every backoff: the executor starts with the risk on its
+        // row and confirms it with real tools.
         now += 30_000;
         await runner.pump();
         assert.equal(discoveries, 2);
-        assert.equal(queue.runState, 'PAUSED');
-        assert.equal(queue.get(task.id).status, 'PAUSED');
-        assert.equal(queue.get(task.id).activityPhase, 'owner_review');
-        assert.equal(queue.events(task.id, -1).filter(e => e.kind === 'blocked-prerequisite').length, 1);
+        assert.equal(queue.runState, 'RUNNING');
+        assert.ok(['EXECUTING', 'VERIFYING'].includes(queue.get(task.id).status),
+          `the executor ran instead of the run pausing (status ${queue.get(task.id).status})`);
+        assert.notEqual(queue.get(task.id).activityPhase, 'owner_review');
+        assert.match(queue.get(task.id).supervisorFeedback, /could not confirm this prerequisite/);
+        assert.equal(queue.events(task.id, -1).filter(e => e.kind === 'scope-assessment').length, 1);
       } finally { runner.dispose(); queue.close(); }
     });
   } finally {

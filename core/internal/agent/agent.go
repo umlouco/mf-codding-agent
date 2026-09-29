@@ -54,6 +54,10 @@ type Agent struct {
 	sessions map[string]*Session
 	system   string
 	journal  cognition.Journal
+	// directMu serializes host-initiated tools/invoke calls (see
+	// InvokeDirectTool): they share one cognition observer, and the store
+	// admits only one current run per observer at a time.
+	directMu sync.Mutex
 }
 
 type Session struct {
@@ -295,7 +299,12 @@ func (a *Agent) Send(ctx context.Context, req SendRequest) (*SendResult, error) 
 		// A fixed-target rejection is an invalid premise, not a transient tool
 		// error to retry for another model round. Hand the evidence back now.
 		for _, toolResult := range results {
-			if toolResult.IsError && strings.HasPrefix(toolResult.Text, "queue ownership:") {
+			// Only a role that edits has an invalid premise to hand back: an executor refused a
+			// test file needs the supervisor's repair. A verifier or a live supervisor is read-only
+			// by design, so its refusal is just one refused check. Ending the turn on it turned a
+			// refused screenshot-to-scratch into an INCOMPLETE report with no check run, which the
+			// supervisor answered with another retest that hit the same refusal.
+			if toolResult.IsError && strings.HasPrefix(toolResult.Text, "queue ownership:") && !a.inspectionRole() {
 				result.Text = "Execution stopped: " + toolResult.Text
 				result.StopReason = "supervisor_repair_required"
 				return result, nil
@@ -622,6 +631,13 @@ func (a *Agent) toolNames() string {
 		names = append(names, t.Name)
 	}
 	return strings.Join(names, ", ")
+}
+
+// inspectionRole reports whether this turn belongs to a role that only observes: an independent
+// verifier or a live supervisor. Its refusals are limits on its scope, not evidence that a task
+// needs repair, so they fail one call instead of ending the turn.
+func (a *Agent) inspectionRole() bool {
+	return a.cfg.QueueRole == "validator" || a.cfg.QueueRole == "supervisor"
 }
 
 func (a *Agent) toolAllowed(t *tools.Tool) bool {

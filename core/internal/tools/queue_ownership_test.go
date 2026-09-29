@@ -67,6 +67,28 @@ func TestCleanupToolsAllowedForVerification(t *testing.T) {
 	}
 }
 
+// The container is not judged by its steps' path arguments; each step is checked as the call it is.
+// A read-only sweep (list_dir of the workspace, a database query, a window listing, a status
+// command) used to be refused as a "writing tool" because list_dir's path was outside scratch,
+// which ended the tester's turn after twelve seconds with no check run.
+func TestRunScriptContainerIsCheckedByItsSteps(t *testing.T) {
+	env := &Env{Root: t.TempDir(), QueueRole: "validator"}
+	sweep := json.RawMessage(`{"steps":[{"tool":"list_dir","args":{"path":"."}},` +
+		`{"tool":"mcp__dbisam__dbisam_select","args":{"sql":"SELECT 1"}},` +
+		`{"tool":"run_shell","args":{"command":"Get-Item SAC.exe"}}]}`)
+	if err := env.CheckQueueOwnership("run_script", sweep, true); err != nil {
+		t.Fatalf("validator refused a read-only batch: %v", err)
+	}
+	// The steps themselves are still held to the role: a direct write is refused, a scratch write is not.
+	if err := env.CheckQueueOwnership("write_file", json.RawMessage(`{"path":"main.go"}`), true); err == nil {
+		t.Fatal("a writing step must still be refused when it is checked as its own call")
+	}
+	scratch := json.RawMessage(`{"path":".mfagent/scratch/helper.ps1"}`)
+	if err := env.CheckQueueOwnership("write_file", scratch, true); err != nil {
+		t.Fatalf("validator refused a helper script under scratch: %v", err)
+	}
+}
+
 // A validator's MCP read must not be mistaken for a workspace writing tool.
 // Registering MCP tools as Mutating (their external side effects are unknown)
 // used to refuse mcp__jira__get_issue with a queue-ownership error, which the

@@ -1,4 +1,3 @@
-import * as vscode from 'vscode';
 import { attemptsExhausted, runOnce, coreHalted } from './agents';
 import { Task, TaskStatus, NewTask } from './db';
 import { LiveLog } from './liveLog';
@@ -9,6 +8,7 @@ import { decisionEvidence, recoveryContext, recoveryEvidence, recoveryFailure, r
 import { isLocalScope } from './scopeContract';
 import { recoverOwnershipStop } from './ownershipRecovery';
 import { workerProgress } from './workerProgress';
+import { MAX_TEST_REPAIRS } from './supervisorGraph';
 
 /** Live-review actions that kill the running coder. START_VALIDATION ends a finished turn, not an unfinished one. */
 const STOPPING_ACTIONS = new Set<ProgressDecision['action']>(['STOP_AND_REWRITE_TASK', 'STOP_AND_REWRITE_VALIDATION',
@@ -60,8 +60,16 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       return true;
     }
     const last = this.reviewed.get(task.id);
-    const since = last && last.attempt === task.attempts ? last.eventId : 0;
-    return this.queue.modelCallsSince(task.id, since) >= this.reviewEveryModelCalls;
+    const current = !!last && last.attempt === task.attempts;
+    const since = current ? last!.eventId : 0;
+    // A review takes minutes, and a fast worker makes many model calls in that time. With a
+    // flat cadence the next review was due the moment the last one ended, so a busy worker
+    // was reviewed back to back and every verdict arrived after the evidence it judged had
+    // moved on (observed: review after review discarded as outdated). `minCalls` scales the
+    // wait to the calls the previous review overlapped: still counted in model calls, never
+    // in wall-clock time.
+    const needed = current ? Math.max(this.reviewEveryModelCalls, last!.minCalls ?? 0) : this.reviewEveryModelCalls;
+    return this.queue.modelCallsSince(task.id, since) >= needed;
   }
 
   /** Lets the supervisor judge live work and choose one fixed control action. */
@@ -112,7 +120,9 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
           testingUrl: this.queue.testingUrl,
           ownerInstructions: this.queue.testingContext + this.queue.instructions,
           silentMs: this.silentMs,
-          failedRepairs: this.queue.countEvents(task.id, 'test-repair-halted'),
+          // Halted repairs and finished-but-unsuccessful ones both spend the allowance.
+          failedRepairs: Math.max(this.queue.countEvents(task.id, 'test-repair-halted'),
+            this.queue.countEvents(task.id, 'test-repair-started')),
           refreshProgress: () => {
             if (gen !== this.reviewGen) throw new Error('Progress review was superseded.');
             const current = this.queue.get(task.id);
@@ -179,6 +189,14 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
       if (this.review === review) {
         this.review = null;
       }
+      // Whatever became of the verdict, the worker kept going while it was made.
+      // Wait three times as many model calls as it made in that time before the
+      // next review; see shouldReview.
+      const entry = this.reviewed.get(task.id);
+      if (entry && entry.attempt === task.attempts) {
+        const overlapped = this.queue.modelCallsSince(task.id, latestEventId);
+        this.reviewed.set(task.id, { ...entry, minCalls: overlapped * 3 });
+      }
     }
   }
 
@@ -214,6 +232,16 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     if (recoverOwnershipStop(this.queue, task)) { this.changed(); return; }
     if (this.queue.countEvents(task.id, 'test-repair-halted') > 0) {
       this.requestFailureDecomposition(task, `A previous supervisor test repair halted. Replace this task rather than restarting the exhausted repair.\n${reason}`);
+      return;
+    }
+    // Every entry point (a post-test REPAIR_TESTS verdict, a live STOP_AND_REWRITE_TESTS,
+    // a marker left by the executor, the panel) ends here, so the bound lives here. A repair
+    // that finished and left the tester unsatisfied is not progress: after MAX_TEST_REPAIRS
+    // of them the task is replaced by smaller ones instead of being repaired again.
+    const repairs = this.queue.countEvents(task.id, 'test-repair-started');
+    if (repairs >= MAX_TEST_REPAIRS) {
+      this.requestFailureDecomposition(task, `Test repair already ran ${repairs} times on this task and the tester still ` +
+        `could not pass it. Another repair would repeat the same work; replace the task with smaller ordered tasks.\n${reason}`);
       return;
     }
     // Replace the completed decision's worker without releasing the current
@@ -456,7 +484,12 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
     // Unchanged task instructions do not make that older evidence current.
     // Preserve the worker and ask again with its new results; heartbeat-only
     // activity must not invalidate a useful review of slow, ongoing inference.
-    if (review.evidenceEventId !== undefined &&
+    // Guidance for a running worker (CONTINUE_EXECUTION on an executing task) cannot stop it or
+    // change its contract, so evidence that moved on while the verdict was made only makes the
+    // advice slightly older, not wrong to deliver. Discarding it wasted the whole review; only the
+    // decisions that stop, rewrite or split are held back for fresh evidence.
+    const guidanceOnly = decision.action === 'CONTINUE_EXECUTION' && task.status === 'EXECUTING';
+    if (!guidanceOnly && review.evidenceEventId !== undefined &&
         decisionEvidence(this.queue, task) > review.evidenceEventId) {
       this.queue.log(task.id, 'supervisor', 'review-outdated',
         'A novel completed tool outcome or a potentially mutating/test tool start arrived during review. Decision discarded; execution preserved.');
@@ -511,7 +544,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         if (!description || description.trim() === task.description.trim()) {
           throw new Error('The supervisor requested a task rewrite without supplying changed requirements. Preserve the task and request a complete decision; do not verify the rejected approach.');
         }
-        if (this.holdRewriteForOwner(task, `rewrite: ${description}`)) return;
+        if (this.replaceAfterRepeatedRewrites(task, `rewrite: ${description}`)) return;
         // Recorded so supervisorRewritesSinceOwner keeps bounding rewrites;
         // the row itself is replaced by the decomposition below.
         this.queue.log(task.id, 'supervisor', 'task-edited', description.slice(0, 8000));
@@ -532,7 +565,7 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
         if (!hasRewrite) {
           throw new Error('The supervisor requested a validation rewrite without changed checks. Preserve the task and request a complete decision; do not run the rejected checks.');
         }
-        if (this.holdRewriteForOwner(task, `new verification: ${decision.solutionVerifyPrompt}`)) return;
+        if (this.replaceAfterRepeatedRewrites(task, `new verification: ${decision.solutionVerifyPrompt}`)) return;
 
         if (!this.stopForDecision(task, {
           status: 'PENDING',
@@ -611,32 +644,26 @@ export abstract class OrchestratorProgress extends OrchestratorRemediation {
 
   /**
    * Refuses a supervisor rewrite once the task has had `maxRewrites` of them
-   * without finishing, and pauses the run for the owner instead.
+   * without finishing, and replaces the task with smaller ones instead.
    *
    * Every rewrite also restarts the attempt budget (see attemptsExhausted), so
    * without this the budget never ends: attempts run out, the supervisor
-   * rephrases the task, attempts start over. Several rephrasings that each
-   * failed are the signal that a person has to look — the requirement may be
-   * wrong, the environment broken, or the model too weak for the job. The
-   * proposal is kept in the journal and on the row; Start resumes with a fresh
-   * allowance, and any owner edit to the task resets it too.
+   * rephrases the task, attempts start over. Rephrasing has stopped converging,
+   * and a person is not who decides what happens next: the queue does not
+   * pause. The proposal is kept in the journal and handed to the replacement
+   * planner as evidence; the original acceptance rides on the last child.
+   * Returns true when it took the task over, so callers stop.
    */
-  protected holdRewriteForOwner(task: Task, proposal: string): boolean {
+  protected replaceAfterRepeatedRewrites(task: Task, proposal: string): boolean {
     const limit = this.maxRewrites;
     if (!limit) return false;
     const used = this.queue.supervisorRewritesSinceOwner(task.id);
     if (used < limit) return false;
     const reason = `The supervisor has already rewritten task ${task.seq} ${used} time(s) and it still has not ` +
-      `finished; another rewrite was held for you instead of applied. Review the task and its journal, edit it ` +
-      `if needed, then press Start. Held proposal — ${proposal}`;
+      `finished; another rewrite is not applied. Replace it with smaller ordered tasks. Rejected proposal — ${proposal}`;
     this.queue.log(task.id, 'supervisor', 'rewrite-limit', reason.slice(0, 8000));
-    this.pause();
-    this.queue.recordActivity(task.id, 'owner_review', reason.slice(0, 2000), 'supervisor');
-    this.log(`task ${task.seq}: rewrite limit reached (${used} of ${limit}); run paused for the owner`);
-    void vscode.window.showWarningMessage(
-      `MF Agent paused: task ${task.seq} "${task.title}" was rewritten ${used} times without finishing. ` +
-      'Review it and press Start to continue.');
-    this.notify('rewrite-limit', this.queue.stats());
+    this.log(`task ${task.seq}: rewrite limit reached (${used} of ${limit}); replacing it with smaller tasks`);
+    this.requestFailureDecomposition(task, reason);
     return true;
   }
 

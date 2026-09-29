@@ -293,6 +293,13 @@ test('the supervisor orchestrates coder and tester', async t => {
       assert.equal(evidenceProblem(cli, ['run_shell']), '');
       assert.match(evidenceProblem(ui, ['run_shell']), /browser/);
       assert.equal(evidenceProblem(ui, ['browser_open']), '');
+      // An MCP tool that builds, queries or drives the product is an executed check; a ticket lookup is not.
+      const executedFrom = names => executedChecks(names.map(name => ({ name, ok: true, input: {} })));
+      assert.equal(evidenceProblem(cli, executedFrom(['mcp__dbisam__dbisam_select'])), '');
+      assert.equal(evidenceProblem(cli, executedFrom(['mcp__wsc_build__delphi_build'])), '');
+      assert.match(evidenceProblem(cli, executedFrom(['mcp__jira__get_issue'])), /without executing/);
+      assert.match(evidenceProblem(ui, executedFrom(['mcp__dbisam__dbisam_select'])), /user-interface/);
+      assert.equal(evidenceProblem(ui, executedFrom(['mcp__delphi_gui__click_menu_item'])), '');
       assert.deepEqual(executedChecks([
         { name: 'read_file', ok: true, input: {} },
         { name: 'run_shell', ok: false, input: {} },
@@ -301,11 +308,34 @@ test('the supervisor orchestrates coder and tester', async t => {
       ]), ['browser_open']);
     });
 
+    await t.test('a third test repair is never started: the task is replaced instead', async () => {
+      const queue = fresh();
+      const runner = runnerFor(queue);
+      try {
+        const task = verifying(queue);
+        // Two repair turns already ran and finished normally (none halted), yet the tester
+        // is still unsatisfied: the observed 167-verdict REPAIR_TESTS loop.
+        queue.log(task.id, 'supervisor', 'test-repair-started', 'first repair');
+        queue.log(task.id, 'supervisor', 'test-repair-started', 'second repair');
+        await runner.repairTests(queue.get(task.id), 'The checks still cannot run.');
+        assert.equal(queue.countEvents(task.id, 'test-repair-started'), 2, 'no third repair turn started');
+        const row = queue.get(task.id);
+        assert.equal(row.status, 'VERIFYING');
+        assert.equal(row.activityPhase, 'decomposition_required', 'the split lane owns it now');
+        assert.match(row.activityDetail, /already ran 2 times/);
+        assert.equal(queue.runState, 'RUNNING');
+      } finally { runner.dispose(); queue.close(); }
+    });
+
     await t.test('decision guards prune actions from recorded facts', () => {
       const { allowedVerdicts, verdictViolation } = decision;
-      const base = { exhausted: false, retests: 0, maxRetests: 2, failedRepairs: 0, localScope: false };
+      const base = { exhausted: false, retests: 0, maxRetests: 2, failedRepairs: 0, repairs: 0, localScope: false };
       assert.deepEqual(allowedVerdicts(base), ['RETRY', 'REWRITE', 'SPLIT', 'RETEST', 'REPAIR_TESTS']);
       assert.deepEqual(allowedVerdicts({ ...base, exhausted: true, retests: 2, failedRepairs: 1, localScope: true }), ['SPLIT']);
+      // Repairs that finished normally but left the tester unsatisfied still spend the
+      // allowance: REPAIR_TESTS is a bounded action, not a loop the supervisor can repeat.
+      assert.ok(allowedVerdicts({ ...base, repairs: 1 }).includes('REPAIR_TESTS'));
+      assert.ok(!allowedVerdicts({ ...base, repairs: 2 }).includes('REPAIR_TESTS'));
       const task = { description: 'd', solutionVerifyPrompt: 'v' };
       assert.match(verdictViolation({ action: 'RETRY', reason: 'r' }, task, ['RETRY']), /guidance/);
       assert.match(verdictViolation({ action: 'REWRITE', reason: 'r', rewrittenDescription: 'd' }, task, ['REWRITE']), /changed/);

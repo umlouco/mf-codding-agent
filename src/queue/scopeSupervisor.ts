@@ -31,6 +31,17 @@ function blockedDeferral(reason: string): boolean {
   return /^Discovery needs evidence:/.test(reason.trim());
 }
 
+/**
+ * Whether a discovery model turn runs before each task. Off by default: the
+ * planner already sizes every task to one coder session, and a task that still
+ * fails is split by the failure lane. The turn only delayed each start (and, on a
+ * Claude CLI planner, cost an Opus-class request per task) without ever
+ * changing what the executor was asked to do.
+ */
+function preflightEnabled(): boolean {
+  return vscode.workspace.getConfiguration('mfagent').get<boolean>('queue.scopePreflight', false) === true;
+}
+
 function smallScopeFiles(): number {
   const configured = vscode.workspace.getConfiguration('mfagent').get<number>('queue.scopeDiscoveryMinFiles', 20);
   return Number.isFinite(configured) ? Math.max(0, configured) : 20;
@@ -45,25 +56,6 @@ export interface ScopeHost {
   current: () => boolean;
   split: (assessment: ScopeAssessment, snapshot: Task) => boolean;
   preflightActivity: (phase: string, detail: string, at: number) => void;
-}
-
-/**
- * Discovery found a prerequisite that no worker can supply — a credential, an
- * authenticated session, or a human-attended state.
- *
- * This is not a transient scope-review failure. The preflight used to throw a
- * plain error, which the executor treated as a deferred scope review and
- * retried; discovery then returned `blocked` again on the same unchanged
- * evidence, so the run looped on the missing prerequisite forever (observed:
- * task 1 re-planned five times, ~1M input tokens per preflight, for a SAC.exe
- * Administrator login no agent can perform). The typed error lets the host
- * pause the run and hand the prerequisite to the owner instead.
- */
-export class ScopeBlockedError extends Error {
-  constructor(readonly prerequisite: string) {
-    super(`Discovery needs evidence: ${prerequisite}`);
-    this.name = 'ScopeBlockedError';
-  }
 }
 
 /** An independent scope lane: a long verifier must not occupy its own supervisor. */
@@ -112,6 +104,11 @@ export class ScopeSupervisor {
 
   private async assess(stage: 'preflight'): Promise<boolean> {
     if (!this.current() || this.busy) return false;
+    if (!preflightEnabled()) {
+      const { queue, task, role } = this.host;
+      return this.keepDeterministically(stage, role, queue.get(task.id) ?? task,
+        'Pre-execution discovery is off (queue.scopePreflight); the planner sized this task and a failure splits it.');
+    }
     this.busy = true;
     const { queue, task, role } = this.host;
     const snapshot = queue.get(task.id)!;
@@ -190,10 +187,24 @@ export class ScopeSupervisor {
           // The first blocker is deferred: evidence may still arrive (a missing
           // file written, an owner edit made), so ask again at the backoff
           // deadline. A second blocked result on the same fingerprint means
-          // nothing discovery can see has changed — re-planning this task only
-          // repeats the missing prerequisite, so hand it to the owner.
+          // nothing discovery can see has changed. Re-planning only repeats the
+          // missing prerequisite, and nobody is going to supply it: the queue
+          // never waits on a person. Discovery's claim is an unverified risk,
+          // not a scope finding, so the executor starts with the blocker on its
+          // row and checks it with real tools. A prerequisite that is truly
+          // absent fails that attempt with evidence, and the ordinary failure
+          // lane replaces the task with smaller ones.
           const prior = readScopeRetry(queue, snapshot)?.reason || '';
-          if (blockedDeferral(prior)) throw new ScopeBlockedError(inventory.reason);
+          if (blockedDeferral(prior)) {
+            const risk = `Scope discovery could not confirm this prerequisite and reported it twice: ${inventory.reason}\n` +
+              'Treat it as an unverified risk, not a fact. Check it yourself with your tools; if it is really ' +
+              'missing, create what you can (a fixture, another credential source) and otherwise report the ' +
+              'blocker with the evidence you gathered instead of waiting for it.';
+            queue.update(task.id, { supervisorFeedback: [snapshot.supervisorFeedback, risk].filter(Boolean).join('\n\n') });
+            return this.keepDeterministically(stage, role, snapshot,
+              'Discovery reported the same blocker twice; the executor confirms it instead of the run waiting.',
+              { blocker: inventory.reason });
+          }
           throw Error(`Discovery needs evidence: ${inventory.reason}`);
         }
         // "atomic" is already the host's definition of one independently

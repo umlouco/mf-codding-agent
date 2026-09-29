@@ -1,8 +1,8 @@
 // Real queue, orchestrator and SQLite; only the supervisor and tester models are
 // stubbed. Pins the two guards against a task that works for hours without
 // finishing: a live stop is held while the coder is making changes, and the
-// supervisor may rewrite one task only `queue.maxRewrites` times before the run
-// pauses for the owner.
+// supervisor may rewrite one task only `queue.maxRewrites` times before the
+// task is replaced by smaller ones. The run never pauses for an owner.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -144,25 +144,69 @@ test('live stops and supervisor rewrites are bounded', async t => {
       } finally { runner.dispose(); queue.close(); }
     });
 
-    await t.test('a live rewrite past the limit pauses the run and keeps the task text', async () => {
+    await t.test('guidance survives evidence that moved on during the review; a stop does not', async () => {
+      for (const [action, delivered] of [['CONTINUE_EXECUTION', true], ['STOP_AND_REWRITE_TASK', false]]) {
+        const queue = fresh();
+        const runner = runnerFor(queue);
+        try {
+          const task = executing(queue);
+          tool(queue, task.id, 'read_file', { path: 'a.php' });
+          // The coder finishes a tool call while the supervisor is still deciding.
+          monitor.reviewProgress = async () => {
+            tool(queue, task.id, 'edit_file', { path: 'b.php' });
+            return { action, reason: 'Judged on the earlier journal.', guidance: 'Do not rebuild; the build already passed.',
+              rewrittenDescription: 'Something else entirely.', usage: USAGE };
+          };
+          await runner.reviewWork(queue.get(task.id));
+          const row = queue.get(task.id);
+          assert.equal(row.status, 'EXECUTING', 'the worker keeps running either way');
+          assert.equal(queue.countEvents(task.id, 'review-outdated'), delivered ? 0 : 1);
+          assert.equal(row.supervisorFeedback.includes('Do not rebuild'), delivered);
+        } finally { runner.dispose(); queue.close(); }
+      }
+    });
+
+    await t.test('a review that overlapped many model calls delays the next one in proportion', async () => {
+      const queue = fresh();
+      const runner = runnerFor(queue);
+      try {
+        const task = executing(queue);
+        // reviewEveryModelCalls is 1 in this file. The first review sees one call and is due.
+        tool(queue, task.id, 'read_file', { path: 'a.php' });
+        assert.equal(runner.shouldReview(queue.get(task.id), 0), true);
+        const cursor = queue.events(task.id, 1, true)[0].id;
+        // While that review ran the coder made four more calls, so the next is due after twelve.
+        runner.reviewed.set(task.id, { attempt: task.attempts, at: 0, eventId: cursor, minCalls: 12 });
+        for (let i = 0; i < 4; i++) tool(queue, task.id, 'read_file', { path: `c${i}.php` });
+        assert.equal(runner.shouldReview(queue.get(task.id), 0), false, 'four calls are far below twelve');
+        for (let i = 0; i < 8; i++) tool(queue, task.id, 'read_file', { path: `d${i}.php` });
+        assert.equal(runner.shouldReview(queue.get(task.id), 0), true);
+      } finally { runner.dispose(); queue.close(); }
+    });
+
+    await t.test('a live rewrite past the limit replaces the task and never pauses the run', async () => {
       const queue = fresh();
       const runner = runnerFor(queue);
       supervisorSays('STOP_AND_REWRITE_TASK');
+      stubDecomposition();
       try {
         const task = executing(queue);
         priorRewrites(queue, task.id, 2);
         tool(queue, task.id, 'read_file', { path: 'a.php' });
         await runner.reviewWork(queue.get(task.id));
         const row = queue.get(task.id);
-        assert.equal(queue.runState, 'PAUSED');
-        assert.equal(row.status, 'PAUSED');
-        assert.equal(row.description, task.description, 'the held rewrite is not applied');
-        assert.equal(row.activityPhase, 'owner_review');
+        assert.equal(queue.runState, 'RUNNING', 'no owner is asked to press Start');
+        assert.equal(row.description, task.description, 'the rewrite itself is not applied');
+        assert.notEqual(row.activityPhase, 'owner_review');
         assert.match(queue.events(task.id, 20).find(e => e.kind === 'rewrite-limit').message, /Rewritten 1/);
+        await runner.tick();
+        assert.equal(queue.get(task.id), undefined, 'the task is replaced by smaller ones');
+        assert.ok(queue.list().length >= 2);
+        assert.equal(queue.runState, 'RUNNING');
       } finally { runner.dispose(); queue.close(); }
     });
 
-    await t.test('a post-test REWRITE past the limit pauses; Start grants a fresh allowance', async () => {
+    await t.test('a post-test REWRITE past the limit replaces the task without pausing', async () => {
       const queue = fresh();
       const runner = runnerFor(queue);
       const fail = { conclusion: 'FAIL', summary: 'Row still reads the old name.', implementationEvidence: '',
@@ -180,16 +224,13 @@ test('live stops and supervisor rewrites are bounded', async t => {
         queue.update(task.id, { attempts: 3, startedAt: Date.now() });
         priorRewrites(queue, task.id, 2);
 
-        await runner.tick();
-        let row = queue.get(task.id);
-        assert.equal(queue.runState, 'PAUSED');
-        assert.equal(row.description, task.description);
-        assert.equal(row.attempts, 3, 'a held rewrite does not restart the attempt budget');
-
         stubDecomposition();
-        queue.resumePaused();
         await runner.tick();
-        assert.equal(queue.get(task.id), undefined, 'the resumed rewrite is a replacement, not an edit');
+        assert.equal(queue.runState, 'RUNNING', 'the rewrite limit never parks the run for an owner');
+        assert.equal(queue.get(task.id)?.description ?? task.description, task.description, 'the rewrite is never an in-place edit');
+        assert.equal(queue.events(task.id, 20).filter(e => e.kind === 'rewrite-limit').length, 1);
+        await runner.tick();
+        assert.equal(queue.get(task.id), undefined, 'the task is replaced, not edited');
         const rows = queue.list();
         assert.ok(rows.length >= 2, `the rewrite produced ${rows.length} smaller tasks`);
         assert.ok(rows.every(r => r.status === 'PENDING'));

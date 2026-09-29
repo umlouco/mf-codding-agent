@@ -171,6 +171,17 @@ func trimEvidence(s *State) {
 	}
 }
 
+// lastEvidence is the newest sequence a focus item cites, or 0 for an item that
+// cites none. Aggregates ("N earlier operations...") may carry no evidence, and
+// indexing the last element of an empty slice panicked the whole core from
+// inside the sort comparator.
+func lastEvidence(f Focus) int64 {
+	if len(f.Evidence) == 0 {
+		return 0
+	}
+	return f.Evidence[len(f.Evidence)-1]
+}
+
 // Project compiles attention according to stable engineering priorities. Raw
 // observations never become policy, even if their text looks like instructions.
 func Project(s State, scope Scope) Snapshot {
@@ -181,15 +192,43 @@ func Project(s State, scope Scope) Snapshot {
 	if s.LastGapSeq > 0 {
 		add("observation_gap", 98, "", "Some runtime events could not be recorded. Earlier observations were invalidated when recording resumed; the missing history was not reconstructed or treated as successful.", s.LastGapSeq)
 	}
+	// A stopped or crashed turn can leave many open operations behind. One
+	// focus item per record would fill the whole window with near-identical
+	// "previous worker left no result" entries and hide live findings, so only
+	// the newest few are listed and the rest are counted once.
+	const maxOpenFocus = 2
+	pending := []Ticket{}
 	for _, p := range s.Pending {
 		if p.Observer == scope.Observer || p.Mutating {
-			add("unfinished_operation", 100, p.Action, p.Summary+": invocation started; no result is recorded. Its effects are unknown, and this record does not authorize repeating it.", p.StartSeq)
+			pending = append(pending, p)
 		}
 	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].StartSeq < pending[j].StartSeq })
+	pendingTotal := len(pending)
+	if pendingTotal > maxOpenFocus {
+		pending = pending[pendingTotal-maxOpenFocus:]
+	}
+	for _, p := range pending {
+		add("unfinished_operation", 100, p.Action, p.Summary+": invocation started; no result is recorded. Its effects are unknown, and this record does not authorize repeating it.", p.StartSeq)
+	}
+	if pendingTotal > maxOpenFocus {
+		add("unfinished_operations", 100, "", fmt.Sprintf("%d invocation(s) started without a recorded result; the newest %d are listed. Their effects are unknown. This is recorded history, not an action to repeat.", pendingTotal, maxOpenFocus), pending[len(pending)-1].StartSeq)
+	}
+	interrupted := []Interrupted{}
 	for _, p := range s.Interrupted {
 		if p.Ticket.Observer == scope.Observer || p.Ticket.Mutating {
-			add("interrupted_operation", 95, p.Ticket.Action, p.Ticket.Summary+": a previous worker left no result. Its effects are unknown; no automatic replay was performed.", p.Ticket.StartSeq, p.Seq)
+			interrupted = append(interrupted, p)
 		}
+	}
+	interruptedTotal := len(interrupted)
+	if interruptedTotal > maxOpenFocus {
+		interrupted = interrupted[interruptedTotal-maxOpenFocus:]
+	}
+	for _, p := range interrupted {
+		add("interrupted_operation", 95, p.Ticket.Action, p.Ticket.Summary+": a previous worker left no result. Its effects are unknown; no automatic replay was performed.", p.Ticket.StartSeq, p.Seq)
+	}
+	if interruptedTotal > maxOpenFocus {
+		add("interrupted_operations", 95, "", fmt.Sprintf("%d invocation(s) were interrupted without a recorded result; the newest %d are listed. No automatic replay was performed. This is recorded history, not an action to repeat.", interruptedTotal, maxOpenFocus), interrupted[len(interrupted)-1].Seq)
 	}
 	stale := 0
 	for _, v := range s.Evidence {
@@ -233,17 +272,14 @@ func Project(s State, scope Scope) Snapshot {
 		if a.Priority != b.Priority {
 			return a.Priority > b.Priority
 		}
-		lastA, lastB := a.Evidence[len(a.Evidence)-1], b.Evidence[len(b.Evidence)-1]
+		lastA, lastB := lastEvidence(a), lastEvidence(b)
 		if lastA != lastB {
 			return lastA > lastB
 		}
 		if a.Action != b.Action {
 			return a.Action < b.Action
 		}
-		if a.Rule != b.Rule {
-			return a.Rule < b.Rule
-		}
-		return a.Evidence[len(a.Evidence)-1] < b.Evidence[len(b.Evidence)-1]
+		return a.Rule < b.Rule
 	})
 	out.Omitted = s.OmittedEvidence + s.OmittedUncertain
 	if len(out.Focus) > maxFocus {

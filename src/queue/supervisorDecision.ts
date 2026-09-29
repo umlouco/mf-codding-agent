@@ -8,7 +8,7 @@ import { taskCognition } from './cognition';
 import { isLocalScope } from './scopeContract';
 import { originalGoalContext, projectNotesContext } from './prompts';
 import { completionForSupervisor, parseCompletionClaim, validationForSupervisor } from './validation';
-import { isCompleteSplitPart } from './supervisorGraph';
+import { isCompleteSplitPart, MAX_TEST_REPAIRS } from './supervisorGraph';
 
 /**
  * The supervisor's decision after the tester reports anything but a supported
@@ -50,19 +50,22 @@ export interface VerdictFacts {
   exhausted: boolean;
   retests: number;
   maxRetests: number;
+  /** Test-repair turns that halted on this task. */
   failedRepairs: number;
+  /** Test-repair turns started on this task, however they ended. */
+  repairs: number;
   localScope: boolean;
 }
 
-export function verdictFacts(task: Task, retests: number, failedRepairs: number, maxRetests = 2): VerdictFacts {
-  return { exhausted: attemptsExhausted(task), retests, maxRetests, failedRepairs, localScope: isLocalScope(task) };
+export function verdictFacts(task: Task, retests: number, failedRepairs: number, maxRetests = 2, repairs = 0): VerdictFacts {
+  return { exhausted: attemptsExhausted(task), retests, maxRetests, failedRepairs, repairs, localScope: isLocalScope(task) };
 }
 
 export function allowedVerdicts(facts: VerdictFacts): VerdictAction[] {
   return VERDICT_ACTIONS.filter(action =>
     !(action === 'RETRY' && facts.exhausted) &&
     !(action === 'RETEST' && facts.retests >= facts.maxRetests) &&
-    !(action === 'REPAIR_TESTS' && facts.failedRepairs > 0) &&
+    !(action === 'REPAIR_TESTS' && (facts.failedRepairs > 0 || facts.repairs >= MAX_TEST_REPAIRS)) &&
     !(action === 'REWRITE' && facts.localScope));
 }
 
@@ -129,23 +132,46 @@ export function verdictPrompt(task: Task, siblings: readonly Pick<Task, 'seq' | 
     `CURRENT TASK ${task.seq}: ${task.title}  (attempt ${task.attempts} of ${task.maxAttempts})\n${task.description}`,
     task.splitScope || '',
     `ACCEPTANCE CRITERIA:\n${task.solutionVerifyPrompt}`,
-    `CODER'S CLAIM:\n${completionForSupervisor(parseCompletionClaim(task.output))}`,
-    `INDEPENDENT TESTER REPORT (the evidence):\n${validationForSupervisor(task.validationReport).slice(0, 12000)}`,
-    `EARLIER ATTEMPTS:\n${attemptHistory(task) || '(none)'}`,
+    `CODER'S CLAIM:\n${completionForSupervisor(parseCompletionClaim(task.output)).slice(0, 2000)}`,
+    `INDEPENDENT TESTER REPORT (the evidence):\n${validationForSupervisor(task.validationReport).slice(0, 6000)}`,
+    `EARLIER ATTEMPTS:\n${(attemptHistory(task) || '(none)').slice(0, 3000)}`,
     `The tester did not establish PASS. Decide the next step. Allowed actions: ${allowed.join(', ')}.
 - RETRY: the report shows an implementation defect. guidance names the failing behavior, the
   observed evidence, and the concrete fix for the coder.
-- REWRITE: the task text or acceptance is wrong, ambiguous, or drifted from the original request.
-  Supply the complete corrected rewrittenDescription and/or solutionVerifyPrompt. The host replaces
-  this task with smaller ordered tasks and deletes the original; it is never edited in place and
-  re-run. The corrected direction is evidence for the replacement planner.
+- REWRITE: the task's direction is wrong or has drifted from the original request, so different
+  work is needed. Supply the complete corrected rewrittenDescription and/or solutionVerifyPrompt.
+  The host replaces this task with smaller ordered tasks and deletes the original; it is never
+  edited in place and re-run, and it costs a full replanning turn. Not for a stale detail (below).
 - SPLIT: the task is too large to pass in one coder session. splitInto: 2+ ordered parts, each
   {title, description, solutionVerifyPrompt}; they replace this task.
 - RETEST: the tester's own invocation failed (server did not start, wrong command, tool error)
-  and the implementation may be fine. guidance tells the tester what to do differently.
+  and the implementation may be fine, OR every substantive criterion passed and the only thing
+  left unmet is a stale descriptive detail of the task text (a caption, page order, count or
+  identifier the product legitimately does differently). guidance tells the tester what to do
+  differently, and for a stale detail it states the corrected fact and the source that proves it
+  (file and symbol, or the UI evidence) so the tester applies it when judging that clause.
   Retests used this attempt: ${facts.retests} of ${facts.maxRetests}.
 - REPAIR_TESTS: a test file or harness is itself defective; guidance names the defect for a
   separate test-repair worker.
+Routing rules:
+- Never RETRY a report that is a transport or format failure (a reply that "could not be parsed
+  as structured validation" or "did not return a structured validation object"): the checks may
+  have run fine. Route it to RETEST, telling the tester to complete the checks and end with the
+  JSON report only.
+- Judge the report against the ACCEPTANCE CRITERIA alone. If the tester's INCOMPLETE cites
+  requirements, artifacts, or re-observations the criteria do not ask for (extra receipts,
+  self-hashes, expanded evidence, live re-observation of behavior the criteria do not require),
+  route to RETEST and tell the tester in guidance that only the criteria and owner instructions
+  bind it. Do not RETRY.
+- A stale descriptive detail is neither a RETRY nor a REWRITE: the code is right and the task's
+  direction is right, so a coder attempt or a replanning turn would only repeat finished work.
+  Route it to RETEST with the corrected fact. If RETEST is no longer allowed, choose REWRITE.
+- RETRY is for behavior that demonstrably fails a criterion: name the criterion, the observed
+  evidence, and the concrete fix for the coder.
+- Your guidance must not add acceptance elements beyond the criteria and owner instructions, and
+  must not demand more evidence than a criterion requires.
+Be concise: reason under 60 words, guidance under 150 words. The JSON must fit in a few
+kilobytes — a truncated reply is a failed decision.
 Reply with ONE JSON object, no fences:
 {"action":"RETRY","reason":"requirement + decisive evidence","guidance":"...","rewrittenDescription":"","solutionVerifyPrompt":"","splitInto":[]}`,
   ].filter(part => part.trim()).join('\n\n');

@@ -241,7 +241,8 @@ export abstract class OrchestratorPipeline extends OrchestratorExpansion {
         this.queue.list().map(t => ({ seq: t.seq, title: t.title, status: t.status })),
         this.queue.getMeta('goal'), this.queue.testingContext + this.queue.instructions,
         verdictFacts(task, this.attemptEvents(task, 'tester-retest'),
-          this.queue.countEvents(task.id, 'test-repair-halted'), this.maxRetests),
+          this.queue.countEvents(task.id, 'test-repair-halted'), this.maxRetests,
+          this.queue.countEvents(task.id, 'test-repair-started')),
         {
           onEvent: this.observerEvents(task.id, 'supervisor', live, accepts),
           onAbort: abort => { if (!accepts()) { abort(); return; } review.abort = abort; },
@@ -279,7 +280,7 @@ export abstract class OrchestratorPipeline extends OrchestratorExpansion {
         // corrected work becomes a split: the row is replaced by an ordered
         // decomposition and deleted, never edited in place and re-run as-is.
         // The supervisor's correction travels as evidence for the planner.
-        if (this.holdRewriteForOwner(task, `rewrite: ${verdict.rewrittenDescription || verdict.reason}`)) return;
+        if (this.replaceAfterRepeatedRewrites(task, `rewrite: ${verdict.rewrittenDescription || verdict.reason}`)) return;
         // Recorded so supervisorRewritesSinceOwner keeps bounding rewrites;
         // the row itself is replaced by the decomposition below.
         this.queue.log(task.id, 'supervisor', 'task-edited',

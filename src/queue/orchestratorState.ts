@@ -162,7 +162,7 @@ export abstract class OrchestratorState {
    * correctness. Everything that decides what actually *happens* to a task
    * still comes off the row.
    */
-  protected readonly reviewed = new Map<number, { attempt: number; at: number; eventId: number }>();
+  protected readonly reviewed = new Map<number, { attempt: number; at: number; eventId: number; minCalls?: number }>();
 
   /**
    * Kills the execution worker currently in flight, if any.
@@ -228,10 +228,6 @@ export abstract class OrchestratorState {
    * and retires the original row — see orchestratorDecomposition.
    */
   protected abstract requestFailureDecomposition(task: Task, reason: string): void;
-  /**
-   * Compatibility handoff: return unresolved work to the executor before later tasks.
-   */
-  protected abstract blockForHuman(task: Task, reason: string): void;
   protected abstract serviceFailureDecomposition(task: Task): Promise<boolean>;
   protected abstract reviewWork(task: Task): Promise<void>;
   protected abstract pauseForRecovery(task: Task, reason: string): void;

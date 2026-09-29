@@ -42,6 +42,26 @@ function preflight(host) {
   });
 }
 
+/**
+ * MCP servers for a source run. The editor reads them from VS Code's user
+ * mcp.json, which a headless host has no path to, so a run names a file
+ * (VS Code `servers` or Claude Code `mcpServers` shape) and optionally the
+ * subset it wants. They are handed over as the `mfagent.mcpServers` setting,
+ * which reaches both the Claude CLI roles and the Go core's workers.
+ */
+function loadMcpSettings(file, names) {
+  const doc = JSON.parse(fs.readFileSync(path.resolve(file), 'utf8'));
+  const wanted = names ? new Set(names.split(',').map(name => name.trim()).filter(Boolean)) : null;
+  const servers = [];
+  for (const [name, def] of Object.entries(doc.servers || doc.mcpServers || {})) {
+    if ((wanted && !wanted.has(name)) || def.disabled === true) continue;
+    servers.push({ name, command: def.command, args: def.args, env: def.env, url: def.url, headers: def.headers });
+  }
+  const missing = wanted ? [...wanted].filter(name => !servers.some(server => server.name === name)) : [];
+  if (missing.length) throw Error(`MCP server(s) not found in ${file}: ${missing.join(', ')}.`);
+  return servers;
+}
+
 async function plan(host, goal) {
   if (host.queue.list().length) throw Error('Planning requires an empty queue; archive the existing queue first.');
   const testing = host.load('src/queue/testingEnvironment.ts');
@@ -59,6 +79,7 @@ async function main(argv) {
   if (argv.includes('--help')) {
     console.log('Source queue runner: plan | run | status\n' +
       'node scripts/queue-runner.cjs <command> --workspace <path> [--goal-file <path>] [--instructions-file <path>] [--url <url>] [--model sonnet] [--effort medium] [--cli <path>]\n' +
+      'Reproducible run: --providers-file <settings export> --queue-path <db> --mcp-file <mcp.json> [--mcp-servers a,b] --settings-file <json of editor settings>.\n' +
       'HTTP worker roles: --worker-url <API base> --worker-model <model>; API key: MFAGENT_WORKER_API_KEY.\n' +
       '  Add --worker-all to run planner/supervisor on the worker too (no Claude CLI dependency).\n' +
       'Auto-detected workers: MFAGENT_WORKER_URL/MODEL, or OPENROUTER_API_KEY / OPENAI_API_KEY (+ optional MFAGENT_WORKER_MODEL).\n' +
@@ -70,7 +91,8 @@ async function main(argv) {
   loadDotEnv(path.join(repo, '.env'));
   const command = argv[0], options = {};
   const valued = ['--workspace', '--goal-file', '--instructions-file', '--url', '--model', '--effort', '--cli',
-    '--worker-url', '--worker-model', '--providers-file', '--queue-path'];
+    '--worker-url', '--worker-model', '--providers-file', '--queue-path', '--mcp-file', '--mcp-servers',
+    '--settings-file'];
   if (!['plan', 'run', 'status'].includes(command)) throw Error('Expected plan, run or status; see --help.');
   for (let index = 1; index < argv.length;) {
     const key = argv[index];
@@ -86,8 +108,12 @@ async function main(argv) {
   if (!options.workspace) throw Error('--workspace is required.');
   if (options.effort && !['low', 'medium', 'high', 'xhigh', 'max'].includes(options.effort)) throw Error('Invalid --effort.');
   if (command === 'plan' && !options['goal-file']) throw Error('--goal-file is required for planning.');
+  if (options['mcp-servers'] && !options['mcp-file']) throw Error('--mcp-servers requires --mcp-file.');
+  // Plain editor settings (queue.workerMaxRounds and so on) for a reproducible run; --mcp-file adds mcpServers.
+  const settings = options['settings-file'] ? JSON.parse(fs.readFileSync(path.resolve(options['settings-file']), 'utf8')) : {};
+  if (options['mcp-file']) settings.mcpServers = loadMcpSettings(options['mcp-file'], options['mcp-servers']);
   const host = await createHost({ ...options, workerUrl: options['worker-url'], workerModel: options['worker-model'],
-    providersFile: options['providers-file'], queuePath: options['queue-path'], workerAll: options.workerAll });
+    providersFile: options['providers-file'], queuePath: options['queue-path'], workerAll: options.workerAll, settings });
   let poll;
   try {
     // Owner instructions plus a host-verified briefing about the local stack.

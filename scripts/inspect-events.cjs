@@ -1,0 +1,11 @@
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[2], { readOnly: true });
+const id = Number(process.argv[3] || 36);
+const ev = db.prepare("select at,kind,actor,message from task_events where task_id=? and kind in ('tester-retest','test-repair-halted','supervisor-verdict') order by at").all(id);
+for (const e of ev) console.log(new Date(e.at).toISOString(), e.kind, e.actor, '|', (e.message || '').slice(0, 140));
+const t = db.prepare('select id,attempts,max_attempts,status,activity_phase from tasks where id=?').get(id);
+console.log('TASK:', JSON.stringify(t));
+const recent = db.prepare('select at,kind,actor,message from task_events where task_id=? order by at desc limit 10').all(id);
+console.log('--- last 10 events ---');
+for (const e of recent) console.log(new Date(e.at).toISOString(), e.kind, e.actor, '|', (e.message || '').slice(0, 140));
+db.close();

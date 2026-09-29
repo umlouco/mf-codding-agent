@@ -60,11 +60,11 @@ export abstract class OrchestratorRemediation extends OrchestratorDecomposition 
         // asking, do something structurally different" — reuse it here instead
         // of deferring the identical question forever on a five-minute timer.
         if (streak >= 3) {
-          this.blockForHuman(task, `Autonomous recovery proposed the identical ` +
+          this.requestFailureDecomposition(task, `Autonomous recovery proposed the identical ` +
             `operation ${streak} times running with no new evidence between attempts (latest ` +
             `diagnosis: ${decision.reason}). Replace this task with smaller, independently ` +
             `verifiable work instead of repeating the same recovery decision.`);
-          // blockForHuman already fenced this review (nulled it and
+          // requestFailureDecomposition already fenced this review (nulled it and
           // bumped reviewGen), so serviceRecovery's post-await gen check discards
           // whatever is returned here; the value only satisfies the return type.
           return { status: 'applied' };
